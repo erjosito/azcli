@@ -1,0 +1,93 @@
+############################################################################
+# Created by Jose Moreno
+# February 2020
+#
+# Creates a VWAN secure hub
+############################################################################
+
+# Variables
+rg=fwmgr
+vwan=vwan
+location1=eastus
+location2=westus2
+username=jose
+password=Microsoft123!
+publisher=cisco
+offer=cisco-csr-1000v
+sku=16_12-byol
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+vwan_hub1_prefix=172.21.10.0/24
+azure_hub1_prefix=172.21.12.0/24
+azure_hub1_subnet=172.21.12.0/26
+azure_hub1_nva_ip=172.21.12.10
+azure_spoke1_prefix=172.21.11.0/24
+azure_spoke1_subnet=172.21.11.0/26
+azure_spoke1_jump_subnet=172.21.11.64/26
+azure_spoke1_vm_ip=172.21.11.11
+branch1_prefix=172.21.200.0/24
+branch1_subnet=172.21.200.0/26
+branch1_bgp_ip=172.21.200.10
+vwan_hub2_prefix=172.22.10.0/24
+branch2_prefix=172.22.200.0/24
+branch2_subnet=172.22.200.0/26
+branch2_bgp_ip=172.22.200.10
+azure_hub2_prefix=172.22.12.0/24
+azure_hub2_subnet=172.22.12.0/26
+azure_hub2_nva_ip=172.22.12.10
+azure_spoke2_prefix=172.22.11.0/24
+azure_spoke2_subnet=172.22.11.0/26
+azure_spoke2_vm_ip=172.22.11.11
+vwan_hub1_asn=65515
+vwan_hub2_asn=65515
+branch1_asn=65501
+branch2_asn=65502
+
+# Start
+az group create -n $rg -l $location1
+
+# vwan and hubs
+az network vwan create -n $vwan -g $rg -l $location1 --branch-to-branch-traffic true --vnet-to-vnet-traffic true
+az network vhub create -n hub1 -g $rg --vwan $vwan -l $location1 --address-prefix $vwan_hub1_prefix
+
+# VM (no PIP)
+az vm create -n spoke-vm1 -g $rg -l $location1 --image ubuntuLTS --admin-username $username --admin-password "$password" \
+             --public-ip-address "" --vnet-name spoke-$location1 --vnet-address-prefix $azure_spoke1_prefix \
+             --subnet vm --subnet-address-prefix $azure_spoke1_subnet --private-ip-address $azure_spoke1_vm_ip
+
+# Jump box (with PIP)
+az vm create -n spoke-vm1 -g $rg -l $location1 --image ubuntuLTS --admin-username $username --admin-password "$password" \
+             --public-ip-address spoke1-pip --vnet-name spoke-$location1 --vnet-address-prefix $azure_spoke1_prefix \
+             --subnet jumphost --subnet-address-prefix $azure_spoke1_jump_subnet --private-ip-address $azure_spoke1_vm_ip
+
+# Connection spoke1-vhub1
+az network vhub connection create -n tohub -g $rg --remote-vnet spoke-$location1 --vhub-name hub1 --remote-vnet-transit true --use-vnet-gateways true
+
+# Firewall policy
+az network policy create blah blah
+
+# NVA to simulate a branch
+az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} \
+    --admin-username "$username" --admin-password "$password" --public-ip-address branch1-pip --public-ip-address-allocation static \
+    --vnet-name branch1 --vnet-address-prefix $branch1_prefix --subnet nva --subnet-address-prefix $branch1_subnet \
+    --private-ip-address $branch1_bgp_ip
+branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
+
+
+# Remove role assignment for zscaler SP
+keyvault=erjositoKeyvault
+appid=$(az keyvault secret show --vault-name $keyvault -n zscaler-app-id --query value -o tsv)
+oid=$(az ad sp show --id $appid --query objectId -o tsv)
+subid=$(az account show --query id -o tsv)
+assignmentid=$(az role assignment list --scope "/subscriptions/${subid}" --assignee $oid --query '[0].id' -o tsv)
+if [[ -z $assignmentid ]]
+then
+    echo "No assignment found for app ID $appid"
+else
+    az role assignment delete --ids $assignmentid -y
+fi
+# Add role assignment
+appid=$(az keyvault secret show --vault-name erjositoKeyvault -n zscaler-app-id --query value -o tsv)
+oid=$(az ad sp show --id $appid --query objectId -o tsv)
+subid=$(az account show --query id -o tsv)
+az role assignment create --scope "/subscriptions/${subid}" --assignee $oid --role Contributor
+

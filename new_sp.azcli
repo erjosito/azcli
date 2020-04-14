@@ -1,0 +1,24 @@
+# First time: create SP and store the app id and secret as AKV secrets. You need to do this only **once**
+purpose=example
+keyvault_name=erjositoKeyvault
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+sp_name=$purpose
+sp_output=$(az ad sp create-for-rbac --name $sp_name --skip-assignment 2>/dev/null)
+sp_app_id=$(echo $sp_output | jq -r '.appId')
+sp_app_secret=$(echo $sp_output | jq -r '.password')
+az keyvault secret set --vault-name $keyvault_name --name $keyvault_appid_secret_name --value $sp_app_id
+az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $sp_app_secret
+# Assign AKV policy (example certificate/secret get) or Azure RBAC roles (example a RG)
+rg_name=my-rg
+rg_id=$(az group show -n $rg_name --query id -o tsv)
+az role assignment create --scope $rg_id --assignee $sp_app_id --role Contributor
+az keyvault set-policy -n $keyvault_name --object-id $sp_app_id --certificate-permissions get --secret-permissions get
+
+# Next time: get SP details from AKV
+purpose=example
+keyvault_name=erjositoKeyvault
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
+sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)

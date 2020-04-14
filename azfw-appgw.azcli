@@ -1,0 +1,227 @@
+############################################################################
+# Created by Jose Moreno
+# April 2020
+#
+# The script creates AzFW and AppGW, plus some VMs for testing:
+#
+############################################################################
+
+# Variables
+rg=azfwappgw
+location=eastus
+vnet_name=azfw
+vnet_prefix=192.168.0.0/16
+vm_name=testvmlinux
+vm_pip_name=testvmlinux-pip
+vm_sku=Standard_B1s
+vm_subnet_name=vm
+vm_subnet_prefix=192.168.10.0/24
+vm_cloudinit_filename=cloudinit-whoami.txt
+vm_rt_name=vm
+vm_nsg_name=vm-nsg
+azfw_name=myazfw
+azfw_pip_name=myazfw-pip
+azfw_subnet_name=AzureFirewallSubnet
+azfw_subnet_prefix=192.168.1.0/24
+appgw_subnet_name=ApplicationGatewaySubnet
+appgw_subnet_prefix=192.168.2.0/24
+appgw_name=appgw
+appgw_pip_name=appgw-pip
+appgw_sku=Standard_v2
+appgw_cookie=Disabled
+appgw_backenddnsname=kuard
+appgw_backendfqdn="$backenddnsname"."$dnszone"
+appgw_rt_name=appgw
+logws_name=log$RANDOM
+
+# RG and vnet
+az group create -n $rg -l $location
+az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $azfw_subnet_name --subnet-prefixes $azfw_subnet_prefix
+az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix
+az network vnet subnet create --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --address-prefixes $appgw_subnet_prefix
+
+# Create Log Analytics workspace
+# logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv)  # Retrieve the WS name if it already existed
+az monitor log-analytics workspace create -n $logws_name -g $rg
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+
+# Find images (optional)
+# az vm image list-publishers -l $location -o table | grep -i canonical
+# publisher=Canonical
+# az vm image list-offers -l $location -p $publisher -o table | grep -i docker
+# offer=UbuntuServer
+# az vm image list-skus -l $location -p $publisher -f $offer -o table
+# sku=19.04
+# az vm image list -l $location -p $publisher -f $offer --sku $sku --all -o table
+
+# Find extensions (optional)
+# az vm extension image list -l $location --latest -o table | grep -i docker
+
+# Deploy a Linux VM with troubleshooting API in a Docker container (whoami)
+az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location
+az network nsg create -n $vm_nsg_name -g $rg
+az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
+az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
+   --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name
+vm_id=$(az vm show -n $vm_name -g $rg --query id -o tsv)
+docker_config='{"compose": {"whoami": {"image": "erjosito/sqlapi:0.1", "ports": ["8080:8080"]}}}'
+az vm extension set -n DockerExtension --publisher Microsoft.Azure.Extensions --ids $vm_id --settings $docker_config
+vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv)
+
+# Verify Linux VM deployed correctly and SSH is working fine
+vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+ssh-keyscan -H $vm_pip_address >> ~/.ssh/known_hosts
+ssh $vm_pip_address "ip a"
+
+# Verify API is working
+curl ${vm_pip_address}:8080/api/healthcheck
+curl ${vm_pip_address}:8080/api/ip
+
+# Deploy AzFW
+az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location
+azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
+az network firewall create -n $azfw_name -g $rg -l $location
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
+az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name
+az network firewall update -n $azfw_name -g $rg
+azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+
+# Outgoing app rule for all FQDNs
+az network firewall application-rule create -f $azfw_name -g $rg -c AllowAll --protocols Http=80 Https=443 \
+    --target-fqdns "*" --source-addresses $vnet_prefix -n Allow-all --priority 200 --action Allow
+
+# DNAT rules for the test VM
+az network firewall nat-rule create -n SSH-to-VM -f $azfw_name -g $rg \
+    --destination-addresses $azfw_pip_address --destination-ports 22 --protocols Tcp --translated-address $vm_private_ip --translated-port 22 \
+    --source-addresses '*' -c VMTraffic --priority 200 --action Dnat
+az network firewall nat-rule create -n Web-to-VM -f $azfw_name -g $rg \
+    --destination-addresses $azfw_pip_address --destination-ports 8080 --protocols Tcp --translated-address $vm_private_ip --translated-port 8080 \
+    --source-addresses '*' -c VMTraffic
+
+# Deploy App Gateway
+# Create GW with sample config for port 80
+az network public-ip create -g $rg -n $appgw_pip_name --sku standard --allocation-method static -l $location
+appgw_pip_address=$(az network public-ip show -g $rg -n $appgw_pip_name --query ipAddress -o tsv)
+az network application-gateway create -g $rg -n $appgw_name --capacity 2 --sku $appgw_sku \
+    --frontend-port 80 --routing-rule-type basic \
+    --http-settings-port 8080 --http-settings-protocol Http \
+    --public-ip-address $appgw_pip_name --vnet-name $vnet_name --subnet $appgw_subnet_name
+
+# Enable autoscaling for App Gateway
+# This could be done at creation time, here for showing that it can be done afterwards as well
+az network application-gateway update -n $appgw_name -g $rg \
+    --set autoscaleConfiguration='{"minCapacity": 1, "maxCapacity": 2}' \
+    --set sku='{"name": "Standard_v2","tier": "Standard_v2"}'
+
+# Create probe and HTTP settings
+az network application-gateway probe create -g $rg --gateway-name $appgw_name \
+  --name myprobe --protocol Https --host-name-from-http-settings \
+  --match-status-codes 200-399
+az network application-gateway http-settings create -g $rg --gateway-name $appgw_name \
+  --name mysettings --protocol https
+
+
+# Connect app gw to Azure Monitor
+appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "ApplicationGatewayAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+        {"category": "ApplicationGatewayPerformanceLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+        {"category": "ApplicationGatewayFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+
+# Route table for the VM subnet pointing to the AzFw, excluding the client's IP
+az network route-table create -n $vm_rt_name -g $rg -l $location
+az network route-table route create -n defaultRoute --route-table-name $vm_rt_name -g $rg --next-hop-type VirtualAppliance --address-prefix "0.0.0.0/0" --next-hop-ip-address $azfw_private_ip
+# my_ip=$(curl -s4 ifconfig.co)
+# az network route-table route create -n clientIP --route-table-name $vm_rt_name -g $rg --next-hop-type Internet --address-prefix "$my_ip/32"
+rt_id=$(az network route-table show -n $vm_rt_name -g $rg --query id -o tsv)
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table $rt_id
+
+# Verify access to the linux VM
+vm_linux_pip_ip=$(az network public-ip show -n $vm_linux_pip_name -g $rg --query ipAddress -o tsv)
+ssh-keyscan -H $vm_linux_pip_ip >> ~/.ssh/known_hosts
+ssh $vm_linux_pip_ip "curl -s4 ifconfig.co"
+echo "The previous output should match the firewall public IP $azfw_ip"
+
+# AzFW logs
+query_apprule_deny='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12]), msg_s 
+| where Rule_Collection != "AzureInternalTraffic" 
+| where Action == "Deny" 
+| take 100'
+query_apprule_allow='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12]), msg_s 
+| where Rule_Collection != "AzureInternalTraffic" 
+| where Action == "Allow" 
+| take 100'
+query_apprule_all='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12]), msg_s 
+| where Rule_Collection != "AzureInternalTraffic" 
+| take 100'
+query_apprule_vm='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12])
+| where Rule_Collection != "AzureInternalTraffic" 
+| where From startswith "'$vm_private_ip'"
+| take 100'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_apprule_deny -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_apprule_allow -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_apprule_all -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_apprule_vm -o tsv
+
+# Diagnostics
+
+# Public IPs
+az network public-ip list -g $rg -o table
+
+# Virtual Machines
+az vm list -g $rg -o table
+
+# Azure Firewall
+az network firewall nat-rule collection list -f $azfw_name -g $rg -o table
+az network firewall nat-rule list -c VMTraffic -f $azfw_name -g $rg --query rules -o table
+az network firewall network-rule collection list -f $azfw_name -g $rg -o table
+az network firewall application-rule collection list -f $azfw_name -g $rg -o table
+az network firewall application-rule list -c AllowAll -f $azfw_name -g $rg --query rules -o table
+az network firewall application-rule list -c AllowAll -f $azfw_name -g $rg --query rules --query '[].{Name:name,Protocols:protocols[],SourceAddresses:sourceAddresses[],TargetFQDNs:targetFqdns[]}'
+
+# App Gateway
+az network application-gateway list -g $appgw_rg -o table
+az network application-gateway http-listener list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway frontend-ip list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway probe list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway address-pool list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway rule show -g $appgw_rg --gateway-name $appgw_name -n rule1
+az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name -o table
+rule=$(az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name --query '[0].name' -o tsv)
+az network application-gateway rule show -g $appgw_rg --gateway-name $appgw_name -n $rule
+az network application-gateway url-path-map list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway http-settings list -g $appgw_rg --gateway-name $appgw_name -o table
+
+# Delete VM
+vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+vm_disk_id=$(az vm show -n $vm_name -g $rg --query 'storageProfile.osDisk.managedDisk.id' -o tsv)
+az vm delete -n $vm_name -g $rg -y
+az disk delete --ids $vm_disk_id -y
+az network nic delete --ids $vm_nic_id
+
+# Cleanup all
+az group delete -n $rg -y --no-wait

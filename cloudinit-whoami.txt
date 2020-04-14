@@ -1,0 +1,6 @@
+#cloud-config
+runcmd:
+  - git clone https://github.com/erjosito/whoami.git /root/whoami
+  - apt update && apt install python3-pip
+  - pip3 install -r /root/whoami/api/requirements.txt
+  - python3 /root/whoami/api/sql_api.py&

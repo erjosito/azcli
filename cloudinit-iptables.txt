@@ -1,0 +1,6 @@
+#cloud-config
+runcmd:
+  - sysctl -w net.ipv4.ip_forward=1
+  - sysctl -w net.ipv6.conf.all.forwarding=1
+  - iptables -A FORWARD -j ACCEPT
+  - iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE

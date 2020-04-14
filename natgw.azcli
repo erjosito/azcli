@@ -1,0 +1,99 @@
+############################################################################
+# Created by Jose Moreno
+# March 2020
+#
+# The test creates a NAT gw with a number of resources:
+# * VM
+# * VMSS
+# * AKS (just a glorified VMSS)
+############################################################################
+
+
+region=westeurope
+prefix=natgw-
+rg=$prefix$region
+#verbose="--verbose --debug"
+zone=""
+# zone="1"
+if [[ zone -ne "" ]] ; then zone="--zone $2"; fi
+# RG
+az group delete --name $rg --yes $verbose
+az group create --location $region --name $rg $verbose
+# Vnet and PIPs
+az network public-ip create --resource-group $rg --name vmpip --sku Standard --version IPv4 $zone $verbose
+az network public-ip create --resource-group $rg --name natgwpip01 --sku Standard --version IPv4 $zone $verbose
+az network public-ip create --resource-group $rg --name natgwpip02 --sku Standard --version IPv4 $zone $verbose
+az network vnet create --resource-group $rg --name vnet --address-prefixes 192.168.0.0/16 $verbose
+az network vnet subnet create --resource-group $rg --vnet-name vnet --name subnet --address-prefixes 192.168.0.0/24 $verbose
+# NSG
+az network nsg create --resource-group $rg --name nsg $verbose
+az network nsg rule create --resource-group $rg --nsg-name nsg --name ssh --description ssh --priority 100 --destination-port-ranges 22 --protocol Tcp $verbose
+az network vnet subnet update --resource-group $rg --vnet-name vnet --name subnet --network-security-group nsg $verbose
+# NAT GW
+az network nat gateway create --resource-group $rg --name natgw --public-ip-addresses natgwpip01 $zone
+az network vnet subnet update --resource-group $rg --vnet-name vnet --name subnet --nat-gateway natgw
+# VM
+az network nic create --resource-group $rg --name nic --vnet-name vnet --subnet subnet --private-ip-address-version IPv4 --private-ip-address 192.168.0.16 --public-ip-address vmpip $verbose
+az vm create --resource-group $rg --name vm --image UbuntuLTS --nics nic $verbose --generate-ssh-keys --size Standard_B1s
+# ALB/ILB for VMSS
+# External LB
+az network public-ip create -g $rg -n elbpip --sku Standard --allocation-method Static
+az network lb create -g $rg -n elb --sku Standard --vnet-name vnet --public-ip-address elbpip
+extbackend=$(az network lb address-pool list -g $rg --lb-name elb --query [0].name -o tsv)
+if [[ -z "$extbackend" ]]
+then
+    az network lb address-pool create -g $rg --lb-name elb -n elb-backend
+else
+    echo "elb already has a backend pool: $extbackend"
+fi
+az network lb probe create -g $rg --lb-name elb -n elb-probe --protocol tcp --port 22
+# Internal LB
+az network lb create -g $rg -n ilb --sku Standard --vnet-name vnet --subnet subnet
+intbackend=$(az network lb address-pool list -g $rg --lb-name ilb --query [0].name -o tsv)
+if [[ -z "$intbackend" ]]
+then
+    az network lb address-pool create -g $rg --lb-name ilb -n ilb-backend
+else
+    echo "ilb already has a backend pool: $intbackend"
+fi
+az network lb probe create -g $rg --lb-name ilb -n ilb-probe --protocol tcp --port 22
+# VMSS
+az vmss create -n vmss -g $rg -l $region --image UbuntuLTS --generate-ssh-keys --lb "" --vnet-name vnet --subnet subnet --vm-sku Standard_B1s --instance-count 1
+# outbound nat (elb)
+extfrontend=$(az network lb frontend-ip list -g $rg --lb-name elb -o tsv --query '[0].name')
+extbackend=$(az network lb address-pool list -g $rg --lb-name elb --query '[0].name' -o tsv)
+extprobe=$(az network lb probe list -g $rg --lb-name elb --query '[0].name' -o tsv)
+az network lb outbound-rule create -g $rg --address-pool $extbackend --frontend-ip-configs $extfrontend --idle-timeout 5 --lb-name elb --name outboundRule --outbound-ports 10000 --protocol Tcp
+extbackendid=$(az network lb address-pool list -g $rg --lb-name elb --query '[0].id' -o tsv)
+az vmss update -g $rg -n vmss --set virtualMachineProfile.networkProfile.networkInterfaceConfigurations\[0\].ipConfigurations\[0\].loadBalancerBackendAddressPools="[{\"id\":\"$extbackendid\"}]"
+#az vmss update-instances -g $rg --name vmss --instance-ids "*"
+az network lb outbound-rule list -g $rg --lb-name elb -o table
+# inbound nat (elb)
+az network lb inbound-nat-pool create -g $rg --lb-name elb -n inboundSSH --protocol Tcp --frontend-port-range-start 22000 --frontend-port-range-end 22009 --backend-port 22 --frontend-ip-name $extfrontend
+extpoolid=$(az network lb inbound-nat-pool list -g $rg --lb-name elb --query '[0].id' -o tsv)
+az vmss update -g $rg -n vmss --set virtualMachineProfile.networkProfile.networkInterfaceConfigurations\[0\].ipConfigurations\[0\].loadBalancerInboundNatPools="[{\"id\":\"$extpoolid\",\"resourceGroup\": \"$rg\"}]"
+#az vmss update-instances -g $rg --name vmss --instance-ids "*"
+az network lb inbound-nat-rule list -g $rg --lb-name elb -o table
+# lb rule (ilb)
+intfrontend=$(az network lb frontend-ip list -g $rg --lb-name ilb --query '[0].name' -o tsv)
+intbackend=$(az network lb address-pool list -g $rg --lb-name ilb --query '[0].name' -o tsv)
+intprobe=$(az network lb probe list -g $rg --lb-name ilb --query '[0].name' -o tsv)
+az network lb rule create -n AllPorts -g $rg --lb-name ilb --protocol All --frontend-port 0 --backend-port 0 --frontend-ip-name $intfrontend --backend-pool-name $intbackend --probe-name $intprobe
+az network lb rule list -g $rg --lb-name ilb -o table
+extbackendid=$(az network lb address-pool list -g $rg --lb-name elb --query '[0].id' -o tsv)
+intbackendid=$(az network lb address-pool list -g $rg --lb-name ilb --query '[0].id' -o tsv)
+az vmss update -g $rg -n vmss --set virtualMachineProfile.networkProfile.networkInterfaceConfigurations\[0\].ipConfigurations\[0\].loadBalancerBackendAddressPools="[{\"id\":\"$extbackendid\"},{\"id\":\"$intbackendid\"}]"
+az vmss update-instances -g $rg --name vmss --instance-ids "*"
+# AKS
+az network vnet subnet create --resource-group $rg --vnet-name vnet --name aks --address-prefixes 192.168.1.0/24 $verbose
+az network public-ip create --resource-group $rg --name akspip01 --sku Standard --version IPv4 $verbose
+az network public-ip create --resource-group $rg --name akspip02 --sku Standard --version IPv4 $verbose
+subnetid=$(az network vnet subnet show -g $rg --vnet-name vnet -n aks --query id -o tsv)
+az aks create -n aks -g $rg --vnet-subnet-id $subnetid --vm-set-type VirtualMachineScaleSets --load-balancer-sku Standard -c 1 -s Standard_B2s
+az aks update -n aks -g $rg --load-balancer-outbound-ips akspip01,akspip02
+az network vnet subnet update --resource-group $rg --vnet-name vnet --name aks --nat-gateway natgw
+
+# List connection info
+az network public-ip list -g $rg -o table
+az vmss list-instance-connection-info -g $rg -n vmss -o table
+az aks list -g $rg -o table

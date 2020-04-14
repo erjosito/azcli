@@ -1,0 +1,128 @@
+############################################################################
+# Created by Jose Moreno
+# March 2020
+#
+# The script creates VMs behind an AzFW to perform tests:
+# * Verify egress public IP address when going to Internet
+# * Install extension in a VM
+# * Verify AzFW logs in Log Analytics
+############################################################################
+
+# Variables
+rg=azfw
+location=eastus
+vnet_name=azfw
+vnet_prefix=192.168.0.0/16
+azfw_name=myazfw
+azfw_pip_name=myazfw-pip
+azfw_subnet_name=AzureFirewallSubnet
+azfw_subnet_prefix=192.168.1.0/24
+vm_linux_name=testvmlinux
+vm_linux_pip_name=testvmlinux-pip
+vm_win_name=testvmwin
+vm_win_pip_name=testvmwin-pip
+vm_win_username=jose
+vm_win_password=$(az keyvault secret show --vault-name erjositoKeyvault -n defaultPassword --query value -o tsv)
+vm_subnet_name=vm
+vm_subnet_prefix=192.168.10.0/24
+logws_name=log$RANDOM
+rt_name=vmrt
+
+# RG and vnet
+az group create -n $rg -l $location
+az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $azfw_subnet_name --subnet-prefixes $azfw_subnet_prefix
+az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix
+
+# Deploy Linux and Windows VMs
+az vm create -n $vm_linux_name -g $rg --image ubuntuLTS --generate-ssh-keys --public-ip-address $vm_linux_pip_name --vnet-name $vnet_name --subnet $vm_subnet_name --no-wait
+az vm create -n $vm_win_name -g $rg --image win2016datacenter --admin-username $vm_win_username --admin-password $vm_win_password --public-ip-address $vm_win_pip_name --vnet-name $vnet_name --subnet $vm_subnet_name --no-wait
+az vm list -g $rg -o table
+
+# Deploy AzFW
+az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location
+azfw_ip=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
+az network firewall create -n $azfw_name -g $rg -l $location
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az monitor log-analytics workspace create -n $logws_name -g $rg
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
+az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name
+az network firewall update -n $azfw_name -g $rg
+azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+az network firewall application-rule create -f $azfw_name -g $rg -c AllowAll --protocols Http=80 Https=443 --target-fqdns "*" --source-addresses $vnet_prefix -n Allow-all --priority 200 --action Allow
+
+# Route table for the VM subnet pointing to the AzFw, excluding the client's IP
+az network route-table create -n $rt_name -g $rg -l $location
+az network route-table route create -n defaultRoute --route-table-name $rt_name -g $rg --next-hop-type VirtualAppliance --address-prefix "0.0.0.0/0" --next-hop-ip-address $azfw_private_ip
+my_ip=$(curl -s4 ifconfig.co)
+az network route-table route create -n clientIP --route-table-name $rt_name -g $rg --next-hop-type Internet --address-prefix "$my_ip/32"
+rt_id=$(az network route-table show -n $rt_name -g $rg --query id -o tsv)
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table $rt_id
+
+# Verify access to the linux VM
+vm_linux_pip_ip=$(az network public-ip show -n $vm_linux_pip_name -g $rg --query ipAddress -o tsv)
+ssh-keyscan -H $vm_linux_pip_ip >> ~/.ssh/known_hosts
+ssh $vm_linux_pip_ip "curl -s4 ifconfig.co"
+echo "The previous output should match the firewall public IP $azfw_ip"
+
+# Install extension to Windows VM
+# az vm extension image list -l $location --latest -o table | grep Sql  # This command takes a while to run
+az vm extension set -n SqlIaasAgent --vm-name $vm_win_name -g $rg --version "2.0" --publisher Microsoft.SqlServer.Management
+az vm extension list --vm-name $vm_win_name -g $rg -o table
+
+# Get private IPs
+vm_win_private_ip=$(az vm show -g $rg -n $vm_win_name -d --query privateIps -o tsv)
+vm_linux_private_ip=$(az vm show -g $rg -n $vm_linux_name -d --query privateIps -o tsv)
+
+# AzFW app rule logs
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+query_apprule_deny='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12]), msg_s 
+| where Rule_Collection != "AzureInternalTraffic" 
+| where Action == "Deny" 
+| take 100'
+query_apprule_allow='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12]), msg_s 
+| where Rule_Collection != "AzureInternalTraffic" 
+| where Action == "Allow" 
+| take 100'
+query_apprule_all='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12]), msg_s 
+| where Rule_Collection != "AzureInternalTraffic" 
+| take 100'
+query_apprule_linux='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12])
+| where Rule_Collection != "AzureInternalTraffic" 
+| where From startswith "'$vm_linux_private_ip'"
+| take 100'
+query_apprule_win='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12])
+| where Rule_Collection != "AzureInternalTraffic" 
+| where From startswith "'$vm_win_private_ip'"
+| take 100'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_apprule_deny -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_apprule_allow -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_apprule_all -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_apprule_linux -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_apprule_win -o tsv
+
+# Cleanup
+# az group delete -n $rg -y --no-wait

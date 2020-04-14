@@ -1,0 +1,165 @@
+############################################################################
+# Created by Jose Moreno
+# March 2020
+#
+# The script creates a vnet with an NVA cluster behind a LB, plus a VM
+#  with UDRs to send traffic through it.
+#
+############################################################################
+
+# Initialization
+rg=nvalab
+location=eastus
+vnet_name=vnet
+vnet_prefix=192.168.0.0/16
+# VM
+vm_name=testvm
+vm_subnet_name=vm
+vm_subnet_prefix=192.168.2.0/24
+vm_nsg_name=vm-nsg
+vm_sku=Standard_B1s
+vm_pip_name=vm_pip
+vm_cloudinit_filename=cloudinit-apache2.txt
+# NVA
+nva_subnet_name=nva
+nva_subnet_prefix=192.168.50.0/24
+nva_name=nva01
+nva_nsg_name=vm-nsg
+nva_cloudinit_filename=cloudinit-iptables.txt
+nva_sku=Standard_B1s
+nva_pip_name=nva_pip
+nva_lb_sku=Standard
+nva_lb_ext_name=nva-lb-ext
+nva_lb_ext_pip=nva-lb-pip
+nva_lb_ext_frontend_name=frontend
+nva_outbound_backend_name=backend-outbound
+nva_outbound_pip_name=nva-outbound
+nva_outbound_frontend_name=frontend-outbound
+nva_outbound_allocated_ports=10000
+nva_outbound_rule_name=outbound
+nva_lb_ext_backend_name=backend-lb
+nva_lb_int_name=nva-lb-int
+nva_lb_int_frontend_ip=192.168.50.100
+nva_lb_int_frontend_name=frontend
+nva_lb_int_backend_name=backend-lb
+nva_inbound_rule_name=inbound
+lb_probe_name=SSHprobe
+lb_probe_port=22
+
+# Create RG
+az group create -n $rg -l $location
+
+# Create vnet, subnets, PIPs
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $nva_subnet_name --address-prefixes $nva_subnet_prefix
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $vm_subnet_name --address-prefixes $vm_subnet_prefix
+az network public-ip create -n $vm_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+az network public-ip create -n $nva_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+az network public-ip create -n $nva_outbound_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+vm_pip_ip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+nva_pip_ip=$(az network public-ip show -n $nva_pip_name -g $rg --query ipAddress -o tsv)
+nva_outbound_pip_ip=$(az network public-ip show -n $nva_outbound_pip_name -g $rg --query ipAddress -o tsv)
+
+# Create NSGs (2 different ones for VM and NVA for ease of modification)
+az network nsg create -n $vm_nsg_name -g $rg
+az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 80 --access Allow --protocol Tcp
+az network nsg create -n $nva_nsg_name -g $rg
+az network nsg rule create -n ssh --nsg-name $nva_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n web --nsg-name $nva_nsg_name -g $rg --priority 510 --destination-port-ranges 80 --access Allow --protocol Tcp
+
+# Create NVA and VM
+az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku --custom-data $vm_cloudinit_filename \
+   --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address "" --no-wait
+az vm create -n $nva_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $nva_sku --custom-data $nva_cloudinit_filename \
+   --vnet-name $vnet_name --subnet $nva_subnet_name --nsg $nva_nsg_name --public-ip-address "" --no-wait
+
+# Create couple of ALBs for NVA: public and private
+# Public ALB (with lb, inbound and outbound rules)
+az network lb create -g $rg -n $nva_lb_ext_name --sku $nva_lb_sku --vnet-name $vnet_name \
+   --frontend-ip-name $nva_lb_ext_frontend_name --public-ip-address $nva_lb_ext_pip --backend-pool-name $nva_lb_ext_backend_name
+az network lb probe create -g $rg --lb-name $nva_lb_ext_name -n $lb_probe_name --protocol tcp --port $lb_probe_port
+az network lb rule create -n HTTP -g $rg --lb-name $nva_lb_ext_name --protocol Tcp --frontend-port 80 --backend-port 80 \
+   --frontend-ip-name $nva_lb_ext_frontend_name --backend-pool-name $nva_lb_ext_backend_name --probe-name $lb_probe_name \
+   --disable-outbound-snat  # Since we are going to create an outbound rule
+nva_lb_ext_backend_id=$(az network lb address-pool show -n $nva_lb_ext_backend_name --lb-name $nva_lb_ext_name -g $rg --query id -o tsv)
+az network lb inbound-nat-rule create -n $nva_inbound_rule_name --lb-name $nva_lb_ext_name -g $rg \
+   --frontend-ip-name $nva_lb_ext_frontend_name \
+   --protocol Tcp --frontend-port 1022 --backend-port 22
+nva_inbound_rule_id=$(az network lb inbound-nat-rule show -n $nva_inbound_rule_name --lb-name $nva_lb_ext_name -g $rg --query id -o tsv)
+az network lb frontend-ip create -n $nva_outbound_frontend_name --lb-name $nva_lb_ext_name -g $rg --public-ip-address $nva_outbound_pip_name
+az network lb address-pool create -n $nva_outbound_backend_name --lb-name $nva_lb_ext_name -g $rg  # It is best practice to add a dedicated backend pool for outbound
+nva_outbound_backend_id=$(az network lb address-pool show -n $nva_outbound_backend_name --lb-name $nva_lb_ext_name -g $rg --query id -o tsv)
+az network lb outbound-rule create -n $nva_outbound_rule_name --lb-name $nva_lb_ext_name -g $rg \
+   --address-pool $nva_outbound_backend_name --frontend-ip-configs $nva_outbound_frontend_name --protocol All --outbound-ports $nva_outbound_allocated_ports
+# Internal ALB (only lb rule)
+az network lb create -g $rg -n $nva_lb_int_name --sku $nva_lb_sku --vnet-name $vnet_name --subnet $nva_subnet_name \
+   --frontend-ip-name $nva_lb_int_frontend_name --private-ip-address-version IPv4 --private-ip-address $nva_lb_int_frontend_ip \
+   --backend-pool-name $nva_lb_int_backend_name
+az network lb probe create -g $rg --lb-name $nva_lb_int_name -n $lb_probe_name --protocol tcp --port $lb_probe_port
+az network lb rule create -n AllPorts -g $rg --lb-name $nva_lb_int_name --protocol All --frontend-port 0 --backend-port 0 \
+   --frontend-ip-name $nva_lb_int_frontend_name --backend-pool-name $nva_lb_int_backend_name --probe-name $lb_probe_name
+nva_lb_int_backend_id=$(az network lb address-pool show -n $nva_lb_int_backend_name --lb-name $nva_lb_int_name -g $rg --query id -o tsv)
+
+# Associate NVA NIC to LBs and configure IP forwarding at Azure level
+nva_nic_id=$(az vm show -n $nva_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+nva_nic_name=$(echo $nva_nic_id | cut -d/ -f 9)
+az network nic update -n $nva_nic_name -g $rg --ip-forwarding true
+nva_ipconfig_name=$(az network nic ip-config list --nic-name $nva_nic_name -g $rg --query '[0].name' -o tsv)
+az network nic ip-config update -n $nva_ipconfig_name --nic-name $nva_nic_name -g $rg --public-ip-address "" # Remove PIP if there was one
+az network nic ip-config update -n $nva_ipconfig_name --nic-name $nva_nic_name -g $rg \
+   --lb-address-pools $nva_lb_ext_backend_id $nva_lb_int_backend_id $nva_outbound_backend_id \
+   --lb-inbound-nat-rules $nva_inbound_rule_id
+
+# Default IP route for the VM subnet 
+az network route-table create -n vm -g $rg
+az network route-table route create -n default --route-table vm -g $rg \
+   --address-prefix '0.0.0.0/0' --next-hop-type VirtualAppliance --next-hop-ip-address $nva_lb_int_frontend_ip
+az network vnet subnet update -n $vm_subnet_name --vnet-name $vnet_name -g $rg --route-table vm
+
+# SSH test into the NVA
+nva_lb_ext_pip_ip=$(az network public-ip show -n $nva_lb_ext_pip -g $rg --query ipAddress -o tsv)
+ssh -p 1022 $nva_lb_ext_pip_ip "ip a"
+
+# SSH test into the VM using the NVA as jump host
+vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+vm_nic_name=$(echo $vm_nic_id | cut -d/ -f 9)
+vm_private_ip=$(az network nic show -n $vm_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+ssh -J ${nva_lb_ext_pip_ip}:1022 $vm_private_ip "ip a"
+
+# Verify outbound traffic from the NVA and the VM
+ssh -p 1022 $nva_lb_ext_pip_ip "curl -s4 ifconfig.co"
+ssh -J ${nva_lb_ext_pip_ip}:1022 $vm_private_ip "curl -s4 ifconfig.co"
+echo "The previous outputs should be the outbound NAT PIP $nva_outbound_pip_ip"
+
+# Test: configure secondary ip in the NVA, and add a specific outbound rule
+# Goal: specific SNAT for certain workloads going through the NVA
+nva_ipconfig_2ary_name=ipconfig2
+nva_outbound_2ary_pip_name=outbound-2ary-pip
+nva_outbound_2ary_backend_name=backend-nat-2ary
+nva_outbound_2ary_frontend_name=frontend-nat-2ary
+nva_outbound_2ary_rule_name=outbound-2ary
+az network nic ip-config create -n $ipconfig_2ary_name --nic-name $nva_nic_name -g $rg --vnet-name $vnet_name --subnet $nva_subnet_name --private-ip-address-version IPv4 --public-ip-address ""
+az network public-ip create -n $nva_outbound_2ary_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+az network lb frontend-ip create -n $nva_outbound_2ary_frontend_name --lb-name $nva_lb_ext_name -g $rg --public-ip-address $nva_outbound_2ary_pip_name
+az network lb address-pool create -n $nva_outbound_2ary_backend_name --lb-name $nva_lb_ext_name -g $rg
+nva_outbound_2ary_backend_id=$(az network lb address-pool show -n $nva_outbound_2ary_backend_name --lb-name $nva_lb_ext_name -g $rg --query id -o tsv)
+az network lb outbound-rule create -n $nva_outbound_2ary_rule_name --lb-name $nva_lb_ext_name -g $rg \
+   --address-pool $nva_outbound_2ary_backend_name --frontend-ip-configs $nva_outbound_2ary_frontend_name --protocol All --outbound-ports $nva_outbound_allocated_ports
+az network nic ip-config update -n $nva_ipconfig_2ary_name --nic-name $nva_nic_name -g $rg --lb-address-pools $nva_outbound_2ary_backend_id
+# Error:
+# "OutboundRule /blah/outbound-2ary cannot be used with Backend Address Pool /blah/backend-nat-2ary that contains Secondary IPConfig /blah/ipconfig2"
+
+# Test: Assign new public-ip to 2ary config
+test_pip_name=test-pip
+az network public-ip create -n $test_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+az network nic ip-config update -n $nva_ipconfig_2ary_name --nic-name $nva_nic_name -g $rg --public-ip-address $test_pip_name
+
+# Test: put 2ary ip-configuration on different subnet does not work, as expected
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n test_subnet --address-prefixes 192.168.31.0/24
+az network nic ip-config update -n $nva_ipconfig_2ary_name --nic-name $nva_nic_name -g $rg --vnet-name $vnet_name --subnet test_subnet
+# Error:
+# "IPConfigurations on a Nic /blah/nva01VMNic cannot belong to different subnets. Subnets referred: /blah/nva;/blah/test_subnet"
+
+# Verification commands
+az network public-ip list -g $rg -o table

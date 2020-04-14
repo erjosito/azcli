@@ -1,0 +1,238 @@
+############################################################################
+# Created by Jose Moreno
+# April 2020
+#
+# AFD and ATM demo script
+# * The AFD commands use a frontdoor CLI extension
+# * It uses ACI to simulate an app in 2 locations
+# * It configures different routing algorithms for ATM, and verifies with whatsmydns.net
+# * Probe interval verification via ACI logs
+# * The lab uses AFD SSL offload with default certs
+#
+############################################################################
+
+# Variables
+rg=multiregiontest
+location1=westeurope  # blue
+location2=eastus      # purple
+unique_id=$RANDOM
+app_name=app${unique_id}
+logws_name=log${unique_id}
+
+# Resource group
+az group create -n $rg -l $location1
+
+# Create Log analytics workspace
+az monitor log-analytics workspace create -n $logws_name -g $rg
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+
+# Apps will be simulated with ACI
+az container create -n ${app_name}-${location1} --image gcr.io/kuar-demo/kuard-amd64:blue -l $location1 -g $rg \
+    --ip-address public --dns-name-label ${app_name}-${location1} --port 8080 \
+    --cpu 0.5 --memory 0.5
+az container create -n ${app_name}-${location2} --image gcr.io/kuar-demo/kuard-amd64:purple -l $location2 -g $rg \
+    --ip-address public --dns-name-label ${app_name}-${location2} --port 8080 \
+    --cpu 0.5 --memory 0.5
+app1_fqdn=$(az container show -n ${app_name}-${location1} -g $rg --query 'ipAddress.fqdn' -o tsv)
+app2_fqdn=$(az container show -n ${app_name}-${location2} -g $rg --query 'ipAddress.fqdn' -o tsv)
+echo "App1 available in region $location1 under http://${app1_fqdn}:8080"
+echo "App2 available in region $location2 under http://${app2_fqdn}:8080"
+
+# Traffic Manager - Function to delete all endpoints
+delete_atm_endpoints() {
+    az network traffic-manager endpoint delete -n ${location1} --profile-name $app_name -g $rg --type externalEndpoints
+    az network traffic-manager endpoint delete -n ${location2} --profile-name $app_name -g $rg --type externalEndpoints
+}
+
+# Create Traffic Manager - Weight
+atm_routing_method=Weighted   # Geographic, Multivalue, Performance, Priority, Subnet, Weighted
+az network traffic-manager profile create -n $app_name -g $rg --routing-method $atm_routing_method --unique-dns-name $app_name \
+    --protocol Http --port 8080 --path /healthy
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location1 -t externalEndPoints --target $app1_fqdn --weight 1
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location2 -t externalEndPoints --target $app2_fqdn --weight 2
+atm_fqdn=$(az network traffic-manager profile show -n $app_name -g $rg --query 'dnsConfig.fqdn' -o tsv)
+echo "Point your browser to http://${atm_fqdn}:8080"
+
+# Traffic Manager - Update to Performance
+delete_atm_endpoints
+atm_routing_method=Performance   # Geographic, Multivalue, Performance, Priority, Subnet, Weighted
+az network traffic-manager profile update -n $app_name -g $rg --routing-method $atm_routing_method
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location1 -t externalEndPoints --target $app1_fqdn --endpoint-location $location1
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location2 -t externalEndPoints --target $app2_fqdn --endpoint-location $location2
+
+# Traffic Manager - Update to Weight
+delete_atm_endpoints
+atm_routing_method=Weighted   # Geographic, Multivalue, Performance, Priority, Subnet, Weighted
+az network traffic-manager profile update -n $app_name -g $rg --routing-method $atm_routing_method
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location1 -t externalEndPoints --target $app1_fqdn --weight 1
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location2 -t externalEndPoints --target $app2_fqdn --weight 2
+
+# Traffic Manager - Update to Geographic
+delete_atm_endpoints
+atm_routing_method=Geographic   # Geographic, Multivalue, Performance, Priority, Subnet, Weighted
+az network traffic-manager profile update -n $app_name -g $rg --routing-method $atm_routing_method
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location1 -t externalEndPoints --target $app1_fqdn --geo-mapping World
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location2 -t externalEndPoints --target $app2_fqdn --geo-mapping US AU
+
+# Traffic Manager - Update to Priority
+delete_atm_endpoints
+atm_routing_method=Priority   # Geographic, Multivalue, Performance, Priority, Subnet, Weighted
+az network traffic-manager profile update -n $app_name -g $rg --routing-method $atm_routing_method
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location1 -t externalEndPoints --target $app1_fqdn --priority 1 # better
+az network traffic-manager endpoint create --profile-name $app_name -g $rg -n $location2 -t externalEndPoints --target $app2_fqdn --priority 2 # worse
+
+# Configure ATM logging to Azure Monitor
+atm_id=$(az network traffic-manager profile show -n $app_name -g $rg --query id -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $atm_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "ProbeHealthStatusEvents", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' 
+
+
+# Verification with whatsmydns.com
+echo "You can check in https://www.whatsmydns.net/#A/${atm_fqdn}"
+app1_ip=$(az container show -n ${app_name}-${location1} -g $rg --query 'ipAddress.ip' -o tsv)
+app2_ip=$(az container show -n ${app_name}-${location2} -g $rg --query 'ipAddress.ip' -o tsv)
+echo "$location1 IP: $app1_ip - $location2 IP: $app2_ip"
+
+# AFD
+az network front-door create -n $app_name -g $rg --backend-address $app1_fqdn
+# Backend
+backend_pool_name=$(az network front-door backend-pool list -f $app_name -g $rg --query '[0].name' -o tsv)
+az network front-door backend-pool backend add --pool-name $backend_pool_name -f $app_name -g $rg --address $app2_fqdn --http-port 8080 \
+    --priority 1 --weight 50
+az network front-door backend-pool backend remove --pool-name $backend_pool_name -f $app_name -g $rg --index 1 # Remove backend so that we can re-add with the right HttpPort
+az network front-door backend-pool backend add --pool-name $backend_pool_name -f $app_name -g $rg --address $app1_fqdn --http-port 8080 \
+    --priority 1 --weight 50
+az network front-door backend-pool backend list --pool-name $backend_pool_name -f $app_name -g $rg -o table
+# Probe
+probe_name=$(az network front-door probe list -f $app_name -g $rg --query '[0].name' -o tsv)
+az network front-door probe update -n $probe_name -f $app_name -g $rg --protocol Http --path /ready --interval 30 # Change from Https to Http
+# Routing rule
+routing_rule_name=$(az network front-door routing-rule list -f $app_name -g $rg --query '[0].name' -o tsv)
+az network front-door routing-rule update -n $routing_rule_name -f $app_name -g $rg --accepted-protocols Http Https --forwarding-protocol HttpOnly  # Change from Https to Http
+# Frontend FQDN
+afd_frontend_name=$(az network front-door frontend-endpoint list -f $app_name -g $rg --query '[].name' -o tsv)
+afd_fqdn=$(az network front-door frontend-endpoint show -n $afd_frontend_name -f $app_name -g $rg --query hostName -o tsv)
+echo "Point your browser to http://${afd_fqdn} or https://${afd_fqdn}"
+
+# Configure AFD logging to Azure Monitor
+afd_id=$(az network front-door show -n $app_name -g $rg --query id -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $afd_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "FrontdoorAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "FrontdoorWebApplicationFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+
+# Custom domain (Assumes you have a public DNS zone in Azure)
+dns_zone_name=cloudtrooper.net
+dns_name=kuard-afd
+dns_zone_rg=$(az network dns zone list -o tsv --query "[?name=='$dns_zone_name'].resourceGroup")
+dns_fqdn=${dns_name}.${dns_zone_name}
+# az network dns record-set cname set-record -z $dns_zone_name -g $dns_zone_rg -n afdverify.${dns_name} -c afdverify.${afd_fqdn} (recommended for prod, not required for tests)
+az network dns record-set cname set-record -z $dns_zone_name -g $dns_zone_rg -n ${dns_name} -c ${afd_fqdn}
+az network front-door frontend-endpoint create -n $afd_frontend_name -f $app_name -g $rg --host-name $dns_fqdn # No update command, using "create" to replace
+afd_fqdn=$(az network front-door frontend-endpoint show -n $afd_frontend_name -f $app_name -g $rg --query hostName -o tsv)
+fqdn_validation_result=$(az network front-door check-custom-domain -n $app_name -g $rg --host-name $dns_fqdn --query customDomainValidated -o tsv)
+if [[ "$fqdn_validation_result" == "true" ]]
+then
+    echo "FQDN validated OK"
+else
+    echo "FQDN validation failed"
+fi
+echo "Point your browser to http://${afd_fqdn} or https://${afd_fqdn}"
+
+# Get existing certificate from AKV: create SP and store the app id and secret as AKV secrets. You need to do this only **once**
+# You need to have AAD Global Admin privilege for this operation to succeed
+afd_app_id=ad0e1c7e-6d38-4ba4-9efd-0bc77ba9f037
+# Check if SP for the app already exists
+afd_sp_oid=$(az ad sp show --id $afd_app_id --query objectId -o tsv 2>/dev/null)
+if [[ -z ${afd_sp_oid} ]]
+then
+    echo "Creating SP..."
+    afd_sp_output=$(az ad sp create --id $afd_app_id)
+    if [[ -z "$afd_sp_output" ]]
+    then
+        echo "It looks like you dont have global admin permission in your AAD tenant"
+    else
+        afd_sp_oid=$(echo $afd_sp_output | jq -r '.objectId')
+    fi
+else
+    echo "SP already exists (${afd_sp_oid})"
+fi
+
+# Set permissions for SP on AKV
+keyvault_name=cloudtrooper
+az keyvault set-policy -n $keyvault_name --object-id $afd_sp_oid --certificate-permissions get --secret-permissions get
+
+# Get certificate from AKV (assuming SP id and secret are in the keyvault): insert certificate in AFD
+keyvault_cert_name=cloudtroopernet
+keyvault_id=$(az keyvault list -o tsv --query "[?name=='$keyvault_name'].id")
+cert_sid=$(az keyvault certificate show --vault-name $keyvault_name -n $keyvault_cert_name --query sid -o tsv)
+cert_version=$(echo $cert_sid | cut -d/ -f 6)
+az network front-door frontend-endpoint enable-https -n $afd_frontend_name -f $app_name -g $rg \
+    --certificate-source AzureKeyVault --secret-name $keyvault_cert_name --secret-version $cert_version --vault-id $keyvault_id \
+    --minimum-tls-version 1.0
+echo "Certificate provisioning started, this could take up to 20 minutes"
+while [[ $(az network front-door frontend-endpoint show -n $afd_frontend_name -f $app_name -g $rg --query customHttpsProvisioningSubstate -o tsv) != "CertificateDeployed" ]]
+do
+    echo "Waiting for certificate to be deployed..."
+    sleep 15
+done
+
+# Check logs
+categories_query='AzureDiagnostics | summarize count() by Category'
+test_query='search "'$app_name'" | take 5'
+atm_query='AzureDiagnostics 
+| where TimeGenerated >= ago(3m) 
+| where Category == "ProbeHealthStatusEvents"
+| project TimeGenerated, EndpointName_s, Status_s'
+afd_query='AzureDiagnostics 
+| where TimeGenerated >= ago(10m) 
+| where Category == "FrontdoorAccessLog" 
+| project TimeGenerated, clientIp_s, httpMethod_s, requestUri_s'
+az monitor log-analytics query -w $logws_customerid --analytics-query $categories_query -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $atm_query -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $afd_query -o tsv
+
+
+###############
+# Diagnostics #
+###############
+
+# ACI
+az container list -g $rg -o table
+# Note: this lab configures AFD probes to /ready, and ATM probes to /healthy
+az container logs -n ${app_name}-${location1} -g $rg -o table | grep healthy | tail -n 10  # location1, ATM
+az container logs -n ${app_name}-${location1} -g $rg -o table | grep ready | tail -n 10    # location1, AFD
+az container logs -n ${app_name}-${location2} -g $rg -o table | grep healthy | tail -n 10  # location2, ATM
+az container logs -n ${app_name}-${location2} -g $rg -o table | grep ready | tail -n 10    # location2, AFD
+
+# ATM
+az network traffic-manager profile list -g $rg -o table
+az network traffic-manager profile show -n $app_name -g $rg --query monitorConfig
+az network traffic-manager endpoint list --profile-name $app_name -g $rg -o table
+
+# AFD
+az network front-door list -g $rg -o table
+az network front-door frontend-endpoint list -f $app_name -g $rg -o table
+az network front-door backend-pool list -f $app_name -g $rg -o table
+az network front-door backend-pool backend list --pool-name $backend_pool_name -f $app_name -g $rg -o table
+az network front-door load-balancing list -f $app_name -g $rg -o table
+az network front-door probe list -f $app_name -g $rg -o table
+az network front-door routing-rule list -f $app_name -g $rg -o table
+az network front-door waf-policy list -f $app_name -g $rg -o table
+az network front-door rules-engine list -f $app_name -g $rg -o table
+
+
+###############
+#   Cleanup   #
+###############
+
+# Delete selective components
+az container delete -n ${app_name}-${location1} -g $rg -y
+az container delete -n ${app_name}-${location2} -g $rg -y
+az network traffic-manager profile delete -n $app_name -g $rg
+az network front-door delete -n $app_name -g $rg
+
+# Delete everything
+az group delete -n $rg -y --no-wait 

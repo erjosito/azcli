@@ -1,0 +1,21 @@
+############################################################################
+# Created by Jose Moreno
+# March 2020
+#
+# Azure search useful commands
+#
+############################################################################
+
+# Variables
+rg=kmoh
+azsearch_name=cloudtrooper
+
+# Azure Search
+az search service list -g $rg -o table 
+az search admin-key show --service-name $azsearch_name -g $rg
+
+# Delete Azure Search
+# az search service delete -n $azsearch_name -g $rg -y
+
+# Azure Cognitive Services
+az cognitiveservices account list -g $rg -o table
