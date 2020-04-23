@@ -1,0 +1,148 @@
+
+# Registration
+
+# Register feature
+az feature register --namespace Microsoft.VirtualMachineImages --name VirtualMachineTemplatePreview
+# Wait until the feature is registered
+az feature show --namespace Microsoft.VirtualMachineImages --name VirtualMachineTemplatePreview --query properties.state -o tsv
+# check you are registered for the providers
+az provider show -n Microsoft.VirtualMachineImages | grep registrationState
+az provider show -n Microsoft.Storage | grep registrationState
+az provider show -n Microsoft.Compute | grep registrationState
+az provider show -n Microsoft.KeyVault | grep registrationState
+
+# Initialization
+rg=aibrg
+location=westeurope  # Check https://raw.githubusercontent.com/danielsollondon/azvmimagebuilder/master/solutions/12_Creating_AIB_Security_Roles/aibRoleImageCreation.json
+image_name=aib-custom-w2k
+run_output_name=aibCustWinManImg01ro  # image distribution metadata reference name
+user=jose
+keyvault=erjositoKeyvault
+password=$(az keyvault secret show --vault-name $keyvault -n defaultPassword --query value -o tsv)
+subscription_id=$(az account show --query id -o tsv)
+
+# RG
+az group create -n $rg -l $location
+rg_id=$(az group show -n $rg --query id -o tsv)
+
+# Custom role:
+filename=/tmp/aibRoleImageCreation.json
+curl https://raw.githubusercontent.com/danielsollondon/azvmimagebuilder/master/solutions/12_Creating_AIB_Security_Roles/aibRoleImageCreation.json -o $filename
+sed -i -e "s/<subscriptionID>/$subscription_id/g" $filename
+sed -i -e "s/<rgName>/$rg/g" $filename
+az role definition create --role-definition $filename
+az role definition list -n "Azure Image Builder Service Image Creation Role"
+
+#####################################
+# Deploy image template as resource #
+#####################################
+
+aib_app_id=cf32a0cc-373c-47c9-9156-0db11f6a6dfc
+# role_name="Azure Image Builder Service Image Creation Role"
+role_name=Contributor
+# Note that the feature needs to be registered for this to work
+az role assignment create --assignee $aib_app_id --role  $role_name --scope $rg_id
+az role assignment list --scope $rg_id
+
+# Role assignment (pwsh)
+$aib_app_id="cf32a0cc-373c-47c9-9156-0db11f6a6dfc"
+$role_name="Contributor"
+$rg="aib"
+$location="westeurope"
+# Note that the feature needs to be registered for this to work
+az group create -n $rg -l $location
+$rg_id=$(az group show -n $rg --query id -o tsv)
+#az role assignment create --assignee $aib_app_id --role  $role_name --scope $rg_id
+New-AzRoleAssignment -ObjectId ef511139-6170-438e-a6e1-763dc31bdf74 -Scope "/subscriptions/$subscriptionID/resourceGroups/aibmdiwin06" -RoleDefinitionName $role_name
+
+# Download hello world example
+template_url=https://raw.githubusercontent.com/danielsollondon/azvmimagebuilder/master/quickquickstarts/0_Creating_a_Custom_Windows_Managed_Image/helloImageTemplateWin.json
+template_file=/tmp/helloImageTemplateWin.json
+more $template_file
+curl -s $template_url -o $template_file
+sed -i -e "s/<subscriptionID>/$subscription_id/g" $template_file
+sed -i -e "s/<rgName>/$rg/g" $template_file
+sed -i -e "s/<region>/$location/g" $template_file
+sed -i -e "s/<imageName>/$image_name/g" $template_file
+sed -i -e "s/<runOutputName>/$run_output_name/g" $template_file
+
+# Create image template
+image_template_name=helloImageTemplateWin02
+az resource create \
+    --resource-group $rg \
+    --properties @$template_file \
+    --is-full-object \
+    --resource-type Microsoft.VirtualMachineImages/imageTemplates \
+    --name $image_template_name
+# wait approx 1-3mins, depending on external links
+az resource list -g $rg -o table
+
+# Start the image build out of the template
+az resource invoke-action \
+     --resource-group $rg \
+     --resource-type  Microsoft.VirtualMachineImages/imageTemplates \
+     --name $image_template_name \
+     --action Run 
+
+##################################
+# Deploy image template from ARM #
+##################################
+
+version=$(az vm image list -l $location -p MicrosoftWindowsDesktop -f windows-10 -s 19h1-evd --all --query '[0].version' -o tsv)
+arm_template_url=https://raw.githubusercontent.com/TomHickling/WVD-Images/master/1.AzureImageBuilder/DeployAnImage.json
+# az deployment group create -n newimagetemplate -g $rg --template-uri $arm_template_url --parameters "{\"version\": {\"value\": \"$version\"}}"
+az deployment group create -n newimagetemplate -g $rg --template-uri $arm_template_url --parameters version=$version
+
+####################
+# az image builder #
+####################
+
+# Initialize variables
+publisher=MicrosoftWindowsDesktop
+offer=windows-10
+sku=19h1-evd
+version=$(az vm image list -l $location -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+image_source="$publisher:$offer:$sku:$version"
+image_template_name=myw10template
+script_url=https://raw.githubusercontent.com/TomHickling/WVD-Images/master/1.AzureImageBuilder/SetupGoldenImage.ps1
+# Create image template with image as output
+az image builder create -n  $image_template_name -g $rg --image-source $image_source \
+      --scripts $script_url --managed-image-destinations myimage=westeurope
+# Create image template with SIG as output (NOT working, claims that 'Location westeurope,westus is not a valid subscription location')
+az image builder create -n  $image_template_name -g $rg --image-source $image_source \
+      --scripts $script_url --managed-image-destinations my_shared_gallery/my_image_def=westeurope,westus
+
+# List/show
+az image builder list -g $rg --query '[].{Name:name,ProvisioningState:provisioningState,RunState:runState}' -o table
+az image builder show -n $image_template_name -g $rg --query 'lastRunStatus'
+
+# Run
+az image builder run -n $image_template_name -g $rg --no-wait
+
+# See runs
+az image builder show-runs -n $image_template_name -g $rg -o table
+
+# Delete
+image_template_name=AIBzq6mrjjnzh6na
+az image builder delete -g $rg -n $image_template_name
+
+
+###############
+# Image / SIG #
+###############
+
+az image list -g $rg -o table
+az image show -g $rg -n $imagename --query id
+az image delete -g $rg -n $imagename
+
+az sig list -g $rg -o table
+sig_name=my_shared_gallery
+az sig image-definition list -g $rg --gallery-name $sig_name -o table
+def_name=my_image_def
+az sig image-version list -g $rg --gallery-name $sig_name -i $def_name -o table
+
+
+###########
+# Cleanup #
+###########
+az group delete -n $rg -y --no-wait

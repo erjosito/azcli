@@ -202,6 +202,9 @@ az network firewall application-rule collection list -f $azfw_name -g $rg -o tab
 az network firewall application-rule list -c AllowAll -f $azfw_name -g $rg --query rules -o table
 az network firewall application-rule list -c AllowAll -f $azfw_name -g $rg --query rules --query '[].{Name:name,Protocols:protocols[],SourceAddresses:sourceAddresses[],TargetFQDNs:targetFqdns[]}'
 
+# Azure Firewall: SNAT configuration
+# No yet supported with CLI (https://docs.microsoft.com/en-us/azure/firewall/snat-private-range)
+
 # App Gateway
 az network application-gateway list -g $appgw_rg -o table
 az network application-gateway http-listener list -g $appgw_rg --gateway-name $appgw_name -o table
