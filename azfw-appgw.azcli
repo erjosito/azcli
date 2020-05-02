@@ -59,16 +59,15 @@ logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg
 # az vm extension image list -l $location --latest -o table | grep -i docker
 
 # Deploy a Linux VM with troubleshooting API in a Docker container (whoami)
-az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location
-az network nsg create -n $vm_nsg_name -g $rg
-az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
-az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
-az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
-   --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name
-vm_id=$(az vm show -n $vm_name -g $rg --query id -o tsv)
-docker_config='{"compose": {"whoami": {"image": "erjosito/sqlapi:0.1", "ports": ["8080:8080"]}}}'
-az vm extension set -n DockerExtension --publisher Microsoft.Azure.Extensions --ids $vm_id --settings $docker_config
-vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv)
+# az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location
+# az network nsg create -n $vm_nsg_name -g $rg
+# az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
+# az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
+# az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
+#    --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name
+# vm_id=$(az vm show -n $vm_name -g $rg --query id -o tsv)
+# docker_config='{"compose": {"whoami": {"image": "erjosito/sqlapi:0.1", "ports": ["8080:8080"]}}}'
+# az vm extension set -n DockerExtension --publisher Microsoft.Azure.Extensions --ids $vm_id --settings $docker_config
 
 # Deploy a Linux VM with a troubleshooting web page
 az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location
@@ -76,17 +75,8 @@ az network nsg create -n $vm_nsg_name -g $rg
 az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
 az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
-   --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name
-
-
-# Verify Linux VM deployed correctly and SSH is working fine
-vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
-ssh-keyscan -H $vm_pip_address >> ~/.ssh/known_hosts
-ssh $vm_pip_address "ip a"
-
-# Verify API is working
-curl ${vm_pip_address}:8080/api/healthcheck
-curl ${vm_pip_address}:8080/api/ip
+   --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
+   --custom-data $vm_cloudinit_filename --no-wait
 
 # Deploy AzFW
 az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location
@@ -106,12 +96,43 @@ az network firewall application-rule create -f $azfw_name -g $rg -c AllowAll --p
     --target-fqdns "*" --source-addresses $vnet_prefix -n Allow-all --priority 200 --action Allow
 
 # DNAT rules for the test VM
+vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv)
 az network firewall nat-rule create -n SSH-to-VM -f $azfw_name -g $rg \
     --destination-addresses $azfw_pip_address --destination-ports 22 --protocols Tcp --translated-address $vm_private_ip --translated-port 22 \
     --source-addresses '*' -c VMTraffic --priority 200 --action Dnat
 az network firewall nat-rule create -n Web-to-VM -f $azfw_name -g $rg \
     --destination-addresses $azfw_pip_address --destination-ports 8080 --protocols Tcp --translated-address $vm_private_ip --translated-port 8080 \
     --source-addresses '*' -c VMTraffic
+
+# Verify Linux VM deployed correctly and SSH is working fine
+vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+ssh-keyscan -H $vm_pip_address >> ~/.ssh/known_hosts
+ssh $vm_pip_address "ip a"
+
+# Verify API is working
+curl ${vm_pip_address}:8080/api/healthcheck
+curl ${vm_pip_address}:8080/api/ip
+
+# Route table for the VM subnet pointing to the AzFw, optionally excluding the client's IP
+az network route-table create -n $vm_rt_name -g $rg -l $location
+az network route-table route create -n defaultRoute --route-table-name $vm_rt_name -g $rg --next-hop-type VirtualAppliance --address-prefix "0.0.0.0/0" --next-hop-ip-address $azfw_private_ip
+my_ip=$(curl -s4 ifconfig.co)
+# Optionally bypass the Azure Firewall for the client IP
+# az network route-table route create -n clientIP --route-table-name $vm_rt_name -g $rg --next-hop-type Internet --address-prefix "$my_ip/32"
+rt_id=$(az network route-table show -n $vm_rt_name -g $rg --query id -o tsv)
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table $rt_id
+
+# Verify SSH now works through the AzFW
+ssh-keyscan -H $azfw_pip_address >> ~/.ssh/known_hosts
+ssh $azfw_pip_address "ip a"
+
+# Verify egress from the linux VM through the AzFW's PIP
+ssh $azfw_pip_address "curl -s4 ifconfig.co"
+echo "The previous output should match the firewall public IP $azfw_pip_address"
+
+# To check AzFW SNAT we will use the deployed app
+ssh $azfw_pip_address "who am i"
+curl ${azfw_pip_address}:8080/api/ip
 
 # Deploy App Gateway
 # Create GW with sample config for port 80
@@ -135,7 +156,6 @@ az network application-gateway probe create -g $rg --gateway-name $appgw_name \
 az network application-gateway http-settings create -g $rg --gateway-name $appgw_name \
   --name mysettings --protocol https
 
-
 # Connect app gw to Azure Monitor
 appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
 az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace $logws_id \
@@ -143,20 +163,6 @@ az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace
     --logs '[{"category": "ApplicationGatewayAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
         {"category": "ApplicationGatewayPerformanceLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
         {"category": "ApplicationGatewayFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
-
-# Route table for the VM subnet pointing to the AzFw, excluding the client's IP
-az network route-table create -n $vm_rt_name -g $rg -l $location
-az network route-table route create -n defaultRoute --route-table-name $vm_rt_name -g $rg --next-hop-type VirtualAppliance --address-prefix "0.0.0.0/0" --next-hop-ip-address $azfw_private_ip
-# my_ip=$(curl -s4 ifconfig.co)
-# az network route-table route create -n clientIP --route-table-name $vm_rt_name -g $rg --next-hop-type Internet --address-prefix "$my_ip/32"
-rt_id=$(az network route-table show -n $vm_rt_name -g $rg --query id -o tsv)
-az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table $rt_id
-
-# Verify access to the linux VM
-vm_linux_pip_ip=$(az network public-ip show -n $vm_linux_pip_name -g $rg --query ipAddress -o tsv)
-ssh-keyscan -H $vm_linux_pip_ip >> ~/.ssh/known_hosts
-ssh $vm_linux_pip_ip "curl -s4 ifconfig.co"
-echo "The previous output should match the firewall public IP $azfw_ip"
 
 # AzFW logs
 query_apprule_deny='AzureDiagnostics 
