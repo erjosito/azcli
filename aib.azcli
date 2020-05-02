@@ -119,7 +119,7 @@ az image builder show -n $image_template_name -g $rg --query 'lastRunStatus'
 # Run
 az image builder run -n $image_template_name -g $rg --no-wait
 
-# See runs
+# See completed runs
 az image builder show-runs -n $image_template_name -g $rg -o table
 
 # Delete

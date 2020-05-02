@@ -70,6 +70,15 @@ docker_config='{"compose": {"whoami": {"image": "erjosito/sqlapi:0.1", "ports": 
 az vm extension set -n DockerExtension --publisher Microsoft.Azure.Extensions --ids $vm_id --settings $docker_config
 vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv)
 
+# Deploy a Linux VM with a troubleshooting web page
+az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location
+az network nsg create -n $vm_nsg_name -g $rg
+az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
+az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
+   --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name
+
+
 # Verify Linux VM deployed correctly and SSH is working fine
 vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
 ssh-keyscan -H $vm_pip_address >> ~/.ssh/known_hosts
