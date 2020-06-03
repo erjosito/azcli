@@ -1,0 +1,29 @@
+# Create a SAS and download blob to test it
+
+# Variables
+subscription_id=e7da9914-9b05-4891-893c-546cb7b0422e
+storage_account=myobjects
+container_name=templates
+blob_path='KubernetesMain.json'
+
+# Check we are in the right subscription
+current_subscription_id=$(az account show --query id -o tsv)
+if [[ "${current_subscription_id}" == "${subscription_id}" ]]
+then
+    echo "Subscription seems to be correct (${current_subscription_id})"
+else
+    az account set -s $subscription_id
+fi
+
+# Calculate dates, get storage key, generate SAS
+expiry=`date -u -d "30 minutes" '+%Y-%m-%dT%H:%MZ'`
+key=$(az storage account keys list -n myobjects --query '[0].value' -o tsv)
+sas=$(az storage container generate-sas --account-name $storage_account --account-key $key \
+    -n $container_name --https-only --permissions r --expiry=$expiry -o tsv)
+
+# Retrieve blob URL and download blob
+# az storage blob show -n $blob_path -c $container_name --account-name $storage_account --account-key $key
+blob_url=$(az storage blob url -n $blob_path -c $container_name --account-name $storage_account --account-key $key -o tsv)
+url=${blob_url}?${sas}
+echo "Downloading from ${url}..."
+wget $url -O /tmp/workspace.json

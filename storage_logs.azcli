@@ -1,0 +1,58 @@
+storage_account=myobjects
+container_name=templates
+key=$(az storage account keys list -n myobjects --query '[0].value' -o tsv)
+log_container_name=$(az storage container show -n '$logs' --account-name $storage_account --account-key $key --query name -o tsv)
+if [[ -z ${log_container_name} ]]
+then
+    echo "Are you sure that you have activated audit trail logs for the storage account ${storage_account}?"
+else
+    echo "Container with audit logs found, retrieving log list..."
+    # Use this line for all logs
+    full_blob_list=$(az storage blob list -c '$logs' --account-name $storage_account --account-key $key --query '[].name' -o tsv)
+    echo "Found these log files:"
+    az storage blob list -c '$logs' --account-name $storage_account --account-key $key -o table
+    # Use this line for only the last log file
+    filtered_blob_list=$(az storage blob list -c '$logs' --account-name $storage_account --account-key $key --query '[-1].name' -o tsv)
+    # Process the retrieved logs one by one
+    echo "Printing only the last log file:"
+    temp_filename=/tmp/blog.log 
+    echo $full_blob_list | while read blob_name ; do
+        if [[ -n "${blob_name}" ]]
+        then
+            az storage blob download -n $blob_name -c '$logs' --account-name $storage_account --account-key $key --no-progress -f $temp_filename >/dev/null
+            cat $temp_filename | while read line ; do
+                version=$(echo $line | cut -d';' -f 1)
+                # Only v2.0
+                if [[ ${version} == "2.0" ]]
+                then
+                    timestamp=$(echo $line | cut -d';' -f 2)
+                    operation=$(echo $line | cut -d';' -f 3)
+                    accessed_blob_url=$(echo $line | cut -d';' -f 12)
+                    accessed_blob_name=$(echo $line | cut -d';' -f 13)
+                    accessed_container=$(echo $blob_url | cut -d'/' -f 4)
+                    accessed_container=$(echo $accessed_container | cut -d'?' -f 1)
+                    agent=$(echo $line | cut -d';' -f 30)
+                else
+                    timestamp=$(echo $line | cut -d';' -f 2)
+                    operation=$(echo $line | cut -d';' -f 3)
+                    accessed_blob_url=$(echo $line | cut -d';' -f 12)
+                    accessed_blob_name=$(echo $line | cut -d';' -f 13)
+                    accessed_container=$(echo $blob_url | cut -d'/' -f 4)
+                    accessed_container=$(echo $accessed_container | cut -d'?' -f 1)
+                    agent=$(echo $line | cut -d';' -f 30)
+                fi
+                # Only print certain operations
+                if [[ ${operation} == 'PutBlob' ]] || [[ ${operation} == 'GetBlob' ]]
+                then
+                    # Do not print access to the logs (this tool for example)
+                    if [[ ${container} != '$logs' ]]
+                    then
+                        # echo $line  # Uncommnet for debugging
+                        printf "** %.25s %4s %.10s %.40s %.15s %.60s\n" $timestamp $version $operation $agent $accessed_container $accessed_blob_name
+                    fi
+                fi
+            done
+            rm $temp_filename
+        fi
+    done
+fi

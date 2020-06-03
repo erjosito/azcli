@@ -15,16 +15,17 @@ vm_name=testvmlinux
 vm_pip_name=testvmlinux-pip
 vm_sku=Standard_B1s
 vm_subnet_name=vm
-vm_subnet_prefix=192.168.10.0/24
-vm_cloudinit_filename=cloudinit-whoami.txt
+vm_subnet_prefix=192.168.1.0/24
+vm_cloudinit_filename=/tmp/cloudinit-whoami.txt
+vm_cloudinit_url=https://raw.githubusercontent.com/erjosito/azcli/master/cloudinit-whoami.txt
 vm_rt_name=vm
 vm_nsg_name=vm-nsg
 azfw_name=myazfw
 azfw_pip_name=myazfw-pip
 azfw_subnet_name=AzureFirewallSubnet
-azfw_subnet_prefix=192.168.1.0/24
+azfw_subnet_prefix=192.168.100.0/24
 appgw_subnet_name=ApplicationGatewaySubnet
-appgw_subnet_prefix=192.168.2.0/24
+appgw_subnet_prefix=192.168.200.0/24
 appgw_name=appgw
 appgw_pip_name=appgw-pip
 appgw_sku=Standard_v2
@@ -33,6 +34,7 @@ appgw_backenddnsname=kuard
 appgw_backendfqdn="$backenddnsname"."$dnszone"
 appgw_rt_name=appgw
 logws_name=log$RANDOM
+
 
 # RG and vnet
 az group create -n $rg -l $location
@@ -46,34 +48,12 @@ az monitor log-analytics workspace create -n $logws_name -g $rg
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 
-# Find images (optional)
-# az vm image list-publishers -l $location -o table | grep -i canonical
-# publisher=Canonical
-# az vm image list-offers -l $location -p $publisher -o table | grep -i docker
-# offer=UbuntuServer
-# az vm image list-skus -l $location -p $publisher -f $offer -o table
-# sku=19.04
-# az vm image list -l $location -p $publisher -f $offer --sku $sku --all -o table
-
-# Find extensions (optional)
-# az vm extension image list -l $location --latest -o table | grep -i docker
-
-# Deploy a Linux VM with troubleshooting API in a Docker container (whoami)
-# az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location
-# az network nsg create -n $vm_nsg_name -g $rg
-# az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
-# az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
-# az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
-#    --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name
-# vm_id=$(az vm show -n $vm_name -g $rg --query id -o tsv)
-# docker_config='{"compose": {"whoami": {"image": "erjosito/sqlapi:0.1", "ports": ["8080:8080"]}}}'
-# az vm extension set -n DockerExtension --publisher Microsoft.Azure.Extensions --ids $vm_id --settings $docker_config
-
 # Deploy a Linux VM with a troubleshooting web page
 az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location
 az network nsg create -n $vm_nsg_name -g $rg
 az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
 az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
+wget $vm_cloudinit_url -O $vm_cloudinit_filename
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
    --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
    --custom-data $vm_cloudinit_filename --no-wait
@@ -106,8 +86,8 @@ az network firewall nat-rule create -n Web-to-VM -f $azfw_name -g $rg \
 
 # Verify Linux VM deployed correctly and SSH is working fine
 vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
-ssh-keyscan -H $vm_pip_address >> ~/.ssh/known_hosts
-ssh $vm_pip_address "ip a"
+# ssh-keyscan -H $vm_pip_address >> ~/.ssh/known_hosts
+# ssh $vm_pip_address "ip a"
 
 # Verify API is working
 curl ${vm_pip_address}:8080/api/healthcheck
@@ -123,38 +103,34 @@ rt_id=$(az network route-table show -n $vm_rt_name -g $rg --query id -o tsv)
 az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table $rt_id
 
 # Verify SSH now works through the AzFW
-ssh-keyscan -H $azfw_pip_address >> ~/.ssh/known_hosts
-ssh $azfw_pip_address "ip a"
+# ssh-keyscan -H $azfw_pip_address >> ~/.ssh/known_hosts
+# ssh $azfw_pip_address "ip a"
 
 # Verify egress from the linux VM through the AzFW's PIP
-ssh $azfw_pip_address "curl -s4 ifconfig.co"
-echo "The previous output should match the firewall public IP $azfw_pip_address"
+# ssh $azfw_pip_address "curl -s4 ifconfig.co"
+# echo "The previous output should match the firewall public IP $azfw_pip_address"
 
 # To check AzFW SNAT we will use the deployed app
-ssh $azfw_pip_address "who am i"
 curl ${azfw_pip_address}:8080/api/ip
 
 # Deploy App Gateway
-# Create GW with sample config for port 80
+# Create GW with sample config for port 8080
 az network public-ip create -g $rg -n $appgw_pip_name --sku standard --allocation-method static -l $location
 appgw_pip_address=$(az network public-ip show -g $rg -n $appgw_pip_name --query ipAddress -o tsv)
 az network application-gateway create -g $rg -n $appgw_name --capacity 2 --sku $appgw_sku \
-    --frontend-port 80 --routing-rule-type basic \
-    --http-settings-port 8080 --http-settings-protocol Http \
+    --frontend-port 8080 --routing-rule-type basic \
+    --servers $vm_private_ip --http-settings-port 8080 --http-settings-protocol Http \
+    --sku Standard_v2 --min-capacity 1 --max-capacity 2 \
     --public-ip-address $appgw_pip_name --vnet-name $vnet_name --subnet $appgw_subnet_name
 
-# Enable autoscaling for App Gateway
-# This could be done at creation time, here for showing that it can be done afterwards as well
-az network application-gateway update -n $appgw_name -g $rg \
-    --set autoscaleConfiguration='{"minCapacity": 1, "maxCapacity": 2}' \
-    --set sku='{"name": "Standard_v2","tier": "Standard_v2"}'
-
-# Create probe and HTTP settings
+# Create probe with specific path (api/healthcheck) and update the http settings
+probe_name=healthcheck
 az network application-gateway probe create -g $rg --gateway-name $appgw_name \
-  --name myprobe --protocol Https --host-name-from-http-settings \
-  --match-status-codes 200-399
-az network application-gateway http-settings create -g $rg --gateway-name $appgw_name \
-  --name mysettings --protocol https
+  --name $probe_name --protocol Http --host-name-from-http-settings \
+  --match-status-codes 200-399 --path /api/healthcheck
+settings_name=$(az network application-gateway http-settings list -g $rg --gateway-name $appgw_name --query '[0].name' -o tsv)
+az network application-gateway http-settings update -n $settings_name --gateway-name $appgw_name -g $rg \
+  --probe $probe_name --host-name-from-backend-pool
 
 # Connect app gw to Azure Monitor
 appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
@@ -164,7 +140,33 @@ az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace
         {"category": "ApplicationGatewayPerformanceLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
         {"category": "ApplicationGatewayFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
 
-# AzFW logs
+# Verify access to the app over the App Gateway
+appgw_pip_address=$(az network public-ip show -n $appgw_pip_name -g $rg --query ipAddress -o tsv)
+curl ${appgw_pip_address}:8080/api/ip
+
+################################ WORK IN PROGRES ############################################
+# APIM Gateway 
+apim_subnet_name=APIMSubnet
+apim_subnet_prefix=192.168.210.0/24
+apim_sku=Developer  # The Premium SKU offers multi-region on top
+apim_vnet_type=Internal
+apim_name=apim$RANDOM
+apim_publisher_email=admin@contoso.com
+apim_publisher_name=Contoso
+
+az network vnet subnet create -g $rg -n $apim_subnet_name --vnet-name $vnet_name --address-prefix $apim_subnet_prefix
+apim_subnet_id=$(az network vnet subnet show -n $apim_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+# This takes 34m!
+az apim create -n $apim_name -g $rg \
+  --publisher-email $apim_publisher_email --publisher-name $apim_publisher_name \
+  --sku-name $apim_sku --virtual-network $apim_vnet_type
+# And this another 23m
+az apim update -n $apim_name -g $rg \
+  --set virtualNetworkType=$apim_vnet_type \
+  --set virtualNetworkConfiguration.subnetResourceId=$apim_subnet_id
+##############################################################################################
+
+# Query AzFW logs
 query_apprule_deny='AzureDiagnostics 
 | where ResourceType == "AZUREFIREWALLS" 
 | where Category == "AzureFirewallApplicationRule" 

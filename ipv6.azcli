@@ -260,6 +260,11 @@ az vmss create -n $vmss_name -g $rg -l $location --image UbuntuLTS --generate-ss
     --vnet-name $vnet_name --subnet $vmss_subnet_name --nsg $nsg_name \
     --lb-sku $vmss_lb_sku --lb $vmss_lb_name --lb-nat-pool-name $vmss_lb_natpool --public-ip-address $vmss_pipv4_name
 
+# Optionally, create VMSS without LB
+az vmss create -n $vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys \
+    --vm-sku $vmss_sku --instance-count $vmss_vm_count --custom-data $cloudinit_filename \
+    --vnet-name $vnet_name --subnet $vmss_subnet_name --nsg $nsg_name \
+    --lb "" --public-ip-per-vm
 
 # Add IPv6 ALB frontend, probe, backend and LB rule
 backend_name_v4=$(az network lb address-pool list --lb-name $vmss_lb_name -g $rg --query '[0].name' -o tsv)
@@ -309,6 +314,7 @@ az vmss update -g $rg -n $vmss_name --add virtualMachineProfile.networkProfile.n
 az vmss update-instances -g $rg --name $vmss_name --instance-ids "*"
 
 # Alternatively, add a new IP config with ILPIP v6 (instead of the ALB association)
+vmss_subnet_id=$(az network vnet subnet show -n $vmss_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 ipconfig_v6="{
     \"name\": \"ipconfigv6\",
     \"subnet\": { \"id\": \"$vmss_subnet_id\" },
@@ -318,7 +324,70 @@ az vmss update -g $rg -n $vmss_name --add virtualMachineProfile.networkProfile.n
 az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[]'
 az vmss update-instances -g $rg --name $vmss_name --instance-ids "*"
 
+# Error because IPv4 PIPs deployed with Basic SKU
+# Deployment failed. Correlation ID: blah. Different basic sku and standard sku load balancer or public Ip resources in availability set is not allowed 
+#   /blah|instancepublicipv6 and /blah|instancepublicip.
 
+# Optional: modify previous IPv4 config
+az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations'
+ipconfig_v4="{
+    \"name\": \"ipconfigv4\",
+    \"subnet\": { \"id\": \"$vmss_subnet_id\" },
+    \"privateIPAddressVersion\":\"IPv4\",
+    \"publicIpAddressConfiguration\": { \"name\": \"instancepublicipv4\", \"publicIPAddressVersion\": \"IPv4\", \"sku\":{\"name\": \"standard\"}}}"
+az vmss update -g $rg -n $vmss_name --set virtualMachineProfile.networkProfile.networkInterfaceConfigurations\[0\].ipConfigurations\[0\] $ipconfig_v4
+
+# Optional: add a new NIC with a 1ary IPv4 ipconfig, a 2ary ipv6 ipconfig, and an ILPIP in the ipv6 ipconfig
+# not working :(
+az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations'
+ipconfig_v4="{
+        \"name\": \"ipv4config\",
+        \"subnet\": { \"id\": \"$vmss_subnet_id\" },
+        \"privateIPAddressVersion\":\"IP${version}\"}"
+# Removed the ILPIP for testing purposes:
+ipconfig_v6="{
+        \"name\": \"ipconfigv6\",
+        \"subnet\": { \"id\": \"$vmss_subnet_id\" },
+        \"privateIPAddressVersion\":\"IPv6\"}"
+nsg_config="{
+        \"id\": \"/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/$rg/providers/Microsoft.Network/networkSecurityGroups/$nsg_name\",
+        \"resourceGroup\": \"$rg\" }"
+nic_2="{
+    \"name\": \"vmssnic2\",
+    \"dnsSettings\": { \"dnsServers\": [] },
+    \"enableAcceleratedNetworking\": false,
+    \"enableIpForwarding\": false,
+    \"ipConfigurations\": [ $ipconfig_v4, $ipconfig_v6 ],
+    \"networkSecurityGroup\": $nsg_config ,
+    \"primary\": false }"
+az vmss deallocate -n $vmss_name -g $rg
+az vmss update -g $rg -n $vmss_name --add virtualMachineProfile.networkProfile.networkInterfaceConfigurations $nic_2
+# Error if ILPIP in 2ary ipv6 ipconfig(?????):
+# Cannot specify public ip address for a secondary nic IPv6 ipConfiguration 'ipconfigv6' of VM Scale Set '/blah/myvmss' since the scale set is in an IPv6 vnet.
+# Add ILPIP to 2ary config - NOT working either
+ipv6_ilpip="{ \"name\": \"ilpipv6\", \"publicIPAddressVersion\": \"IPv6\" }"
+az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[1].ipConfigurations[1]'
+az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[1].ipConfigurations[1].publicIpAddressConfiguration'
+az vmss update -g $rg -n $vmss_name --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[1].ipConfigurations[1].publicIpAddressConfiguration'=$ipv6_ilpip
+# Error if ILPIP in 2ary ipv6 ipconfig(?????):
+# Cannot specify public ip address for a secondary nic IPv6 ipConfiguration 'ipconfigv6' of VM Scale Set '/blah/myvmss' since the scale set is in an IPv6 vnet.
+
+# az vmss update -g $rg -n $vmss_name --remove virtualMachineProfile.networkProfile.networkInterfaceConfigurations 1
+az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations'
+az vmss update-instances -g $rg --name $vmss_name --instance-ids "*"
+az vmss start -n $vmss_name -g $rg
+
+# Optional: replace the 1ary ipv4 nic with an ipv6 one
+az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[0]'
+ipconfig_v6="{
+    \"name\": \"ipconfigv6\",
+    \"subnet\": { \"id\": \"$vmss_subnet_id\" },
+    \"privateIPAddressVersion\":\"IPv6\",
+    \"publicIpAddressConfiguration\": { \"name\": \"instancepublicipv6\", \"publicIPAddressVersion\": \"IPv6\" }}"
+az vmss update -g $rg -n $vmss_name --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[0]'=$ipconfig_v6
+az vmss update -g $rg -n $vmss_name \
+--set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[0].privateIPAddressVersion'=IPv6 \
+--set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[0].publicIpAddressConfiguration.publicIPAddressVersion'=IPv6
 
 ###############
 #   Cleanup   #
@@ -386,6 +455,7 @@ az network nic ip-config list --nic-name $nic_name -g $rg -o table
 # Verify VMSS network config
 az vmss list -g $rg -o table
 az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0]'
+az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[]'
 az vmss list-instance-connection-info -g $rg -n $vmss_name -o table
 az vmss list-instance-public-ips -g $rg -n $vmss_name -o table
 
