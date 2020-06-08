@@ -264,7 +264,13 @@ az vmss create -n $vmss_name -g $rg -l $location --image UbuntuLTS --generate-ss
 az vmss create -n $vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys \
     --vm-sku $vmss_sku --instance-count $vmss_vm_count --custom-data $cloudinit_filename \
     --vnet-name $vnet_name --subnet $vmss_subnet_name --nsg $nsg_name \
-    --lb "" --public-ip-per-vm
+    --lb "" --public-ip-per-vm --zones 1 2 3
+
+# Combining Standard LB with ILPIP iwll not work (SKU mismatch)
+az vmss create -n $vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys \
+    --vm-sku $vmss_sku --instance-count $vmss_vm_count --custom-data $cloudinit_filename \
+    --vnet-name $vnet_name --subnet $vmss_subnet_name --nsg $nsg_name \
+    --lb-sku $vmss_lb_sku --lb $vmss_lb_name --lb-nat-pool-name $vmss_lb_natpool --public-ip-per-vm
 
 # Add IPv6 ALB frontend, probe, backend and LB rule
 backend_name_v4=$(az network lb address-pool list --lb-name $vmss_lb_name -g $rg --query '[0].name' -o tsv)
@@ -458,6 +464,7 @@ az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.
 az vmss show -g $rg -n $vmss_name --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[]'
 az vmss list-instance-connection-info -g $rg -n $vmss_name -o table
 az vmss list-instance-public-ips -g $rg -n $vmss_name -o table
+az vmss list-instance-public-ips -g $rg -n $vmss_name --query '[].[name,ipAddress,sku.name]' -o tsv
 
 # Cleanup
 # az group delete -n $rg -y --no-wait

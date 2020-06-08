@@ -1,0 +1,335 @@
+# Resource group
+rg=containerlab
+location=westeurope
+az group create -n $rg -l $location
+# Azure SQL
+sql_server_name=myserver$RANDOM
+sql_db_name=mydb
+sql_username=azure
+sql_password=Microsoft123!
+az sql server create -n $sql_server_name -g $rg -l $location --admin-user $sql_username --admin-password $sql_password
+az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait
+# Optionally test for serverless SKU
+# az sql db update -g $rg -s $sql_server_name -n $sql_db_name --edition GeneralPurpose --min-capacity 1 --capacity 4 --family Gen5 --compute-model Serverless --auto-pause-delay 1440
+sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName)
+# Create Vnet
+vnet_name=myvnet
+vnet_prefix=192.168.0.0/16
+subnet_sql_name=sql
+subnet_sql_prefix=192.168.2.0/24
+subnet_vm_name=vm
+subnet_vm_prefix=192.168.13.0/24
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_sql_name --address-prefix $subnet_sql_prefix
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_vm_name --address-prefix $subnet_vm_prefix
+
+# Create VM
+vm_name=apivm
+vm_nsg_name=${vm_name}-nsg
+vm_pip_name=${vm_name}-pip
+vm_disk_name=${vm_name}-disk0
+vm_sku=Standard_B2ms
+publisher=Canonical
+offer=UbuntuServer
+sku=18.04-LTS
+image_urn=$(az vm image list -p $publisher -f $offer -s $sku -l $location --query '[0].urn' -o tsv)
+# Deploy VM
+az vm create -n $vm_name -g $rg -l $location --image $image_urn --size $vm_sku --generate-ssh-keys \
+  --os-disk-name $vm_disk_name --os-disk-size-gb 32 \
+  --vnet-name $vnet_name --subnet $subnet_vm_name \
+  --nsg $vm_nsg_name --nsg-rule SSH --public-ip-address $vm_pip_name
+# Add rule to NSG on port 8080
+az network nsg rule create -n TCP8080 --nsg-name $vm_nsg_name -g $rg \
+  --protocol Tcp --access Allow --priority 105 --direction Inbound \
+  --destination-port-ranges 8080
+# Install app, this will take a while (a bunch of apt updates, installs, etc).
+# You might have to Ctrl-C this, it hangs when executing the app (for some reason i am not able to run it as a background task)
+script_url=https://raw.githubusercontent.com/erjosito/whoami/master/api-vm/cse.sh
+script_command='./cse.sh'
+az vm extension set -n customScript --vm-name $vm_name -g $rg --publisher Microsoft.Azure.Extensions \
+  --protected-settings "{\"fileUris\": [\"${script_url}\"],\"commandToExecute\": \"${script_command}\"}"
+# Set environment variables
+# command="export SQL_SERVER_USERNAME=${sql_username} && export SQL_SERVER_PASSWORD=${sql_password}"
+# az vm run-command invoke -n $vm_name -g $rg --command-id RunShellScript --scripts "${command}"
+# az vm run-command invoke -n $vm_name -g $rg --command-id RunShellScript --scripts 'export SQL_SERVER_USERNAME=$1 && export SQL_SERVER_PASSWORD=$2' \
+#    --parameters $sql_username $sql_password
+# Get private IP
+vm_private_ip=$(az vm list-ip-addresses -n $vm_name -g $rg --query '[0].virtualMachine.network.privateIpAddresses[0]' -o tsv)
+# Get public IP
+vm_pip_ip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+echo "You can SSH to $vm_pip_ip"
+# Send a probe to the app
+curl -s ${vm_pip_ip}:8080/api/healthcheck
+
+# Explore VM API endpoints
+curl -s ${vm_pip_ip}:8080/api/ip
+curl -s ${vm_pip_ip}:8080/api/printenv
+
+# Create private link endpoint for SQL Server
+sql_endpoint_name=sqlep
+sql_server_id=$(az sql server show -n $sql_server_name -g $rg -o tsv --query id)
+az network vnet subnet update -n $subnet_sql_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
+az network private-endpoint create -n $sql_endpoint_name -g $rg --vnet-name $vnet_name --subnet $subnet_sql_name --private-connection-resource-id $sql_server_id --group-id sqlServer --connection-name sqlConnection
+sql_nic_id=$(az network private-endpoint show -n $sql_endpoint_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
+sql_endpoint_ip=$(az network nic show --ids $sql_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+echo "Private IP address for SQL server ${sql_server_name}: ${sql_endpoint_ip}"
+nslookup ${sql_server_fqdn}
+nslookup ${sql_server_name}.privatelink.database.windows.net
+
+# Create private DNS zone
+dns_zone_name=privatelink.database.windows.net
+az network private-dns zone create -n $dns_zone_name -g $rg
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n myDnsLink --virtual-network $vnet_name --registration-enabled false
+az network private-dns record-set a create -n $sql_server_name -z $dns_zone_name -g $rg
+az network private-dns record-set a add-record --record-set-name $sql_server_name -z $dns_zone_name -g $rg -a $sql_endpoint_ip
+
+# DNS resolution verification
+curl -s "http://${vm_pip_ip}:8080/api/dns?fqdn=${sql_server_fqdn}"
+
+# Test SQL query
+curl "http://${vm_pip_ip}:8080/api/sqlsrcip?SQL_SERVER_FQDN=${sql_server_fqdn}&SQL_SERVER_USERNAME=${sql_username}&SQL_SERVER_PASSWORD=${sql_password}"
+
+# Check effective routes generated by private link
+vm_nic_name=${vm_name}VMNic
+az network nic show-effective-route-table -n $vm_nic_name -g $rg -o table
+
+##################
+# Azure Firewall #
+##################
+
+# Create Azure Firewall
+azfw_name=myazfw
+azfw_pip_name=myazfw-pip
+subnet_azfw_name=AzureFirewallSubnet
+subnet_azfw_prefix=192.168.15.0/24
+logws_name=log$RANDOM
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_azfw_name --address-prefix $subnet_azfw_prefix
+az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location
+azfw_ip=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
+az network firewall create -n $azfw_name -g $rg -l $location
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az monitor log-analytics workspace create -n $logws_name -g $rg
+logws_id=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query id -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name
+az network firewall update -n $azfw_name -g $rg
+azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+# az network firewall application-rule create -f $azfw_name -g $rg -c AllowAll --protocols Http=8080 Https=443 --target-fqdns "*" --source-addresses $vnet_prefix -n Allow-all --priority 200 --action Allow
+az network firewall network-rule create -f $azfw_name -g $rg -c VnetTraffic --protocols Any --destination-addresses $vnet_prefix --destination-ports '*' --source-addresses $vnet_prefix \
+  -n Allow-Vnet-Traffic --priority 210 --action Allow
+
+# Create client Route Table (VM subnet)
+vm_rt_name=vmrt
+az network route-table create -n $vm_rt_name -g $rg -l $location
+vm_rt_id=$(az network route-table show -n $vm_rt_name -g $rg --query id -o tsv)
+az network route-table route create -n sqlendpoint --route-table-name $vm_rt_name -g $rg --next-hop-type VirtualAppliance --address-prefix "${sql_endpoint_ip}/32" --next-hop-ip-address $azfw_private_ip
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $subnet_vm_name --route-table $vm_rt_id
+# Remove route
+# az network route-table route delete -n sqlendpoint --route-table-name $vm_rt_name -g $rg
+az network route-table route list --route-table-name $vm_rt_name -g $rg -o table
+
+# Check effective routes generated with route table attached
+vm_nic_name=${vm_name}VMNic
+az network nic show-effective-route-table -n $vm_nic_name -g $rg -o table
+
+# Create server Route Table (in endpoint subnet, not working according to docs)
+ep_rt_name=plinkrt
+az network route-table create -n $ep_rt_name -g $rg -l $location
+ep_rt_id=$(az network route-table show -n $ep_rt_name -g $rg --query id -o tsv)
+# Route to the VM's subnet
+az network route-table route create -n vmsubnet --route-table-name $ep_rt_name -g $rg --next-hop-type VirtualAppliance --address-prefix "${subnet_vm_prefix}" --next-hop-ip-address $azfw_private_ip
+# Route to the VM's IP (/32)
+az network route-table route create -n vmip --route-table-name $ep_rt_name -g $rg --next-hop-type VirtualAppliance --address-prefix "${vm_private_ip}/32" --next-hop-ip-address $azfw_private_ip
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $subnet_sql_name --route-table $ep_rt_id
+az network route-table route list --route-table-name $ep_rt_name -g $rg -o table
+
+# Test SQL query
+curl "http://${vm_pip_ip}:8080/api/sqlsrcip?SQL_SERVER_FQDN=${sql_server_fqdn}&SQL_SERVER_USERNAME=${sql_username}&SQL_SERVER_PASSWORD=${sql_password}"
+
+# Show Azure Firewall logs
+query_nw_rule='AzureDiagnostics
+| where Category == "AzureFirewallNetworkRule"
+| parse msg_s with Protocol " request from " SourceIP ":" SourcePortInt:int " to " TargetIP ":" TargetPortInt:int *
+| parse msg_s with * ". Action: " Action1a
+| parse msg_s with * " was " Action1b " to " NatDestination
+| parse msg_s with Protocol2 " request from " SourceIP2 " to " TargetIP2 ". Action: " Action2
+| extend SourcePort = tostring(SourcePortInt),TargetPort = tostring(TargetPortInt)
+| extend Action = case(Action1a == "", case(Action1b == "",Action2,Action1b), Action1a),Protocol = case(Protocol == "", Protocol2, Protocol),SourceIP = case(SourceIP == "", SourceIP2, SourceIP),TargetIP = case(TargetIP == "", TargetIP2, TargetIP),SourcePort = case(SourcePort == "", "N/A", SourcePort),TargetPort = case(TargetPort == "", "N/A", TargetPort),NatDestination = case(NatDestination == "", "N/A", NatDestination)
+| project TimeGenerated, msg_s, Protocol, SourceIP,SourcePort,TargetIP,TargetPort,Action, NatDestination'
+# This might take a while to work
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_nw_rule -o tsv
+
+# Customized SNAT behavior of AzFW
+az network firewall update -n $azfw_name -g $rg --private-ranges $subnet_vm_prefix
+
+# Test SQL query
+curl "http://${vm_pip_ip}:8080/api/sqlsrcip?SQL_SERVER_FQDN=${sql_server_fqdn}&SQL_SERVER_USERNAME=${sql_username}&SQL_SERVER_PASSWORD=${sql_password}"
+
+# Customized SNAT behavior of AzFW: revert to default
+az network firewall update -n $azfw_name -g $rg --private-ranges IANAPrivateRanges
+
+#####################
+#  Storage account  #
+#####################
+
+# Create Azure Storage account
+storage_account_name=plink$RANDOM
+storage_container_name=test
+storage_blob_name=test.txt
+az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2
+storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
+az storage container create -n $storage_container_name --public-access container \
+    --auth-mode key --account-name $storage_account_name --account-key $storage_account_key
+echo "Hello world!" >/tmp/$storage_blob_name
+az storage blob upload -n $storage_blob_name -c $storage_container_name -f /tmp/$storage_blob_name \
+    --auth-mode key --account-name $storage_account_name --account-key $storage_account_key
+# az storage account delete -n $storage_account_name -g $rg -y
+
+# Create storage endpoint (in the SQL Subnet)
+storage_endpoint_name=storageep
+storage_account_id=$(az storage account show -n $storage_account_name -g $rg -o tsv --query id)
+# az network vnet subnet update -n $subnet_sql_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
+az network private-endpoint create -n $storage_endpoint_name -g $rg --vnet-name $vnet_name --subnet $subnet_sql_name --private-connection-resource-id $storage_account_id --group-id blob --connection-name blob
+storage_nic_id=$(az network private-endpoint show -n $storage_endpoint_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
+storage_endpoint_ip=$(az network nic show --ids $storage_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+echo "Private IP address for Storage Account ${storage_account_name}: ${storage_endpoint_ip}"
+nslookup ${storage_account_name}.blob.core.windows.net
+nslookup ${storage_account_name}.privatelink.blob.core.windows.net
+
+# Create private DNS
+dns_zone_name=privatelink.blob.core.windows.net
+az network private-dns zone create -n $dns_zone_name -g $rg
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n myDnsLink --virtual-network $vnet_name --registration-enabled false
+az network private-dns record-set a create -n $storage_account_name -z $dns_zone_name -g $rg
+az network private-dns record-set a add-record --record-set-name $storage_account_name -z $dns_zone_name -g $rg -a $storage_endpoint_ip
+
+# Verify DNS resolution
+curl -s "http://${vm_pip_ip}:8080/api/dns?fqdn=${storage_account_name}.privatelink.blob.core.windows.net"
+
+# Add /32 route for storage endpoint to the client route table
+az network route-table route create -n sqlendpoint --route-table-name $vm_rt_name -g $rg --next-hop-type VirtualAppliance --address-prefix "${storage_endpoint_ip}/32" --next-hop-ip-address $azfw_private_ip
+
+
+# Download file
+# ssh $vm_pip_ip "wget https://${storage_account_name}.blob.core.windows.net/test/test.txt --no-check-certificate"
+ssh $vm_pip_ip "curl -s https://${storage_account_name}.blob.core.windows.net/test/test.txt"
+
+# Full test
+echo "Route Table at the client (VM) side:"
+az network route-table route list --route-table-name $vm_rt_name -g $rg -o table
+echo "Route Table at the server (private link endpoint) side:"
+az network route-table route list --route-table-name $ep_rt_name -g $rg -o table
+# Test DNS resolution
+curl -s "http://${vm_pip_ip}:8080/api/dns?fqdn=${sql_server_fqdn}"
+curl -s "http://${vm_pip_ip}:8080/api/dns?fqdn=${storage_account_name}.blob.core.windows.net"
+# Test SQL Server
+curl "http://${vm_pip_ip}:8080/api/sqlsrcip?SQL_SERVER_FQDN=${sql_server_fqdn}&SQL_SERVER_USERNAME=${sql_username}&SQL_SERVER_PASSWORD=${sql_password}"
+# Test Storage Account
+ssh $vm_pip_ip "curl -s https://${storage_account_name}.blob.core.windows.net/test/test.txt"
+
+# Optionally add/remove routes
+az network route-table route list --route-table-name $vm_rt_name -g $rg -o table
+az network route-table route create --route-table $vm_rt_name -n sqlendpoint -g $rg --next-hop-type VirtualAppliance --address-prefix "${sql_endpoint_ip}/32" --next-hop-ip-address $azfw_private_ip
+az network route-table route create --route-table $vm_rt_name -n storageendpoint -g $rg --next-hop-type VirtualAppliance --address-prefix "${storage_endpoint_ip}/32" --next-hop-ip-address $azfw_private_ip
+az network route-table route delete --route-table $vm_rt_name -n sqlendpoint
+az network route-table route delete --route-table $vm_rt_name -n storageendpoint
+az network route-table route list --route-table $ep_rt_name -g $rg -o table
+az network route-table route create --route-table $ep_rt_name -n vmsubnet -g $rg --next-hop-type VirtualAppliance --address-prefix "${subnet_vm_prefix}" --next-hop-ip-address $azfw_private_ip
+az network route-table route create --route-table $ep_rt_name -n vmip -g $rg --next-hop-type VirtualAppliance --address-prefix "${vm_private_ip}/32" --next-hop-ip-address $azfw_private_ip
+az network route-table route delete --route-table $ep_rt_name -n vmsubnet
+az network route-table route delete --route-table $ep_rt_name -n vmip
+# Verify subnets
+az network vnet subnet show -g $rg --vnet-name $vnet_name -n $subnet_vm_name --query 'routeTable.id' -o tsv
+az network vnet subnet show -g $rg --vnet-name $vnet_name -n $subnet_sql_name --query 'routeTable.id' -o tsv
+
+#################
+#   Linux NVA   #
+#################
+
+# Create Ubuntu VM in a new subnet, to be used as NVA
+subnet_nva_name=nva
+subnet_nva_prefix=192.168.16.0/24
+nva_name=nva
+nva_nsg_name=${nva_name}-nsg
+nva_pip_name=${nva_name}-pip
+nva_disk_name=${nva_name}-disk0
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_nva_name --address-prefix $subnet_nva_prefix
+nva_sku=Standard_B2ms
+publisher=Canonical
+offer=UbuntuServer
+sku=18.04-LTS
+image_urn=$(az vm image list -p $publisher -f $offer -s $sku -l $location --query '[0].urn' -o tsv)
+# Deploy VM
+az vm create -n $nva_name -g $rg -l $location --image $image_urn --size $nva_sku --generate-ssh-keys \
+  --os-disk-name $nva_disk_name --os-disk-size-gb 32 \
+  --vnet-name $vnet_name --subnet $subnet_nva_name \
+  --nsg $nva_nsg_name --nsg-rule SSH --public-ip-address $nva_pip_name
+# Enable IP forwarding
+nva_nic_id=$(az vm show -n $nva_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $nva_nic_id --ip-forwarding true
+# Connect to VM
+nva_pip_ip=$(az network public-ip show -n $nva_pip_name -g $rg --query ipAddress -o tsv)
+ssh-keyscan -H $nva_pip_ip >> ~/.ssh/known_hosts
+echo "You can SSH to $nva_pip_ip"
+ssh $nva_pip_ip "sudo sysctl -w net.ipv4.ip_forward=1"
+# Get private IP
+nva_private_ip=$(az network nic show --ids $nva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+echo "NVA provisioned with private IP $nva_private_ip"
+
+# Update client/server routes
+az network route-table route update --route-table $vm_rt_name -n sqlendpoint -g $rg --next-hop-ip-address $nva_private_ip
+az network route-table route update --route-table $vm_rt_name -n storageendpoint -g $rg --next-hop-ip-address $nva_private_ip
+az network route-table route update --route-table $ep_rt_name -n vmip -g $rg --next-hop-ip-address $nva_private_ip
+az network route-table route update --route-table $ep_rt_name -n vmsubnet -g $rg --next-hop-ip-address $nva_private_ip
+
+# Optionally add/remove routes
+az network route-table route list --route-table-name $vm_rt_name -g $rg -o table
+az network route-table route create --route-table $vm_rt_name -n sqlendpoint -g $rg --next-hop-type VirtualAppliance --address-prefix "${sql_endpoint_ip}/32" --next-hop-ip-address $nva_private_ip
+az network route-table route create --route-table $vm_rt_name -n storageendpoint -g $rg --next-hop-type VirtualAppliance --address-prefix "${storage_endpoint_ip}/32" --next-hop-ip-address $nva_private_ip
+az network route-table route delete --route-table $vm_rt_name -n sqlendpoint -g $rg
+az network route-table route delete --route-table $vm_rt_name -n storageendpoint -g $rg
+az network route-table route list --route-table $ep_rt_name -g $rg -o table
+az network route-table route create --route-table $ep_rt_name -n vmsubnet -g $rg --next-hop-type VirtualAppliance --address-prefix "${subnet_vm_prefix}" --next-hop-ip-address $nva_private_ip
+az network route-table route create --route-table $ep_rt_name -n vmip -g $rg --next-hop-type VirtualAppliance --address-prefix "${vm_private_ip}/32" --next-hop-ip-address $nva_private_ip
+az network route-table route delete --route-table $ep_rt_name -n vmsubnet -g $rg
+az network route-table route delete --route-table $ep_rt_name -n vmip -g $rg
+
+# Enable SNAT in the NVA
+ssh $nva_pip_ip "sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+# Disable SNAT in the NVA
+ssh $nva_pip_ip "sudo iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE"
+
+# You can SSH into the NVA and use tcpdump to inspect packets
+ssh $nva_pip_ip "sudo tcpdump not host $nva_private_ip"
+
+# Full test
+echo "Route Table at the client (VM) side:"
+az network route-table route list --route-table-name $vm_rt_name -g $rg -o table
+echo "Route Table at the server (private link endpoint) side:"
+az network route-table route list --route-table-name $ep_rt_name -g $rg -o table
+# Test DNS resolution
+curl -s "http://${vm_pip_ip}:8080/api/dns?fqdn=${sql_server_fqdn}"
+curl -s "http://${vm_pip_ip}:8080/api/dns?fqdn=${storage_account_name}.blob.core.windows.net"
+# Test SQL Server
+curl "http://${vm_pip_ip}:8080/api/sqlsrcip?SQL_SERVER_FQDN=${sql_server_fqdn}&SQL_SERVER_USERNAME=${sql_username}&SQL_SERVER_PASSWORD=${sql_password}"
+# Test Storage Account
+ssh $vm_pip_ip "curl -s https://${storage_account_name}.blob.core.windows.net/test/test.txt"
+
+# Optionally add/remove routes
+az network route-table route list --route-table-name $vm_rt_name -g $rg -o table
+az network route-table route create --route-table $vm_rt_name -n sqlendpoint -g $rg --next-hop-type VirtualAppliance --address-prefix "${sql_endpoint_ip}/32" --next-hop-ip-address $nva_private_ip
+az network route-table route create --route-table $vm_rt_name -n storageendpoint -g $rg --next-hop-type VirtualAppliance --address-prefix "${storage_endpoint_ip}/32" --next-hop-ip-address $nva_private_ip
+az network route-table route delete --route-table $vm_rt_name -n sqlendpoint
+az network route-table route delete --route-table $vm_rt_name -n storageendpoint
+az network route-table route list --route-table $ep_rt_name -g $rg -o table
+az network route-table route create --route-table $ep_rt_name -n vmsubnet -g $rg --next-hop-type VirtualAppliance --address-prefix "${subnet_vm_prefix}" --next-hop-ip-address $nva_private_ip
+az network route-table route create --route-table $ep_rt_name -n vmip -g $rg --next-hop-type VirtualAppliance --address-prefix "${vm_private_ip}/32" --next-hop-ip-address $nva_private_ip
+az network route-table route delete --route-table $ep_rt_name -n vmsubnet
+az network route-table route delete --route-table $ep_rt_name -n vmip
+# Verify subnets
+az network vnet subnet show -g $rg --vnet-name $vnet_name -n $subnet_vm_name --query 'routeTable.id' -o tsv
+az network vnet subnet show -g $rg --vnet-name $vnet_name -n $subnet_sql_name --query 'routeTable.id' -o tsv
