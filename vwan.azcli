@@ -216,8 +216,12 @@ az network vpn-gateway connection create -n branch2-2ary --gateway-name hubvpn1 
 az network vhub route-table create -n vnets --vhub-name hub1 -g $rg -l $location1 --connections All_Vnets --destination-type CIDR --destinations 172.21.11.0/24 --next-hop-type IPAddress --next-hops 172.21.12.10
 az network vhub route-table create -n branches --vhub-name hub1 -g $rg -l $location1 --connections All_Branches --destination-type CIDR --destinations 172.21.11.0/24 --next-hop-type IPAddress --next-hops 172.21.12.10
 
-# Troubleshooting
+#################################
+# Troubleshooting / Diagnostics #
+#################################
+
 az network public-ip list -g $rg -o table
+az network nic list -g $rg -o table
 az network nic show-effective-route-table -n spoke-vm1VMNic -g $rg -o table
 az network nic show-effective-route-table -n azure-nva1VMNic -g $rg -o table
 az network nic show-effective-route-table -n spoke-vm2VMNic -g $rg -o table

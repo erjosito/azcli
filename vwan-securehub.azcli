@@ -45,11 +45,11 @@ branch2_asn=65502
 # Start
 az group create -n $rg -l $location1
 
-# vwan and hubs
+# vwan and hub
 az network vwan create -n $vwan -g $rg -l $location1 --branch-to-branch-traffic true --vnet-to-vnet-traffic true
 az network vhub create -n hub1 -g $rg --vwan $vwan -l $location1 --address-prefix $vwan_hub1_prefix
 
-# VM (no PIP)
+# Test VM (no PIP)
 az vm create -n spoke-vm1 -g $rg -l $location1 --image ubuntuLTS --admin-username $username --admin-password "$password" \
              --public-ip-address "" --vnet-name spoke-$location1 --vnet-address-prefix $azure_spoke1_prefix \
              --subnet vm --subnet-address-prefix $azure_spoke1_subnet --private-ip-address $azure_spoke1_vm_ip
