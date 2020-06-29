@@ -72,9 +72,9 @@ subscription_id=$(az account show --query id -o tsv)
 # JSON
 vwan_json='{location: $location, properties: {disableVpnEncryption: false, type: $sku}}'
 vhub_json='{location: $location, properties: {virtualWan: {id: $vwan_id}, addressPrefix: $hub_prefix, sku: $sku}}'
-vpnsitelink_json='{name: "vpnsitelink1", properties: {ipAddress: $remote_pip, bgpProperties: {bgpPeeringAddress: $remote_bgp_ip, asn: $remote_asn}, linkProperties: {linkProviderName: "vendor1", linkSpeedInMbps: 100}}}'
+vpnsitelink_json='{name: $link_name, properties: {ipAddress: $remote_pip, bgpProperties: {bgpPeeringAddress: $remote_bgp_ip, asn: $remote_asn}, linkProperties: {linkProviderName: "vendor1", linkSpeedInMbps: 100}}}'
 vpnsite_json='{location: $location, properties: {virtualWan: {id: $vwan_id}, addressSpace: { addressPrefixes: [ $site_prefix ] }, isSecuritySite: $security, vpnSiteLinks: [ '${vpnsitelink_json}']}}'
-cx_json='{name: "connection1", properties: {connectionBandwidth: 200, vpnConnectionProtocolType: "IKEv2", enableBgp: true, sharedKey: $psk, vpnSiteLink: {id: $site_link_id}}}'
+cx_json='{name: $cx_name, properties: {connectionBandwidth: 200, vpnConnectionProtocolType: "IKEv2", enableBgp: true, sharedKey: $psk, vpnSiteLink: {id: $site_link_id}}}'
 vpncx_json='{properties: {remoteVpnSite: {id: $site_id}, vpnLinkConnections: ['$cx_json']}}'
 vpngw_json='{location: $location, properties: {virtualHub: {id: $vhub_id}, connections: [], bgpSettings: {asn: $asn, peerWeight: 0}}}'
 vnet_cx_json='{properties: {remoteVirtualNetwork: {id: $vnet_id}, enableInternetSecurity: true}}'
@@ -139,18 +139,21 @@ branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -
 # vpn site branch1
 # az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --ip-address $branch1_ip --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100
 # https://docs.microsoft.com/en-us/rest/api/virtualwan/vpnsites/createorupdate
+# Note that changing IsSecuritySite' flag is not supported, so configuring it as "active" is probably a good practice
 vpnsite1_json_string=$(jq -n \
         --arg location "$location1" \
+        --arg link_name "branch1" \
         --arg vwan_id $vwan_id \
         --arg remote_bgp_ip $branch1_bgp_ip \
         --arg remote_asn $branch1_asn \
         --arg remote_pip $branch1_ip \
         --arg site_prefix ${branch1_ip}/32 \
-        --arg security 'false' \
+        --arg security 'true' \
         $vpnsite_json)
 vpnsite1_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch1?api-version=$vwan_api_version"
 az rest --method put --uri $vpnsite1_uri --body $vpnsite1_json_string  # PUT
 az rest --method get --uri $vpnsite1_uri                               # GET
+# az rest --method delete --uri $vpnsite1_uri                          # DELETE
 
 # vpn gateway hub1
 # az network vpn-gateway create -n hubvpn1 -g $rg -l $location1 --vhub hub1 --asn $vwan_hub1_asn
@@ -174,6 +177,7 @@ az rest --method get --uri $vpngw1_uri                              # GET
 site1_id=$(az network vpn-site show -n branch1 -g $rg --query id -o tsv)
 site1_link_id=$(az rest --method get --uri $vpnsite1_uri | jq -r '.properties.vpnSiteLinks[0].id')
 vpncx1_json_string=$(jq -n \
+        --arg cx_name "branch1" \
         --arg site_id "$site1_id" \
         --arg site_link_id $site1_link_id \
         --arg psk $password \
@@ -189,6 +193,7 @@ branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -
 # VPN site branch2
 vpnsite2_json_string=$(jq -n \
         --arg location "$location2" \
+        --arg link_name "branch2" \
         --arg vwan_id $vwan_id \
         --arg remote_bgp_ip $branch2_bgp_ip \
         --arg remote_asn $branch2_asn \
@@ -197,7 +202,8 @@ vpnsite2_json_string=$(jq -n \
         --arg security 'false' \
         $vpnsite_json)
 vpnsite2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch2?api-version=$vwan_api_version"
-az rest --method put --uri $vpnsite2_uri --body $vpnsite2_json_string
+az rest --method put --uri $vpnsite2_uri --body $vpnsite2_json_string  # PUT
+# az rest --method delete --uri $vpnsite2_uri                          # DELETE
 
 # VPN GW hub2
 vhub2_id=$(az network vhub show -n hub2 -g $rg --query id -o tsv)
@@ -207,12 +213,14 @@ vpngw2_json_string=$(jq -n \
         --arg asn $vwan_hub2_asn \
         $vpngw_json)
 vpngw2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn2?api-version=$vwan_api_version"
-az rest --method put --uri $vpngw2_uri --body $vpngw2_json_string
+az rest --method put --uri $vpngw2_uri --body $vpngw2_json_string  # PUT
+# az rest --method delete --uri $vpngw2_uri                        # DELETE
 
 # Connection hub2-branch2
 site2_id=$(az network vpn-site show -n branch2 -g $rg --query id -o tsv)
 site2_link_id=$(az rest --method get --uri $vpnsite2_uri | jq -r '.properties.vpnSiteLinks[0].id')
 vpncx2_json_string=$(jq -n \
+        --arg cx_name "branch2" \
         --arg site_id "$site2_id" \
         --arg site_link_id $site2_link_id \
         --arg psk $password \
@@ -228,6 +236,7 @@ branch3_ip=$(az network public-ip show -n branch3-pip -g $rg --query ipAddress -
 # VPN site branch3
 vpnsite3_json_string=$(jq -n \
         --arg location "$location2" \
+        --arg link_name "branch3" \
         --arg vwan_id $vwan_id \
         --arg remote_bgp_ip $branch3_bgp_ip \
         --arg remote_asn $branch3_asn \
@@ -236,12 +245,14 @@ vpnsite3_json_string=$(jq -n \
         --arg security 'false' \
         $vpnsite_json)
 vpnsite3_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch3?api-version=$vwan_api_version"
-az rest --method put --uri $vpnsite3_uri --body $vpnsite3_json_string
+az rest --method put --uri $vpnsite3_uri --body $vpnsite3_json_string   # PUT
+# az rest --method delete --uri $vpnsite3_uri                           # DELETE
 
 # Connection hub2-branch3
 site3_id=$(az network vpn-site show -n branch3 -g $rg --query id -o tsv)
 site3_link_id=$(az rest --method get --uri $vpnsite3_uri | jq -r '.properties.vpnSiteLinks[0].id')
 vpncx3_json_string=$(jq -n \
+        --arg cx_name "branch3" \
         --arg site_id "$site3_id" \
         --arg site_link_id $site3_link_id \
         --arg psk $password \
@@ -707,6 +718,7 @@ vhub1_default_hubrt_uri="${vhub1_base_uri}/hubRouteTables/defaultRouteTable?api-
 vhub2_rt_uri="${vhub2_base_uri}/routeTables?api-version=$vwan_api_version"
 vhub2_hubrt_uri="${vhub2_base_uri}/hubRouteTables?api-version=$vwan_api_version"
 vhub2_default_hubrt_uri="${vhub2_base_uri}/hubRouteTables/defaultRouteTable?api-version=$vwan_api_version"
+vpnsites_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites?api-version=$vwan_api_version"
 vpngws_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways?api-version=$vwan_api_version"
 vpngw1_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn1"
 vpngw1_uri="${vpngw1_base_uri}?api-version=$vwan_api_version"
@@ -717,6 +729,7 @@ vpngw2_cx_uri="${vpngw2_base_uri}/vpnConnections?api-version=$vwan_api_version"
 
 # Get hubs
 az rest --method get --uri $vhubs_uri | jq '.value'
+az rest --method get --uri $vhubs_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
 # Get hub details
 az rest --method get --uri $vhub1_uri
 # Get hub ipconfig (not working)
@@ -732,13 +745,18 @@ az rest --method get --uri $vhub2_default_hubrt_uri
 az rest --method get --uri $vhub1_bgp_uri
 # Get VPN GWs
 az rest --method get --uri $vpngws_uri
-# Get VPN GW details
+az rest --method get --uri $vpngws_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
+ # Get VPN GW details
 az rest --method get --uri $vpngw1_uri
 az rest --method get --uri $vpngw2_uri
 # Get VPN GW connections
 az rest --method get --uri $vpngw1_cx_uri
+az rest --method get --uri $vpngw1_cx_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
 az rest --method get --uri $vpngw2_cx_uri
-az rest --method get --uri $vpngw2_cx_uri | jq '.value[] | .properties.provisioningState'
+az rest --method get --uri $vpngw2_cx_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
+# Get VPN Sites
+az rest --method get --uri $vpnsites_uri
+az rest --method get --uri $vpnsites_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
 
 
 #########################
