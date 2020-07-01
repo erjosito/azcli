@@ -86,6 +86,34 @@ vnet_cx_json='{properties: {remoteVirtualNetwork: {id: $vnet_id}, enableInternet
 rt_json='{properties: {routes: [], labels: []}}'
 route_json='{name: $name, destinationType: "CIDR", destinations: [ $prefixes ], nextHopType: $type, nextHop: $nexthop }'
 cxroute_json='{name: $name, addressPrefixes: [ $prefixes ], nextHopIpAddress: $nexthop }'
+# REST URIs
+vwan_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualWans/$vwan?api-version=$vwan_api_version"
+vhubs_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs?api-version=$vwan_api_version"
+vhub1_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub1"
+vhub2_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub2"
+vhub1_uri="${vhub1_base_uri}?api-version=$vwan_api_version"
+vhub1_ipconfigs_uri="${vhub1_base_uri}/ipConfigurations?api-version=$vwan_api_version"
+vhub1_bgp_uri="${vhub1_base_uri}/bgpConnections?api-version=$vwan_api_version"
+vhub1_vnetcx_uri="${vhub1_base_uri}/hubVirtualNetworkConnections?api-version=$vwan_api_version"
+vhub1_rt_uri="${vhub1_base_uri}/routeTables?api-version=$vwan_api_version"
+vhub1_hubrt_uri="${vhub1_base_uri}/hubRouteTables?api-version=$vwan_api_version"
+vhub1_effrt_uri="${vhub1_base_uri}/effectiveRoutes?api-version=$vwan_api_version"
+vhub1_default_hubrt_uri="${vhub1_base_uri}/hubRouteTables/defaultRouteTable?api-version=$vwan_api_version"
+vhub2_rt_uri="${vhub2_base_uri}/routeTables?api-version=$vwan_api_version"
+vhub2_hubrt_uri="${vhub2_base_uri}/hubRouteTables?api-version=$vwan_api_version"
+vhub2_default_hubrt_uri="${vhub2_base_uri}/hubRouteTables/defaultRouteTable?api-version=$vwan_api_version"
+vhub2_vnetcx_uri="${vhub2_base_uri}/hubVirtualNetworkConnections?api-version=$vwan_api_version"
+vpnsites_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites?api-version=$vwan_api_version"
+vpnsite1_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch1?api-version=$vwan_api_version"
+vpnsite2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch2?api-version=$vwan_api_version"
+vpnsite3_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch3?api-version=$vwan_api_version"
+vpngws_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways?api-version=$vwan_api_version"
+vpngw1_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn1"
+vpngw1_uri="${vpngw1_base_uri}?api-version=$vwan_api_version"
+vpngw1_cx_uri="${vpngw1_base_uri}/vpnConnections?api-version=$vwan_api_version"
+vpngw2_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn2"
+vpngw2_uri="${vpngw2_base_uri}?api-version=$vwan_api_version"
+vpngw2_cx_uri="${vpngw2_base_uri}/vpnConnections?api-version=$vwan_api_version"
 
 
 ###################
@@ -98,7 +126,6 @@ az group create -n $rg -l $location1
 # vwan
 # https://docs.microsoft.com/en-us/rest/api/virtualwan/virtualwans/createorupdate
 # az network vwan create -n $vwan -g $rg -l $location1 --branch-to-branch-traffic true --vnet-to-vnet-traffic true
-vwan_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualWans/$vwan?api-version=$vwan_api_version"
 vwan_json_string=$(jq -n \
     --arg location "$location1" \
     --arg sku "Standard" \
@@ -115,7 +142,6 @@ vhub1_json_string=$(jq -n \
     --arg sku "Standard" \
     --arg hub_prefix $vwan_hub1_prefix \
     $vhub_json)
-vhub1_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub1?api-version=$vwan_api_version"
 az rest --method put --uri $vhub1_uri --body $vhub1_json_string    # PUT
 az rest --method get --uri $vhub1_uri                              # GET
 
@@ -127,7 +153,6 @@ vhub2_json_string=$(jq -n \
     --arg sku "Standard" \
     --arg hub_prefix $vwan_hub2_prefix \
     $vhub_json)
-vhub2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub2?api-version=$vwan_api_version"
 az rest --method put --uri $vhub2_uri --body $vhub2_json_string                                   # PUT
 az rest --method get --uri $vhub2_uri | jq                                                        # GET
 az rest --method get --uri $vhubs_uri | jq '.value[] | .name,.properties.provisioningState'       # GET
@@ -142,12 +167,13 @@ az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:$
     --admin-username "$username" --generate-ssh-keys --public-ip-address branch1-pip --public-ip-address-allocation static \
     --vnet-name branch1 --vnet-address-prefix $branch1_prefix --subnet nva --subnet-address-prefix $branch1_subnet --private-ip-address $branch1_bgp_ip --no-wait
 branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
-echo $branch1_ip
+echo $branch1_ip  # A few seconds are required before a public IP address is allocated
 
 # vpn site branch1
 # az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --ip-address $branch1_ip --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100
 # https://docs.microsoft.com/en-us/rest/api/virtualwan/vpnsites/createorupdate
-# Note that changing IsSecuritySite' flag is not supported, so configuring it as "active" is probably a good practice
+# Note that changing IsSecuritySite' flag is not supported after creation time
+# IsSecuritySite allows to advertise a 0.0.0.0/0??
 vpnsite1_json_string=$(jq -n \
         --arg location "$location1" \
         --arg link_name "branch1" \
@@ -156,9 +182,8 @@ vpnsite1_json_string=$(jq -n \
         --arg remote_asn $branch1_asn \
         --arg remote_pip $branch1_ip \
         --arg site_prefix ${branch1_ip}/32 \
-        --arg security 'true' \
+        --arg security 'false' \
         $vpnsite_json)
-vpnsite1_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch1?api-version=$vwan_api_version"
 az rest --method put --uri $vpnsite1_uri --body $vpnsite1_json_string  # PUT
 az rest --method get --uri $vpnsite1_uri                               # GET
 # az rest --method delete --uri $vpnsite1_uri                          # DELETE
@@ -175,7 +200,6 @@ vpngw1_json_string=$(jq -n \
         --arg vhub_id $vhub1_id \
         --arg asn $vwan_hub1_asn \
         $vpngw_json)
-vpngw1_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn1?api-version=$vwan_api_version"
 az rest --method put --uri $vpngw1_uri --body $vpngw1_json_string   # PUT
 az rest --method get --uri $vpngw1_uri                              # GET
 
@@ -203,6 +227,7 @@ branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -
 echo $branch2_ip
 
 # VPN site branch2
+# isSecuritySite set to true for testing (so that it can be compared to sites 1 and 3)
 vpnsite2_json_string=$(jq -n \
         --arg location "$location2" \
         --arg link_name "branch2" \
@@ -211,9 +236,8 @@ vpnsite2_json_string=$(jq -n \
         --arg remote_asn $branch2_asn \
         --arg remote_pip $branch2_ip \
         --arg site_prefix ${branch2_ip}/32 \
-        --arg security 'false' \
+        --arg security 'true' \
         $vpnsite_json)
-vpnsite2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch2?api-version=$vwan_api_version"
 az rest --method put --uri $vpnsite2_uri --body $vpnsite2_json_string  # PUT
 # az rest --method delete --uri $vpnsite2_uri                          # DELETE
 
@@ -828,31 +852,6 @@ az network firewall policy rule-collection-group collection list --policy myfwpo
 ssh $username@$branch1_ip "sh ip bgp"
 ssh $username@$branch1_ip "sh ip interface brief"
 ssh $username@$branch1_ip "sh ip route"
-
-# REST URIs
-vhubs_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs?api-version=$vwan_api_version"
-vhub1_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub1"
-vhub2_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub2"
-vhub1_uri="${vhub1_base_uri}?api-version=$vwan_api_version"
-vhub1_ipconfigs_uri="${vhub1_base_uri}/ipConfigurations?api-version=$vwan_api_version"
-vhub1_bgp_uri="${vhub1_base_uri}/bgpConnections?api-version=$vwan_api_version"
-vhub1_vnetcx_uri="${vhub1_base_uri}/hubVirtualNetworkConnections?api-version=$vwan_api_version"
-vhub1_rt_uri="${vhub1_base_uri}/routeTables?api-version=$vwan_api_version"
-vhub1_hubrt_uri="${vhub1_base_uri}/hubRouteTables?api-version=$vwan_api_version"
-vhub1_effrt_uri="${vhub1_base_uri}/effectiveRoutes?api-version=$vwan_api_version"
-vhub1_default_hubrt_uri="${vhub1_base_uri}/hubRouteTables/defaultRouteTable?api-version=$vwan_api_version"
-vhub2_rt_uri="${vhub2_base_uri}/routeTables?api-version=$vwan_api_version"
-vhub2_hubrt_uri="${vhub2_base_uri}/hubRouteTables?api-version=$vwan_api_version"
-vhub2_default_hubrt_uri="${vhub2_base_uri}/hubRouteTables/defaultRouteTable?api-version=$vwan_api_version"
-vhub2_vnetcx_uri="${vhub2_base_uri}/hubVirtualNetworkConnections?api-version=$vwan_api_version"
-vpnsites_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites?api-version=$vwan_api_version"
-vpngws_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways?api-version=$vwan_api_version"
-vpngw1_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn1"
-vpngw1_uri="${vpngw1_base_uri}?api-version=$vwan_api_version"
-vpngw1_cx_uri="${vpngw1_base_uri}/vpnConnections?api-version=$vwan_api_version"
-vpngw2_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn2"
-vpngw2_uri="${vpngw2_base_uri}?api-version=$vwan_api_version"
-vpngw2_cx_uri="${vpngw2_base_uri}/vpnConnections?api-version=$vwan_api_version"
 
 # Get hubs
 az rest --method get --uri $vhubs_uri | jq '.value'
