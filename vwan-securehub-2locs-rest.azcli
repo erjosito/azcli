@@ -95,6 +95,8 @@ vhub1_uri="${vhub1_base_uri}?api-version=$vwan_api_version"
 vhub1_ipconfigs_uri="${vhub1_base_uri}/ipConfigurations?api-version=$vwan_api_version"
 vhub1_bgp_uri="${vhub1_base_uri}/bgpConnections?api-version=$vwan_api_version"
 vhub1_vnetcx_uri="${vhub1_base_uri}/hubVirtualNetworkConnections?api-version=$vwan_api_version"
+vhub1_vnetcx1_uri="${vhub1_base_uri}/hubVirtualNetworkConnections/spoke1?api-version=$vwan_api_version"
+vhub1_vnetcx2_uri="${vhub1_base_uri}/hubVirtualNetworkConnections/spoke2?api-version=$vwan_api_version"
 vhub1_rt_uri="${vhub1_base_uri}/routeTables?api-version=$vwan_api_version"
 vhub1_hubrt_uri="${vhub1_base_uri}/hubRouteTables?api-version=$vwan_api_version"
 vhub1_effrt_uri="${vhub1_base_uri}/effectiveRoutes?api-version=$vwan_api_version"
@@ -103,6 +105,8 @@ vhub2_rt_uri="${vhub2_base_uri}/routeTables?api-version=$vwan_api_version"
 vhub2_hubrt_uri="${vhub2_base_uri}/hubRouteTables?api-version=$vwan_api_version"
 vhub2_default_hubrt_uri="${vhub2_base_uri}/hubRouteTables/defaultRouteTable?api-version=$vwan_api_version"
 vhub2_vnetcx_uri="${vhub2_base_uri}/hubVirtualNetworkConnections?api-version=$vwan_api_version"
+vhub2_vnetcx3_uri="${vhub2_base_uri}/hubVirtualNetworkConnections/spoke3?api-version=$vwan_api_version"
+vhub2_vnetcx4_uri="${vhub2_base_uri}/hubVirtualNetworkConnections/spoke4?api-version=$vwan_api_version"
 vpnsites_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites?api-version=$vwan_api_version"
 vpnsite1_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch1?api-version=$vwan_api_version"
 vpnsite2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch2?api-version=$vwan_api_version"
@@ -111,9 +115,12 @@ vpngws_uri="https://management.azure.com/subscriptions/$subscription_id/resource
 vpngw1_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn1"
 vpngw1_uri="${vpngw1_base_uri}?api-version=$vwan_api_version"
 vpngw1_cx_uri="${vpngw1_base_uri}/vpnConnections?api-version=$vwan_api_version"
+vpngw1_cx1_uri="${vpngw1_base_uri}/vpnConnections/branch1?api-version=$vwan_api_version"
 vpngw2_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn2"
 vpngw2_uri="${vpngw2_base_uri}?api-version=$vwan_api_version"
 vpngw2_cx_uri="${vpngw2_base_uri}/vpnConnections?api-version=$vwan_api_version"
+vpngw2_cx2_uri="${vpngw2_base_uri}/vpnConnections/branch2?api-version=$vwan_api_version"
+vpngw2_cx3_uri="${vpngw2_base_uri}/vpnConnections/branch3?api-version=$vwan_api_version"
 
 
 ###################
@@ -214,9 +221,8 @@ vpncx1_json_string=$(jq -n \
         --arg site_link_id $site1_link_id \
         --arg psk $password \
         $vpncx_json)
-vpncx1_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn1/vpnConnections/branch1?api-version=$vwan_api_version"
-az rest --method put --uri $vpncx1_uri --body $vpncx1_json_string    # PUT
-az rest --method get --uri $vpncx1_uri                               # GET
+az rest --method put --uri $vpngw1_cx1_uri --body $vpncx1_json_string    # PUT
+az rest --method get --uri $vpngw1_cx1_uri                               # GET
 
 # Branch 2 CSR
 az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} \
@@ -239,6 +245,7 @@ vpnsite2_json_string=$(jq -n \
         --arg security 'true' \
         $vpnsite_json)
 az rest --method put --uri $vpnsite2_uri --body $vpnsite2_json_string  # PUT
+az rest --method get --uri $vpnsite2_uri                               # GET
 # az rest --method delete --uri $vpnsite2_uri                          # DELETE
 
 # VPN GW hub2
@@ -248,8 +255,8 @@ vpngw2_json_string=$(jq -n \
         --arg vhub_id $vhub2_id \
         --arg asn $vwan_hub2_asn \
         $vpngw_json)
-vpngw2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn2?api-version=$vwan_api_version"
 az rest --method put --uri $vpngw2_uri --body $vpngw2_json_string  # PUT
+az rest --method get --uri $vpngw2_uri                             # GET
 # az rest --method delete --uri $vpngw2_uri                        # DELETE
 
 # Connection hub2-branch2
@@ -261,9 +268,9 @@ vpncx2_json_string=$(jq -n \
         --arg site_link_id $site2_link_id \
         --arg psk $password \
         $vpncx_json)
-vpncx2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn2/vpnConnections/branch2?api-version=$vwan_api_version"
-az rest --method put --uri $vpncx2_uri --body $vpncx2_json_string
-# az rest --method delete --uri $vpncx2_uri # DELETE
+az rest --method put --uri $vpngw2_cx2_uri --body $vpncx2_json_string
+az rest --method get --uri $vpngw2_cx2_uri # GET
+# az rest --method delete --uri $vpngw2_cx2_uri # DELETE
 
 # Branch 3 CSR
 az vm create -n branch3-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} \
@@ -284,8 +291,8 @@ vpnsite3_json_string=$(jq -n \
         --arg site_prefix ${branch3_ip}/32 \
         --arg security 'false' \
         $vpnsite_json)
-vpnsite3_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch3?api-version=$vwan_api_version"
 az rest --method put --uri $vpnsite3_uri --body $vpnsite3_json_string   # PUT
+az rest --method get --uri $vpnsite3_uri                                # GET
 # az rest --method delete --uri $vpnsite3_uri                           # DELETE
 
 # Connection hub2-branch3
@@ -297,9 +304,9 @@ vpncx3_json_string=$(jq -n \
         --arg site_link_id $site3_link_id \
         --arg psk $password \
         $vpncx_json)
-vpncx3_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn2/vpnConnections/branch3?api-version=$vwan_api_version"
-az rest --method put --uri $vpncx3_uri --body $vpncx3_json_string
-# az rest --method delete --uri $vpncx3_uri                          # DELETE
+az rest --method put --uri $vpngw2_cx3_uri --body $vpncx3_json_string    # PUT
+az rest --method get --uri $vpngw2_cx3_uri                               # GET
+# az rest --method delete --uri $vpngw2_cx3_uri                          # DELETE
 
 # Add public key of CSRs to known_hosts
 ssh-keyscan -H $branch1_ip >> ~/.ssh/known_hosts
@@ -386,9 +393,8 @@ vnet1_id=$(az network vnet show -n spoke1-$location1 -g $rg --query id -o tsv)
 vnet1_cx_json_string=$(jq -n \
         --arg vnet_id "$vnet1_id" \
         $vnet_cx_json)
-vnet1_cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub1/hubVirtualNetworkConnections/spoke1?api-version=$vwan_api_version"
-az rest --method put --uri $vnet1_cx_uri --body $vnet1_cx_json_string  # PUT
-az rest --method get --uri $vnet1_cx_uri                               # GET
+az rest --method put --uri $vhub1_vnetcx1_uri --body $vnet1_cx_json_string  # PUT
+az rest --method get --uri $vhub1_vnetcx1_uri                               # GET
 
 # Connection spoke2-vhub1
 # az network vhub connection create -n tospoke2 -g $rg --remote-vnet spoke3-$location2 --vhub-name hub2 --remote-vnet-transit true --use-hub-vnet-gateways true --internet-security false
@@ -396,27 +402,25 @@ vnet2_id=$(az network vnet show -n spoke2-$location1 -g $rg --query id -o tsv)
 vnet2_cx_json_string=$(jq -n \
         --arg vnet_id "$vnet2_id" \
         $vnet_cx_json)
-vnet2_cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub1/hubVirtualNetworkConnections/spoke2?api-version=$vwan_api_version"
-az rest --method put --uri $vnet2_cx_uri --body $vnet2_cx_json_string  # PUT
-az rest --method get --uri $vnet2_cx_uri                               # GET
+az rest --method put --uri $vhub1_vnetcx2_uri --body $vnet2_cx_json_string  # PUT
+az rest --method get --uri $vhub1_vnetcx2_uri                               # GET
+# az rest --method delete --uri $vhub1_vnetcx2_uri                          # DELETE
 
 # Connection spoke3-vhub2
 vnet3_id=$(az network vnet show -n spoke3-$location2 -g $rg --query id -o tsv)
 vnet3_cx_json_string=$(jq -n \
         --arg vnet_id "$vnet3_id" \
         $vnet_cx_json)
-vnet3_cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub2/hubVirtualNetworkConnections/spoke3?api-version=$vwan_api_version"
-az rest --method put --uri $vnet3_cx_uri --body $vnet3_cx_json_string  # PUT
-az rest --method get --uri $vnet3_cx_uri                               # GET
+az rest --method put --uri $vhub2_vnetcx3_uri --body $vnet3_cx_json_string  # PUT
+az rest --method get --uri $vhub2_vnetcx3_uri                               # GET
 
 # Connection spoke4-vhub2
 vnet4_id=$(az network vnet show -n spoke4-$location2 -g $rg --query id -o tsv)
 vnet4_cx_json_string=$(jq -n \
         --arg vnet_id "$vnet4_id" \
         $vnet_cx_json)
-vnet4_cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub2/hubVirtualNetworkConnections/spoke4?api-version=$vwan_api_version"
-az rest --method put --uri $vnet4_cx_uri --body $vnet4_cx_json_string  # PUT
-az rest --method get --uri $vnet4_cx_uri                               # GET
+az rest --method put --uri $vhub2_vnetcx4_uri --body $vnet4_cx_json_string  # PUT
+az rest --method get --uri $vhub2_vnetcx4_uri                               # GET
 
 
 # Route table for jump hosts to send ssh traffic to this computer (where you are running these az commands) over Internet
@@ -442,7 +446,7 @@ file_name="/tmp/${blob_name}"
 az storage account create -n $storage_account -g $rg -l $location1 --sku Standard_LRS
 az storage container create -n $container_name --account-name $storage_account
 # Create SAS and download config file for 3 branches
-end_time=`date -u -d "30 minutes" '+%Y-%m-%dT%H:%MZ'`
+end_time=`date -u -d "240 minutes" '+%Y-%m-%dT%H:%MZ'`
 sas=$(az storage container generate-sas -n $container_name --account-name $storage_account --permissions dlrw --expiry $end_time -o tsv)
 account_url=$(az storage account show -n $storage_account -g $rg --query primaryEndpoints.blob -o tsv)
 storage_url=${account_url}${container_name}"/"${blob_name}"?"${sas}
@@ -496,6 +500,7 @@ ssh $branch1_ip "copy bootflash:${config_file_csr} running-config"
 ssh $branch1_ip "wr mem"
 ssh $branch1_ip "sh ip int b"
 ssh $branch1_ip "sh ip bgp summary"
+ssh $branch1_ip "sh ip route bgp"
 
 # Create CSR config for branch 2
 # If you are going to cross-connect branch2 to both hubs, you want to skip this and go to the 4-tunnel config
@@ -518,6 +523,7 @@ ssh $branch2_ip "copy bootflash:${config_file_csr} running-config"
 ssh $branch2_ip "wr mem"
 ssh $branch2_ip "sh ip int b"
 ssh $branch2_ip "sh ip bgp summary"
+ssh $branch2_ip "sh ip route bgp"
 
 # Create CSR config for branch 3
 # If you are going to cross-connect branch2 to both hubs, you want to skip this and go to the 4-tunnel config
@@ -540,6 +546,7 @@ ssh $branch3_ip "copy bootflash:${config_file_csr} running-config"
 ssh $branch3_ip "wr mem"
 ssh $branch3_ip "sh ip int b"
 ssh $branch3_ip "sh ip bgp summary"
+ssh $branch3_ip "sh ip route bgp"
 
 #################
 #       RT      #
@@ -555,20 +562,21 @@ ssh $branch3_ip "sh ip bgp summary"
 
 # Create Route Table (aka hubRouteTable)
 # https://docs.microsoft.com/en-us/rest/api/virtualwan/hubroutetables/createorupdate
-rt_name=rt1
+hub_name=hub1
+rt_name=vnet_RT
 rt_json_string=$(jq -n \
         $rt_json)
-rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub1/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
+rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
 az rest --method put --uri $rt_uri --body $rt_json_string   # PUT
 az rest --method get --uri $rt_uri                          # GET
 # az rest --method delete --uri $rt_uri                     # DELETE
 
 # Update vnet connection associated RT
 hub_name=hub1
-cx_name=spoke1
+cx_name=spoke2
 cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
 cx_json=$(az rest --method get --uri $cx_uri)
-new_rt_name=rt1
+new_rt_name=vnet_RT
 new_rt_id="/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${new_rt_name}"
 cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.associatedRouteTable.id = "'$new_rt_id'" | {name, properties}')
 az rest --method put --uri $cx_uri --body $cx_json_updated
@@ -576,10 +584,10 @@ az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.associ
 
 # Update vnet connection propagated RT
 hub_name=hub1
-cx_name=spoke1
+cx_name=spoke2
 cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
 cx_json=$(az rest --method get --uri $cx_uri)
-new_rt_names=(defaultRouteTable rt1)
+new_rt_names=(noneRouteTable)
 new_rt_ids=""
 for new_rt_name in ${new_rt_names[@]}; do
     new_rt_ids="${new_rt_ids}{\"id\": \"/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${new_rt_name}\"},"
@@ -599,19 +607,12 @@ azfw1_id=$(az network firewall show -n azfw1 -g $rg -o tsv --query id)
 # type (next hop): CIDR, resourceId, Service
 # prefixes: comma-separated prefix list
 new_route_json_string=$(jq -n \
-        --arg name "onprem" \
+        --arg name "hub1vnets" \
         --arg type "ResourceId" \
-        --arg prefixes "172.16.0.0/12" \
+        --arg prefixes "10.1.0.0/17" \
         --arg nexthop "$azfw1_id" \
         $route_json)
-existing_routes=$(echo $rt_json_current | jq '.properties.routes[]')
-if [ -z "${existing_routes}" ]
-then
-    new_routes=${new_route_json_string}
-else
-    new_routes=${existing_routes},${new_route_json_string}
-fi
-rt_json_updated=$(echo $rt_json_current | jq '.properties.routes = ['$new_routes'] | {name, properties}')
+rt_json_updated=$(echo $rt_json_current | jq '.properties.routes += [ '$new_route_json_string' ] | {name, properties}')
 az rest --method put --uri $rt_uri --body $rt_json_updated    # PUT
 az rest --method get --uri $rt_uri | jq '.properties.routes'  # GET
 
@@ -655,6 +656,25 @@ cx_json=$(az rest --method get --uri $cx_uri)
 cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes = [] | {name, properties}')
 az rest --method put --uri $cx_uri --body $cx_json_updated    # PUT
 az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes'  # GET
+
+#################
+#  Reset stuff  #
+#################
+
+# vhub
+hub_name=hub1
+hub_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}?api-version=$vwan_api_version"
+hub_json_current=$(az rest --method get --uri $hub_uri)
+hub_json_updated=$(echo $hub_json_current | jq '{name, location, properties}')
+az rest --method put --uri $hub_uri --body $hub_json_updated
+
+# vnet cx
+hub_name=hub1
+cx_name=spoke1
+cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
+cx_json_current=$(az rest --method get --uri $cx_uri)
+cx_json_updated=$(echo $cx_json_current | jq '{name, location, properties}')
+az rest --method put --uri $cx_uri --body $cx_json_updated
 
 #################
 # Log Analytics #
@@ -718,8 +738,8 @@ ssh $branch1_ip "ping $branch2_bgp_ip"
 ###############
 
 # Enable/disable secured vnet connections (enables 0/0 propagation, but doesnt actually inject it)
-az network vhub connection create -n tospoke1 -g $rg --remote-vnet spoke1-$location1 --vhub-name hub1 --remote-vnet-transit true --use-hub-vnet-gateways true --internet-security true
-az network vhub connection create -n tospoke2 -g $rg --remote-vnet spoke3-$location2 --vhub-name hub2 --remote-vnet-transit true --use-hub-vnet-gateways true --internet-security true
+# az network vhub connection create -n tospoke1 -g $rg --remote-vnet spoke1-$location1 --vhub-name hub1 --remote-vnet-transit true --use-hub-vnet-gateways true --internet-security true
+# az network vhub connection create -n tospoke2 -g $rg --remote-vnet spoke3-$location2 --vhub-name hub2 --remote-vnet-transit true --use-hub-vnet-gateways true --internet-security true
 # az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true
 # az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true
 
@@ -862,11 +882,16 @@ az rest --method get --uri $vhub1_uri
 az rest --method get --uri $vhub1_ipconfigs_uri
 # Get hub vnet connections
 az rest --method get --uri $vhub1_vnetcx_uri
+az rest --method get --uri $vhub1_vnetcx_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
+az rest --method get --uri $vhub1_vnetcx_uri | jq -r '.value | map({name, associatedRT: .properties.routingConfiguration.associatedRouteTable.id, propagateRTs: .properties.routingConfiguration.propagatedRouteTables.ids[].id})'
 az rest --method get --uri $vhub2_vnetcx_uri
+az rest --method get --uri $vhub2_vnetcx_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
+az rest --method get --uri $vhub2_vnetcx_uri | jq -r '.value | map({name, associatedRT: .properties.routingConfiguration.associatedRouteTable.id, propagateRTs: .properties.routingConfiguration.propagatedRouteTables.ids[].id})'
 # Get RTv2 (aka routeTable)
 az rest --method get --uri $vhub1_rt_uri
 # Get hub RTs (aka hubRouteTable)
 az rest --method get --uri $vhub1_hubrt_uri
+az rest --method get --uri $vhub1_hubrt_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
 # Get hub default hubRT
 az rest --method get --uri $vhub1_default_hubrt_uri
 az rest --method get --uri $vhub2_default_hubrt_uri
