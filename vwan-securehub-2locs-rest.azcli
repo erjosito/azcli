@@ -97,6 +97,7 @@ vhub1_bgp_uri="${vhub1_base_uri}/bgpConnections?api-version=$vwan_api_version"
 vhub1_vnetcx_uri="${vhub1_base_uri}/hubVirtualNetworkConnections?api-version=$vwan_api_version"
 vhub1_vnetcx1_uri="${vhub1_base_uri}/hubVirtualNetworkConnections/spoke1?api-version=$vwan_api_version"
 vhub1_vnetcx2_uri="${vhub1_base_uri}/hubVirtualNetworkConnections/spoke2?api-version=$vwan_api_version"
+vhub1_vnetcxhub1_uri="${vhub1_base_uri}/hubVirtualNetworkConnections/userhub?api-version=$vwan_api_version"
 vhub1_rt_uri="${vhub1_base_uri}/routeTables?api-version=$vwan_api_version"
 vhub1_hubrt_uri="${vhub1_base_uri}/hubRouteTables?api-version=$vwan_api_version"
 vhub1_effrt_uri="${vhub1_base_uri}/effectiveRoutes?api-version=$vwan_api_version"
@@ -107,6 +108,7 @@ vhub2_default_hubrt_uri="${vhub2_base_uri}/hubRouteTables/defaultRouteTable?api-
 vhub2_vnetcx_uri="${vhub2_base_uri}/hubVirtualNetworkConnections?api-version=$vwan_api_version"
 vhub2_vnetcx3_uri="${vhub2_base_uri}/hubVirtualNetworkConnections/spoke3?api-version=$vwan_api_version"
 vhub2_vnetcx4_uri="${vhub2_base_uri}/hubVirtualNetworkConnections/spoke4?api-version=$vwan_api_version"
+vhub2_vnetcxhub2_uri="${vhub2_base_uri}/hubVirtualNetworkConnections/userhub?api-version=$vwan_api_version"
 vpnsites_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites?api-version=$vwan_api_version"
 vpnsite1_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch1?api-version=$vwan_api_version"
 vpnsite2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch2?api-version=$vwan_api_version"
@@ -339,15 +341,19 @@ az vm create -n spoke4-jumphost -g $rg -l $location2 --image ubuntuLTS --admin-u
 
 #  Add PIPs to known_hosts
 spoke1_jump_pip=$(az network public-ip show -n spoke1-pip -g $rg --query ipAddress -o tsv)
+echo $spoke1_jump_pip
 ssh-keyscan -H $spoke1_jump_pip >> ~/.ssh/known_hosts
 ssh $spoke1_jump_pip "ip a"
 spoke2_jump_pip=$(az network public-ip show -n spoke2-pip -g $rg --query ipAddress -o tsv)
+echo $spoke2_jump_pip
 ssh-keyscan -H $spoke2_jump_pip >> ~/.ssh/known_hosts
 ssh $spoke2_jump_pip "ip a"
 spoke3_jump_pip=$(az network public-ip show -n spoke3-pip -g $rg --query ipAddress -o tsv)
+echo $spoke3_jump_pip
 ssh-keyscan -H $spoke3_jump_pip >> ~/.ssh/known_hosts
 ssh $spoke3_jump_pip "ip a"
 spoke4_jump_pip=$(az network public-ip show -n spoke4-pip -g $rg --query ipAddress -o tsv)
+echo $spoke4_jump_pip
 ssh-keyscan -H $spoke4_jump_pip >> ~/.ssh/known_hosts
 ssh $spoke4_jump_pip "ip a"
 
@@ -431,6 +437,99 @@ az network vnet subnet update -n jumphost --vnet-name spoke1-$location1 -g $rg -
 az network route-table create -n jumphost-$location2 -g $rg -l $location2
 az network route-table route create -n mypc -g $rg --route-table-name jumphost-$location2 --address-prefix "${mypip}/32" --next-hop-type Internet
 az network vnet subnet update -n jumphost --vnet-name spoke3-$location2 -g $rg --route-table jumphost-$location2
+
+#################
+#   User hubs   #
+#################
+
+# User hub 1
+az vm create -n azure-nva1 -g $rg -l $location1 --image ubuntuLTS \
+    --admin-username $username --generate-ssh-keys \
+    --public-ip-address userhub1-pip --public-ip-address-allocation static \
+    --vnet-name userhub-$location1 --vnet-address-prefix $user_hub1_prefix \
+    --subnet nva --subnet-address-prefix $user_hub1_subnet \
+    --private-ip-address $user_hub1_nva_ip --no-wait
+# Peerings
+# sleep 30  # Wait 30 seconds for the creation of the vnets, so that we can configure the peerings
+# az network vnet peering create -n spoke2hub -g $rg --vnet-name spoke-$location1 --remote-vnet hub-$location1 --allow-vnet-access --allow-forwarded-traffic
+# az network vnet peering create -n hub2spoke -g $rg --vnet-name hub-$location1 --remote-vnet spoke-$location1 --allow-vnet-access --allow-forwarded-traffic
+# az network vhub connection create -n tohub -g $rg --vhub-name hub1 --remote-vnet hub-$location1 --remote-vnet-transit true --use-hub-vnet-gateways true --internet-security true
+# UDR
+# az network route-table create -n spoke1 -g $rg -l $location1 --disable-bgp-route-propagation
+# az network route-table route create -n branch1 -g $rg --route-table-name spoke1 --address-prefix $branch1_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $azure_hub1_nva_ip
+# az network vnet subnet update -n vm --vnet-name spoke-$location1 -g $rg --route-table spoke1
+user_nva1_nic_id=$(az vm show -n azure-nva1 -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $user_nva1_nic_id --ip-forwarding
+user_nva1_pip=$(az network public-ip show -n userhub1-pip -g $rg --query ipAddress -o tsv)
+echo $user_nva1_pip
+ssh-keyscan -H $user_nva1_pip >> ~/.ssh/known_hosts
+ssh $user_nva1_pip "sudo sysctl -w net.ipv4.ip_forward=1"
+# Connection to hub1
+userhub1_vnet_id=$(az network vnet show -n userhub-$location1 -g $rg --query id -o tsv)
+userhub1_cx_json_string=$(jq -n \
+        --arg vnet_id "$userhub1_vnet_id" \
+        $vnet_cx_json)
+az rest --method put --uri $vhub1_vnetcxhub1_uri --body $userhub1_cx_json_string  # PUT
+az rest --method get --uri $vhub1_vnetcxhub1_uri                                  # GET
+
+# User hub 2
+az vm create -n azure-nva2 -g $rg -l $location2 --image ubuntuLTS \
+    --admin-username $username --generate-ssh-keys \
+    --public-ip-address userhub2-pip --public-ip-address-allocation static \
+    --vnet-name userhub-$location2 --vnet-address-prefix $user_hub2_prefix \
+    --subnet nva --subnet-address-prefix $user_hub2_subnet \
+    --private-ip-address $user_hub2_nva_ip --no-wait
+# Peerings
+# sleep 30  # Wait 30 seconds for the creation of the vnets, so that we can configure the peerings
+az network vnet peering create -n spoke3tohub -g $rg --vnet-name spoke3-$location2 --remote-vnet userhub-$location2 --allow-vnet-access --allow-forwarded-traffic
+az network vnet peering create -n hubtospoke3 -g $rg --vnet-name userhub-$location2 --remote-vnet spoke3-$location2 --allow-vnet-access --allow-forwarded-traffic
+az network vnet peering create -n spoke4tohub -g $rg --vnet-name spoke4-$location2 --remote-vnet userhub-$location2 --allow-vnet-access --allow-forwarded-traffic
+az network vnet peering create -n hubtospoke4 -g $rg --vnet-name userhub-$location2 --remote-vnet spoke4-$location2 --allow-vnet-access --allow-forwarded-traffic
+# UDR
+az network route-table create -n userspokes -g $rg -l $location2 --disable-bgp-route-propagation
+az network route-table route create -n default -g $rg --route-table-name userspokes --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $user_hub2_nva_ip
+az network vnet subnet update -n vm --vnet-name spoke3-$location2 -g $rg --route-table userspokes
+az network vnet subnet update -n vm --vnet-name spoke4-$location2 -g $rg --route-table userspokes
+# Connection to hub2
+userhub2_vnet_id=$(az network vnet show -n userhub-$location2 -g $rg --query id -o tsv)
+userhub2_cx_json_string=$(jq -n \
+        --arg vnet_id "$userhub2_vnet_id" \
+        $vnet_cx_json)
+az rest --method put --uri $vhub2_vnetcxhub2_uri --body $userhub2_cx_json_string  # PUT
+az rest --method get --uri $vhub2_vnetcxhub2_uri                                  # GET
+# Delete spoke connections to hub1
+az rest --method delete --uri $vhub2_vnetcx3_uri
+az rest --method delete --uri $vhub2_vnetcx4_uri
+# Add static routes to connection to userhub2
+hub_name=hub2
+cx_name=userhub
+cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
+cx_json=$(az rest --method get --uri $cx_uri)
+new_route_json_string=$(jq -n \
+        --arg name "test" \
+        --arg prefixes "10.2.3.0/24", "10.2.4.0/24"' \
+        --arg nexthop "$user_hub2_nva_ip" \
+        $cxroute_json)
+cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes = ['$new_route_json_string'] | {name, properties}')
+az rest --method put --uri $cx_uri --body $cx_json_updated  # PUT
+az rest --method get --uri $cx_uri | jq -r '.properties.routingConfiguration.vnetRoutes.staticRoutes'  # GET
+# Add static route to default RT
+# https://docs.microsoft.com/en-us/rest/api/virtualwan/hubroutetables/createorupdate#hubroute
+hub_name=hub2
+rt_name=defaultRouteTable
+rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
+rt_json_current=$(az rest --method get --uri $rt_uri)
+userhub_cxid=$(az rest --method get --uri $cx_uri | jq -r '.id')
+new_route_json_string=$(jq -n \
+        --arg name "hub2spokes" \
+        --arg type "ResourceId" \
+        --arg prefixes '"10.2.0.0/17"' \
+        --arg nexthop "$userhub_cxid" \
+        $route_json)
+rt_json_updated=$(echo $rt_json_current | jq '.properties.routes += [ '$new_route_json_string' ] | {name, properties}')
+az rest --method put --uri $rt_uri --body $rt_json_updated    # PUT
+az rest --method get --uri $rt_uri | jq '.properties.routes'  # GET
+
 
 ##################
 # Configure CSRs #
@@ -597,19 +696,37 @@ cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.propagate
 az rest --method put --uri $cx_uri --body $cx_json_updated
 az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.propagatedRouteTables.ids'
 
+# Update vnet connection associated and propagated RT at the same time
+hub_name=hub1
+cx_name=userhub
+cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
+cx_json=$(az rest --method get --uri $cx_uri)
+new_assrt_name=vnet_RT
+new_assrt_id="/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${new_assrt_name}"
+new_proprt_names=(noneRouteTable)
+new_proprt_ids=""
+for new_proprt_name in ${new_proprt_names[@]}; do
+    new_proprt_ids="${new_proprt_ids}{\"id\": \"/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${new_proprt_name}\"},"
+done
+new_proprt_ids="${new_proprt_ids: : -1}"   # Remove trailing comma
+cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.associatedRouteTable.id = "'$new_assrt_id'" | .properties.routingConfiguration.propagatedRouteTables.ids = ['$new_proprt_ids'] | {name, properties}')
+az rest --method put --uri $cx_uri --body $cx_json_updated
+az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.associatedRouteTable.id'
+az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.propagatedRouteTables.ids'
+
 # Add routes to RT
 # https://docs.microsoft.com/en-us/rest/api/virtualwan/hubroutetables/createorupdate#hubroute
 hub_name=hub1
-rt_name=defaultRouteTable
+rt_name=vnet_RT
 rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
 rt_json_current=$(az rest --method get --uri $rt_uri)
 azfw1_id=$(az network firewall show -n azfw1 -g $rg -o tsv --query id)
 # type (next hop): CIDR, resourceId, Service
 # prefixes: comma-separated prefix list
 new_route_json_string=$(jq -n \
-        --arg name "hub1vnets" \
+        --arg name "alltraffic" \
         --arg type "ResourceId" \
-        --arg prefixes "10.1.0.0/17" \
+        --arg prefixes '"0.0.0.0/0", "10.1.0.0/17", "10.2.0.0/17"' \
         --arg nexthop "$azfw1_id" \
         $route_json)
 rt_json_updated=$(echo $rt_json_current | jq '.properties.routes += [ '$new_route_json_string' ] | {name, properties}')
@@ -618,7 +735,7 @@ az rest --method get --uri $rt_uri | jq '.properties.routes'  # GET
 
 # Delete all routes from RT
 hub_name=hub1
-rt_name=defaultRouteTable
+rt_name=vnet_RT
 rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
 rt_json_current=$(az rest --method get --uri $rt_uri)
 rt_json_updated=$(echo $rt_json_current | jq '.properties.routes = [] | {name, properties}')
@@ -662,7 +779,7 @@ az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.vnetRo
 #################
 
 # vhub
-hub_name=hub1
+hub_name=hub2
 hub_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}?api-version=$vwan_api_version"
 hub_json_current=$(az rest --method get --uri $hub_uri)
 hub_json_updated=$(echo $hub_json_current | jq '{name, location, properties}')
@@ -670,11 +787,12 @@ az rest --method put --uri $hub_uri --body $hub_json_updated
 
 # vnet cx
 hub_name=hub1
-cx_name=spoke1
+cx_name=userhub
 cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
-cx_json_current=$(az rest --method get --uri $cx_uri)
+cx_json_current=$(az rest --method get --uri $cx_uri)       # GET
 cx_json_updated=$(echo $cx_json_current | jq '{name, location, properties}')
-az rest --method put --uri $cx_uri --body $cx_json_updated
+# az rest --method delete --uri $cx_uri                     # DELETE
+az rest --method put --uri $cx_uri --body $cx_json_updated  # PUT
 
 #################
 # Log Analytics #
@@ -853,8 +971,13 @@ az network public-ip list -g $rg -o table
 az network nic list -g $rg -o table
 az network nic show-effective-route-table -n spoke1-jumphostVMNic -g $rg -o table
 az network nic show-effective-route-table -n spoke2-jumphostVMNic -g $rg -o table
+az network nic show-effective-route-table -n spoke3-jumphostVMNic -g $rg -o table
+az network nic show-effective-route-table -n spoke4-jumphostVMNic -g $rg -o table
 az network nic show-effective-route-table -n spoke1-vmVMNic -g $rg -o table
 az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o table
+az network nic show-effective-route-table -n spoke3-vmVMNic -g $rg -o table
+az network nic show-effective-route-table -n spoke4-vmVMNic -g $rg -o table
+az network nic show-effective-route-table --ids $user_nva1_nic_id -o table
 az network vhub connection list --vhub-name hub1 -g $rg -o table
 az network vhub route-table list --vhub-name hub1 -g $rg -o table
 az network vhub route list --vhub-name hub1 -g $rg -o table
@@ -908,8 +1031,10 @@ az rest --method get --uri $vpngw2_uri
 # Get VPN GW connections
 az rest --method get --uri $vpngw1_cx_uri
 az rest --method get --uri $vpngw1_cx_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
+az rest --method get --uri $vpngw1_cx_uri | jq -r '.value | map({name, associatedRT: .properties.routingConfiguration.associatedRouteTable.id, propagateRTs: .properties.routingConfiguration.propagatedRouteTables.ids[].id})'
 az rest --method get --uri $vpngw2_cx_uri
 az rest --method get --uri $vpngw2_cx_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
+az rest --method get --uri $vpngw2_cx_uri | jq -r '.value | map({name, associatedRT: .properties.routingConfiguration.associatedRouteTable.id, propagateRTs: .properties.routingConfiguration.propagatedRouteTables.ids[].id})'
 # Get VPN Sites
 az rest --method get --uri $vpnsites_uri
 az rest --method get --uri $vpnsites_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
