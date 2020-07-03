@@ -1,0 +1,204 @@
+# Variables
+rg=vwan
+# location1
+location1=westeurope
+location1_summary=172.21.0.0/16
+vwan1=vwan1
+vwan1_hub_prefix=172.21.0.0/24
+vwan_hub1_asn=65515
+spoke1_prefix=172.21.11.0/24
+spoke1_subnet=172.21.11.0/26
+spoke1_vm_ip=172.21.11.11
+spoke1_jump_subnet=172.21.11.64/26
+spoke1_jump_ip=172.21.11.75
+# location2
+location2=westus
+location2_summary=172.22.0.0/16
+vwan2=vwan2
+vwan2_hub_prefix=172.22.0.0/24
+vwan_hub2_asn=65515
+spoke2_prefix=172.22.12.0/24
+spoke2_subnet=172.22.12.0/26
+spoke2_vm_ip=172.22.12.11
+spoke2_jump_subnet=172.22.12.64/26
+spoke2_jump_ip=172.22.12.75
+# vm parameters
+vm_size=Standard_B1ms
+username=jose
+password=Microsoft123!
+
+# RG and vwan
+az group create -n $rg -l $location1
+
+# vwans and hubs
+az network vwan create -n $vwan1 -g $rg -l $location1 --branch-to-branch-traffic true --vnet-to-vnet-traffic true
+az network vhub create -n hub1 -g $rg --vwan $vwan1 -l $location1 --address-prefix $vwan1_hub_prefix --sku Standard
+az network vwan create -n $vwan2 -g $rg -l $location2 --branch-to-branch-traffic true --vnet-to-vnet-traffic true
+az network vhub create -n hub2 -g $rg --vwan $vwan2 -l $location2 --address-prefix $vwan2_hub_prefix --sku Standard
+
+# VPN Gateways
+az network vpn-gateway create -n hubvpn1 -g $rg -l $location1 --vhub hub1 --asn $vwan_hub1_asn --no-wait
+az network vpn-gateway create -n hubvpn2 -g $rg -l $location2 --vhub hub2 --asn $vwan_hub2_asn --no-wait
+
+# Log Analytics
+logws_name=log$RANDOM
+az monitor log-analytics workspace create -n $logws_name -g $rg
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+hub1_vpngw_id=$(az network vpn-gateway show -n hubvpn1 -g $rg --query id -o tsv)
+hub2_vpngw_id=$(az network vpn-gateway show -n hubvpn2 -g $rg --query id -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $hub1_vpngw_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "GatewayDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "TunnelDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "RouteDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "IKEDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
+az monitor diagnostic-settings create -n mydiag --resource $hub2_vpngw_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "GatewayDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "TunnelDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "RouteDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "IKEDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
+
+# Sites and connections
+# First sites are created with dummy addresses. When the sites are created and associated, VPN parameters can be downloaded with the real IP addresses
+# BGP not supported, because both hubs would have 65515, and only eBGP is supported
+# hub1->hub2
+az network vpn-site create -n hub2-0 -g $rg -l $location1 --virtual-wan $vwan1 --ip-address 1.2.3.4 --address-prefixes $location2_summary --device-vendor microsoft --device-model vhub --link-speed 100
+az network vpn-gateway connection create -n hub2-0 --gateway-name hubvpn1 -g $rg --remote-vpn-site hub2-0 --enable-bgp false --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true
+# hub2->hub1
+az network vpn-site create -n hub1-0 -g $rg -l $location2 --virtual-wan $vwan2 --ip-address 1.2.3.4 --address-prefixes $location1_summary --device-vendor microsoft --device-model vhub --link-speed 100
+az network vpn-gateway connection create -n hub1-0 --gateway-name hubvpn2 -g $rg --remote-vpn-site hub1-0 --enable-bgp false --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true
+
+# Download configuration to find out GWs public IP addresses
+# Create storage account and SAS
+storage_account=vpnconfigs$RANDOM 
+container_name=configs
+az storage account create -n $storage_account -g $rg -l $location1 --sku Standard_LRS
+az storage container create -n $container_name --account-name $storage_account
+end_time=`date -u -d "240 minutes" '+%Y-%m-%dT%H:%MZ'`
+sas=$(az storage container generate-sas -n $container_name --account-name $storage_account --permissions dlrw --expiry $end_time -o tsv)
+account_url=$(az storage account show -n $storage_account -g $rg --query primaryEndpoints.blob -o tsv)
+# hub1:
+blob_name=vpnconfig1.json
+file_name="/tmp/${blob_name}"
+storage_url=${account_url}${container_name}"/"${blob_name}"?"${sas}
+az network vpn-site download --vwan-name $vwan1 -g $rg --vpn-sites hub2 --output-blob-sas-url $storage_url
+az storage blob download --account-name $storage_account -c $container_name -n $blob_name --sas-token $sas -f $file_name
+site=hub2
+hub1_psk=$(cat $file_name | jq -r '.[] | select (.vpnSiteConfiguration.Name == "'$site'") | .vpnSiteConnections[].connectionConfiguration.PSK')
+hub1_gw0_pip=$(cat $file_name | jq -r '.[] | select (.vpnSiteConfiguration.Name == "'$site'") | .vpnSiteConnections[].gatewayConfiguration.IpAddresses.Instance0')
+hub1_gw1_pip=$(cat $file_name | jq -r '.[] | select (.vpnSiteConfiguration.Name == "'$site'") | .vpnSiteConnections[].gatewayConfiguration.IpAddresses.Instance1')
+echo "Extracted info for $site: Gateway0 $hub1_gw0_pip. Gateway1 $hub1_gw1_pip. PSK $hub1_psk"
+# hub2:
+blob_name=vpnconfig2.json
+file_name="/tmp/${blob_name}"
+storage_url=${account_url}${container_name}"/"${blob_name}"?"${sas}
+az network vpn-site download --vwan-name $vwan2 -g $rg --vpn-sites hub1 --output-blob-sas-url $storage_url
+az storage blob download --account-name $storage_account -c $container_name -n $blob_name --sas-token $sas -f $file_name
+site=hub1
+hub2_psk=$(cat $file_name | jq -r '.[] | select (.vpnSiteConfiguration.Name == "'$site'") | .vpnSiteConnections[].connectionConfiguration.PSK')
+hub2_gw0_pip=$(cat $file_name | jq -r '.[] | select (.vpnSiteConfiguration.Name == "'$site'") | .vpnSiteConnections[].gatewayConfiguration.IpAddresses.Instance0')
+hub2_gw1_pip=$(cat $file_name | jq -r '.[] | select (.vpnSiteConfiguration.Name == "'$site'") | .vpnSiteConnections[].gatewayConfiguration.IpAddresses.Instance1')
+echo "Extracted info for $site: Gateway0 $hub2_gw0_pip. Gateway1 $hub2_gw1_pip, PSK $hub1_psk"
+
+# Update vpn site IP addresses
+az network vpn-site update -n hub2-0 --virtual-wan $vwan1 -g $rg --ip-address $hub2_gw0_pip
+az network vpn-site update -n hub1-0 --virtual-wan $vwan2 -g $rg --ip-address $hub1_gw0_pip
+
+# Second set of tunnels
+# hub1->hub2
+az network vpn-site create -n hub2-1 -g $rg -l $location1 --virtual-wan $vwan1 --ip-address $hub2_gw1_pip --address-prefixes $location2_summary --device-vendor microsoft --device-model vhub --link-speed 100
+az network vpn-gateway connection create -n hub2-1 --gateway-name hubvpn1 -g $rg --remote-vpn-site hub2-1 --enable-bgp false --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true
+# hub2->hub1
+az network vpn-site create -n hub1-1 -g $rg -l $location2 --virtual-wan $vwan2 --ip-address $hub1_gw1_pip --address-prefixes $location1_summary --device-vendor microsoft --device-model vhub --link-speed 100
+az networs vpn-gateway connection create -n hub1-1 --gateway-name hubvpn2 -g $rg --remote-vpn-site hub1-1 --enable-bgp false --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true
+# Delete Second set of tunnels
+# az network vpn-gateway connection delete -n hub2-1 --gateway-name hubvpn1 -g $rg
+# az network vpn-site delete -n hub2-1 -g $rg --virtual-wan $vwan1
+# az network vpn-gateway connection delete -n hub1-1 --gateway-name hubvpn2 -g $rg
+# az network vpn-site delete -n hub1-1 -g $rg --virtual-wan $vwan2
+
+# Jump box in spoke1 (with PIP)
+az vm create -n spoke1-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys --size $vm_size \
+             --public-ip-address spoke1-pip --vnet-name spoke-$location1 --vnet-address-prefix $spoke1_prefix \
+             --subnet jumphost --subnet-address-prefix $spoke1_jump_subnet --private-ip-address $spoke1_jump_ip --no-wait
+spoke1_jump_pip=$(az network public-ip show -n spoke1-pip -g $rg --query ipAddress -o tsv)
+echo $spoke1_jump_pip
+ssh-keyscan -H $spoke1_jump_pip >> ~/.ssh/known_hosts
+ssh $spoke1_jump_pip "ip a"
+
+# Jump box in spoke2 (with PIP)
+az vm create -n spoke2-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys --size $vm_size \
+             --public-ip-address spoke2-pip --vnet-name spoke-$location2 --vnet-address-prefix $spoke2_prefix \
+             --subnet jumphost --subnet-address-prefix $spoke2_jump_subnet --private-ip-address $spoke2_jump_ip --no-wait
+spoke2_jump_pip=$(az network public-ip show -n spoke2-pip -g $rg --query ipAddress -o tsv)
+echo $spoke2_jump_pip
+ssh-keyscan -H $spoke2_jump_pip >> ~/.ssh/known_hosts
+ssh $spoke2_jump_pip "ip a"
+
+# Vnet connections
+az network vhub connection create -n hub1tospoke1 -g $rg --remote-vnet spoke-$location1 --vhub-name hub1 --remote-vnet-transit true --use-hub-vnet-gateways true --internet-security false
+az network vhub connection create -n hub2tospoke2 -g $rg --remote-vnet spoke-$location2 --vhub-name hub2 --remote-vnet-transit true --use-hub-vnet-gateways true --internet-security false
+
+# Ping
+ssh $spoke1_jump_pip "ping $spoke2_jump_ip"
+ssh $spoke2_jump_pip "ping $spoke1_jump_ip"
+# SSH
+ssh -J $spoke1_jump_pip $spoke2_jump_ip
+ssh -J $spoke2_jump_pip $spoke1_jump_ip
+
+# Diagnostics
+az network vwan list -g $rg -o table
+az network vhub list -g $rg -o table
+az network vhub connection list --vhub-name hub1 -g $rg
+az network vhub connection list --vhub-name hub2 -g $rg
+az network vpn-gateway list -g $rg -o table
+az network vpn-site list -g $rg -o table
+az network vpn-gateway connection list --gateway-name hubvpn1 -g $rg -o table
+az network vpn-gateway connection list --gateway-name hubvpn2 -g $rg -o table
+az network vnet list -g $rg -o table
+az network public-ip list -g $rg -o table
+az vm list -d -g $rg -o table
+az network nic list -g $rg -o table
+az network nic show-effective-route-table -n spoke1-vmVMNic -g $rg -o table
+az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o table
+
+#########################
+# Log Analytics queries #
+#########################
+
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+# VPNGW diagnostic log summary
+query='AzureDiagnostics 
+| where ResourceType == "VPNGATEWAYS" 
+| where TimeGenerated >= ago(1h) 
+| summarize count() by Category'
+# VPNGW IKE diagnostics
+query='AzureDiagnostics 
+| where ResourceType == "VPNGATEWAYS" 
+| where Category == "IKEDiagnosticLog" 
+| where TimeGenerated >= ago(5m) 
+| project Message
+| take 10'
+# VPNGW Tunnel diagnostics summary (the presence of logs indicate tunnel instability)
+query='AzureDiagnostics 
+| where ResourceType == "VPNGATEWAYS" 
+| where Category == "TunnelDiagnosticLog" 
+| where TimeGenerated >= ago(3h) 
+| summarize count() by OperationName'
+# VPNGW Tunnel diagnostics (the presence of logs indicate tunnel instability)
+query='AzureDiagnostics 
+| where ResourceType == "VPNGATEWAYS" 
+| where Category == "TunnelDiagnosticLog" 
+| where TimeGenerated >= ago(15m) 
+| project TimeGenerated, Resource, remoteIP_s, stateChangeReason_s, status_s
+| take 20'
+# VPNGW Gateway log summary
+query='AzureDiagnostics 
+| where ResourceType == "VPNGATEWAYS" 
+| where TimeGenerated >= ago(10m) 
+| summarize count() by Category'
+# Search something
+query='search "azfw"'
+# Send query
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
