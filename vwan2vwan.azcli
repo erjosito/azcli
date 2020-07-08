@@ -111,7 +111,7 @@ az network vpn-site create -n hub2-1 -g $rg -l $location1 --virtual-wan $vwan1 -
 az network vpn-gateway connection create -n hub2-1 --gateway-name hubvpn1 -g $rg --remote-vpn-site hub2-1 --enable-bgp false --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true
 # hub2->hub1
 az network vpn-site create -n hub1-1 -g $rg -l $location2 --virtual-wan $vwan2 --ip-address $hub1_gw1_pip --address-prefixes $location1_summary --device-vendor microsoft --device-model vhub --link-speed 100
-az networs vpn-gateway connection create -n hub1-1 --gateway-name hubvpn2 -g $rg --remote-vpn-site hub1-1 --enable-bgp false --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true
+az network vpn-gateway connection create -n hub1-1 --gateway-name hubvpn2 -g $rg --remote-vpn-site hub1-1 --enable-bgp false --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true
 # Delete Second set of tunnels
 # az network vpn-gateway connection delete -n hub2-1 --gateway-name hubvpn1 -g $rg
 # az network vpn-site delete -n hub2-1 -g $rg --virtual-wan $vwan1
