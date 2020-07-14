@@ -128,6 +128,7 @@ vpngw2_cx3_uri="${vpngw2_base_uri}/vpnConnections/branch3?api-version=$vwan_api_
 ####################
 # Helper functions #
 ####################
+
 wait_interval=5
 function WaitUntilFinished {
      resource_id=$1
@@ -331,6 +332,14 @@ function create_rt {
     # az rest --method delete --uri $rt_uri                     # DELETE
 }
 
+# Delete rt
+function delete_rt {
+    hub_name=$1
+    rt_name=$2
+    rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
+    az rest --method delete --uri $rt_uri
+}
+
 # Update vnet connection associated RT
 function cx_set_ass_rt {
     hub_name=$1
@@ -362,13 +371,45 @@ function cx_set_prop_rt {
     az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.propagatedRouteTables.ids'
 }
 
+# Modify propagated RT for VPN connection
+function vpncx_set_prop_rt {
+    gw_name=$1
+    cx_name=$2
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}?api-version=$vwan_api_version"
+    if [ -n "$BASH_VERSION" ]; then
+        arr_opt=a
+    elif [ -n "$ZSH_VERSION" ]; then
+        arr_opt=A
+    fi
+    IFS=',' read -r"$arr_opt" new_rt_names <<< "$3"
+    new_rt_ids=""
+    for new_rt_name in ${new_rt_names[@]}
+    do
+        new_rt_ids="${new_rt_ids}{\"id\": \"/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${new_rt_name}\"},"
+    done
+    new_rt_ids="${new_rt_ids: : -1}"   # Remove trailing comma
+    vpn_json=$(az rest --method get --uri $uri)
+    connections=$(echo $vpn_json | jq '.properties.connections')
+    connections_updated=$(echo $connections | jq 'map(if .name=="'$cx_name'" then .propagatedRouteTables.ids=['"$new_rt_ids"'] else . end)')
+    vpn_json_updated=$(echo $vpn_json | jq '.properties.connections = '${connections_updated}' | {name, properties}')
+    az rest --method put --uri $cx_uri --body $cx_json_updated
+    # az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.propagatedRouteTables.ids'
+}
+
+
 # Update vnet connection associated and propagated RT at the same time
 # example: cx_set_rt hub1 spoke1 redRT redRT,defaultRouteTable
 function cx_set_rt {
     hub_name=$1
     cx_name=$2
     new_assrt_name=$3
-    IFS=',' read -r -a new_proprt_names <<< "$4"
+    if [ -n "$BASH_VERSION" ]; then
+        arr_opt=a
+    elif [ -n "$ZSH_VERSION" ]; then
+        arr_opt=A
+    fi
+    IFS=',' read -r"$arr_opt" new_proprt_names <<< "$4"
+    echo "Setting associated route table to $new_assrt_name, propagated route tables to $new_proprt_names"  # DEBUG
     cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
     cx_json=$(az rest --method get --uri $cx_uri)
     new_assrt_id="/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${new_assrt_name}"
@@ -379,9 +420,9 @@ function cx_set_rt {
     new_proprt_ids="${new_proprt_ids: : -1}"   # Remove trailing comma
     cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.associatedRouteTable.id = "'$new_assrt_id'" | .properties.routingConfiguration.propagatedRouteTables.ids = ['$new_proprt_ids'] | {name, properties}')
     az rest --method put --uri $cx_uri --body $cx_json_updated
-    az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.associatedRouteTable.id'
-    az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.propagatedRouteTables.ids'
-    az rest --method get --uri $cx_uri | jq '.properties.provisioningState'
+    # az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.associatedRouteTable.id'
+    # az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.propagatedRouteTables.ids'
+    # az rest --method get --uri $cx_uri | jq '.properties.provisioningState'
 }
 
 # Add routes to RT
@@ -456,6 +497,18 @@ function cx_delete_routes {
     az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes'  # GET
 }
 
+# Delete all labels from vnet cx
+function cx_delete_routes {
+    hub_name=$1
+    cx_name=$2
+    cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
+    cx_json=$(az rest --method get --uri $cx_uri)
+    cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.propagatedRouteTables.labels = [] | {name, properties}')
+    az rest --method put --uri $cx_uri --body $cx_json_updated    # PUT
+    az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes'  # GET
+}
+
+
 # Add label to route table
 # https://docs.microsoft.com/en-us/rest/api/virtualwan/hubroutetables/createorupdate#hubroute
 function rt_add_label {
@@ -491,6 +544,60 @@ function reset_vhub_cx {
     cx_json_updated=$(echo $cx_json_current | jq '{name, location, properties}')
     # az rest --method delete --uri $cx_uri                     # DELETE
     az rest --method put --uri $cx_uri --body $cx_json_updated  # PUT
+}
+
+
+################
+# Getting logs #
+################
+
+function get_fw_logs_net {
+    query='AzureDiagnostics
+    | where Category == "AzureFirewallNetworkRule"
+    | where TimeGenerated >= ago(5m) 
+    | parse msg_s with Protocol " request from " SourceIP ":" SourcePortInt:int " to " TargetIP ":" TargetPortInt:int *
+    | parse msg_s with * ". Action: " Action1a
+    | parse msg_s with * " was " Action1b " to " NatDestination
+    | parse msg_s with Protocol2 " request from " SourceIP2 " to " TargetIP2 ". Action: " Action2
+    | extend SourcePort = tostring(SourcePortInt),TargetPort = tostring(TargetPortInt)
+    | extend Action = case(Action1a == "", case(Action1b == "",Action2,Action1b), Action1a),Protocol = case(Protocol == "", Protocol2, Protocol),SourceIP = case(SourceIP == "", SourceIP2, SourceIP),TargetIP = case(TargetIP == "", TargetIP2, TargetIP),SourcePort = case(SourcePort == "", "N/A", SourcePort),TargetPort = case(TargetPort == "", "N/A", TargetPort),NatDestination = case(NatDestination == "", "N/A", NatDestination)
+    //| where Action == "Deny" 
+    //| project TimeGenerated, msg_s, Protocol, SourceIP,SourcePort,TargetIP,TargetPort,Action, NatDestination  // with msg_s
+    | project TimeGenerated, Protocol, SourceIP,SourcePort,TargetIP,TargetPort,Action, NatDestination  // without msg_s
+    | take 20 '
+    az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+}
+
+function get_fw_logs_app {
+    query='AzureDiagnostics 
+    | where ResourceType == "AZUREFIREWALLS" 
+    | where Category == "AzureFirewallApplicationRule" 
+    | where TimeGenerated >= ago(5m) 
+    | project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12]), msg_s 
+    | where Rule_Collection != "AzureInternalTraffic" 
+    //| where Action == "Deny" 
+    | take 20'
+    az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+}
+
+##################
+# VM Maintenance #
+##################
+function stop_vms {
+    vms=$(az vm list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r vm_name; do
+        echo "Stopping ${vm_name}..."
+        az vm deallocate -n $vm_name -g $rg --no-wait
+    done <<< "$vms"
+    az vm list -d -g $rg -o table
+}
+function start_vms {
+    vms=$(az vm list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r vm_name; do
+        echo "Starting ${vm_name}..."
+        az vm start -n $vm_name -g $rg --no-wait
+    done <<< "$vms"
+    az vm list -d -g $rg -o table
 }
 
 ###################
@@ -1214,6 +1321,75 @@ az network vhub route-table create -n BranchRouteTable -g $rg --vhub-name hub2 -
 # If route-tables need to be deleted:
 # az network vhub route-table delete -n VnetRouteTable -g $rg --vhub-name hub1
 # az network vhub route-table delete -n VnetRouteTable -g $rg --vhub-name hub2
+
+##################
+# Red/Blue vnets #
+##################
+
+# hub1
+create_rt hub1 redRouteTable
+rt_add_label hub1 redRouteTable red
+# Verify:
+#   get_vhub_state hub1
+#   get_rt_state hub1 redRouteTable
+#   get_rt hub1 redRouteTable
+# Reset:
+#   reset_rt hub1 redRouteTable
+# Delete
+#   delete_rt hub1 redRouteTable
+create_rt hub1 blueRouteTable
+rt_add_label hub1 blueRouteTable blue
+cx_set_rt hub1 spoke1 redRouteTable redRouteTable,defaultRouteTable
+# Verify:
+#   get_vhub_state hub1
+#   get_vnetcx_state hub1
+#   get_vnetcx hub1 spoke1
+cx_set_rt hub1 spoke2 blueRouteTable blueRouteTable,defaultRouteTable
+# Verify:
+#   get_vhub_state hub1
+#   get_vnetcx_state hub1 spoke2
+#   get_vnetcx hub1 spoke2
+
+# hub2
+create_rt hub2 redRouteTable
+rt_add_label hub2 redRouteTable red
+# Verify:
+#   get_vhub_state hub2
+#   get_rt_state hub2 redRouteTable
+#   get_rt hub2 redRouteTable
+# Reset:
+#   reset_rt hub2 redRouteTable
+# Delete
+#   delete_rt hub2 redRouteTable
+create_rt hub2 blueRouteTable
+rt_add_label hub2 blueRouteTable blue
+cx_set_rt hub2 spoke3 redRouteTable redRouteTable,defaultRouteTable
+cx_set_rt hub2 spoke4 blueRouteTable blueRouteTable,defaultRouteTable
+
+# branches
+vpncx_set_prop_rt hubvpn1 branch1 defaultRouteTable,redRouteTable,blueRouteTable
+vpncx_set_prop_rt hubvpn2 branch2 defaultRouteTable,redRouteTable,blueRouteTable
+
+#################
+# FW Mgr (RTv3) #
+#################
+azfw1_id=$(az network firewall show -n azfw1 -g $rg -o tsv --query id)
+azfw2_id=$(az network firewall show -n azfw2 -g $rg -o tsv --query id)
+rt_add_route hub1 defaultRouteTable 0.0.0.0/0 $azfw1_id
+# Verify:
+# get_rt_state hub1
+# get_rt hub1 defaultRouteTable
+# az network nic show-effective-route-table -n spoke1-vmVMNic -g $rg -o table
+# Undo:
+# rt_delete_routes hub1 defaultRouteTable
+rt_add_route hub2 defaultRouteTable 0.0.0.0/0 $azfw2_id
+# Verify:
+# get_rt_state hub2
+# get_rt hub2 defaultRouteTable
+# az network nic show-effective-route-table -n spoke3-vmVMNic -g $rg -o table
+# Undo:
+# rt_delete_routes hub2 defaultRouteTable
+
 
 ###########
 # zScaler #
