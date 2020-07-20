@@ -617,6 +617,16 @@ function reset_vhub_cx {
     az rest --method put --uri $cx_uri --body $cx_json_updated  # PUT
 }
 
+# reset vpngw - NOT WORKING!
+function reset_vpngw {
+    gw_name=$1
+    gw_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}?api-version=$vwan_api_version"
+    gw_json_current=$(az rest --method get --uri $gw_uri)
+    gw_json_updated=$(echo $gw_json_current | jq '{name, location, properties}')
+    az rest --method put --uri $gw_uri --body $gw_json_updated
+}
+
+
 ##################
 #  Summary info  #
 ##################
@@ -768,13 +778,19 @@ function get_ips {
 ###################
 
 # Creates spoke vnets and connects it to hub
-# create_spokes <hub_id> <location> <number_of_spokes>
-# create_spokes 1 westeurope 5
+# create_spokes <hub_id> <number_of_spokes>
+# create_spokes 1 5
 function create_spokes {
     hub_id=$1
     hub_name=hub$1
-    location=$2
-    num_of_spokes=$3
+    num_of_spokes=$2
+    # Get location
+    if [[ "$hub_id" == "1" ]]
+    then
+        location=$location1
+    else
+        location=$location2
+    fi
     # Create route-table to send traffic to this PC over Internet
     mypip=$(curl -s4 ifconfig.co)
     echo "Creating route table to send traffic to $mypip over the Internet..."
@@ -830,10 +846,38 @@ function create_spokes {
         # Optionally, modify properties for the connection
         # vnet_cx_json_string=$(echo $vnet_cx_json_string | jq '.properties.routingConfiguration.propagatedRouteTables.labels = ["red"]')
         echo "Associating vnet $vnet_name to hub hub${hub_id}..."
-        az rest --method put --uri $vhub_vnetcx_uri --body $vnet_cx_json_string              # PUT
+        az rest --method put --uri $vhub_vnetcx_uri --body $vnet_cx_json_string >/dev/null
+        # This should be replaced by some kind of WaitUntilComplete function
+        echo "Waiting 5 minutes..."
+        sleep 300 # To give time to associations to complete
     done
 }
 
+function connect_spoke {
+    hub_id=$1
+    spoke_id=$2
+    # Variables
+    if [[ "$hub_id" == "1" ]]
+    then
+        location=$location1
+    else
+        location=$location2
+    fi
+    vm_name=spoke${hub_id}${spoke_id}
+    vnet_name=${vm_name}-$location
+    echo "Finding out resource ID for vnet ${vnet_name}..."
+    vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+    vhub_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/hub${hub_id}"
+    vhub_vnetcx_uri="${vhub_base_uri}/hubVirtualNetworkConnections/${vm_name}?api-version=$vwan_api_version"
+    # Create JSON
+    vnet_cx_json_string=$(jq -n \
+            --arg vnet_id "$vnet_id" \
+            $vnet_cx_json)
+    # Optionally, modify properties for the connection
+    # vnet_cx_json_string=$(echo $vnet_cx_json_string | jq '.properties.routingConfiguration.propagatedRouteTables.labels = ["red"]')
+    echo "Associating vnet $vnet_name to hub hub${hub_id}..."
+    az rest --method put --uri $vhub_vnetcx_uri --body $vnet_cx_json_string >/dev/null
+}
 
 ###################
 #      Help       #
@@ -976,7 +1020,7 @@ vpngw1_json_string=$(jq -n \
         --arg asn $vwan_hub1_asn \
         $vpngw_json)
 az rest --method put --uri $vpngw1_uri --body $vpngw1_json_string   # PUT
-az rest --method get --uri $vpngw1_uri                              # GET
+# az rest --method get --uri $vpngw1_uri                            # GET
 
 # Branch 2 CSR
 az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} \
@@ -1027,8 +1071,16 @@ vpncx1_json_string=$(jq -n \
         --arg site_link_id $site1_link_id \
         --arg psk $password \
         $vpncx_json)
+# Optional: configure some additional attributes:
+# hub_name=hub1
+# rt1_id=/subscriptions/$subscription/resourceGroups/vwan/providers/Microsoft.Network/virtualHubs/$hub_name/hubRouteTables/defaultRouteTable
+# rt2_id=/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/vwan/providers/Microsoft.Network/virtualHubs/$hub_name/hubRouteTables/redRouteTable
+# rt3_id=/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/vwan/providers/Microsoft.Network/virtualHubs/$hub_name/hubRouteTables/blueRouteTable
+# rt4_id=/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/vwan/providers/Microsoft.Network/virtualHubs/$hub_name/hubRouteTables/commonRouteTable
+# vpncx1_json_string=$(echo $vpncx1_json_string | jq '.properties.routingConfiguration.propagatedRouteTables.ids = [{"id": "'$rt1_id'"}, {"id": "'$rt2_id'"}, {"id": "'$rt3_id'"}, {"id": "'$rt4_id'"}]')
+# Send JSON
 az rest --method put --uri $vpngw1_cx1_uri --body $vpncx1_json_string    # PUT
-az rest --method get --uri $vpngw1_cx1_uri                               # GET
+# az rest --method get --uri $vpngw1_cx1_uri                             # GET
 
 # Connection hub2-branch2
 site2_id=$(az network vpn-site show -n branch2 -g $rg --query id -o tsv)
