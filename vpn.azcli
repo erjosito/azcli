@@ -1,0 +1,90 @@
+# Created by jose.moreno@microsoft.com
+# July 2020
+
+rg=vpntest
+location=westeurope
+psk=Microsoft123!
+
+###############
+#  Functions  #
+###############
+
+# Example create_gw 1 2
+# <no_of_gws> is 1 for active/passive, 2 for active/active
+function create_gw {
+    id=$1
+    no_of_gws=$2
+    vnet_name=vnet${id}
+    vnet_prefix=10.${id}.0.0/16
+    subnet_prefix=10.${id}.0.0/24
+    az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name GatewaySubnet --subnet-prefix $subnet_prefix
+    az network public-ip create -g $rg -n pip0
+    if [[ $no_of_gws == "1" ]]
+    then
+        az network public-ip create -g $rg -n pip${id}
+        az network vnet-gateway create -g $rg -sku VpnGw1 --gateway-type Vpn --vpn-type Route-Based --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id} --no-wait
+    else
+        az network public-ip create -g $rg -n pip${id}a
+        az network public-ip create -g $rg -n pip${id}b
+        az network vnet-gateway create -g $rg -sku VpnGw1 --gateway-type Vpn --vpn-type Route-Based --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id}a pip${id}b --no-wait
+    fi
+}
+
+function connect_gws {
+    gw1_id=$1
+    gw2_id=$2
+    az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n ${gw1_id}to${gw2_id} --vnet-gateway1 vng${gw1_id} --vnet-gateway2 vng${gw2_id}
+}
+
+############
+#  Script  #
+############
+
+# Create RG
+az group create -n $rg -l $location
+
+# Connection between Azure VNGs
+az network vpn-connection create -g $rg --shared-key $password --enable-bgp -n 0to11 --vnet-gateway1 vng0 --vnet-gateway2 vng11
+
+# Connection between VNG and LocalGW
+# Local GW without BGP
+az network local-gateway create -g $rg -n vng0 --gateway-ip-address 1.2.3.4 --local-address-prefixes 192.168.0.0/24
+# Local GW with BGP
+az network local-gateway create -g $rg -n lgw0 --gateway-ip-address 1.2.3.4 --local-address-prefixes 192.168.0.0/24 --asn 65101 --bgp-peering-address 192.168.0.1 --peer-weight 0
+
+
+####################
+#  IPsec policies  #
+####################
+
+# Policy-Based Connection
+az network vpn-connection create -g $rg -n mycx --vnet-gateway1 vpntest --local-gateway2 lgw0 --shared-key $psk --use-policy-based-traffic-selectors
+# ERROR:
+# Conflict when enabling policy-based traffic selectors for the connection /blah/mycx 
+#   due to IPSec policies or traffic selector policies being defined
+
+# IPsec/IKE policies at gw level (P2S)
+az network vnet-gateway ipsec-policy add -g $rg --gateway-name vpntest \
+    --dh-group DHGroup14 --ike-encryption AES256 --ike-integrity SHA384 \
+    --ipsec-encryption DES3 --ipsec-integrity GCMAES256 --pfs-group PFS2048 \
+    --sa-lifetime 27000 --sa-max-size 102400000
+
+# IPsec/IKE policies at connection level (S2S)
+az network vpn-connection ipsec-policy add -g $rg --connection-name mycx \
+    --dh-group DHGroup14 --ike-encryption AES256 --ike-integrity SHA384 \
+    --ipsec-encryption DES3 --ipsec-integrity GCMAES256 --pfs-group PFS2048 \
+    --sa-lifetime 27000 --sa-max-size 102400000
+
+###############
+# Diagnostics #
+###############
+
+az network vnet-gateway list -g $rg -o table
+az network local-gateway list -g $rg -o table
+az network vpn-connection list -g $rg -o table
+az network vpn-connection ipsec-policy list -g $rg --connection-name mycx -o table
+
+###########
+# Cleanup #
+###########
+az group delete -n $rg -y --no-wait
