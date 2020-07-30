@@ -2162,6 +2162,15 @@ az rest --method get --uri $vpngw2_cx_uri | jq -r '.value | map({name, associate
 az rest --method get --uri $vpnsites_uri
 az rest --method get --uri $vpnsites_uri | jq -r '.value | map({name, provisioningState: .properties.provisioningState})'
 
+##########################
+# Delete AzFW and vpnGWs #
+##########################
+
+az network vpn-gateway delete -n hubvpn1 -g $rg
+az network vpn-gateway delete -n hubvpn2 -g $rg
+az network firewall delete -n azfw1 -g $rg
+az network firewall delete -n azfw2 -g $rg
+
 #########################
 # Log Analytics queries #
 #########################

@@ -1,6 +1,25 @@
+# Day zero: create Azure Key Vault if required
+keyvault_name=joseakv-airs
+keyvault_rg=keyvaults # Only required if new AKV is to be created
+get_kvname=$(az keyvault list -o tsv --query '[?name=="'$keyvault_name'"].name')
+if [[ -n ${get_kvname} ]]
+then
+    echo "AKV ${keyvault_name} found"
+else
+    echo "Creating AKV ${keyvault_name} in RG ${keyvault_rg}..."
+    az group create -n $keyvault_rg -l $location
+    az keyvault create -n $keyvault_name -g $keyvault_rg -l $location
+    user_name=$(az account show --query 'user.name' -o tsv)
+    echo "Setting policies for user ${user_name}..."
+    az keyvault set-policy -n $keyvault_name -g $keyvault_rg --upn $user_name \
+        --certificate-permissions backup create delete deleteissuers get getissuers import list listissuers managecontacts manageissuers purge recover restore setissuers update \
+        --key-permissions backup create decrypt delete encrypt get import list purge recover restore sign unwrapKey update verify wrapKey \
+        --secret-permissions backup delete get list purge recover restore set \
+        --storage-permissions backup delete deletesas get getsas list listsas purge recover regeneratekey restore set setsas update
+fi
+
 # First time: create SP and store the app id and secret as AKV secrets. You need to do this only **once**
-purpose=example
-keyvault_name=erjositoKeyvault
+purpose=aks
 keyvault_appid_secret_name=$purpose-sp-appid
 keyvault_password_secret_name=$purpose-sp-secret
 sp_name=$purpose
@@ -9,7 +28,7 @@ sp_app_id=$(echo $sp_output | jq -r '.appId')
 sp_app_secret=$(echo $sp_output | jq -r '.password')
 az keyvault secret set --vault-name $keyvault_name --name $keyvault_appid_secret_name --value $sp_app_id
 az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $sp_app_secret
-# Assign AKV policy (example certificate/secret get) or Azure RBAC roles (example a RG)
+# Assign  Azure RBAC roles (example a RG) or AKV policy (example certificate/secret get if the SP should be able to retrieve certs)
 rg_name=my-rg
 rg_id=$(az group show -n $rg_name --query id -o tsv)
 az role assignment create --scope $rg_id --assignee $sp_app_id --role Contributor
