@@ -19,7 +19,8 @@ else
 fi
 
 # First time: create SP and store the app id and secret as AKV secrets. You need to do this only **once**
-purpose=aks
+keyvault_name=joseakv-airs
+purpose=aro
 keyvault_appid_secret_name=$purpose-sp-appid
 keyvault_password_secret_name=$purpose-sp-secret
 sp_name=$purpose
@@ -35,8 +36,8 @@ az role assignment create --scope $rg_id --assignee $sp_app_id --role Contributo
 az keyvault set-policy -n $keyvault_name --object-id $sp_app_id --certificate-permissions get --secret-permissions get
 
 # Next time: get SP details from AKV
-purpose=example
-keyvault_name=erjositoKeyvault
+purpose=aks
+keyvault_name=joseakv-airs
 keyvault_appid_secret_name=$purpose-sp-appid
 keyvault_password_secret_name=$purpose-sp-secret
 sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
