@@ -9,7 +9,7 @@
 # Waits until a resourced finishes provisioning
 # Example: wait_until_finished <resource_id> 
 function wait_until_finished {
-     wait_interval=5
+     wait_interval=60
      resource_id=$1
      resource_name=$(echo $resource_id | cut -d/ -f 9)
      echo "Waiting for resource $resource_name to finish provisioning..."
@@ -30,6 +30,43 @@ function wait_until_finished {
         echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
      fi
 }
+
+# Wait until a public IP address answers via SSH
+# The only thing CSR-specific is the command sent
+function wait_until_csr_available {
+    wait_interval=15
+    csr_id=$1
+    csr_ip=$(az network public-ip show -n csr${csr_id}-pip -g $rg --query ipAddress -o tsv)
+    echo "Waiting for IP address $csr_ip to answer over SSH..."
+    start_time=`date +%s`
+    # ssh_command="pwd"  # Using something that works both in IOS and Linux
+    ssh_command="show version | include uptime"  # A bit more info (contains VM name and uptime)
+    ssh_output=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip $ssh_command 2>/dev/null)
+    until [[ -n "$ssh_output" ]]
+    do
+        sleep $wait_interval
+        ssh_output=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip $ssh_command)
+    done
+    run_time=$(expr `date +%s` - $start_time)
+    ((minutes=${run_time}/60))
+    ((seconds=${run_time}%60))
+    echo "IP address $csr_ip is available (wait time $minutes minutes and $seconds seconds). Answer to SSH command \"$ssh_command\":"
+    echo $ssh_output
+}
+
+# Wait until all VNGs in the router list finish provisioning
+function wait_for_csrs_finished {
+    for router in "${routers[@]}"
+    do
+        type=$(get_router_type $router)
+        id=$(get_router_id $router)
+        if [[ "$type" == "csr" ]]
+        then
+            wait_until_csr_available $id
+        fi
+    done
+}
+
 
 # Creates BGP-enabled VNG
 # ASN as parameter is optional
@@ -593,15 +630,14 @@ do
     create_router $router
 done
 
-# Wait for VNGs to finish provisioning
-wait_for_gws_finished
+# Config BGP routers
+wait_for_csrs_finished
+config_csrs_base
 
-# Configure logging for gateways
+# Wait for VNGs to finish provisioning and configuring logging
+wait_for_gws_finished
 init_log
 config_gw_logging
-
-# Config BGP routers
-config_csrs_base
 
 # Configure connections
 for connection in "${connections[@]}"
@@ -609,16 +645,13 @@ do
     create_connection $connection
 done
 
-# We are done here!
-exit
-
-# Diagnostics
-az network vnet-gateway list -g $rg -o table
-az network local-gateway list -g $rg -o table
-az network vpn-connection list -g $rg -o table
-az network public-ip list -g $rg -o table
-az network vnet-gateway list-bgp-peer-status -n vng1 -g $rg -o table
-az network vnet-gateway list-learned-routes -n vng1 -g $rg -o table
-az network vnet-gateway list-advertised-routes -n vng1 -g $rg -o table
-sh_csr_int 4
+# Sample diagnostics commands:
+# az network vnet-gateway list -g $rg -o table
+# az network local-gateway list -g $rg -o table
+# az network vpn-connection list -g $rg -o table
+# az network public-ip list -g $rg -o table
+# az network vnet-gateway list-bgp-peer-status -n vng1 -g $rg -o table
+# az network vnet-gateway list-learned-routes -n vng1 -g $rg -o table
+# az network vnet-gateway list-advertised-routes -n vng1 -g $rg -o table
+# sh_csr_int 4
 
