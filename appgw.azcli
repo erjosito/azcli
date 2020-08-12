@@ -1,0 +1,138 @@
+# Variables
+rg=appgw
+location=eastus
+appgw_pipname=appgwpip
+dnsname=kuardgw
+dnszone=cloudtrooper.net
+dnsrg=dns
+appgw_name=appgw
+sku=Standard_v2
+cookie=Disabled
+backenddnsname=kuard
+backendfqdn="$backenddnsname"."$dnszone"
+vnet_name=appgw
+vnet_prefix=10.0.0.0/16
+appgw_subnet_name=AppGateway
+appgw_subnet_prefix=10.0.0.0/24
+aci_subnet_name=aci
+aci_subnet_prefix=10.0.1.0/24
+
+# Create RG
+az group create -n $rg -l $location
+
+# Create vnet
+az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix --subnet-name $appgw_subnet_name --subnet-prefix $appgw_subnet_prefix
+
+# Alternatively create subnet in the vnet
+# az network vnet subnet create --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --address-prefixes 10.13.123.0/24
+
+# Create PIP
+az network public-ip create -g $rg -n $appgw_pipname --sku Standard
+#fqdn=$(az network public-ip show -g $rg -n $appgw_pipname --query dnsSettings.fqdn -o tsv)
+
+# Create GW with sample config for port 80
+az network application-gateway create -g $rg -n $appgw_name --capacity 2 --sku $sku \
+    --frontend-port 80 --routing-rule-type basic \
+    --http-settings-port 80 --http-settings-protocol Http \
+    --public-ip-address $appgw_pipname --vnet-name $vnet_name --subnet $appgw_subnet_name \
+    --no-wait
+    # --servers "$backendfqdn" \
+
+# If using a DNS entry, create A record pointing to the PIP
+ip=$(az network public-ip show -g $rg -n $appgw_pipname --query ipAddress -o tsv)
+fqdn="$dnsname"."$dnszone"
+echo "Creating A-record $fqdn for IP $ip"
+# Create DNS names, these commands are idempotent
+az network dns record-set a create -g $dnsrg -z cloudtrooper.net -n $dnsname
+az network dns record-set a add-record -g $dnsrg -z cloudtrooper.net -n $dnsname -a $ip
+echo "Your App Gateway applications should be reachable under http://$dnsname.$dnszone"
+
+# Create ACI instance in the vnet
+echo "Creating ACI..."
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $aci_subnet_name --address-prefix $aci_subnet_prefix
+vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+aci_subnet_id=$(az network vnet subnet show -n $aci_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az container create -n kuard -g $rg --image gcr.io/kuar-demo/kuard-amd64:1 --ip-address private --ports 8080 --vnet $vnet_id --subnet $aci_subnet_id
+aci_ip=$(az container show -n kuard -g $rg --query 'ipAddress.ip' -o tsv)
+echo "ACI created with IP $aci_ip"
+
+# Wait for GW to be created
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
+wait_until_finished $appgw_id
+
+# Create backend
+az network application-gateway address-pool create -n kuardpool -g $rg --gateway-name $appgw_name --servers $aci_ip
+
+# Create probe and HTTP settings
+az network application-gateway probe create -g $rg --gateway-name $appgw_name \
+  --name kuardprobe --protocol Http --host-name-from-http-settings \
+  --match-status-codes 200-399 --port 8080
+az network application-gateway http-settings create -g $rg --gateway-name $appgw_name \
+  --name kuardsettings --protocol http --port 8080 --host-name-from-backend-pool \
+  --probe kuardprobe
+
+# Create HTTP listener
+frontend_name=$(az network application-gateway frontend-ip list -g $rg --gateway-name $appgw_name --query '[0].name' -o tsv)
+az network application-gateway http-listener create -n kuardlistener -g $rg --gateway-name $appgw_name \
+  --frontend-port 80 --frontend-ip $frontend_name --host-name $dnsname.$dnszone
+
+# Create rule
+az network application-gateway rule create -g $rg --gateway-name $appgw_name \
+  -n kuardrule --http-listener kuardlistener --rule-type Basic \
+  --address-pool kuardpool --http-settings kuardsettings
+
+#######
+# SSL #
+#######
+
+# Get SP to access AKV
+purpose=appgw
+keyvault_name=joseakv-airs
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
+sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
+echo "$sp_app_id retrieved for Azure Key Vault access"
+
+# az network application-gateway ssl-cert create -n cloudtroopernet -g $rg --gateway-name $appgw_name \
+#     --key-vault-secret-id https://erjositokeyvault.vault.azure.net/secrets/cloudtroopernet/9498f25b036e40739b36e5b30ea112bd
+az network application-gateway ssl-cert create -g $rg --gateway-name $appgw_name -n starcloudtrooper \
+  --cert-file ~/certs/cloudtrooper.net/star_cloudtrooper_net.p7b --cert-password Microsoft123!
+
+# Troubleshoot
+az network application-gateway list -g $rg -o table
+az network application-gateway http-listener list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway frontend-ip list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway probe list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway address-pool list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway rule list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway rule show -g $rg --gateway-name $appgw_name -n rule1
+az network application-gateway rule list -g $rg --gateway-name $appgw_name -o table
+rule=$(az network application-gateway rule list -g $rg --gateway-name $appgw_name --query '[0].name' -o tsv)
+az network application-gateway rule show -g $rg --gateway-name $appgw_name -n $rule
+az network application-gateway url-path-map list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway http-settings list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway show-backend-health -g $rg --gateway-name $appgw_name -o table
+

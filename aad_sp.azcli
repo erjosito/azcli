@@ -20,7 +20,7 @@ fi
 
 # First time: create SP and store the app id and secret as AKV secrets. You need to do this only **once**
 keyvault_name=joseakv-airs
-purpose=aro
+purpose=appgw
 keyvault_appid_secret_name=$purpose-sp-appid
 keyvault_password_secret_name=$purpose-sp-secret
 sp_name=$purpose

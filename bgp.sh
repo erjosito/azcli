@@ -1,9 +1,16 @@
 ############################################################
-# Create a BGP lab in Azure using VNGs and Cisco CSR NVAs
+# Create a BGP lab in Azure using VNGs and/or Cisco CSR NVAs
 # Jose Moreno, August 2020
 #
-# Example:
-# zsh bgp.sh "1:vng:65501,2:vng:65502,3:csr:65001,4:csr:65001" "1:2,1:3,2:4,3:4" mybgprg northeurope Microsoft123!
+# Examples:
+# * Basic example with 1 VNG connected to one CSR
+#   bash bgp.sh "1:vng:65501,2:csr:65502" "1:2" mylab northeurope mypresharedkey
+# * 4 CSRs connected in full mesh
+#   bash bgp.sh "1:csr:65501,2:csr:65502,3:csr:65503,4:csr:65504" "1:2,1:3,2:4,3:4,1:4,2:3" mylab northeurope mypresharedkey
+# * Environment simulating 2 ExpressRoute locations (note you cannot use the 12076 ASN in Local Gateways)
+#   bash bgp.sh "1:vng:65515,2:vng:65515,3:csr:22076,4:csr:22076,5:csr:65001,6:csr:65002" "1:3,1:4,2:3,2:4,3:5,4:6,5:6" mylab northeurope mypresharedkey
+#
+# bash and zsh tested
 ############################################################
 
 # Waits until a resourced finishes provisioning
@@ -79,7 +86,7 @@ function create_vng {
     else
         asn=$(get_router_asn_from_id ${id})
     fi
-    vnet_name=azurevnet${id}
+    vnet_name=vng${id}
     vnet_prefix=10.${id}.0.0/16
     subnet_prefix=10.${id}.0.0/24
     echo "Creating vnet $vnet_name and public IPs..."
@@ -217,15 +224,16 @@ function connect_csr {
     # Baseline config for IPsec and BGP
     # config_csr_base $csr_id
 
-    # Tunnels for vpngw1
+    # Tunnels for vpngw1 (IKEv2)
     echo "Configuring tunnels between CSR $csr_id and VPN GW $gw1_d"
-    config_csr_tunnel $csr_id ${csr_id}${gw1_id}0 $vpngw1_gw0_pip $vpngw1_gw0_bgp_ip $(get_router_asn_from_id $gw1_id)
-    config_csr_tunnel $csr_id ${csr_id}${gw1_id}1 $vpngw1_gw1_pip $vpngw1_gw1_bgp_ip $(get_router_asn_from_id $gw1_id)
+    config_csr_tunnel $csr_id ${csr_id}${gw1_id}0 $vpngw1_gw0_pip $vpngw1_gw0_bgp_ip $(get_router_asn_from_id $gw1_id) ikev2
+    config_csr_tunnel $csr_id ${csr_id}${gw1_id}1 $vpngw1_gw1_pip $vpngw1_gw1_bgp_ip $(get_router_asn_from_id $gw1_id) ikev2
     if [[ -n "$gw2_id" ]]
     then
+      # Optionally, tunnels for vpngw2 (IKEv2)
       echo "Configuring tunnels between CSR $csr_id and VPN GW $gw2_d"
-      config_csr_tunnel $csr_id ${csr_id}${gw2_id}0 $vpngw2_gw0_pip $vpngw2_gw0_bgp_ip $(get_router_asn_from_id $gw2_id)
-      config_csr_tunnel $csr_id ${csr_id}${gw2_id}1 $vpngw2_gw1_pip $vpngw2_gw1_bgp_ip $(get_router_asn_from_id $gw2_id)
+      config_csr_tunnel $csr_id ${csr_id}${gw2_id}0 $vpngw2_gw0_pip $vpngw2_gw0_bgp_ip $(get_router_asn_from_id $gw2_id) ikev2
+      config_csr_tunnel $csr_id ${csr_id}${gw2_id}1 $vpngw2_gw1_pip $vpngw2_gw1_bgp_ip $(get_router_asn_from_id $gw2_id) ikev2
     fi
 
     # Connect Local GWs to VNGs
@@ -289,6 +297,14 @@ function config_csr_base {
         set security-association lifetime kilobytes 102400000
         set transform-set azure-ipsec-proposal-set
         set ikev2-profile azure-profile
+      crypto isakmp policy 1
+        encr aes
+        authentication pre-share
+        group 14
+      crypto ipsec transform-set csr-ts esp-aes esp-sha-hmac
+        mode tunnel
+      crypto ipsec profile csr-profile
+        set transform-set csr-ts
       router bgp $asn
         bgp router-id interface GigabitEthernet1
         bgp log-neighbor-changes
@@ -300,12 +316,25 @@ EOF
 }
 
 # Configure a tunnel a BGP neighbor for a specific remote endpoint on a Cisco CSR
+# "mode" can be either IKEv2 or ISAKMP. I havent been able to bring up 
+#   a CSR-to-CSR connection using IKEv2, hence my workaround is using isakmp.
 function config_csr_tunnel {
     csr_id=$1
     tunnel_id=$2
     public_ip=$3
     private_ip=$4
     remote_asn=$5
+    mode=$6
+    if [[ -z "$mode" ]]
+    then
+        mode=ikev2
+    fi
+    if [[ "$mode" == "ikev2" ]]
+    then
+        ipsec_profile="azure-vti"
+    else
+        ipsec_profile="csr-profile"
+    fi
     asn=$(get_router_asn_from_id ${csr_id})
     default_gateway="10.20${csr_id}.0.1"
     csr_ip=$(az network public-ip show -n csr${csr_id}-pip -g $rg -o tsv --query ipAddress)
@@ -318,13 +347,14 @@ function config_csr_tunnel {
           pre-shared-key $psk
       crypto ikev2 profile azure-profile
         match identity remote address $public_ip 255.255.255.255
+      crypto isakmp key $psk address $public_ip
       interface Tunnel${tunnel_id}
         ip unnumbered GigabitEthernet1
         ip tcp adjust-mss 1350
         tunnel source GigabitEthernet1
         tunnel mode ipsec ipv4
         tunnel destination $public_ip
-        tunnel protection ipsec profile azure-vti
+        tunnel protection ipsec profile $ipsec_profile
       router bgp $asn
         neighbor $private_ip remote-as $remote_asn
         neighbor $private_ip ebgp-multihop 5
@@ -346,12 +376,12 @@ function connect_csrs {
     csr2_asn=$(get_router_asn_from_id ${csr2_id})
     csr1_bgp_ip="10.20${csr1_id}.0.10"
     csr2_bgp_ip="10.20${csr2_id}.0.10"
-    # Tunnel from csr1 to csr2
+    # Tunnel from csr1 to csr2 (using ISAKMP instead of IKEv2)
     tunnel_id=${csr1_id}${csr2_id}
-    config_csr_tunnel $csr1_id $tunnel_id $csr2_ip $csr2_bgp_ip $csr2_asn
-    # Tunnel from csr2 to csr1
+    config_csr_tunnel $csr1_id $tunnel_id $csr2_ip $csr2_bgp_ip $csr2_asn isakmp
+    # Tunnel from csr2 to csr1 (using ISAKMP instead of IKEv2)
     tunnel_id=${csr2_id}${csr1_id}
-    config_csr_tunnel $csr2_id $tunnel_id $csr1_ip $csr1_bgp_ip $csr1_asn
+    config_csr_tunnel $csr2_id $tunnel_id $csr1_ip $csr1_bgp_ip $csr1_asn isakmp
 }
 
 # Configure logging
@@ -464,6 +494,24 @@ function get_router_asn_from_id {
     done
 }
 
+# Verifies a VNG or CSR has been created in Azure
+function verify_router {
+    router=$1
+    echo "Verifying $router..."
+    type=$(get_router_type $router)
+    id=$(get_router_id $router)
+    if [[ "$type" == "csr" ]]
+    then
+        vm_status=$(az vm show -n csr${id}-nva -g $rg --query provisioningState -o tsv)
+        ip=$(az network public-ip show -n csr${id}-pip -g $rg --query ipAddress -o tsv)
+        echo "VM csr${id}-nva status is ${vm_status}, public IP is ${ip}"
+    else
+        gw_status=$(az network vnet-gateway show -n vng${id} -g $rg --query provisioningState -o tsv)
+        ip_a=$(az network public-ip show -n pip${id}a -g $rg --query ipAddress -o tsv)
+        ip_b=$(az network public-ip show -n pip${id}b -g $rg --query ipAddress -o tsv)
+        echo "Gateway vng${id} status is ${gw_status}, public IPs are ${ip_a} and ${ip_b}"
+    fi
+}
 
 # Create a VNG or a CSR, configuration given by a colon-separated parameter string (like "1:vng:65515")
 function create_router {
@@ -580,8 +628,8 @@ function convert_csv_to_array {
     elif [ -n "$ZSH_VERSION" ]; then
         arr_opt=A
     fi
-    IFS=',' read -r"$arr_opt" array <<< "$1"
-    echo $array
+    IFS=',' read -r"${arr_opt}" myarray <<< "$1"
+    echo ${myarray[@]}
 }
 
 ########
@@ -589,16 +637,27 @@ function convert_csv_to_array {
 ########
 
 # Create lab variable from arguments, or use default
+if [ -n "$BASH_VERSION" ]; then
+    echo "It looks like running under BASH"
+elif [ -n "$ZSH_VERSION" ]; then
+    echo "It looks like running under ZSH"
+fi
 if [[ -n "$1" ]]
 then
+    # echo "Converting CSV string to array: $1"
     routers=($(convert_csv_to_array $1))
+    # echo ""${#routers[@]}" routers identified"
 else
+    echo "Using sample values for routers"
     routers=("1:vng:65501" "2:vng:65502" "3:csr:65001" "4:csr:65001")
 fi
 if [[ -n "$2" ]]
 then
+    # echo "Converting CSV string to array: $2"
     connections=($(convert_csv_to_array $2))
+    # echo ""${#connections[@]}" connections identified"
 else
+    echo "Using sample values for connections"
     connections=("1:2" "1:3" "2:4" "3:4")
 fi
 if [[ -n "$3" ]]
@@ -625,9 +684,16 @@ echo "Creating resource group $rg..."
 az group create -n $rg -l $location >/dev/null
 
 # Deploy CSRs and VNGs
+# echo "Routers array: $routers"
 for router in "${routers[@]}"
 do
     create_router $router
+done
+
+# Verify VMs/VNGs exist
+for router in "${routers[@]}"
+do
+    verify_router $router
 done
 
 # Config BGP routers
@@ -644,6 +710,9 @@ for connection in "${connections[@]}"
 do
     create_connection $connection
 done
+
+# Finish
+echo "Your resources should be ready in resource group $rg. Enjoy!"
 
 # Sample diagnostics commands:
 # az network vnet-gateway list -g $rg -o table
