@@ -11,8 +11,8 @@
 rg=twovwans
 vwan1_name=vwan1
 vwan2_name=vwan2
-location1=uksouth
-location2=ukwest
+location1=westeurope
+location2=uksouth
 username=jose
 password=Microsoft123!
 publisher=cisco
@@ -1597,6 +1597,28 @@ function connect_vwan_site {
     vpngw_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/hubvpn${vwan1_id}"
     vpngw_cx_uri="${vpngw_base_uri}/vpnConnections/${site_name}?api-version=$vwan_api_version"
     az rest --method put --uri $vpngw_cx_uri --body $vpncx_json_string  # PUT
+}
+
+function sh_ip_int_b {
+    branch_ip_list=$(az network public-ip list -g $rg -o tsv --query "[?contains(name,'branch')].[ipAddress]")
+    while IFS= read -r branch_ip; do
+        echo "sh ip int brief on CSR with IP ${branch_ip}..."
+        remote $branch_ip "sh ip int b"
+    done <<< "$branch_ip_list"
+}
+
+function branch_cmd {
+    if [[ -z "$1" ]]
+    then
+        cmd="sh ip int b"
+    else
+        cmd=$1
+    fi
+    branch_ip_list=$(az network public-ip list -g $rg -o tsv --query "[?contains(name,'branch')].[ipAddress]")
+    while IFS= read -r branch_ip; do
+        echo "\"$cmd\" on CSR with IP ${branch_ip}..."
+        remote $branch_ip "\"$cmd\""
+    done <<< "$branch_ip_list"
 }
 
 
