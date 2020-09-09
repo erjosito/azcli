@@ -67,8 +67,29 @@ function wait_until_finished {
         run_time=$(expr `date +%s` - $start_time)
         ((minutes=${run_time}/60))
         ((seconds=${run_time}%60))
-        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+        # echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
      fi
+}
+
+function wait_until_csr_finished {
+    branch_id=$1
+    echo "Waiting until CSR in branch${branch_id} is reachable..."
+    # Wait until getting an IP
+    branch_ip=$(az network public-ip show -n branch${branch_id}-pip -g $rg --query ipAddress -o tsv 2>/dev/null)
+    until [[ -n "$branch_ip" ]]
+    do
+        sleep $wait_interval
+        branch_ip=$(az network public-ip show -n branch${branch_id}-pip -g $rg --query ipAddress -o tsv 2>/dev/null)
+    done
+    # Wait until getting SSH output
+    command="sho ver | i uptime"
+    command_output=$(remote $branch_ip "$command" 2>/dev/null)
+    until [[ -n "$command_output" ]]
+    do
+        sleep $wait_interval
+        command_output=$(remote $branch_ip "$command")
+    done
+    echo "CSR is live, output to the command \"$command\" is $command_output"
 }
 
 function wait_until_hub_finished {
@@ -76,7 +97,7 @@ function wait_until_hub_finished {
     hub_id=$(az network vhub show -n $hub_name -g $rg --query id -o tsv)
     wait_until_finished $hub_id
     # Check state of connections
-    echo "Hub state is $(get_vhub_state $hub_name), checking connections..."
+    # echo "Hub state is $(get_vhub_state $hub_name), checking connections..."
     connections=$(get_vnetcx_state $hub_name | grep Updating)
     until [[ -z "$connections" ]]
     do
@@ -84,7 +105,7 @@ function wait_until_hub_finished {
         connections=$(get_vnetcx_state $hub_name | grep Updating)
     done
     # Check state of route tables
-    echo "No connections in Updating state in hub $hub_name, checking route tables..."
+    # echo "No connections in Updating state in hub $hub_name, checking route tables..."
     rts=$(get_rt_state $hub_name | grep Updating)
     until [[ -z "$rts" ]]
     do
@@ -328,6 +349,7 @@ function create_rt {
     then
         rt_json_string=$(echo $rt_json_string | jq '.properties.labels += [ "'$rt_label'" ] | {name, properties}')
     fi
+    echo "Creating route in ${hub_name}/${rt_name}..."
     wait_until_hub_finished $hub_name
     az rest --method put --uri $rt_uri --body $rt_json_string >/dev/null
 }
@@ -350,7 +372,7 @@ function cx_set_ass_rt {
     new_rt_id="/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${new_rt_name}"
     cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.associatedRouteTable.id = "'$new_rt_id'" | {name, properties}')
     wait_until_hub_finished $hub_name
-    az rest --method put --uri $cx_uri --body $cx_json_updated
+    az rest --method put --uri $cx_uri --body $cx_json_updated >/dev/null
     # az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.associatedRouteTable.id'
 }
 
@@ -369,7 +391,7 @@ function cx_set_prop_rt {
     new_rt_ids="${new_rt_ids: : -1}"   # Remove trailing comma
     cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.propagatedRouteTables.ids = ['$new_rt_ids'] | {name, properties}')
     wait_until_hub_finished $hub_name
-    az rest --method put --uri $cx_uri --body $cx_json_updated
+    az rest --method put --uri $cx_uri --body $cx_json_updated >/dev/null
 }
 
 # Modify propagation labels
@@ -378,6 +400,7 @@ function cx_set_prop_labels {
     cx_name=$2
     if [[ -n "$3" ]]
     then
+        echo "Setting labels from connection ${hub_name}/${cx_name} to $3..."
         if [ -n "$BASH_VERSION" ]; then
             arr_opt=a
         elif [ -n "$ZSH_VERSION" ]; then
@@ -390,13 +413,30 @@ function cx_set_prop_labels {
         done
         new_labels_txt="${new_labels_txt: : -1}"   # Remove trailing comma
     else
+        echo "Deleting labels from connection ${hub_name}/${cx_name}..."
         new_labels_txt=" "
     fi
     cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
     cx_json=$(az rest --method get --uri $cx_uri)
     cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.propagatedRouteTables.labels = ['${new_labels_txt}'] | {name, properties}')
     wait_until_hub_finished $hub_name
-    az rest --method put --uri $cx_uri --body $cx_json_updated
+    # Check: if hub is Failed, we can try to reset it
+    # We dont do this inside of the wait_until_hub_finished function because we could have infinite recursion
+    hub_state=$(get_vhub_state $hub_name)
+    if [[ "$hub_state" == "Failed" ]]
+    then
+        echo "Hub $hub_name is Failed, trying to fix it with a reset"
+        reset_vhub "$hub_name"
+        wait_until_hub_finished "$hub_name"
+    fi
+    # Check: if hub is still Failed, do not do anything
+    hub_state=$(get_vhub_state "$hub_name")
+    if [[ "$hub_state" == "Succeeded" ]]
+    then
+    az rest --method put --uri "$cx_uri" --body "$cx_json_updated" >/dev/null
+    else
+        echo "Hub $hub_name is $hub_state and could not fix it"
+    fi
 }
 
 # Modify propagated RT for VPN connection
@@ -408,6 +448,7 @@ function vpncx_set_prop_rt {
     cx_name=$2
     gw_id=$(az network vhub show -n hub${hub_id} -g $rg --query vpnGateway.id -o tsv)
     gw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    echo "Setting routing for VPN connection $cx_name in gateway $gw_name..."
     uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}?api-version=$vwan_api_version"
     if [ -n "$BASH_VERSION" ]; then
         arr_opt=a
@@ -503,7 +544,7 @@ function cx_set_rt {
         arr_opt=A
     fi
     IFS=',' read -r"$arr_opt" new_proprt_names <<< "$4"
-    echo "Setting associated route table to $new_assrt_name, propagated route tables to $new_proprt_names"  # DEBUG
+    echo "Setting connection $cx_name associated route table to $new_assrt_name, propagated route tables to $new_proprt_names"  # DEBUG
     cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
     cx_json=$(az rest --method get --uri $cx_uri)
     new_assrt_id="/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${new_assrt_name}"
@@ -533,9 +574,6 @@ function cx_set_rt {
     fi
     wait_until_hub_finished $hub_name
     az rest --method put --uri $cx_uri --body $cx_json_updated >/dev/null
-    # az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.associatedRouteTable.id'
-    # az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.propagatedRouteTables.ids'
-    # az rest --method get --uri $cx_uri | jq '.properties.provisioningState'
 }
 
 # Add routes to RT
@@ -545,6 +583,7 @@ function rt_add_route {
     rt_name=$2
     prefix=$3
     nexthop=$4
+    echo "Adding static route for ${prefix} to route table ${hub_name}/${rt_name}"
     rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
     rt_json_current=$(az rest --method get --uri $rt_uri)
     # type (next hop): CIDR, resourceId, Service
@@ -557,20 +596,35 @@ function rt_add_route {
             $route_json)
     rt_json_updated=$(echo $rt_json_current | jq '.properties.routes += [ '$new_route_json_string' ] | {name, properties}')
     wait_until_hub_finished $hub_name
-    az rest --method put --uri $rt_uri --body $rt_json_updated >/dev/null   # PUT
-    # az rest --method get --uri $rt_uri | jq '.properties.routes'  # GET
+    # Check: if hub is Failed, we can try to reset it
+    # We dont do this inside of the wait_until_hub_finished function because we could have infinite recursion
+    hub_state=$(get_vhub_state $hub_name)
+    if [[ "$hub_state" == "Failed" ]]
+    then
+        echo "Hub $hub_name is Failed, trying to fix it with a reset"
+        reset_vhub "$hub_name"
+        wait_until_hub_finished "$hub_name"
+    fi
+    # Check: if hub is still Failed, do not do anything
+    hub_state=$(get_vhub_state "$hub_name")
+    if [[ "$hub_state" == "Succeeded" ]]
+    then
+        az rest --method put --uri $rt_uri --body $rt_json_updated >/dev/null   # PUT
+    else
+        echo "Hub $hub_name is $hub_state and could not fix it"
+    fi
 }
 
 # Delete all routes from RT
 function rt_delete_routes {
     hub_name=$1
     rt_name=$2
+    echo "Deleting all routes from route table ${hub_name}/${rt_name}"
     rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
     rt_json_current=$(az rest --method get --uri $rt_uri)
     rt_json_updated=$(echo $rt_json_current | jq '.properties.routes = [] | {name, properties}')
     wait_until_hub_finished $hub_name
-    az rest --method put --uri $rt_uri --body $rt_json_updated    # PUT
-    # az rest --method get --uri $rt_uri | jq '.properties.routes'  # GET
+    az rest --method put --uri $rt_uri --body $rt_json_updated >/dev/null   # PUT
 }
 
 # Add routes to vnet conection
@@ -581,6 +635,7 @@ function cx_add_routes {
     cx_name=$2
     prefix=$3
     nexthop=$4
+    echo "Adding route for $prefix to $nexthop in connection ${hub_name}/${cx_name}..."
     cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
     cx_json=$(az rest --method get --uri $cx_uri)
     # prefixes: comma-separated prefix list
@@ -599,7 +654,6 @@ function cx_add_routes {
     cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes = ['$new_routes'] | {name, properties}')
     wait_until_hub_finished $hub_name
     az rest --method put --uri $cx_uri --body $cx_json_updated >/dev/null # PUT
-    # az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes'  # GET
 }
 
 # Delete all routes from vnet cx
@@ -610,7 +664,7 @@ function cx_delete_routes {
     cx_json=$(az rest --method get --uri $cx_uri)
     cx_json_updated=$(echo $cx_json | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes = [] | {name, properties}')
     wait_until_hub_finished $hub_name
-    az rest --method put --uri $cx_uri --body $cx_json_updated    # PUT
+    az rest --method put --uri $cx_uri --body $cx_json_updated >/dev/null
     # az rest --method get --uri $cx_uri | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes'  # GET
 }
 
@@ -671,7 +725,7 @@ function reset_rt {
     rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
     rt_json_current=$(az rest --method get --uri $rt_uri)
     rt_json_updated=$(echo $rt_json_current | jq '{name, location, properties}')
-    az rest --method put --uri $rt_uri --body $rt_json_updated
+    az rest --method put --uri $rt_uri --body $rt_json_updated >/dev/null
 }
 
 # reset vnet cx
@@ -681,9 +735,9 @@ function reset_vhub_cx {
     cx_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubVirtualNetworkConnections/${cx_name}?api-version=$vwan_api_version"
     cx_json_current=$(az rest --method get --uri $cx_uri)       # GET
     cx_json_updated=$(echo $cx_json_current | jq '{name, location, properties}')
+    # If you delete, you should wait until the delete operation finishes before sending the PUT, hence commented out
     # az rest --method delete --uri $cx_uri                     # DELETE
-    # Here you should wait until the delete operation finishes!!!!
-    az rest --method put --uri $cx_uri --body $cx_json_updated  # PUT
+    az rest --method put --uri $cx_uri --body $cx_json_updated  >/dev/null
 }
 
 # reset vpngw - NOT WORKING!
@@ -1104,8 +1158,15 @@ function delete_vpngw {
 function connect_branch {
     hub_id=$1
     branch_id=$2
-    site_id=$(az network vpn-site show -n branch${branch_id} -g $rg --query id -o tsv)
-    vpnsite_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/branch${branch_id}?api-version=$vwan_api_version"
+    # Create site
+    branch_ip=$(az network public-ip show -n branch${branch_id}-pip -g $rg --query ipAddress -o tsv)
+    branch_bgp_ip=$(az vm list-ip-addresses -n branch${branch_id}-nva -g $rg --query '[0].virtualMachine.network.privateIpAddresses[0]' -o tsv)
+    create_site $hub_id $branch_id $branch_ip $branch_bgp_ip
+    sleep 30
+    # Create connection
+    site_name=hub${hub_id}branch${branch_id}
+    site_id=$(az network vpn-site show -n ${site_name} -g $rg --query id -o tsv)
+    vpnsite_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/${site_name}?api-version=$vwan_api_version"
     site_link_id=$(az rest --method get --uri $vpnsite_uri | jq -r '.properties.vpnSiteLinks[0].id')
     vpngw_id=$(az network vhub show -n hub${hub_id} -g $rg --query vpnGateway.id -o tsv)
     vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
@@ -1135,6 +1196,7 @@ function configure_csr {
     vpngw_id=$(az network vhub show -n hub${hub_id} -g $rg --query vpnGateway.id -o tsv)
     vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
     wait_until_gw_finished $vpngw_name
+    wait_until_csr_finished $branch_id
     echo "Extracting IP information from VPN gateway $vpngw_name..."
     branch_asn=6550${branch_id}
     vpngw_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/$vpngw_name?api-version=$vwan_api_version"
@@ -1189,7 +1251,94 @@ EOF
 EOF
         # Save config and check
         remote $branch_ip "wr mem"
-        remote $branch_ip "sh ip int b"
+        # remote $branch_ip "sh ip int b"
+    fi
+}
+
+# Configures CSR in branch x to connect to the VPN gateways in two hubs
+function configure_csr_dualhomed {
+    hub1_id=$1
+    hub2_id=$2
+    branch_id=$3
+    vpngw1_id=$(az network vhub show -n hub${hub1_id} -g $rg --query vpnGateway.id -o tsv)
+    vpngw1_name=$(echo $vpngw1_id | cut -d/ -f 9)
+    vpngw2_id=$(az network vhub show -n hub${hub2_id} -g $rg --query vpnGateway.id -o tsv)
+    vpngw2_name=$(echo $vpngw2_id | cut -d/ -f 9)
+    wait_until_gw_finished $vpngw1_name
+    wait_until_gw_finished $vpngw2_name
+    wait_until_csr_finished $branch_id
+    branch_asn=6550${branch_id}
+
+    echo "Extracting IP information from VPN gateway $vpngw1_name..."
+    vpngw1_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/$vpngw1_name?api-version=$vwan_api_version"
+    vpngw1=$(az rest --method get --uri $vpngw1_uri)
+    vpngw1_gw0_pip=$(echo $vpngw1 | jq -r '.properties.ipConfigurations[0].publicIpAddress')
+    vpngw1_gw1_pip=$(echo $vpngw1 | jq -r '.properties.ipConfigurations[1].publicIpAddress')
+    vpngw1_gw0_bgp_ip=$(echo $vpngw1 | jq -r '.properties.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
+    vpngw1_gw1_bgp_ip=$(echo $vpngw1 | jq -r '.properties.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
+    echo "Extracted info for vpngw1: Gateway0 $vpngw1_gw0_pip, $vpngw1_gw0_bgp_ip. Gateway1 $vpngw1_gw1_pip, $vpngw1_gw1_bgp_ip."
+
+    echo "Extracting IP information from VPN gateway $vpngw2_name..."
+    vpngw2_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/$vpngw2_name?api-version=$vwan_api_version"
+    vpngw2=$(az rest --method get --uri $vpngw2_uri)
+    vpngw2_gw0_pip=$(echo $vpngw2 | jq -r '.properties.ipConfigurations[0].publicIpAddress')
+    vpngw2_gw1_pip=$(echo $vpngw2 | jq -r '.properties.ipConfigurations[1].publicIpAddress')
+    vpngw2_gw0_bgp_ip=$(echo $vpngw2 | jq -r '.properties.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
+    vpngw2_gw1_bgp_ip=$(echo $vpngw2 | jq -r '.properties.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
+    echo "Extracted info for vpngw2: Gateway0 $vpngw2_gw0_pip, $vpngw2_gw0_bgp_ip. Gateway1 $vpngw2_gw1_pip, $vpngw2_gw1_bgp_ip."
+
+    if [[ "$vpngw1_gw0_pip" == "null" ]] || [[ "$vpngw1_gw0_pip" == "null" ]] || [[ "$vpngw2_gw0_pip" == "null" ]] || [[ "$vpngw2_gw0_pip" == "null" ]]
+    then
+        echo "Could not extract IP information out of existing VPN gateways"
+    else
+        # Create config
+        csr_config_url="https://raw.githubusercontent.com/erjosito/azure-wan-lab/master/csr_config_4tunnels_tokenized.txt"
+        config_file_csr='branch${branch_id}_csr.cfg'
+        config_file_local='/tmp/branch${branch_id}_csr.cfg'
+        wget $csr_config_url -O $config_file_local
+        sed -i "s|\*\*PSK\*\*|${password}|g" $config_file_local
+        sed -i "s|\*\*GW0_Private_IP\*\*|${vpngw1_gw0_bgp_ip}|g" $config_file_local
+        sed -i "s|\*\*GW1_Private_IP\*\*|${vpngw1_gw1_bgp_ip}|g" $config_file_local
+        sed -i "s|\*\*GW2_Private_IP\*\*|${vpngw2_gw0_bgp_ip}|g" $config_file_local
+        sed -i "s|\*\*GW3_Private_IP\*\*|${vpngw2_gw1_bgp_ip}|g" $config_file_local
+        sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw1_gw0_pip}|g" $config_file_local
+        sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw1_gw1_pip}|g" $config_file_local
+        sed -i "s|\*\*GW2_Public_IP\*\*|${vpngw2_gw0_pip}|g" $config_file_local
+        sed -i "s|\*\*GW3_Public_IP\*\*|${vpngw2_gw1_pip}|g" $config_file_local
+        sed -i "s|\*\*BGP_ID\*\*|${branch_asn}|g" $config_file_local
+        # eval "branch_ip=\"\${branch${branch_id}_ip}\""
+        branch_ip=$(az network public-ip show -n branch${branch_id}-pip -g $rg -o tsv --query ipAddress)
+        # The remote alias includes the -n flag, which does not work with EOF
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch_ip <<EOF
+        config t
+            file prompt quiet
+EOF
+        echo "Sending config to IP $branch_ip..."
+        scp $config_file_local ${branch_ip}:/${config_file_csr}
+        # echo "Verifying file bootflash:${config_file_csr}:"
+        # remote $branch_ip "dir bootflash:${config_file_csr}"
+        remote $branch_ip "copy bootflash:/${config_file_csr} running-config"
+        # Additional routing config
+        default_gateway="10.${hub_id}.20${branch_id}.1"
+        loopback_ip="${branch_id}.${branch_id}.${branch_id}.${branch_id} 255.255.255.255"
+        # loopback_ip="10.${hub_id}.20${branch_id}.129 255.255.255.192"
+        myip=$(curl -s4 ifconfig.co)
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch_ip <<EOF
+        config t
+            interface Loopback0
+                ip address ${loopback_ip}
+            router bgp ${branch_asn}
+                redistribute connected
+            ip route ${vpngw1_gw0_pip} 255.255.255.255 ${default_gateway}
+            ip route ${vpngw1_gw1_pip} 255.255.255.255 ${default_gateway}
+            ip route ${vpngw2_gw0_pip} 255.255.255.255 ${default_gateway}
+            ip route ${vpngw2_gw1_pip} 255.255.255.255 ${default_gateway}
+            ip route ${myip} 255.255.255.255 ${default_gateway}
+        end
+EOF
+        # Save config and check
+        remote $branch_ip "wr mem"
+        # remote $branch_ip "sh ip int b"
     fi
 }
 
@@ -1229,6 +1378,7 @@ function create_hub {
         --arg sku "Standard" \
         --arg hub_prefix $hub_prefix \
         $vhub_json)
+    echo "Creating hub hub${hub_id} in $location with prefix ${hub_prefix}..."
     az rest --method put --uri $vhub_uri --body $vhub_json_string >/dev/null    # PUT
 }
 
@@ -1272,7 +1422,7 @@ az network firewall policy rule-collection-group collection add-filter-collectio
     --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
     --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 >/dev/null
 az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
-    --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 --rule-type ApplicationRule
+    --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 --rule-type ApplicationRule >/dev/null
 # Example application collection with wildcards (*.ubuntu.com)
 echo "Creating rule to allow *.ubuntu.com..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -1347,7 +1497,7 @@ function get_spoke_prefix {
     hub_id=$1
     spoke_id=$2
     userspoke_id=$3
-    echo "10.${hub_id}.${spoke_id}.0/24"
+    echo "10.${hub_id}.${spoke_id}${userspoke_id}.0/24"
 }
 
 # Return the private IP of the VM in a spoke
@@ -1392,7 +1542,7 @@ function connect_spoke {
     elif [ -n "$ZSH_VERSION" ]; then
         arr_opt=A
     fi
-    echo "Waiting for hub $hub_name to reach the Succeeded state..."
+    echo "Waiting for hub $hub_name and related objects to reach the Succeeded state..."
     wait_until_hub_finished $hub_name
     # Check: if hub is Failed, we can try to reset it
     # We dont do this inside of the wait_until_hub_finished function because we could have infinite recursion
@@ -1403,7 +1553,7 @@ function connect_spoke {
         reset_vhub "$hub_name"
         wait_until_hub_finished "$hub_name"
     fi
-    # Check: if hub is still Failed, do not create the connection
+    # Check: if hub is still Failed, do not do anything
     hub_state=$(get_vhub_state "$hub_name")
     if [[ "$hub_state" == "Succeeded" ]]
     then
@@ -1570,7 +1720,8 @@ function create_csr {
     branch_ip=$(az network public-ip show -n branch${branch_id}-pip -g $rg --query ipAddress -o tsv)
     echo "CSR created with IP address $branch_ip. Creating vwan VPN sites now..."
     # Create site
-    create_site $hub_id $branch_id $branch_ip $branch_bgp_ip
+    # create_site called from connect_branch
+    # create_site $hub_id $branch_id $branch_ip $branch_bgp_ip
 }
 
 function create_site {
@@ -1578,7 +1729,7 @@ function create_site {
     branch_id=$2
     branch_public_ip=$3
     branch_private_ip=$4
-    site_name="branch${branch_id}"
+    site_name="hub${hub_id}branch${branch_id}"
     branch_name="branch${hub_id}${branch_id}"
     branch_asn="6550${branch_id}"
     location=$(get_location $hub_id)
@@ -1594,7 +1745,7 @@ function create_site {
         --arg security 'false' \
         $vpnsite_json)
     vpnsite_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/${site_name}?api-version=$vwan_api_version"
-    echo "Creating site $branch_name (hub${hub_id} to branch$branch_id)..."
+    echo "Creating site $site_name (hub${hub_id} to branch$branch_id)..."
     az rest --method put --uri $vpnsite_uri --body $vpnsite_json_string >/dev/null # PUT
 }
 
@@ -1616,6 +1767,147 @@ function branch_cmd {
         echo "\"$cmd\" on CSR with IP ${branch_ip}..."
         remote $branch_ip "$cmd"
     done <<< "$branch_ip_list"
+}
+
+######################
+#  Effective routes  #
+######################
+
+function get_async_routes {
+    uri=$1
+    body=$2
+    location=$(az rest --method post --uri $uri --body $body --debug 2>&1 | grep Location | cut -d\' -f 4)
+    echo "Waiting to get info from $location..."
+    wait_interval=5
+    sleep $wait_interval
+    table=$(az rest --method get --uri $location --query 'value')
+    # table=$(az rest --method get --uri $location --query 'value[]' -o table | sed "s|/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/vwanlab2/providers/Microsoft.Network||g")
+    until [[ -n "$table" ]]
+    do
+        sleep $wait_interval
+        table=$(az rest --method get --uri $location --query 'value')
+    done
+    # Remove verbosity
+    table=$(echo $table | sed "s|/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network||g")
+    table=$(echo $table | sed "s|/virtualHubs/||g")
+    table=$(echo $table | sed "s|/vpnGateways/||g")
+    table=$(echo $table | sed "s|/hubVirtualNetworkConnections||g")
+    # echo $table | jq
+    echo "Route Origin\tAddress Prefixes\tNext Hop Type\tNext Hops\tAS Path"
+    echo $table | jq -r '.[] | "\(.routeOrigin)\t\(.addressPrefixes[])\t\(.nextHopType)\t\(.nextHops[])\t\(.asPath)"'
+}
+
+function effective_routes_nic {
+    hub_id=$1
+    spoke_id=$2
+    userspoke_id=$3
+    nic_name=spoke${hub_id}${spoke_id}${userspoke_id}-jumphostVMNic
+    az network nic show-effective-route-table -n $nic_name -g $rg -o table
+}
+
+function effective_routes_rt {
+    hub_name=$1
+    rt_name=$2
+    rt_id="/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/$hub_name/hubRouteTables/$rt_name"
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
+    body="{\"resourceId\": \"$rt_id\", \"virtualWanResourceType\": \"RouteTable\"}"
+    get_async_routes $uri $body
+}
+
+function effective_routes_vpncx {
+    hub_name=$1
+    vpncx_name=$2
+    vpngw_id=$(az network vhub show -n ${hub_name} -g $rg --query vpnGateway.id -o tsv)
+    vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    vpncx_id=$(az network vpn-gateway connection show -n $vpncx_name --gateway-name $vpngw_name -g $rg --query id -o tsv)
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
+    body="{\"resourceId\": \"$vpncx_id\", \"virtualWanResourceType\": \"VpnConnection \"}"
+    get_async_routes $uri $body
+}
+
+function effective_routes_vnetcx {
+    hub_name=$1
+    cx_name=$2
+    cx_id=$(az network vhub connection show -n $cx_name --vhub-name $hub_name -g $rg --query id -o tsv)
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
+    body="{\"resourceId\": \"$cx_id\", \"virtualWanResourceType\": \"ExpressRouteConnection\"}"
+    get_async_routes $uri $body
+}
+
+function effective_routes_hub {
+    hub_name=$1
+    cx_name=$2
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
+    body=""
+    get_async_routes $uri $body
+}
+
+######################
+# Specific scenarios #
+######################
+
+function any_to_any {
+    # Virtual Hubs
+    hubs=$(list_vhub)
+    while IFS= read -r hub_name; do
+        # Route tables
+        rts=$(list_rt $hub_name)
+        if [[ -n "$rts" ]]
+        then
+            while IFS= read -r rt_name; do
+                if [[ "$rt_name" == "defaultRouteTable" ]]
+                then
+                    echo "Deleting static routes from ${hub_name}/${rt_name}..."
+                    rt_delete_routes $hub_name $rt_name
+                    echo "Adding default label to ${hub_name}/${rt_name}..."
+                    # First clear all labels, then add the right one
+                    rt_delete_labels $hub_name $rt_name 
+                    rt_add_label $hub_name $rt_name default
+                elif [[ "$rt_name" == "noneRouteTable" ]]
+                then
+                    echo "Adding none label to ${hub_name}/${rt_name}..."
+                    # First clear all labels, then add the right one
+                    rt_delete_labels $hub_name $rt_name 
+                    rt_add_label $hub_name $rt_name none
+                else
+                    echo "Deleting route table ${hub_name}/${rt_name}..."
+                    delete_rt $hub_name $rt_name
+                fi
+                
+            done <<< "$rts"
+        else
+            echo "No route tables in hub $hub_name"
+        fi
+        # Vnet connections
+        vnet_cxs=$(list_vnetcx $hub_name)
+        if [[ -n "$vnet_cxs" ]]
+        then
+            while IFS= read -r vnetcx_name; do
+                echo "Setting vnet connection ${hub_name}/${vnetcx_name} to associate/propagate to default..."
+                cx_set_rt hub1 spoke11 defaultRouteTable defaultRouteTable default
+                echo "Deleting static routes from vnet connection ${hub_name}/${vnetcx_name}..."
+                cx_delete_routes $hub_name $cx_name
+            done <<< "$vnet_cxs"
+        else
+            echo "No vnet connections in hub $hub_name"
+        fi
+    done <<< "$hubs"
+    # VPN connections
+    vpngws=$(list_vpngw)
+    while IFS= read -r gw_name; do
+        hub_id=${gw_name: -1}       # This might not always work...
+        echo "Looking for VPN connections in gateway ${gw_name}, hub ID $hub_id..."
+        vpn_cxs=$(list_vpncx $gw_name)
+        if [[ -n "$vpn_cxs" ]]
+        then
+            while IFS= read -r vpncx_name; do
+                echo "Setting VPN connection ${gw_name}/${vpncx_name} to associate/propagate to default"
+                vpncx_set_prop_rt $hub_id $vpncx_name hub${hub_id}/defaultRouteTable default
+            done <<< "$vpn_cxs"
+        else
+            echo "No VPN connections in gateway $gw_name"
+        fi
+    done <<< "$vpngws"
 }
 
 ###################
