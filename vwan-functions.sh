@@ -1750,12 +1750,12 @@ function create_site {
 }
 
 ##################
-# Configure CSRs #
+# Remote access  #
 ##################
 
 # Sends a command to all branches
 # Example: branch_cmd "show ip route bgp"
-function branch_cmd {
+function remote_branch_all {
     if [[ -z "$1" ]]
     then
         cmd="sh ip int b"
@@ -1767,6 +1767,13 @@ function branch_cmd {
         echo "\"$cmd\" on CSR with IP ${branch_ip}..."
         remote $branch_ip "$cmd"
     done <<< "$branch_ip_list"
+}
+
+function remote_cmd {
+    pip_name=$1-pip
+    cmd=$2
+    pip_ip=$(az network public-ip show -g $rg -n $pip_name -o tsv --query ipAddress)
+    remote $pip_ip "$cmd"
 }
 
 ######################
