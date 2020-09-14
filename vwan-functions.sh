@@ -3,15 +3,15 @@
 # May 2020
 #
 # Contains functions to manage VWAN using the 2020-05-01 APIs for custom routing
-# Support for up to 3 locations;......../.
+# Support for up to 3 locations.
 ############################################################################
 
 # Variables
 # rg=vwantest         # RG to be defined in the main function
 # vwan_name=vwantest  # RG to be defined in the main function
 location1=westeurope
-location2=uksouth
-location3=westcentralus
+location2=westcentralus
+location3=uksouth
 password=Microsoft123!  # Used as IPsec PSK too
 publisher=cisco
 offer=cisco-csr-1000v
@@ -42,13 +42,19 @@ rt_json='{properties: {routes: [], labels: []}}'
 route_json='{name: $name, destinationType: "CIDR", destinations: [ $prefixes ], nextHopType: $type, nextHop: $nexthop }'
 cxroute_json='{name: $name, addressPrefixes: [ $prefixes ], nextHopIpAddress: $nexthop }'
 
+
+###############
+#   Aliases   #
+###############
+
+alias remote="ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no"
+
 ####################
 #  Wait functions  #
 ####################
 
-alias remote="ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no"
-
 wait_interval=5
+
 function wait_until_finished {
      resource_id=$1
      resource_name=$(echo $resource_id | cut -d/ -f 9)
@@ -73,20 +79,21 @@ function wait_until_finished {
 
 function wait_until_csr_finished {
     branch_id=$1
+    wait_interval_csr=30    # longer wait interval, since this is quite verbose
     echo "Waiting until CSR in branch${branch_id} is reachable..."
     # Wait until getting an IP
-    branch_ip=$(az network public-ip show -n branch${branch_id}-pip -g $rg --query ipAddress -o tsv 2>/dev/null)
+    branch_ip=$(az network public-ip show -n "branch${branch_id}-pip" -g $rg --query ipAddress -o tsv 2>/dev/null)
     until [[ -n "$branch_ip" ]]
     do
-        sleep $wait_interval
-        branch_ip=$(az network public-ip show -n branch${branch_id}-pip -g $rg --query ipAddress -o tsv 2>/dev/null)
+        sleep $wait_interval_csr
+        branch_ip=$(az network public-ip show -n "branch${branch_id}-pip" -g $rg --query ipAddress -o tsv 2>/dev/null)
     done
     # Wait until getting SSH output
     command="sho ver | i uptime"
     command_output=$(remote $branch_ip "$command" 2>/dev/null)
     until [[ -n "$command_output" ]]
     do
-        sleep $wait_interval
+        sleep $wait_interval_csr
         command_output=$(remote $branch_ip "$command")
     done
     echo "CSR is live, output to the command \"$command\" is $command_output"
@@ -116,7 +123,14 @@ function wait_until_hub_finished {
 
 function wait_until_gw_finished {
     gw_name=$1
+    # It can be that we do not get a valid GW ID at the first try
+    echo "Finding out ID for VPN gateway $gw_name..."
     gw_id=$(az network vpn-gateway show -n $gw_name -g $rg --query id -o tsv)
+    while [[ -z "$gw_id" ]]
+    do
+        sleep $wait_interval
+        gw_id=$(az network vpn-gateway show -n $gw_name -g $rg --query id -o tsv)
+    done
     wait_until_finished $gw_id
 }
 
@@ -779,6 +793,12 @@ function get_vpncx_labels {
     gw_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}?api-version=$vwan_api_version"
     az rest --method get --uri $gw_uri | jq -r '.properties.connections[] | select (.name == "'$cx_name'") | .properties.routingConfiguration.propagatedRouteTables.labels[]' | paste -sd, - 2>/dev/null
 }
+function get_vpncx {
+    gw_name=$1
+    cx_name=$2
+    gw_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}?api-version=$vwan_api_version"
+    az rest --method get --uri $gw_uri | jq -r '.properties.connections[] | select (.name == "'$cx_name'")' 2>/dev/null
+}
 function list_vpncx {
     gw_name=$1
     gw_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}?api-version=$vwan_api_version"
@@ -1193,8 +1213,10 @@ function connect_branch {
 function configure_csr {
     hub_id=$1
     branch_id=$2
-    vpngw_id=$(az network vhub show -n hub${hub_id} -g $rg --query vpnGateway.id -o tsv)
-    vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    # These 2 commands do not work if the GW has not been created yet
+    # vpngw_id=$(az network vhub show -n hub${hub_id} -g $rg --query vpnGateway.id -o tsv)
+    # vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    vpngw_name=hubvpn${hub_id}
     wait_until_gw_finished $vpngw_name
     wait_until_csr_finished $branch_id
     echo "Extracting IP information from VPN gateway $vpngw_name..."
@@ -1260,10 +1282,13 @@ function configure_csr_dualhomed {
     hub1_id=$1
     hub2_id=$2
     branch_id=$3
-    vpngw1_id=$(az network vhub show -n hub${hub1_id} -g $rg --query vpnGateway.id -o tsv)
-    vpngw1_name=$(echo $vpngw1_id | cut -d/ -f 9)
-    vpngw2_id=$(az network vhub show -n hub${hub2_id} -g $rg --query vpnGateway.id -o tsv)
-    vpngw2_name=$(echo $vpngw2_id | cut -d/ -f 9)
+    # These 2 commands do not work if the GW has not been created yet
+    # vpngw1_id=$(az network vhub show -n hub${hub1_id} -g $rg --query vpnGateway.id -o tsv)
+    # vpngw1_name=$(echo $vpngw1_id | cut -d/ -f 9)
+    vpngw1_name=hubvpn${hub1_id}
+    # vpngw2_id=$(az network vhub show -n hub${hub2_id} -g $rg --query vpnGateway.id -o tsv)
+    # vpngw2_name=$(echo $vpngw2_id | cut -d/ -f 9)
+    vpngw2_name=hubvpn${hub2_id}
     wait_until_gw_finished $vpngw1_name
     wait_until_gw_finished $vpngw2_name
     wait_until_csr_finished $branch_id
@@ -1427,7 +1452,7 @@ az network firewall policy rule-collection-group collection rule add -g $rg --po
 echo "Creating rule to allow *.ubuntu.com..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name ubuntu --collection-priority 202 --action Allow --rule-name repos --rule-type ApplicationRule --description "ubuntucom" \
-    --target-fqdns "*.ubuntu.com" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 >/dev/null
+    --target-fqdns '*.ubuntu.com' --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 >/dev/null
 }
 
 ###################
@@ -1718,7 +1743,7 @@ function create_csr {
     fi
     # Get public IP
     branch_ip=$(az network public-ip show -n branch${branch_id}-pip -g $rg --query ipAddress -o tsv)
-    echo "CSR created with IP address $branch_ip. Creating vwan VPN sites now..."
+    echo "CSR created with IP address $branch_ip"
     # Create site
     # create_site called from connect_branch
     # create_site $hub_id $branch_id $branch_ip $branch_bgp_ip
@@ -1843,7 +1868,6 @@ function effective_routes_vnetcx {
 
 function effective_routes_hub {
     hub_name=$1
-    cx_name=$2
     uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
     body=""
     get_async_routes $uri $body
@@ -1925,14 +1949,16 @@ function any_to_any {
 function get_help {
     echo 'These functions are defined:'
     echo 'Virtual hubs:'
+    echo '  create_vwan <vwan_name>: creates VWAN'
+    echo '  create_hub <hub_id> <vwan_name>: creates hub in a VWAN'
     echo '  get_vhub [hub_name]: get JSON for all or one hub'
     echo '  get_vhub_state [hub_name]: get state of all or one hub'
     echo '  reset_vhub <hub_name>: resends hub config'
     echo 'Virtual network connections:'
-    echo '  create_spokes <1|2|3> <no_of_spokes>: Creates a bunch of vnets in one location'
-    echo '  connect spoke <1|2|3> <spoke_id>': connects a spoke to a hub
-    echo '  connect userspoke <1|2|3> <spoke_id>': connects a spoke to an NVA vnet
-    echo '  disconnect spoke <1|2|3> <spoke_id>': connects a spoke to a hub
+    echo '  create_spokes <hub_id> <no_of_spokes>: Creates a bunch of vnets in one location'
+    echo '  connect_spoke <hub_id> <spoke_id>': connects a spoke to a hub
+    echo '  connect_userspoke <hub_id> <spoke_id>': connects a spoke to an NVA vnet
+    echo '  disconnect spoke <hub_id> <spoke_id>': disconnects a spoke from a hub
     echo '  get_vnetcx_state <hub_name> [cx_name]: JSON for all or one connections in a hub'
     echo '  get_vnetcx <hub_name> [cx_name]: state of all or one connections in a hub'
     echo '  get_cx_labels <hub_name> <cx_name>: get labels of a vnet connection'
@@ -1944,6 +1970,12 @@ function get_help {
     echo '  cx_set_prop_labels <hub_name> <cx_name> <label1,label2>: sets propagation labels for a connection'
     echo '  cx_delete_labels <hub_name> <cx_name>: deletes all propagating labels'
     echo '  reset_vhub_cx <hub_name> <cx_name>: resends vnet connection config'
+    echo '  get_spoke_ip <hub_id> <spoke_id> [userspoke_id]: gets the private IP of the VM in a spoke'
+    echo '  get_spoke_pip <hub_id> <spoke_id> [userspoke_id]: gets the public IP of the VM in a spoke'
+    echo 'NVA:'
+    echo '  convert_to_nva: converts the Ubuntu VM deployed in a vnet into an NVA'
+    echo '  create_userspoke <hub_id> <spoke_id> <userspoke_id>: creates an indirect spoke'
+    echo '  create_azfw_spoke <hub_id>: deploys a spoke vnet with an AzFW inside'
     echo 'Route tables:'
     echo '  create_rt <hub_name> <rt_name>: creates a route table'
     echo '  get_rt <hub_name> [rt_name]: JSON for all or one route table'
@@ -1955,13 +1987,13 @@ function get_help {
     echo '  delete_rt_labels <hub_name> <rt_name>: delete all labels of a route table'
     echo '  delete_rt <hub_name> <rt_name>: deletes a route table'
     echo 'VPN gateways:'
-    echo '  create_vpngw <1|2|3>: creates VPN gateway'
-    echo '  delete_vpngw <1|2|3>: deletes VPN gateway'
+    echo '  create_vpngw <hub_id>: creates VPN gateway'
+    echo '  delete_vpngw <hub_id>: deletes VPN gateway'
     echo '  get_vpngw [gw_name]: JSON for all or one VPN gateway'
     echo '  get_vpngw [gw_name]: JSON for all or one VPN gateway'
     echo '  get_vpngw_state: state of vpn gateways'
     echo 'VPN connections:'
-    echo '  connect_branch <1|2|3> <branch_id>: connect branch to hub'
+    echo '  connect_branch <hub_id> <branch_id>: connect branch to hub'
     echo '  configure_csr <hub_id> <branch_id>: configure a certain CSR to connect to a certain branch'
     echo '  get_vpngw_cx <gw_name> [site_name]: get JSON for all or one connections of a VPN gateway'
     echo '  get_vpngw_cx_state <gw_name>: get state for all or one connections of a VPN gateway'
@@ -1969,6 +2001,24 @@ function get_help {
     echo '  get_vpncx_labels <gw_name> <cx_name>: get labels for a connections of a VPN gateway'
     echo '  vpncx_set_prop_rt <gw_name> <cx_name> <rt1,rt2>: sets propagation labels for a connection'
     echo '  vpncx_set_prop_labels <gw_name> <cx_name> <label1,label2>: sets propagation labels for a connection'
+    echo 'Cisco CSR routers:'
+    echo '  connect_branch <hub_id> <branch_id>: creates a site a connects a CSR to a VPN gw'
+    echo '  configure_csr <hub_id> <branch_id>: configures CSR to connect to the VPN GW in a hub'
+    echo '  configure_csr_dualhomed <hub1_id> <hub2_id> <branch_id>: configures CSR to connect to the VPN GWs in 2 hubs'
+    echo 'Azure Firewall:'
+    echo '  create_azfw_policy: creates a preconfigured Azure Firewall policy'
+    echo '  create_fw <hub_id>: creates an Azure Firewall in a hub. Assumes a pre-created fw policy'
+    echo '  delete_fw <hub_id>: deletes the Azure Firewall in a hub'
+    echo 'Connectivity:'
+    echo '  remote <ip_address> <command>: sends a command to an IP address over SSH'
+    echo '  remote_branch_all <cmd>: sends a command to all CSRs'
+    echo '  remote_cmd <cx_name> <cmd>: sends a command to a vnet or vpn connection test device'
+    echo 'Effective routes:'
+    echo '  effective_routes_nic <hub_id> <spoke_id> [userspoke_id]: gets the effective routes of a NIC'
+    echo '  effective_routes_rt <hub_name> <rt_name>: gets the effective routes of a route table'
+    echo '  effective_routes_vpncx <hub_name> <cx_name>: gets the effective routes of a VPN connection'
+    echo '  effective_routes_vnetcx <hub_name> <cx_name>: gets the effective routes of a vnet connection'
+    echo '  effective_routes_hub <hub_name>: gets the effective routes of a hub'
     echo 'Summary:'
     echo '  labels: prints label configuration for all connections and route tables'
     echo '  routing: prints routing configuration for all connections and route tables'
