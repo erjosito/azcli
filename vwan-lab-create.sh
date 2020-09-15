@@ -41,6 +41,11 @@ create_hub 2 $vwan_name
 # Going sequentially here
 create_vpngw 1
 create_csr 1 1
+wait_until_gw_finished hubvpn1
+
+create_vpngw 2
+create_csr 2 2
+wait_until_gw_finished hubvpn2
 
 # Example of a single-homed branch (VPN tunnels to 1 hub):
 # configure_csr 1 1
@@ -50,9 +55,6 @@ create_csr 1 1
 configure_csr_dualhomed 1 2 1  # Configures CSR 1 to connect to hubs 1 and 2
 connect_branch 1 1  # Connect hub1 to branch1
 connect_branch 2 1  # Connect hub2 to branch1
-
-create_vpngw 2
-create_csr 2 2
 
 # Example of a single-homed branch (VPN tunnels to 1 hub):
 # configure_csr 2 2
@@ -97,20 +99,33 @@ create_rt hub1 hub1VnetRT vnet
 create_rt hub2 hub2VnetRT vnet
 
 # Modify vnet connections
-cx_set_rt hub1 spoke11 hub1VnetRT hub2/hub1VnetRT
+cx_set_rt hub1 spoke11 hub1VnetRT hub2/hub2VnetRT
 cx_set_prop_labels hub1 spoke11
-cx_set_rt hub1 spoke12 hub1VnetRT hub2/hub1VnetRT
+cx_set_rt hub1 spoke12 hub1VnetRT hub2/hub2VnetRT
 cx_set_prop_labels hub1 spoke12
-cx_set_rt hub2 spoke21 hub1VnetRT hub1/hub1VnetRT
+cx_set_rt hub2 spoke21 hub2VnetRT hub1/hub1VnetRT
 cx_set_prop_labels hub2 spoke21
-cx_set_rt hub2 spoke22 hub1VnetRT hub1/hub1VnetRT
+cx_set_rt hub2 spoke22 hub2VnetRT hub1/hub1VnetRT
 cx_set_prop_labels hub2 spoke22
 
 # Modify vpn connections
-vpncx_set_prop_rt 1 branch1 hub1/defaultRouteTable,hub1/hub2VnetRT default,vnet
-vpncx_set_prop_rt 1 branch2 hub1/defaultRouteTable,hub1/hub2VnetRT default,vnet
+vpncx_set_prop_rt 1 branch1 hub2/defaultRouteTable,hub2/hub2VnetRT
+vpncx_set_prop_rt 1 branch2 hub2/defaultRouteTable,hub2/hub2VnetRT
+vpncx_set_prop_rt 2 branch1 hub1/defaultRouteTable,hub1/hub1VnetRT
+vpncx_set_prop_rt 2 branch2 hub1/defaultRouteTable,hub1/hub1VnetRT
+
+# Delete vpn prop labels
+vpncx_set_prop_labels hubvpn1 branch1
+vpncx_set_prop_labels hubvpn1 branch2
+vpncx_set_prop_labels hubvpn2 branch1
+vpncx_set_prop_labels hubvpn2 branch2
+
+# Set vpn connections to default propagation
+vpncx_set_prop_rt 1 branch1 hub1/defaultRouteTable,hub1/hub1VnetRT default,vnet
+vpncx_set_prop_rt 1 branch2 hub1/defaultRouteTable,hub1/hub1VnetRT default,vnet
 vpncx_set_prop_rt 2 branch1 hub2/defaultRouteTable,hub2/hub2VnetRT default,vnet
 vpncx_set_prop_rt 2 branch2 hub2/defaultRouteTable,hub2/hub2VnetRT default,vnet
+
 
 # Create static routes in route tables for Secure Virtual Hub
 rt_add_route 1 defaultRouteTable "10.0.0.0/16" "$(get_azfw_id 1)"

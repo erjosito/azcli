@@ -461,7 +461,7 @@ function vpncx_set_prop_rt {
     hub_id=$1
     cx_name=$2
     gw_id=$(az network vhub show -n hub${hub_id} -g $rg --query vpnGateway.id -o tsv)
-    gw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    gw_name=$(echo $gw_id | cut -d/ -f 9)
     echo "Setting routing for VPN connection $cx_name in gateway $gw_name..."
     uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}?api-version=$vwan_api_version"
     if [ -n "$BASH_VERSION" ]; then
@@ -1367,6 +1367,20 @@ EOF
     fi
 }
 
+function get_vpngw_ips {
+    hub_id=$1
+    vpngw_name=hubvpn${hub_id}
+    echo "Extracting IP information from VPN gateway $vpngw_name..."
+    vpngw_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/$vpngw_name?api-version=$vwan_api_version"
+    vpngw=$(az rest --method get --uri $vpngw_uri)
+    vpngw_gw0_pip=$(echo $vpngw | jq -r '.properties.ipConfigurations[0].publicIpAddress')
+    vpngw_gw1_pip=$(echo $vpngw | jq -r '.properties.ipConfigurations[1].publicIpAddress')
+    vpngw_gw0_bgp_ip=$(echo $vpngw | jq -r '.properties.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
+    vpngw_gw1_bgp_ip=$(echo $vpngw | jq -r '.properties.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
+    echo "Extracted info for vpngw: Gateway0 $vpngw_gw0_pip, $vpngw_gw0_bgp_ip. Gateway1 $vpngw_gw1_pip, $vpngw_gw1_bgp_ip."
+ }
+
+
 ############################
 #  Create VWAN and hubs    #
 ############################
@@ -1429,13 +1443,13 @@ function create_azfw_policy {
 # Allow SSH
 echo "Creating rule to allow SSH..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-    --name filter01 --collection-priority 101 --action Allow --rule-name allowSSH --rule-type NetworkRule --description "TCP 22" \
-    --destination-addresses "10.0.0.0/8" --source-addresses "10.0.0.0/8" --ip-protocols TCP --destination-ports 22 >/dev/null
+    --name mgmt --collection-priority 101 --action Allow --rule-name allowSSH --rule-type NetworkRule --description "TCP 22" \
+    --destination-addresses "10.0.0.0/8,1.1.1.1/32,2.2.2.2/32,3.3.3.3/32" --source-addresses "10.0.0.0/8,1.1.1.1/32,2.2.2.2/32,3.3.3.3/32" --ip-protocols TCP --destination-ports 22 >/dev/null
 # Allow ICMP
-echo "Creating rule to allow ICMP..."
-az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-    --name filter02 --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
-    --destination-addresses "10.0.0.0/8" --source-addresses "10.0.0.0/8" --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
+# echo "Creating rule to allow ICMP..."
+# az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+#     --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
+#     --destination-addresses "10.0.0.0/8,1.1.1.1/32,2.2.2.2/32,3.3.3.3/32" --source-addresses "10.0.0.0/8,1.1.1.1/32,2.2.2.2/32,3.3.3.3/32" --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
 # Allow NTP
 echo "Creating rule to allow NTP..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -1801,6 +1815,19 @@ function remote_cmd {
     remote $pip_ip "$cmd"
 }
 
+function ssh_to {
+    pip_name=$1-pip
+    pip_ip=$(az network public-ip show -g $rg -n $pip_name -o tsv --query ipAddress)
+    ssh $pip_ip
+}
+
+function ssh_through {
+    pip1_name=$1-pip
+    pip1_ip=$(az network public-ip show -g $rg -n $pip1_name -o tsv --query ipAddress)
+    ssh -J $pip1_ip $2
+}
+
+
 ######################
 #  Effective routes  #
 ######################
@@ -1991,7 +2018,8 @@ function get_help {
     echo '  delete_vpngw <hub_id>: deletes VPN gateway'
     echo '  get_vpngw [gw_name]: JSON for all or one VPN gateway'
     echo '  get_vpngw [gw_name]: JSON for all or one VPN gateway'
-    echo '  get_vpngw_state: state of vpn gateways'
+    echo '  get_vpngw_state [gw_name]: state of vpn gateways'
+    echo '  get_vpngw_ips <hub_id>: get IP address of VPN gateways in hub'
     echo 'VPN connections:'
     echo '  connect_branch <hub_id> <branch_id>: connect branch to hub'
     echo '  configure_csr <hub_id> <branch_id>: configure a certain CSR to connect to a certain branch'
@@ -2013,6 +2041,8 @@ function get_help {
     echo '  remote <ip_address> <command>: sends a command to an IP address over SSH'
     echo '  remote_branch_all <cmd>: sends a command to all CSRs'
     echo '  remote_cmd <cx_name> <cmd>: sends a command to a vnet or vpn connection test device'
+    echo '  ssh_to <cx_name>: ssh to the VM in a spoke or a branch'
+    echo '  ssh_through <cx_name> <ip>: ssh through a VM in a spoke or a branch to an IP'
     echo 'Effective routes:'
     echo '  effective_routes_nic <hub_id> <spoke_id> [userspoke_id]: gets the effective routes of a NIC'
     echo '  effective_routes_rt <hub_name> <rt_name>: gets the effective routes of a route table'
