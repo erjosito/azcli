@@ -83,6 +83,11 @@ az aks create -g $rg -n $aks_name -l $location \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
     --no-wait
 
+# Other options you can use in the previous command
+    # --enable-private-cluster \
+    # --dns-name-prefix cloudtrooper \
+
+
 # Get credentials for kubectl
 az aks list -o table
 az aks get-credentials -n $aks_name -g $rg --overwrite

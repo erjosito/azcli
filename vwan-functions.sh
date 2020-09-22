@@ -463,7 +463,7 @@ function vpncx_set_prop_rt {
     gw_id=$(az network vhub show -n hub${hub_id} -g $rg --query vpnGateway.id -o tsv)
     gw_name=$(echo $gw_id | cut -d/ -f 9)
     echo "Setting routing for VPN connection $cx_name in gateway $gw_name..."
-    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}?api-version=$vwan_api_version"
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}/vpnConnections/${cx_name}?api-version=$vwan_api_version"
     if [ -n "$BASH_VERSION" ]; then
         arr_opt=a
     elif [ -n "$ZSH_VERSION" ]; then
@@ -473,7 +473,7 @@ function vpncx_set_prop_rt {
     hub_id=$(az network vpn-gateway show -n $gw_name -g $rg --query 'virtualHub.id' -o tsv)
     hub_name=$(echo $hub_id | cut -d/ -f 9)
     new_rt_ids=""
-    for new_proprt_name in ${new_rt_names[@]}
+    for new_proprt_name in "${new_rt_names[@]}"
     do
         # support both formats: hub/rt and rt (defaults to local hub)
         proprt_hub_name=$(echo $new_proprt_name | cut -d/ -f 1)
@@ -486,13 +486,15 @@ function vpncx_set_prop_rt {
         new_rt_ids="${new_rt_ids}{\"id\": \"/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${proprt_hub_name}/hubRouteTables/${proprt_rt_name}\"},"
     done
     new_rt_ids="${new_rt_ids: : -1}"   # Remove trailing comma
-    vpn_json=$(az rest --method get --uri $uri)
-    connections=$(echo $vpn_json | jq '.properties.connections | map({name, properties})')
+    vpncx_json=$(az rest --method get --uri $uri)
+    vpncx_json=$(echo $vpncx_json | jq '{name, properties}')
     # Remove unneeded attributes
-    connections=$(echo $connections | jq 'del(.[].properties.vpnLinkConnections[].resourceGroup)')
-    connections=$(echo $connections | jq 'del(.[].properties.vpnLinkConnections[].etag)')
-    connections=$(echo $connections | jq 'del(.[].properties.vpnLinkConnections[].type)')
-    connections_updated=$(echo $connections | jq 'map(if .name=="'$cx_name'" then .properties.routingConfiguration.propagatedRouteTables.ids=['"$new_rt_ids"'] else . end)')
+    vpncx_json=$(echo $vpncx_json | jq 'del(.properties.vpnLinkConnections[].resourceGroup)')
+    vpncx_json=$(echo $vpncx_json | jq 'del(.properties.vpnLinkConnections[].etag)')
+    vpncx_json=$(echo $vpncx_json | jq 'del(.properties.vpnLinkConnections[].type)')
+    # Update routing config
+    # echo "Setting route table ids to $new_rt_ids..."
+    vpncx_json_updated=$(echo $vpncx_json | jq '.properties.routingConfiguration.propagatedRouteTables.ids=['"$new_rt_ids"']')
     # Optionally, set labels
     if [[ -n "$4" ]]
     then
@@ -502,20 +504,22 @@ function vpncx_set_prop_rt {
             new_labels_txt="${new_labels_txt}\"${new_label}\","
         done
         new_labels_txt="${new_labels_txt: : -1}"   # Remove trailing comma
-        connections_updated=$(echo $connections_updated | jq 'map(if .name=="'$cx_name'" then .properties.routingConfiguration.propagatedRouteTables.labels=['"$new_labels_txt"'] else . end)')
+        # echo "Setting labels to $new_labels_txt..."
+        vpncx_json_updated=$(echo $vpncx_json_updated | jq '.properties.routingConfiguration.propagatedRouteTables.labels=['"$new_labels_txt"']')
     fi
-    # Send JSON
-    vpn_json_updated=$(echo $vpn_json | jq '.properties.connections = '${connections_updated}' | {name, properties, location}')
+    # Wait for the vpn gw to be Suceeded
     wait_until_gw_finished $gw_name
-    az rest --method put --uri $uri --body $vpn_json_updated >/dev/null
+    # Send JSON
+    az rest --method put --uri $uri --body $vpncx_json_updated >/dev/null
 }
 
-# Set propagation labels
-# If prop labels empty, clear the labels
+
+# Using vpncx URI
+# https://docs.microsoft.com/en-us/rest/api/virtualwan/vpnconnections/createorupdate
 function vpncx_set_prop_labels {
     gw_name=$1
     cx_name=$2
-    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}?api-version=$vwan_api_version"
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${gw_name}/vpnConnections/${cx_name}?api-version=$vwan_api_version"
     hub_id=$(az network vpn-gateway show -n $gw_name -g $rg --query 'virtualHub.id' -o tsv)
     hub_name=$(echo $hub_id | cut -d/ -f 9)
     if [[ -n "$3" ]]
@@ -534,17 +538,20 @@ function vpncx_set_prop_labels {
     else
         new_labels_txt=""
     fi
-    vpn_json=$(az rest --method get --uri $uri)
-    connections=$(echo $vpn_json | jq '.properties.connections | map({name, properties})')
+    # Get current JSON
+    vpncx_json=$(az rest --method get --uri $uri)
     # Remove unneeded attributes
-    connections=$(echo $connections | jq 'del(.[].properties.vpnLinkConnections[].resourceGroup)')
-    connections=$(echo $connections | jq 'del(.[].properties.vpnLinkConnections[].etag)')
-    connections=$(echo $connections | jq 'del(.[].properties.vpnLinkConnections[].type)')
-    connections_updated=$(echo $connections | jq 'map(if .name=="'$cx_name'" then .properties.routingConfiguration.propagatedRouteTables.labels=['"$new_labels_txt"'] else . end)')
-    vpn_json_updated=$(echo $vpn_json | jq '.properties.connections = '${connections_updated}' | {name, properties, location}')
+    vpncx_json=$(echo $vpncx_json | jq 'del(.properties.vpnLinkConnections[].resourceGroup)')
+    vpncx_json=$(echo $vpncx_json | jq 'del(.properties.vpnLinkConnections[].etag)')
+    vpncx_json=$(echo $vpncx_json | jq 'del(.properties.vpnLinkConnections[].type)')
+    # Update routing config
+    vpncx_json_updated=$(echo $vpncx_json | jq '.properties.routingConfiguration.propagatedRouteTables.labels=['"$new_labels_txt"'] | {name, properties}')
+    # Wait for the vpn gw to be Suceeded
     wait_until_gw_finished $gw_name
-    az rest --method put --uri $uri --body $vpn_json_updated >/dev/null
+    # PUT new JSON
+    az rest --method put --uri $uri --body $vpncx_json_updated >/dev/null
 }
+
 
 # Update vnet connection associated and propagated RT at the same time
 # example: cx_set_rt hub1 spoke1 redRT redRT,defaultRouteTable
@@ -1444,12 +1451,12 @@ function create_azfw_policy {
 echo "Creating rule to allow SSH..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name mgmt --collection-priority 101 --action Allow --rule-name allowSSH --rule-type NetworkRule --description "TCP 22" \
-    --destination-addresses "10.0.0.0/8,1.1.1.1/32,2.2.2.2/32,3.3.3.3/32" --source-addresses "10.0.0.0/8,1.1.1.1/32,2.2.2.2/32,3.3.3.3/32" --ip-protocols TCP --destination-ports 22 >/dev/null
+    --destination-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --source-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --ip-protocols TCP --destination-ports 22 >/dev/null
 # Allow ICMP
 # echo "Creating rule to allow ICMP..."
 # az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
 #     --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
-#     --destination-addresses "10.0.0.0/8,1.1.1.1/32,2.2.2.2/32,3.3.3.3/32" --source-addresses "10.0.0.0/8,1.1.1.1/32,2.2.2.2/32,3.3.3.3/32" --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
+#     --destination-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --source-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
 # Allow NTP
 echo "Creating rule to allow NTP..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -1893,11 +1900,12 @@ function effective_routes_vnetcx {
     get_async_routes $uri $body
 }
 
+# Not working
 function effective_routes_hub {
     hub_name=$1
     uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
     body=""
-    get_async_routes $uri $body
+    get_async_routes $uri $body  # This does not work yet
 }
 
 ######################
