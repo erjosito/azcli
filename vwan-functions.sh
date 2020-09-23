@@ -1714,6 +1714,89 @@ function create_userspoke {
                 --subnet jumphost --subnet-address-prefix $subnet_prefix --private-ip-address $vm_ip --no-wait
 }
 
+# Creates "user spoke" or "nva spoke", a vnet peered to a vhub spoke (but not to a vhub)
+# Example: create_userspoke 2 5 1 (creates userspoke 1 peered to spoke 5 in location2)
+function create_branchvm {
+    hub_id=$1
+    branch_id=$2
+    location=$(get_location $hub_id)
+    hub_name=hub${hub_id}
+    branch_name=branch${branch_id}
+    branch_bgp_ip="10.${hub_id}.20${branch_id}.10"
+    branch_asn="6550${branch_id}"
+    vm_name=${branch_name}vm
+    pip_name=${vm_name}-pip
+    branch_vnet_prefix="10.${hub_id}.20${branch_id}.0/24"
+    subnet_prefix="10.${hub_id}.20${branch_id}.192/26"
+    vm_ip=10.${hub_id}.20${branch_id}.200
+    vm_id=$(az vm show -n $vm_name -g $rg --query id -o tsv 2>/dev/null)
+    if [[ -z "$vm_id" ]]
+    then
+        echo "Creating VM ${vm_name}..."
+        az vm create -n ${vm_name} -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --size $vm_size \
+                    --public-ip-address $pip_name --vnet-name $branch_name \
+                    --subnet vm --subnet-address-prefix $subnet_prefix --private-ip-address $vm_ip --no-wait
+    else
+        echo "VM ${vm_name} already exists"
+    fi
+    # Route table to send everything to the CSR
+    rt_id=$(az network route-table show -n $vm_name -g $rg --query id -o tsv 2>/dev/null)
+    if [[ -z "$rt_id" ]]
+    then
+        echo "Creating route table ${vm_name} in $location..."
+        az network route-table create -n ${vm_name} -g $rg -l $location >/dev/null
+        az network route-table route create -n default -g $rg \
+                --route-table-name ${vm_name} \
+                --address-prefix "0.0.0.0/0" \
+                --next-hop-type VirtualAppliance \
+                --next-hop-ip-address $branch_bgp_ip >/dev/null
+        az network route-table route create -n default -g $rg \
+                --route-table-name ${vm_name} \
+                --address-prefix "0.0.0.0/0" \
+                --next-hop-type VirtualAppliance \
+                --next-hop-ip-address $branch_bgp_ip >/dev/null
+        mypip=$(curl -s4 ifconfig.co)
+        az network route-table route create -n mypc -g $rg \
+            --route-table-name $vm_name --address-prefix "${mypip}/32" \
+            --next-hop-type Internet >/dev/null
+        az network vnet subnet update -n vm \
+            --vnet-name $branch_name -g $rg \
+            --route-table $vm_name >/dev/null 2>/dev/null
+    else
+        echo "Route table ${vm_name} already exists"
+    fi
+    # NIC forwarding in the CSR
+    csr_vm_name=${branch_name}-nva
+    echo "Configuring IP forwarding in NIC of VM ${csr_vm_name}..."
+    csr_nic_id=$(az vm show -n $csr_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $csr_nic_id --ip-forwarding >/dev/null
+    # Configure the CSR to advertise the route
+    echo "Configuring CSR to advertise Vnet prefix $branch_vnet_prefix..."
+    branch_ip=$(az network public-ip show -n branch${branch_id}-pip -g $rg --query ipAddress -o tsv)
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch_ip <<EOF
+    config t
+        ip route 10.${hub_id}.20${branch_id}.0 255.255.255.0 Null0
+        ip route 10.${hub_id}.20${branch_id}.192 255.255.255.192 10.${hub_id}.20${branch_id}.1
+        ip prefix-list StoB permit $branch_vnet_prefix
+        route-map StoB
+            match ip address prefix-list StoB
+        router bgp $branch_asn
+            redistribute static route-map StoB
+EOF
+    # Note: it might be required adding an outbound rule in the NVA and the VM NSG
+    echo "Modifying NSGs to allow traffic..."
+    az network nsg rule create -g $rg --nsg-name "${vm_name}NSG" --priority 200 \
+        --direction Outbound --name allow_out_to_10 --access Allow \
+        --protocol '*' \
+        --source-address-prefixes '*' --source-port-ranges '*' \
+        --destination-address-prefixes '10.0.0.0/8' --destination-port-ranges '*' >/dev/null
+    az network nsg rule create -g $rg --nsg-name "${csr_vm_name}NSG" --priority 200 \
+        --direction Outbound --name allow_out_to_10 --access Allow \
+        --protocol '*' \
+        --source-address-prefixes '*' --source-port-ranges '*' \
+        --destination-address-prefixes '10.0.0.0/8' --destination-port-ranges '*' >/dev/null
+}
+
 # Peer "userspoke" (aka "indirect spoke" or "nva spoke") to vwan spoke
 # Ex: connect_userspoke 2 5 1 (peer userspoke1 to spoke25)
 function connect_userspoke {
@@ -1825,6 +1908,7 @@ function remote_cmd {
 function ssh_to {
     pip_name=$1-pip
     pip_ip=$(az network public-ip show -g $rg -n $pip_name -o tsv --query ipAddress)
+    echo "Connecting to $pip_ip..."
     ssh $pip_ip
 }
 

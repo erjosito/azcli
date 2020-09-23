@@ -1,0 +1,14 @@
+# Variables
+rg=vwanlab2
+vwan_name=vwan
+location1=westeurope
+location2=westcentralus
+
+# Create VWAN and vhubs
+az network vwan create -n $vwan_name -g $rg
+az network vhub create -n "hub1" --vwan $vwan_name -g $rg -l $location1
+az network vhub create -n "hub1" --vwan $vwan_name -g $rg -l $location2
+
+# Diagnostics
+az network vhub route-table list --vhub-name hub1 -g $rg -o table
+az network vhub connection list --vhub-name hub1 -g $rg -o table
