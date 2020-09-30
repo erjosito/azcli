@@ -1,0 +1,343 @@
+#################################
+# Created by Jose Moreno
+# July 2020
+#
+# Some useful commands around AKS
+#################################
+
+# Variables
+rg=akstest3
+location=westeurope
+keyvaultname=erjositoKeyvault
+keyvault_rg=myKeyvault
+wait_interval=5s
+# AKS
+aks_name=aks
+aks_rbac=yes
+aks_service_cidr=10.0.0.0/16
+vmsize=Standard_B2ms
+vm_size=Standard_B2ms
+preview_version=no
+# App Gateway
+appgw_pip_name=appgw-pip
+appgw_name=aksappgw
+appgw_sku=Standard_v2
+# Vnet
+vnet_name=aksVnet
+vnet_prefix=10.13.0.0/16
+aks_subnet_name=aks
+aks_subnet_prefix=10.13.76.0/24
+vm_subnet_name=vm
+vm_subnet_prefix=10.13.1.0/24
+appgw_subnet_name=AppGateway
+appgw_subnet_prefix=10.13.10.0/24
+azfw_subnet_prefix=10.13.11.0/24
+apim_subnet_prefix=10.13.12.0/24
+db_subnet_prefix=10.13.50.0/24
+akslb_subnet_prefix=10.13.77.0/24
+arm_subnet_prefix=10.13.79.0/24
+aci_subnet_prefix=10.13.100.0/24
+# Other
+logws_name=log$RANDOM
+kv_name=erjositoKeyvault
+acr_name=erjositoAcr
+
+####################
+# Helper functions #
+####################
+
+# Wait for GW to be created
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
+##################
+# Enable feature #
+##################
+
+# This will not be required after preview any more
+# az feature register --name AKS-IngressApplicationGatewayAddon --namespace microsoft.containerservice
+# state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/AKS-IngressApplicationGatewayAddon')].properties.state" -o tsv)
+# echo "Waiting for feature to finish registering"
+# wait_interval=15
+# until [[ "$state" == "Succeeded" ]]
+# do
+#     sleep $wait_interval
+#     state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/AKS-IngressApplicationGatewayAddon')].properties.state" -o tsv)
+# done
+# az provider register --namespace Microsoft.ContainerService
+
+########
+# Main #
+########
+
+# Create RG, LA workspace, vnet, AKS
+az group create -n $rg -l $location
+az monitor log-analytics workspace create -n $logws_name -g $rg
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+acr_rg=$(az acr list -o tsv --query "[?name=='$acr_name'].resourceGroup")
+acr_id=$(az acr show -n erjositoAcr -g $acr_rg --query id -o tsv)
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location
+az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix
+aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+
+# Get latest supported/preview version
+k8s_versions=$(az aks get-versions -l $location -o json)
+if [[ "$preview_version" == "yes" ]]
+then
+    k8s_version=$(echo $k8s_versions | jq '.orchestrators[]' | jq -rsc 'sort_by(.orchestratorVersion) | reverse[0] | .orchestratorVersion')
+    echo "Latest supported k8s version in $rg_location is $k8s_version (in preview)"
+else
+    k8s_version=$(echo $k8s_versions | jq '.orchestrators[] | select(.isPreview == null)' | jq -rsc 'sort_by(.orchestratorVersion) | reverse[0] | .orchestratorVersion')
+    echo "Latest supported k8s version (not in preview) in $rg_location is $k8s_version"
+fi
+
+#####################
+# With existing SPs #
+#####################
+
+# Get SP from AKV
+keyvault_name=joseakv-airs
+purpose=aks
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
+sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
+
+# Assign contributor role to the vnet
+vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+az role assignment create --scope $vnet_id --assignee $sp_app_id --role Contributor
+
+# Create AKS
+az aks create -g $rg -n $aks_name -l $location \
+    -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys \
+    --service-principal $sp_app_id --client-secret $sp_app_secret --skip-subnet-role-assignment \
+    --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
+    --network-policy calico --load-balancer-sku Standard \
+    --node-resource-group "$aks_name"-iaas-"$RANDOM" \
+    --no-wait
+
+# Other options you can use in the previous command
+    # --enable-private-cluster \
+    # --dns-name-prefix cloudtrooper \
+
+
+########################
+# Without existing SPs #
+########################
+
+# az aks create -g $rg -n $aks_name -l $location \
+#     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys \
+#     --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
+#     --network-policy calico --load-balancer-sku Standard \
+#     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
+#     --no-wait
+
+###############
+# App Gateway #
+###############
+
+# Only if not creating the app gw with the enable-addons command later on
+az network vnet subnet create -n $appgw_subnet_name -g $rg --address-prefix $appgw_subnet_prefix --vnet-name $vnet_name
+az network public-ip create -g $rg -n $appgw_pip_name --sku Standard
+az network application-gateway create -g $rg -n $appgw_name --capacity 2 --sku $appgw_sku \
+    --frontend-port 80 --routing-rule-type basic \
+    --http-settings-port 80 --http-settings-protocol Http \
+    --public-ip-address $appgw_pip_name --vnet-name $vnet_name --subnet $appgw_subnet_name \
+    --no-wait
+appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
+wait_until_finished $appgw_id
+
+########
+# Wait #
+########
+
+aks_id=$(az aks show -n $aks_name -g $rg --query id -o tsv)
+wait_until_finished $aks_id
+
+# Get credentials for kubectl
+az aks list -o table
+az aks get-credentials -n $aks_name -g $rg --overwrite
+kubectl get nodes
+
+
+#########################
+# Connect AKS and AppGW #
+#########################
+
+# OPTION 1: Using helm
+# Extend RBAC role assignment
+rg_id=$(az group show -n $rg --query id -o tsv)
+az role assignment create --scope $rg_id --assignee $sp_app_id --role Contributor
+# See https://azure.github.io/application-gateway-kubernetes-ingress/setup/install-existing/#using-a-service-principal
+helm_file=/tmp/helm-config.yaml
+helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/
+helm repo update
+# wget https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/docs/examples/sample-helm-config.yaml -O $helm_file
+subscription_id=$(az account show --query id -o tsv)
+tenant_id=$(az account show --query tenantId -o tsv)
+sdk_auth="{
+  \"clientId\": \"$sp_app_id\",
+  \"clientSecret\": \"$sp_app_secret\",
+  \"subscriptionId\": \"$tenant_id\",
+  \"tenantId\": \"$tenant_id\",
+  \"activeDirectoryEndpointUrl\": \"https://login.microsoftonline.com\",
+  \"resourceManagerEndpointUrl\": \"https://management.azure.com/\",
+  \"activeDirectoryGraphResourceId\": \"https://graph.windows.net/\",
+  \"sqlManagementEndpointUrl\": \"https://management.core.windows.net:8443/\",
+  \"galleryEndpointUrl\": \"https://gallery.azure.com/\",
+  \"managementEndpointUrl\": \"https://management.core.windows.net/\"
+}"
+sdk_auth=$(echo $sdk_auth | base64 -w0)
+cat <<EOF > $helm_file
+verbosityLevel: 3
+appgw:
+    subscriptionId: $subscription_id
+    resourceGroup: $rg
+    name: $appgw_name
+    usePrivateIP: false
+    shared: false
+# kubernetes:
+#     watchNamespace: default
+armAuth:
+    type: servicePrincipal
+    secretJSON: $sdk_auth
+rbac:
+    enabled: true
+EOF
+helm install ingress-azure -f $helm_file application-gateway-kubernetes-ingress/ingress-azure
+# helm install ingress-azure -f $helm_file application-gateway-kubernetes-ingress/ingress-azure --version 1.2.0-rc3
+
+# OPTION 2: Using add-on, use an existing gateway
+# appgw_subnet_id=$(az network vnet subnet show -n $appgw_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+# az aks enable-addons -n $aks_name -g $rg -a ingress-appgw --appgw-id $appgw_id --appgw-watch-namespace default
+
+# OPTION 3: Using add-on, create gateway
+# rg_id=$(az group show -n $rg --query id -o tsv)
+# az role assignment create --scope $rg_id --assignee $sp_app_id --role Contributor
+# az aks enable-addons -n $aks_name -g $rg -a ingress-appgw --appgw-subnet-prefix $appgw_subnet_prefix --appgw-name $appgw_name --appgw-watch-namespace default
+
+#################
+#  Disconnect   #
+#################
+
+# az aks disable-addons -a ingress-appgw -n $aks_name -g $rg
+# helm uninstall ingress-azure
+
+###################
+# Deploy test app #
+###################
+
+# appgw_pip=$(az network public-ip show -n aksappgw-appgwpip -g $node_rg --query ipAddress -o tsv) # the PIP name will depend on how the AppGW was created
+appgw_pip=$(az network public-ip show -n $appgw_pip_name -g $rg --query ipAddress -o tsv)
+app_name=kuard02
+image='gcr.io/kuar-demo/kuard-amd64:blue'
+app_url=${app_name}.${appgw_pip}.nip.io
+cat <<EOF | kubectl -n default apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $app_name
+  labels:
+    app: $app_name
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: $app_name
+  template:
+    metadata:
+      labels:
+        app: $app_name
+    spec:
+      containers:
+      - name: $app_name
+        image: $image
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: $app_name
+spec:
+  selector:
+    app: $app_name
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: $app_name
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: "$app_url"
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: $app_name
+          servicePort: 80
+EOF
+echo "Access your app over http://${app_url}"
+
+#########
+# Tests #
+#########
+
+# Scale up/down deployments
+k -n default scale deploy/kuard01 --replicas=0
+k -n default get deploy
+k -n default scale deploy/kuard01 --replicas=1
+k -n default get deploy
+
+###############
+# Diagnostics #
+###############
+# appgw_rg=$(az aks show -n $aks_name -g $rg --query nodeResourceGroup -o tsv)
+appgw_rg=$rg
+az network vnet subnet list -g $rg -o table --vnet-name $vnet_name
+az network application-gateway list -g $appgw_rg -o table
+# appgw_name=$(az network application-gateway list -g $node_rg --query '[0].name' -o tsv)
+az network application-gateway http-listener list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway frontend-ip list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway probe list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway address-pool list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway rule show -g $appgw_rg --gateway-name $appgw_name -n rule1
+az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name -o table
+rule=$(az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name --query '[0].name' -o tsv)
+az network application-gateway rule show -g $appgw_rg --gateway-name $appgw_name -n $rule
+az network application-gateway url-path-map list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway http-settings list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway show-backend-health -g $appgw_rg -n $appgw_name --query 'backendAddressPools[].backendHttpSettingsCollection[].[backendHttpSettings.id,servers[].health]'
+
+###########
+# Cleanup #
+###########
+
+az group delete -n $rg -y --no-wait

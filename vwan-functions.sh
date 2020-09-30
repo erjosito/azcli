@@ -8,7 +8,7 @@
 
 # Variables
 # rg=vwantest         # RG to be defined in the main function
-# vwan_name=vwantest  # RG to be defined in the main function
+# vwan_name=vwantest  # vwan_name to be defined in the main function
 location1=westeurope
 location2=westcentralus
 location3=uksouth
@@ -357,7 +357,7 @@ function create_rt {
     rt_name=$2
     rt_label=$3
     rt_json_string=$(jq -n \
-            $rt_json)
+            "$rt_json")
     rt_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/hubRouteTables/${rt_name}?api-version=$vwan_api_version"
     if [[ -n "$rt_label" ]]
     then
@@ -614,7 +614,7 @@ function rt_add_route {
             --arg type "ResourceId" \
             --arg prefixes "$prefix" \
             --arg nexthop "$nexthop" \
-            $route_json)
+            "$route_json")
     rt_json_updated=$(echo $rt_json_current | jq '.properties.routes += [ '$new_route_json_string' ] | {name, properties}')
     wait_until_hub_finished $hub_name
     # Check: if hub is Failed, we can try to reset it
@@ -664,7 +664,7 @@ function cx_add_routes {
             --arg name "route$RANDOM" \
             --arg prefixes "$prefix" \
             --arg nexthop "$nexthop" \
-            $cxroute_json)
+            "$cxroute_json")
     existing_routes=$(echo $cx_json | jq '.properties.routingConfiguration.vnetRoutes.staticRoutes[]')
     if [ -z "${existing_routes}" ]
     then
@@ -1170,7 +1170,7 @@ function create_vpngw {
             --arg location "$location" \
             --arg vhub_id $vhub_id \
             --arg asn "65515" \
-            $vpngw_json)
+            "$vpngw_json")
     az rest --method put --uri $vpngw_uri --body $vpngw_json_string >/dev/null  # PUT
 }
 function delete_vpngw {
@@ -1203,7 +1203,7 @@ function connect_branch {
             --arg site_id "${site_id}" \
             --arg site_link_id ${site_link_id} \
             --arg psk $password \
-            $vpncx_json)
+            "$vpncx_json")
     vpngw_base_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/${vpngw_name}"
     vpngw_cx_uri="${vpngw_base_uri}/vpnConnections/branch${branch_id}?api-version=$vwan_api_version"
     # Optional: configure some additional attributes:
@@ -1400,7 +1400,7 @@ function create_vwan {
     vwan_json_string=$(jq -n \
         --arg location "$location1" \
         --arg sku "Standard" \
-        $vwan_json)
+        "$vwan_json")
     vwan_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualWans/$vwan_name?api-version=$vwan_api_version"
     echo "Creating VWAN $vwan_name in $location1..."
     az rest --method put --uri $vwan_uri --body $vwan_json_string >/dev/null
@@ -1423,7 +1423,7 @@ function create_hub {
         --arg vwan_id $vwan_id \
         --arg sku "Standard" \
         --arg hub_prefix $hub_prefix \
-        $vhub_json)
+        "$vhub_json")
     echo "Creating hub hub${hub_id} in $location with prefix ${hub_prefix}..."
     az rest --method put --uri $vhub_uri --body $vhub_json_string >/dev/null    # PUT
 }
@@ -1538,6 +1538,69 @@ function create_spokes {
     done
 }
 
+# Create a single spoke
+function create_spoke {
+    hub_id=$1
+    hub_name=hub$hub_id
+    vhub_id=$(az network vhub show -n $hub_name -g $rg --query id -o tsv)
+    spoke_id=$2
+    location=$(get_location $hub_id)
+    # Create route-table to send traffic to this PC over Internet
+    rt_id=$(az network route-table show -n jumphost-$location -g $rg --query id -o tsv 2>/dev/null)
+    if [[ -z "$rt_id" ]]
+    then
+        mypip=$(curl -s4 ifconfig.co)
+        echo "Creating route table to send traffic to $mypip over the Internet..."
+        az network route-table create -n jumphost-$location -g $rg -l $location >/dev/null
+        az network route-table route create -n mypc -g $rg --route-table-name jumphost-$location --address-prefix "${mypip}/32" --next-hop-type Internet >/dev/null
+    else
+        echo "Route table jumphost-$location already exists"
+    fi
+    # Create spoke
+    echo "Starting creating spoke $spoke_id in $location to attach to hub${hub_id}"
+    # Set variables
+    # Create jump host
+    vm_name=spoke${hub_id}${spoke_id}
+    pip_name=${vm_name}-pip
+    vnet_name=${vm_name}-$location
+    vnet_prefix=10.${hub_id}.${spoke_id}.0/24
+    subnet_prefix=10.${hub_id}.${spoke_id}.64/26
+    vm_ip=10.${hub_id}.${spoke_id}.75
+    echo "Creating VM ${vm_name}-jumphost..."
+    vm_id=$(az vm show -n $vm_name-jumphost -g $rg --query id -o tsv 2>/dev/null)
+    if [[ -z "$vm_id" ]]
+    then
+        az vm create -n ${vm_name}-jumphost -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --size $vm_size \
+                    --public-ip-address $pip_name --vnet-name $vnet_name --vnet-address-prefix $vnet_prefix \
+                    --subnet jumphost --subnet-address-prefix $subnet_prefix --private-ip-address $vm_ip --no-wait
+    else
+        echo "VM $vm_name already exists"
+    fi
+    # Optionally, add VM without PIP
+    # subnet_prefix=10.${hub_id}.${spoke_id}.0/26
+    # vm_ip=10.${hub_id}.${spoke_id}.11
+    # echo "Creating VM ${vm_name}-test..."
+    # az vm create -n ${vm_name}-test -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --size $vm_size \
+    #     --public-ip-address "" --vnet-name $vnet_name --vnet-address-prefix $vnet_prefix \
+    #     --subnet vm --subnet-address-prefix $subnet_prefix --private-ip-address $vm_ip --no-wait
+    hub_id=$1
+    vm_name=spoke${hub_id}${spoke_id}
+    vnet_name=${vm_name}-$location
+    # Wait until Vnet is provisioned
+    vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv 2>/dev/null)
+    until [[ -n "$vnet_id" ]]
+    do
+        sleep $wait_interval
+        vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv 2>/dev/null)
+    done
+    # Attach route table to jumphost subnet for SSH traffic
+    echo "Attaching route table jumphost-$location to vnet ${vnet_name}..."
+    az network vnet subnet update -n jumphost --vnet-name $vnet_name -g $rg --route-table jumphost-$location >/dev/null
+    # Associate vnet to hub
+    connect_spoke $hub_id $spoke_id
+}
+
+
 # Return the ip prefix of a spoke
 function get_spoke_prefix {
     hub_id=$1
@@ -1580,7 +1643,7 @@ function connect_spoke {
     # Create JSON
     vnet_cx_json_string=$(jq -n \
             --arg vnet_id "$vnet_id" \
-            $vnet_cx_json)
+            "$vnet_cx_json")
     # Optionally, modify properties for the connection
     # vnet_cx_json_string=$(echo $vnet_cx_json_string | jq '.properties.routingConfiguration.propagatedRouteTables.labels = ["red"]')
     if [ -n "$BASH_VERSION" ]; then
@@ -1872,7 +1935,7 @@ function create_site {
         --arg remote_pip $branch_public_ip \
         --arg site_prefix ${branch_private_ip}/32 \
         --arg security 'false' \
-        $vpnsite_json)
+        "$vpnsite_json")
     vpnsite_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnSites/${site_name}?api-version=$vwan_api_version"
     echo "Creating site $site_name (hub${hub_id} to branch$branch_id)..."
     az rest --method put --uri $vpnsite_uri --body $vpnsite_json_string >/dev/null # PUT

@@ -6,7 +6,7 @@
 #################################
 
 # Variables
-rg=akstest2
+rg=akstest1
 location=westeurope
 keyvaultname=erjositoKeyvault
 keyvault_rg=myKeyvault
@@ -25,7 +25,8 @@ aks_subnet_name=aks
 aks_subnet_prefix=10.13.76.0/24
 vm_subnet_name=vm
 vm_subnet_prefix=10.13.1.0/24
-appgw_subnetprefix=10.13.10.0/24
+appgw_subnet_name=AppGateway
+appgw_subnet_prefix=10.13.10.0/24
 azfw_subnet_prefix=10.13.11.0/24
 apim_subnet_prefix=10.13.12.0/24
 db_subnet_prefix=10.13.50.0/24
@@ -36,6 +37,54 @@ aci_subnet_prefix=10.13.100.0/24
 logws_name=log$RANDOM
 kv_name=erjositoKeyvault
 acr_name=erjositoAcr
+
+####################
+# Helper functions #
+####################
+
+# Wait for resource to be created
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
+##################
+# Enable feature #
+##################
+
+# This will not be required after preview any more
+az feature register --name AKS-IngressApplicationGatewayAddon --namespace microsoft.containerservice
+state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/AKS-IngressApplicationGatewayAddon')].properties.state" -o tsv)
+echo "Waiting for feature to finish registering"
+wait_interval=15
+until [[ "$state" == "Succeeded" ]]
+do
+    sleep $wait_interval
+    state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/AKS-IngressApplicationGatewayAddon')].properties.state" -o tsv)
+done
+az provider register --namespace Microsoft.ContainerService
+
+########
+# Main #
+########
 
 # Create RG, LA workspace, vnet, AKS
 az group create -n $rg -l $location
@@ -88,18 +137,25 @@ az aks create -g $rg -n $aks_name -l $location \
     # --dns-name-prefix cloudtrooper \
 
 
-# Get credentials for kubectl
-az aks list -o table
-az aks get-credentials -n $aks_name -g $rg --overwrite
-kubectl get nodes
-
 ########################
 # Without existing SPs #
 ########################
 
-az aks create -g $rg -n $aks_name -l $location \
-    -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys \
-    --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
-    --network-policy calico --load-balancer-sku Standard \
-    --node-resource-group "$aks_name"-iaas-"$RANDOM" \
-    --no-wait
+# az aks create -g $rg -n $aks_name -l $location \
+#     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys \
+#     --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
+#     --network-policy calico --load-balancer-sku Standard \
+#     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
+#     --no-wait
+
+########
+# Wait #
+########
+
+aks_id=$(az aks show -n $aks_name -g $rg --query id -o tsv)
+wait_until_finished $aks_id
+
+# Get credentials for kubectl
+az aks list -o table
+az aks get-credentials -n $aks_name -g $rg --overwrite
+kubectl get nodes
