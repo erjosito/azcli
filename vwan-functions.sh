@@ -1446,34 +1446,34 @@ function delete_fw {
 function create_azfw_policy {
     az network firewall policy create -n $azfw_policy_name -g $rg >/dev/null
     az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 100 >/dev/null
-# Example network collections
-# Allow SSH
-echo "Creating rule to allow SSH..."
-az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-    --name mgmt --collection-priority 101 --action Allow --rule-name allowSSH --rule-type NetworkRule --description "TCP 22" \
-    --destination-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --source-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --ip-protocols TCP --destination-ports 22 >/dev/null
-# Allow ICMP
-# echo "Creating rule to allow ICMP..."
-# az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-#     --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
-#     --destination-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --source-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
-# Allow NTP
-echo "Creating rule to allow NTP..."
-az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-    --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "ICMP traffic" \
-    --destination-addresses "10.0.0.0/8" --source-addresses "0.0.0.0/0" --ip-protocols UDP --destination-ports "123" >/dev/null
-# Example application collection with 2 rules (ipconfig.co, api.ipify.org)
-echo "Creating rule to allow ifconfig.co and api.ipify.org..."
-az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-    --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
-    --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 >/dev/null
-az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
-    --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 --rule-type ApplicationRule >/dev/null
-# Example application collection with wildcards (*.ubuntu.com)
-echo "Creating rule to allow *.ubuntu.com..."
-az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-    --name ubuntu --collection-priority 202 --action Allow --rule-name repos --rule-type ApplicationRule --description "ubuntucom" \
-    --target-fqdns '*.ubuntu.com' --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 >/dev/null
+    # Example network collections
+    # Allow SSH
+    echo "Creating rule to allow SSH..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name mgmt --collection-priority 101 --action Allow --rule-name allowSSH --rule-type NetworkRule --description "TCP 22" \
+        --destination-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --source-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --ip-protocols TCP --destination-ports 22 >/dev/null
+    # Allow ICMP
+    # echo "Creating rule to allow ICMP..."
+    # az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+    #     --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
+    #     --destination-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --source-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
+    # Allow NTP
+    echo "Creating rule to allow NTP..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "ICMP traffic" \
+        --destination-addresses "10.0.0.0/8" --source-addresses "0.0.0.0/0" --ip-protocols UDP --destination-ports "123" >/dev/null
+    # Example application collection with 2 rules (ipconfig.co, api.ipify.org)
+    echo "Creating rule to allow ifconfig.co and api.ipify.org..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
+        --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 >/dev/null
+    az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
+        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 --rule-type ApplicationRule >/dev/null
+    # Example application collection with wildcards (*.ubuntu.com)
+    echo "Creating rule to allow *.ubuntu.com..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ubuntu --collection-priority 202 --action Allow --rule-name repos --rule-type ApplicationRule --description "ubuntucom" \
+        --target-fqdns '*.ubuntu.com' --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 >/dev/null
 }
 
 ###################

@@ -35,38 +35,38 @@ az network public-ip create -g $rg -n $appgw_pipname --sku Standard
 # Optionally, create NSG and attach it to the subnet
 az network nsg create -n $appgw_nsg_name -g $rg
 # Inbound
-az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_GWM' -g $rg \
+az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_GWM_In' -g $rg \
     --description 'Required for Microsoft to manage the service' \
-    --priority 100 --access Allow  --direction Inbound --protocol '*' \
+    --priority 100 --access Allow --direction Inbound --protocol '*' \
     --destination-port-ranges 65200-65535 --source-address-prefixes 'GatewayManager'
-az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_ALB' -g $rg \
+az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_ALB_In' -g $rg \
     --description 'Required for ALB healthchecks to work' \
     --priority 110 --access Allow  --direction Inbound --protocol '*' \
-    --source-address-prefixes 'AzureLoadBalancer'
-az network nsg rule create --nsg-name $appgw_nsg_name -n 'Deny_Internet' -g $rg \
+    --source-address-prefixes 'AzureLoadBalancer' --destination-port-ranges '*'
+az network nsg rule create --nsg-name $appgw_nsg_name -n 'Deny_Internet_in' -g $rg \
     --description 'Default deny' \
     --priority 1000 --access Deny  --direction Inbound --protocol '*' \
-    --source-address-prefixes 'Internet'
+    --source-address-prefixes 'Internet' --destination-port-ranges '*'
 # Outbound
-az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_GWM' -g $rg \
-    --priority 100 --access Allow  --direction Outbound --protocol '*' \
-    --destination-address-prefixes 'GatewayManager'
-az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_AzMonitor' -g $rg \
-    --description 'Required for sending metrics/logs to AzMonitor' \
-    --priority 110 --access Allow  --direction Outbound --protocol '*' \
-    --destination-address-prefixes 'AzureMonitor'
-az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_AKV' -g $rg \
-    --description 'Required for accessing AKV to get certificates' \
-    --priority 120 --access Allow  --direction Outbound --protocol '*' \
-    --destination-address-prefixes 'AzureKeyVault'
-az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_AAD' -g $rg \
-    --description 'Required for authenticating to AKV' \
-    --priority 130 --access Allow  --direction Outbound --protocol '*' \
-    --destination-address-prefixes 'AzureActiveDirectory'
-az network nsg rule create --nsg-name $appgw_nsg_name -n 'Deny_Internet' -g $rg \
-    --description 'Default deny' \
-    --priority 1000 --access Deny  --direction Outbound --protocol '*' \
-    --destination-address-prefixes 'Internet'
+# az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_GWM_Out' -g $rg \
+#     --priority 100 --access Allow  --direction Outbound --protocol '*' \
+#     --destination-address-prefixes 'GatewayManager' --destination-port-ranges '*'
+# az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_AzMonitor_Out' -g $rg \
+#     --description 'Required for sending metrics/logs to AzMonitor' \
+#     --priority 110 --access Allow  --direction Outbound --protocol '*' \
+#     --destination-address-prefixes 'AzureMonitor' --destination-port-ranges '*'
+# az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_AKV_Out' -g $rg \
+#     --description 'Required for accessing AKV to get certificates' \
+#     --priority 120 --access Allow  --direction Outbound --protocol '*' \
+#     --destination-address-prefixes 'AzureKeyVault' --destination-port-ranges '*'
+# az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_AAD_Out' -g $rg \
+#     --description 'Required for authenticating to AKV' \
+#     --priority 130 --access Allow  --direction Outbound --protocol '*' \
+#     --destination-address-prefixes 'AzureActiveDirectory' --destination-port-ranges '*'
+# az network nsg rule create --nsg-name $appgw_nsg_name -n 'Deny_Internet_Out' -g $rg \
+#     --description 'Default deny' \
+#     --priority 1000 --access Deny  --direction Outbound --protocol '*' \
+#     --destination-address-prefixes 'Internet' --destination-port-ranges '*'
 # Configure NSG flow logging to storage
 az storage account create -n $log_storage_account -g $rg --sku Standard_LRS --kind StorageV2
 # Configure NSG flow logs: GO TO THE PORTAL!!!!
