@@ -382,14 +382,14 @@ az network firewall policy rule-collection-group list --policy-name vwanfwpolicy
 az network firewall policy rule-collection-group collection list --rule-collection-group-name ruleset01 --policy-name vwanfwpolicy -g $rg -o table
 az network firewall policy rule-collection-group collection list --rule-collection-group-name ruleset01 --policy-name vwanfwpolicy -g $rg
 # Effective routes
-az network nic show-effective-route-table -n spoke11-vmVMNic -g $rg -o table
+az network nic show-effective-route-table -n branch1-vmVMNic -g $rg -o table
 rt_id=$(az network vhub route-table show -n defaultRouteTable -g $rg --vhub hub1 --query id -o tsv)
 az network vhub get-effective-routes --resource-type RouteTable --resource-id $rt_id -n hub1 -g $rg
 az network vhub get-effective-routes --resource-type RouteTable --resource-id $rt_id -n hub1 -g $rg --query 'value[].addressPrefixes[]' -o tsv
 cx_id=$(az network vhub connection show -n spoke11 -g $rg --vhub hub1 --query id -o tsv)
 az network vhub get-effective-routes --resource-type HubVirtualNetworkConnection --resource-id $cx_id -n hub1 -g $rg
 vpncx_id=$(az network vpn-gateway connection show -n branch1 --gateway-name hubvpn1 -g $rg --query id -o tsv)
-az network vhub get-effective-routes --resource-type VpnConnection --resource-id $vpncx_id -n hub1 -g $rg
+az network vhub get-effective-routes --resource-type VpnConnection --resource-id $vpncx_id -n hub1 -g $rg --query 'value[].addressPrefixes[]' -o tsv
 # Commands in branches
 branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
 branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)

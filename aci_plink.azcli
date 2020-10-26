@@ -1,0 +1,534 @@
+###############################################
+# Azure Container Instances with Azure CLI
+#
+# Creates container group with SSL offload in a
+#   VNet with access to an AzSQL DB with private
+#   link.
+#
+# Jose Moreno, October 2020
+###############################################
+
+# See https://github.com/erjosito/whoami/blob/master/lab-guides/aci.md
+# Can be combined with the SSL sidecar
+# Additionally with managed identity
+
+# Variables
+rg=acilab
+location=westeurope
+aci_name=sslaci
+vnet_name=acivnet
+vnet_prefix=192.168.0.0/16
+vm_subnet_name=vm
+vm_subnet_prefix=192.168.1.0/24
+aci_subnet_name=aci
+aci_subnet_prefix=192.168.2.0/24
+sql_subnet_name=sql
+sql_subnet_prefix=192.168.3.0/24
+
+# Unit 1. Theory
+# blah blah blah
+
+# Unit 2. The basics
+# Topics:
+# - Container groups
+# - YAML
+
+# Create test RG and VM
+az group create -n $rg -l $location
+az vm create -n test-vm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address test-vm-pip --vnet-name $vnet_name \
+    --vnet-address-prefix $vnet_prefix --subnet $vm_subnet_name --subnet-address-prefix $vm_subnet_prefix
+vm_pip=$(az network public-ip show -n test-vm-pip -g $rg --query ipAddress -o tsv) && echo $vm_pip
+
+# Create database
+sql_server_name=sqlserver$RANDOM
+sql_db_name=mydb
+sql_username=azure
+sql_password=Microsoft123!
+az sql server create -n $sql_server_name -g $rg -l $location --admin-user $sql_username --admin-password $sql_password
+sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName)
+az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait
+
+# Create ACI
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $aci_subnet_name --address-prefix $aci_subnet_prefix
+vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+aci_subnet_id=$(az network vnet subnet show -n $aci_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az container create -n $aci_name -g $rg -e "SQL_SERVER_USERNAME=$sql_username" \
+  "SQL_SERVER_PASSWORD=$sql_password" \
+  "SQL_SERVER_FQDN=${sql_server_fqdn}" \
+  --image erjosito/sqlapi:1.0 \
+  --ip-address private --ports 8080 --vnet $vnet_id --subnet $aci_subnet_id
+
+# Browse YAML
+az container export -n $aci_name -g $rg -f /tmp/aci.yaml
+more /tmp/aci.yaml
+
+# Test container reachabiity
+aci_ip=$(az container show -n $aci_name -g $rg --query 'ipAddress.ip' -o tsv) && echo $aci_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -s http://$aci_ip:8080/api/healthcheck"
+
+# Update Azure SQL firewall rules
+aci_pip=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -s http://$aci_ip:8080/api/ip" | jq -r .my_public_ip) && echo $aci_pip
+az sql server firewall-rule create -g $rg -s $sql_server_name -n public_sqlapi_aci-source --start-ip-address $aci_pip --end-ip-address $aci_pip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -s http://$aci_ip:8080/api/sqlversion"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -s http://$aci_ip:8080/api/sqlsrcip"
+
+# Cleanup unit 2
+az container delete -n $aci_name -g $rg -y
+
+# Unit 3. SSL
+# Topics:
+# - Sidecar
+# - Secret volumes
+
+# Create self-signed certs
+openssl req -new -newkey rsa:2048 -nodes -keyout ssl.key -out ssl.csr -subj "/C=US/ST=WA/L=Redmond/O=AppDev/OU=IT/CN=contoso.com"
+openssl x509 -req -days 365 -in ssl.csr -signkey ssl.key -out ssl.crt
+
+# Create nginx.conf for SSL
+nginx_config_file=/tmp/nginx.conf
+cat <<EOF > $nginx_config_file
+user nginx;
+worker_processes auto;
+events {
+  worker_connections 1024;
+}
+pid        /var/run/nginx.pid;
+http {
+    server {
+        listen [::]:443 ssl;
+        listen 443 ssl;
+        server_name localhost;
+        ssl_protocols              TLSv1.2;
+        ssl_ciphers                ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-DSS-AES128-GCM-SHA256:kEDH+AESGCM:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA256:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA:DHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:ECDHE-RSA-RC4-SHA:ECDHE-ECDSA-RC4-SHA:AES128:AES256:RC4-SHA:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!3DES:!MD5:!PSK;
+        ssl_prefer_server_ciphers  on;
+        ssl_session_cache    shared:SSL:10m; # a 1mb cache can hold about 4000 sessions, so we can hold 40000 sessions
+        ssl_session_timeout  24h;
+        keepalive_timeout 75; # up from 75 secs default
+        add_header Strict-Transport-Security 'max-age=31536000; includeSubDomains';
+        ssl_certificate      /etc/nginx/ssl.crt;
+        ssl_certificate_key  /etc/nginx/ssl.key;
+        location / {
+            proxy_pass http://127.0.0.1:8080 ;
+            proxy_set_header Connection "";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$remote_addr;
+            proxy_buffer_size          128k;
+            proxy_buffers              4 256k;
+            proxy_busy_buffers_size    256k;
+        }
+    }
+}
+EOF
+
+# Encode to Base64
+nginx_conf=$(cat $nginx_config_file | base64)
+ssl_crt=$(cat ssl.crt | base64)
+ssl_key=$(cat ssl.key | base64)
+
+# Get network profile ID
+# Network profiles are created
+nw_profile_id=$(az network profile list -g $rg --query '[0].id' -o tsv) && echo $nw_profile_id
+
+# Create YAML
+aci_yaml_file=/tmp/sftp.yaml
+cat <<EOF > $aci_yaml_file
+apiVersion: 2019-12-01
+location: westus
+name: $aci_name
+properties:
+  networkProfile:
+    id: $nw_profile_id
+  containers:
+  - name: nginx
+    properties:
+      image: nginx
+      ports:
+      - port: 443
+        protocol: TCP
+      resources:
+        requests:
+          cpu: 1.0
+          memoryInGB: 1.5
+      volumeMounts:
+      - name: nginx-config
+        mountPath: /etc/nginx
+  - name: sqlapi
+    properties:
+      image: erjosito/sqlapi:1.0
+      environmentVariables:
+      - name: SQL_SERVER_USERNAME
+        value: $sql_username
+      - name: SQL_SERVER_PASSWORD
+        secureValue: $sql_password
+      - name: SQL_SERVER_FQDN
+        value: $sql_server_fqdn
+      ports:
+      - port: 8080
+        protocol: TCP
+      resources:
+        requests:
+          cpu: 1.0
+          memoryInGB: 1
+  volumes:
+  - secret:
+      ssl.crt: "$ssl_crt"
+      ssl.key: "$ssl_key"
+      nginx.conf: "$nginx_conf"
+    name: nginx-config
+  ipAddress:
+    ports:
+    - port: 443
+      protocol: TCP
+    type: Private
+    dnsNameLabel: $aci_dns
+  osType: Linux
+tags: null
+type: Microsoft.ContainerInstance/containerGroups
+EOF
+
+# Deploy ACI
+az container create -g $rg --file $aci_yaml_file
+
+# Test
+aci_ip=$(az container show -n $aci_name -g $rg --query 'ipAddress.ip' -o tsv) && echo $aci_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_ip/api/healthcheck"
+
+# Cleanup unit 3
+az container delete -n $aci_name -g $rg -y
+
+# Unit 4. Private Link
+# Topics:
+# - Private link
+# - DNS Private Zones
+
+# SQL Server private endpoint
+sql_endpoint_name=sqlep
+sql_server_id=$(az sql server show -n $sql_server_name -g $rg -o tsv --query id)
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $sql_subnet_name --address-prefix $sql_subnet_prefix
+az network vnet subnet update -n $sql_subnet_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
+az network private-endpoint create -n $sql_endpoint_name -g $rg \
+  --vnet-name $vnet_name --subnet $sql_subnet_name \
+  --private-connection-resource-id $sql_server_id --group-ids sqlServer --connection-name sqlConnection
+
+# Endpoint's private IP address
+sql_nic_id=$(az network private-endpoint show -n $sql_endpoint_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
+sql_endpoint_ip=$(az network nic show --ids $sql_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $sql_endpoint_ip
+nslookup ${sql_server_name}.database.windows.net
+
+# Create Azure DNS private zone and records
+dns_zone_name=privatelink.database.windows.net
+az network private-dns zone create -n $dns_zone_name -g $rg 
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n myDnsLink --virtual-network $vnet_name --registration-enabled false
+az network private-dns record-set a create -n $sql_server_name -z $dns_zone_name -g $rg
+az network private-dns record-set a add-record --record-set-name $sql_server_name -z $dns_zone_name -g $rg -a $sql_endpoint_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "nslookup ${sql_server_name}.database.windows.net"
+
+# Deploy ACI
+az container create -g $rg --file $aci_yaml_file
+
+# Test
+aci_ip=$(az container show -n $aci_name -g $rg --query 'ipAddress.ip' -o tsv) && echo $aci_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_ip/api/healthcheck"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_ip/api/dns?fqdn=${sql_server_name}.database.windows.net"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_ip/api/sqlversion"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_ip/api/sqlsrcip"
+
+# Cleanup unit 4
+az container delete -n $aci_name -g $rg -y
+
+# Unit 5. Init container and SP
+# Topics:
+# - Init containers
+# - Mounting AzFiles shares
+
+# Create SP
+scope=$(az group show -n $rg --query id -o tsv)
+new_sp=$(az ad sp create-for-rbac --scopes $scope --role Contributor --name acilab)
+sp_appid=$(echo $new_sp | jq -r '.appId') && echo $sp_appid
+sp_tenant=$(echo $new_sp | jq -r '.tenant') && echo $sp_tenant
+sp_password=$(echo $new_sp | jq -r '.password')
+
+# Create Azure DNS private zone and records
+dns_zone_name=contoso.com
+az network private-dns zone create -n $dns_zone_name -g $rg 
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n contoso --virtual-network $vnet_name --registration-enabled false
+
+# Create script for init container
+storage_account_name="$rg$RANDOM"
+az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2
+storage_account_key=$(az storage account keys list --account-name $storage_account_name -g $rg --query '[0].value' -o tsv)
+az storage share create --account-name $storage_account_name --account-key $storage_account_key --name initscript
+init_script_filename=init.sh
+init_script_path=/tmp/
+cat <<EOF > ${init_script_path}${init_script_filename}
+echo "DEBUG: Environment variables:"
+printenv
+echo "Logging into Azure..."
+az login --service-principal -u \$SP_APPID -p \$SP_PASSWORD --tenant \$SP_TENANT
+echo "Finding out IP address..."
+my_private_ip=\$(az container show -n \$ACI_NAME -g \$RG --query 'ipAddress.ip' -o tsv) && echo \$my_private_ip
+echo "Creating DNS record..."
+az network private-dns record-set a create -n \$HOSTNAME -z \$DNS_ZONE_NAME -g \$RG
+az network private-dns record-set a add-record --record-set-name \$HOSTNAME -z \$DNS_ZONE_NAME -g \$RG -a \$my_private_ip
+EOF
+az storage file upload --account-name $storage_account_name --account-key $storage_account_key -s initscript --source ${init_script_path}${init_script_filename}
+
+# Create YAML
+aci_yaml_file=/tmp/acilab.yaml
+cat <<EOF > $aci_yaml_file
+apiVersion: 2019-12-01
+location: westus
+name: $aci_name
+properties:
+  networkProfile:
+    id: $nw_profile_id
+  initContainers:
+  - name: azcli
+    properties:
+      image: microsoft/azure-cli:latest
+      command:
+      - "/bin/sh"
+      - "-c"
+      - "/mnt/init/$init_script_filename"
+      environmentVariables:
+      - name: RG
+        value: $rg
+      - name: SP_APPID
+        value: $sp_appid
+      - name: SP_PASSWORD
+        secureValue: $sp_password
+      - name: SP_TENANT
+        value: $sp_tenant
+      - name: DNS_ZONE_NAME
+        value: $dns_zone_name
+      - name: HOSTNAME
+        value: $aci_name
+      - name: ACI_NAME
+        value: $aci_name
+      volumeMounts:
+      - name: initscript
+        mountPath: /mnt/init/
+  containers:
+  - name: nginx
+    properties:
+      image: nginx
+      ports:
+      - port: 443
+        protocol: TCP
+      resources:
+        requests:
+          cpu: 1.0
+          memoryInGB: 1.5
+      volumeMounts:
+      - name: nginx-config
+        mountPath: /etc/nginx
+  - name: sqlapi
+    properties:
+      image: erjosito/sqlapi:1.0
+      environmentVariables:
+      - name: SQL_SERVER_FQDN
+        value: $sql_server_fqdn
+      - name: SQL_SERVER_USERNAME
+        value: $sql_username
+      - name: SQL_SERVER_PASSWORD
+        secureValue: $sql_password
+      ports:
+      - port: 8080
+        protocol: TCP
+      resources:
+        requests:
+          cpu: 1.0
+          memoryInGB: 1
+      volumeMounts:
+  volumes:
+  - secret:
+      ssl.crt: "$ssl_crt"
+      ssl.key: "$ssl_key"
+      nginx.conf: "$nginx_conf"
+    name: nginx-config
+  - name: initscript
+    azureFile:
+      readOnly: false
+      shareName: initscript
+      storageAccountName: $storage_account_name
+      storageAccountKey: $storage_account_key
+  ipAddress:
+    ports:
+    - port: 443
+      protocol: TCP
+    type: Private
+    dnsNameLabel: $aci_dns
+  osType: Linux
+tags: null
+type: Microsoft.ContainerInstance/containerGroups
+EOF
+
+# Check YAML file
+# more $aci_yaml_file
+
+# Deploy ACI
+az container create -g $rg --file $aci_yaml_file
+
+# Test
+aci_fqdn=${aci_name}.${dns_zone_name} && echo $aci_fqdn
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "nslookup $aci_fqdn"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_fqdn/api/healthcheck"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_fqdn/api/sqlversion"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_fqdn/api/sqlsrcip"
+az container logs -n $aci_name -g $rg --container-name azcli
+
+# Cleanup unit 5
+az container delete -n $aci_name -g $rg -y
+
+# Not working:
+# Unit xyz. AKV
+# Topics:
+# - Managed Identities
+
+# Create key vault
+akv_name=akv$RANDOM
+az keyvault create -n $akv_name -g $rg -l $location
+az keyvault secret set -n sqlpassword --value $sql_password --vault-name $akv_name
+
+# Create user identity
+identity_name=myACIid
+az identity create -n $identity_name -g $rg
+identity_spid=$(az identity show -g $rg -n $identity_name --query principalId -o tsv)
+identity_appid=$(az identity show -g $rg -n $identity_name --query clientId -o tsv)
+identity_id=$(az identity show -g $rg -n $identity_name --query id -o tsv)
+az keyvault set-policy -n $akv_name -g $rg --object-id $identity_spid --secret-permissions get
+scope=$(az group show -n $rg --query id -o tsv)
+az role assignment create --scope $scope --role Contributor --assignee $identity_appid
+
+# Create script for init container
+storage_account_name="$rg$RANDOM"
+az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2
+storage_account_key=$(az storage account keys list --account-name $storage_account_name -g $rg --query '[0].value' -o tsv)
+az storage share create --account-name $storage_account_name --account-key $storage_account_key --name initscript
+init_script_filename=init.sh
+init_script_path=/tmp/
+cat <<EOF > ${init_script_path}${init_script_filename}
+echo "DEBUG: Environment variables:"
+printenv
+echo "Logging into Azure..."
+az login --identity
+echo "Getting secrets for Azure Key Vault \$AKV_NAME..."
+az keyvault secret show --vault-name \$AKV_NAME -n sqlpassword --query 'value' -o tsv > /secrets/SQL_PASSWORD
+echo "Getting my public IP addresss..."
+myip=\$(curl -s4 ifconfig.co)
+echo "Adding \$myip to firewall rules of SQL Server \$SQL_SERVER_NAME in RG \$RG..."
+az sql server firewall-rule create -g \$RG -s \$SQL_SERVER_NAME -n \$RANDOM --start-ip-address \$myip --end-ip-address \$myip
+EOF
+az storage file upload --account-name $storage_account_name --account-key $storage_account_key -s initscript --source ${init_script_path}${init_script_filename}
+
+# Create YAML
+aci_yaml_file=/tmp/sftp.yaml
+cat <<EOF > $aci_yaml_file
+apiVersion: 2019-12-01
+location: westus
+name: $aci_name
+identity:
+  type: UserAssigned
+  userAssignedIdentities:
+    $identity_id: {}
+properties:
+  networkProfile:
+    id: $nw_profile_id
+  initContainers:
+  - name: azcli
+    properties:
+      image: microsoft/azure-cli:latest
+      command:
+      - "/bin/sh"
+      - "-c"
+      - "/mnt/init/$init_script_filename"
+      environmentVariables:
+      - name: RG
+        value: $rg
+      - name: AKV_NAME
+        value: $akv_name
+      - name: SQL_SERVER_NAME
+        value: $sql_server_name
+      volumeMounts:
+      - name: secrets
+        mountPath: /secrets
+      - name: initscript
+        mountPath: /mnt/init/
+  containers:
+  - name: nginx
+    properties:
+      image: nginx
+      ports:
+      - port: 443
+        protocol: TCP
+      resources:
+        requests:
+          cpu: 1.0
+          memoryInGB: 1.5
+      volumeMounts:
+      - name: nginx-config
+        mountPath: /etc/nginx
+  - name: sqlapi
+    properties:
+      image: erjosito/sqlapi:1.0
+      environmentVariables:
+      - name: SQL_SERVER_USERNAME
+        value: $sql_username
+      - name: SQL_SERVER_FQDN
+        value: $sql_server_fqdn
+      ports:
+      - port: 8080
+        protocol: TCP
+      resources:
+        requests:
+          cpu: 1.0
+          memoryInGB: 1
+      volumeMounts:
+      - name: secrets
+        mountPath: /secrets
+  volumes:
+  - secret:
+      ssl.crt: "$ssl_crt"
+      ssl.key: "$ssl_key"
+      nginx.conf: "$nginx_conf"
+    name: nginx-config
+  - name: secrets
+    emptyDir: {}
+  - name: initscript
+    azureFile:
+      readOnly: false
+      shareName: initscript
+      storageAccountName: $storage_account_name
+      storageAccountKey: $storage_account_key
+  ipAddress:
+    ports:
+    - port: 443
+      protocol: TCP
+    type: Private
+    dnsNameLabel: $aci_dns
+  osType: Linux
+tags: null
+type: Microsoft.ContainerInstance/containerGroups
+EOF
+
+# Check YAML file
+more $aci_yaml_file
+
+# Deploy ACI
+az container create -g $rg --file $aci_yaml_file
+
+# Test
+aci_ip=$(az container show -n $aci_name -g $rg --query 'ipAddress.ip' -o tsv) && echo $aci_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_ip/api/healthcheck"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -ks https://$aci_ip/api/sqlversion"
+az container logs -n $aci_name -g $rg --container-name azcli
+az container exec -n $aci_name -g $rg --container-name sqlapi --exec-command "ls -l /secrets/SQL_PASSWORD"
+
+# Cleanup unit xyz
+az container delete -n $aci_name -g $rg -y
+
+# Cleanup everything
+az group delete -n $rg -y --no-wait
