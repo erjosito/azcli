@@ -420,6 +420,7 @@ az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentL
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
     --internet-security true --associated-route-table $hub2_vnet_rt_id --propagated-route-tables $hub1_vnet_rt_id --labels nohub2
 
+
 # Spoke22 in location2
 spoke_id=22
 vnet_prefix=10.2.2.0/24
