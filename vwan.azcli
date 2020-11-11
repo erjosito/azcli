@@ -18,8 +18,10 @@ rg=vwan
 vwan=vwan
 location1=westeurope
 location2=westus2
-username=jose
 password=Microsoft123!
+username=$(whoami)
+vm_size=Standard_B1s
+nva_size=Standard_B2ms
 vwan_hub1_prefix=192.168.1.0/24
 vwan_hub2_prefix=192.168.2.0/24
 # Branches
@@ -28,16 +30,20 @@ offer=cisco-csr-1000v
 sku=16_12-byol
 version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
 branch1_prefix=172.21.200.0/24
+branch1_prefix_long="172.21.200.0 255.255.255.0"
 branch1_subnet=172.21.200.0/26
 branch1_gateway=172.21.200.1
 branch1_bgp_ip=172.21.200.10
 branch1_asn=65501
+branch1_vm_subnet=172.21.200.64/26
 branch2_prefix=172.22.200.0/24
+branch2_prefix_long="172.22.200.0 255.255.255.0"
 branch2_subnet=172.22.200.0/26
 branch2_gateway=172.22.200.1
 branch2_bgp_ip=172.22.200.10
 branch2_2ary_bgp_ip=172.22.200.20
 branch2_asn=65502
+branch2_vm_subnet=172.22.200.64/26
 
 # Start: create RT
 az group create -n $rg -l $location1
@@ -57,8 +63,63 @@ hub2_none_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n no
 az network vpn-gateway create -n hubvpn1 -g $rg -l $location1 --vhub hub1 --asn 65515
 az network vpn-gateway create -n hubvpn2 -g $rg -l $location2 --vhub hub2 --asn 65515
 
+# Create NSGs to be used by VMs
+nsg1_name=vm-nsg-$location1
+az network nsg create -n $nsg1_name -g $rg -l $location1
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_SSH --priority 1000 \
+    --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges 22
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_HTTP --priority 1010 --direction Inbound \
+    --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' \
+    --destination-address-prefixes '*' --destination-port-ranges 9 80 443
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
+    --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges 500 4500
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_NTP --priority 1030 \
+    --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges 123
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_ICMP --priority 1040 \
+    --access Allow --protocol Icmp --source-address-prefixes '*' --direction Inbound \
+    --destination-address-prefixes '*'
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Outbound_All --priority 1000 \
+    --access Allow --protocol '*' --source-address-prefixes '*' --direction Outbound \
+    --destination-address-prefixes '*' --destination-port-ranges '*'
+nsg2_name=vm-nsg-$location2
+az network nsg create -n $nsg2_name -g $rg -l $location2
+az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_SSH --priority 1000 \
+    --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges 22
+az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_HTTP --priority 1010 \
+    --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' \
+    --destination-address-prefixes '*' --destination-port-ranges 9 80 443
+az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
+    --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges 500 4500
+az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_NTP --priority 1030 \
+    --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges 123
+az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_ICMP --priority 1040 \
+    --access Allow --protocol Icmp --source-address-prefixes '*' --direction Inbound \
+    --destination-address-prefixes '*'
+az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Outbound_All --priority 1000 \
+    --access Allow --protocol '*' --source-address-prefixes '*' --direction Outbound \
+    --destination-address-prefixes '*' --destination-port-ranges '*'
+
+# Configure NSG flow logs
+storage_account1_name=vwan$RANDOM$location1
+storage_account2_name=vwan$RANDOM$location2
+az storage account create -n $storage_account1_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location1
+az storage account create -n $storage_account2_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location2
+az network watcher flow-log create -l $location1 -n flowlog-$location1 -g $rg \
+    --nsg $nsg1_name --storage-account $storage_account1_name --log-version 2 --retention 7
+az network watcher flow-log create -l $location2 -n flowlog-$location2 -g $rg \
+    --nsg $nsg2_name --storage-account $storage_account2_name --log-version 2 --retention 7
+
 # Create CSR to simulate branch1
-az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys --public-ip-address branch1-pip --public-ip-address-allocation static --vnet-name branch1 --vnet-address-prefix $branch1_prefix --subnet nva --subnet-address-prefix $branch1_subnet --private-ip-address $branch1_bgp_ip
+az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} \
+    --generate-ssh-keys --admin-username $username --nsg $nsg1_name --size $nva_size \
+    --public-ip-address branch1-pip --public-ip-address-allocation static --private-ip-address $branch1_bgp_ip \
+    --vnet-name branch1 --vnet-address-prefix $branch1_prefix --subnet nva --subnet-address-prefix $branch1_subnet
 branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
 az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan \
     --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --ip-address $branch1_ip --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100
@@ -67,7 +128,10 @@ az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $r
     --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default --internet-security true
 
 # Create CSR to simulate branch2
-az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys --public-ip-address branch2-pip --public-ip-address-allocation static --vnet-name branch2 --vnet-address-prefix $branch2_prefix --subnet nva --subnet-address-prefix $branch2_subnet --private-ip-address $branch2_bgp_ip
+az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} \
+    --generate-ssh-keys --admin-username $username --nsg $nsg2_name --size $nva_size \
+    --public-ip-address branch2-pip --public-ip-address-allocation static --private-ip-address $branch2_bgp_ip \
+    --vnet-name branch2 --vnet-address-prefix $branch2_prefix --subnet nva --subnet-address-prefix $branch2_subnet
 branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)
 az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan \
     --asn $branch2_asn --bgp-peering-address $branch2_bgp_ip --ip-address $branch2_ip --address-prefixes ${branch2_ip}/32
@@ -128,12 +192,18 @@ config t
         ip address ${loopback_ip} 255.255.255.255
     router bgp ${branch1_asn}
         redistribute connected
+        redistribute static route-map S2B
+    route-map S2B
+        match ip address prefix-list S2B
+    ip prefix-list S2B permit ${branch1_prefix}
+    ip route ${branch1_prefix_long} ${default_gateway}
     ip route ${vpngw1_gw0_pip} 255.255.255.255 ${default_gateway}
     ip route ${vpngw1_gw1_pip} 255.255.255.255 ${default_gateway}
     ip route ${myip} 255.255.255.255 ${default_gateway}
     line vty 0 15
         exec-timeout 0 0
 end
+wr mem
 EOF
 
 # Create CSR config for branch 2
@@ -167,12 +237,18 @@ config t
         ip address ${loopback_ip} 255.255.255.255
     router bgp ${branch2_asn}
         redistribute connected
+        redistribute static route-map S2B
+    route-map S2B
+        match ip address prefix-list S2B
+    ip prefix-list S2B permit ${branch2_prefix}
+    ip route ${branch2_prefix_long} ${default_gateway}
     ip route ${vpngw2_gw0_pip} 255.255.255.255 ${default_gateway}
     ip route ${vpngw2_gw1_pip} 255.255.255.255 ${default_gateway}
     ip route ${myip} 255.255.255.255 ${default_gateway}
     line vty 0 15
         exec-timeout 0 0
 end
+wr mem
 EOF
 
 # Create Azure Firewall policy with sample policies
@@ -259,13 +335,23 @@ while IFS= read -r fw_id; do
     az network firewall update --ids $fw_id --private-ranges 192.168.0.0/16
 done <<< "$fw_id_list"
 
+# Create cloudinit file:
+cloudinit_file=/tmp/cloudinit.txt
+cat <<EOF > $cloudinit_file
+#cloud-config
+package_upgrade: true
+packages:
+  - apache2
+EOF
+
 # Spoke11 in location1
 spoke_id=11
 vnet_prefix=10.1.1.0/24
 subnet_prefix=10.1.1.0/26
 az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 \
-    --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix
+    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 --nsg $nsg1_name --size $vm_size \
+    --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
+az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --remote-vnet spoke${spoke_id}-$location1 \
     --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default
 
@@ -274,8 +360,9 @@ spoke_id=12
 vnet_prefix=10.1.2.0/24
 subnet_prefix=10.1.2.0/26
 az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 \
-    --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix
+    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 --nsg $nsg1_name --size $vm_size \
+    --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
+az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --remote-vnet spoke${spoke_id}-$location1 \
     --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default
 
@@ -283,9 +370,10 @@ az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --
 spoke_id=21
 vnet_prefix=10.2.1.0/24
 subnet_prefix=10.2.1.0/26
-az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location2 \
-    --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix
+az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 --nsg $nsg1_name --size $vm_size \
+    --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
+az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
     --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id --labels default
 
@@ -293,9 +381,10 @@ az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --
 spoke_id=22
 vnet_prefix=10.2.2.0/24
 subnet_prefix=10.2.2.0/26
-az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location2 \
-    --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix
+az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 --nsg $nsg1_name --size $vm_size \
+    --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
+az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
     --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id --labels default
 
@@ -309,6 +398,156 @@ az network route-table create -n spokes-$location2 -g $rg -l $location2
 az network route-table route create -n mypc -g $rg --route-table-name spokes-$location2 --address-prefix "${myip}/32" --next-hop-type Internet
 az network vnet subnet update -n vm --vnet-name spoke21-$location2 -g $rg --route-table spokes-$location2
 az network vnet subnet update -n vm --vnet-name spoke22-$location2 -g $rg --route-table spokes-$location2
+
+# VM in branch1
+az vm create -n branch1-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    --public-ip-address branch1-vm-pip --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
+    --subnet vm --subnet-address-prefix $branch1_vm_subnet --custom-data $cloudinit_file
+az vm extension set --vm-name branch1-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
+az network route-table create -n branchvm-$location1 -g $rg -l $location1
+myip=$(curl -s4 ifconfig.co)
+az network route-table route create -n mypc -g $rg --route-table-name branchvm-$location1 \
+    --address-prefix "${myip}/32" --next-hop-type Internet
+az network route-table route create -n default -g $rg --route-table-name branchvm-$location1 \
+    --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch1_bgp_ip
+az network route-table route create -n rfc1918-1 -g $rg --route-table-name branchvm-$location1 \
+    --address-prefix "10.0.0.0/8" --next-hop-type VirtualAppliance --next-hop-ip-address $branch1_bgp_ip
+az network route-table route create -n rfc1918-2 -g $rg --route-table-name branchvm-$location1 \
+    --address-prefix "172.16.0.0/12" --next-hop-type VirtualAppliance --next-hop-ip-address $branch1_bgp_ip
+az network route-table route create -n rfc1918-3 -g $rg --route-table-name branchvm-$location1 \
+    --address-prefix "192.168.0.0/16" --next-hop-type VirtualAppliance --next-hop-ip-address $branch1_bgp_ip
+az network vnet subnet update -n vm --vnet-name branch1 -g $rg --route-table branchvm-$location1
+
+# VM in branch2
+az vm create -n branch2-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    --public-ip-address branch2-vm-pip --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
+    --subnet vm --subnet-address-prefix $branch2_vm_subnet --custom-data $cloudinit_file
+az vm extension set --vm-name branch2-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
+az network route-table create -n branchvm-$location2 -g $rg -l $location2
+az network route-table route create -n mypc -g $rg --route-table-name branchvm-$location2 \
+    --address-prefix "${myip}/32" --next-hop-type Internet
+az network route-table route create -n default -g $rg --route-table-name branchvm-$location2 \
+    --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch2_bgp_ip
+az network route-table route create -n rfc1918-1 -g $rg --route-table-name branchvm-$location2 \
+    --address-prefix "10.0.0.0/8" --next-hop-type VirtualAppliance --next-hop-ip-address $branch2_bgp_ip
+az network route-table route create -n rfc1918-2 -g $rg --route-table-name branchvm-$location2 \
+    --address-prefix "172.16.0.0/12" --next-hop-type VirtualAppliance --next-hop-ip-address $branch2_bgp_ip
+az network route-table route create -n rfc1918-3 -g $rg --route-table-name branchvm-$location2 \
+    --address-prefix "192.168.0.0/16" --next-hop-type VirtualAppliance --next-hop-ip-address $branch2_bgp_ip
+az network vnet subnet update -n vm --vnet-name branch2 -g $rg --route-table branchvm-$location2
+
+# Configure IP forwarding in the CSR NICs
+vm_names=("branch1-nva" "branch2-nva")
+for vm_name in ${vm_names[@]}; do
+    echo "Enabling IP forwarding for $vm_name..."
+    vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $vm_nic_id --ip-forwarding
+done
+
+
+######################
+# Connection Monitor #
+######################
+
+# Get VM IDs
+spoke11_vm_id=$(az vm show -g $rg --query id -o tsv -n spoke11-vm)
+spoke12_vm_id=$(az vm show -g $rg --query id -o tsv -n spoke12-vm)
+spoke21_vm_id=$(az vm show -g $rg --query id -o tsv -n spoke21-vm)
+spoke22_vm_id=$(az vm show -g $rg --query id -o tsv -n spoke22-vm)
+branch1_vm_id=$(az vm show -g $rg --query id -o tsv -n branch1-vm)
+branch2_vm_id=$(az vm show -g $rg --query id -o tsv -n branch2-vm)
+
+# A separate connection monitor will be created per source, since
+#   creating two test groups per CLI doesnt seem to work
+
+# From spoke11
+monitor_name=spoke11-$location1
+test_name=spoke11
+az network watcher connection-monitor create -n $monitor_name -g $rg -l $location1 \
+    --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type AzureVM \
+    --endpoint-source-resource-id $spoke11_vm_id --endpoint-source-name spoke11 \
+    --endpoint-dest-resource-id $branch2_vm_id --endpoint-dest-name branch2 \
+    --test-config-name HttpConfig --protocol Http \
+    --http-method GET --https-prefer false --http-path '/'
+az network watcher connection-monitor test-configuration add --connection-monitor $monitor_name -l $location1 \
+    -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --resource-id $spoke12_vm_id --name spoke12 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --resource-id $spoke21_vm_id --name spoke21 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --resource-id $spoke22_vm_id --name spoke22 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --resource-id $branch1_vm_id --name branch1 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --address "ubuntu.com" --name ubuntucom --type ExternalAddress --dest-test-groups $test_name
+
+# From branch1
+monitor_name=branch1-$location1
+test_name=branch1
+az network watcher connection-monitor create -n $monitor_name -g $rg -l $location1 \
+    --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type AzureVM \
+    --endpoint-source-resource-id $branch1_vm_id --endpoint-source-name branch1 \
+    --endpoint-dest-resource-id $branch2_vm_id --endpoint-dest-name branch2 \
+    --test-config-name HttpConfig --protocol Http \
+    --http-method GET --https-prefer false --http-path '/'
+az network watcher connection-monitor test-configuration add --connection-monitor $monitor_name -l $location1 \
+    -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --resource-id $spoke11_vm_id --name spoke11 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --resource-id $spoke12_vm_id --name spoke12 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --resource-id $spoke21_vm_id --name spoke21 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --resource-id $spoke22_vm_id --name spoke22 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --address "ubuntu.com" --name ubuntucom --type ExternalAddress --dest-test-groups $test_name
+
+# From spoke21
+monitor_name=spoke21-$location2
+test_name=spoke21
+az network watcher connection-monitor create -n $monitor_name -g $rg -l $location2 \
+    --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type AzureVM \
+    --endpoint-source-resource-id $spoke21_vm_id --endpoint-source-name spoke21 \
+    --endpoint-dest-resource-id $branch2_vm_id --endpoint-dest-name branch2 \
+    --test-config-name HttpConfig --protocol Http \
+    --http-method GET --https-prefer false --http-path '/'
+az network watcher connection-monitor test-configuration add --connection-monitor $monitor_name -l $location2 \
+    -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --resource-id $spoke11_vm_id --name spoke11 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --resource-id $spoke12_vm_id --name spoke12 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --resource-id $spoke22_vm_id --name spoke22 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --resource-id $branch1_vm_id --name branch1 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --address "ubuntu.com" --name ubuntucom --type ExternalAddress --dest-test-groups $test_name
+
+# From branch2
+monitor_name=branch2-$location2
+test_name=branch2
+az network watcher connection-monitor create -n $monitor_name -g $rg -l $location2 \
+    --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type AzureVM \
+    --endpoint-source-resource-id $branch2_vm_id --endpoint-source-name branch2 \
+    --endpoint-dest-resource-id $branch1_vm_id --endpoint-dest-name branch1 \
+    --test-config-name HttpConfig --protocol Http \
+    --http-method GET --https-prefer false --http-path '/'
+az network watcher connection-monitor test-configuration add --connection-monitor $monitor_name -l $location2 \
+    -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --resource-id $spoke11_vm_id --name spoke11 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --resource-id $spoke12_vm_id --name spoke12 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --resource-id $spoke21_vm_id --name spoke21 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --resource-id $spoke22_vm_id --name spoke22 --type AzureVM --dest-test-groups $test_name
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --address "ubuntu.com" --name ubuntucom --type ExternalAddress --dest-test-groups $test_name
+
 
 ##################
 #   Playground   #
@@ -357,6 +596,48 @@ az network route-table route create -n branch1 -g $rg --route-table-name spokes-
 az network route-table route delete -n branch2 -g $rg --route-table-name spokes-$location1
 az network route-table route delete -n branch1 -g $rg --route-table-name spokes-$location2
 
+# Optionally, create a private link endpoint in one of the spokes
+# We will use the storage account created for the NSG flow logs (storage_account1_name)
+vnet_name=spoke11-$location1
+ep_name=spoke11-storage
+ep_subnet_prefix=10.1.1.192/26
+storage_account1_id=$(az storage account show -n $storage_account1_name -g $rg --query id -o tsv)
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n endpoints --address-prefix $ep_subnet_prefix
+az network vnet subnet update -n endpoints -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
+az network private-link-resource list -g $rg -n $storage_account1_name --type Microsoft.Storage/storageAccounts -o table
+az network private-endpoint create -n $ep_name -g $rg --vnet-name $vnet_name --subnet endpoints \
+  --private-connection-resource-id $storage_account1_id --group-ids blob --connection-name storageConnection
+endpoint_nic_id=$(az network private-endpoint show -n $ep_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
+endpoint_ip=$(az network nic show --ids $endpoint_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $endpoint_ip
+# Create public container/blob for testing purposes
+storage_account1_key=$(az storage account keys list --account-name $storage_account1_name -g $rg --query '[0].value' -o tsv)
+az storage container create -n public --account-name $storage_account1_name --auth-mode key --account-key "$storage_account1_key" --public-access container
+local_filename=/tmp/helloworld.txt
+echo "Hello World" >$local_filename
+blob_name=helloworld.txt
+az storage blob upload -f $local_filename -c public -n $blob_name --account-name $storage_account1_name --auth-mode key --account-key "$storage_account1_key"
+blob_url=$(az storage blob url -c public -n $blob_name --account-name $storage_account1_name --auth-mode key --account-key "$storage_account1_key" -o tsv)
+curl -s $blob_url
+# Create DNS zone
+dns_zone_name=privatelink.blob.core.windows.net
+az network private-dns zone create -n $dns_zone_name -g $rg
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n spoke11 --virtual-network spoke11-$location1 --registration-enabled false
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n spoke12 --virtual-network spoke12-$location1 --registration-enabled false
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n spoke21 --virtual-network spoke21-$location2 --registration-enabled false
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n spoke22 --virtual-network spoke22-$location2 --registration-enabled false
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n branch1 --virtual-network branch1 --registration-enabled false
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n branch2 --virtual-network branch2 --registration-enabled false
+az network private-dns record-set a create -n $storage_account1_name -z $dns_zone_name -g $rg
+az network private-dns record-set a add-record --record-set-name $storage_account1_name -z $dns_zone_name -g $rg -a $endpoint_ip
+# Test from one VM (branch or spoke)
+# from_pip_name=spoke11-pip
+from_pip_name=branch2-vm-pip
+from_pip=$(az network public-ip show -n $from_pip_name -g $rg --query ipAddress -o tsv)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $from_pip "hostname"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $from_pip "nslookup ${storage_account1_name}.blob.core.windows.net"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $from_pip "curl -s $blob_url"
+
+
 #################################
 # Troubleshooting / Diagnostics #
 #################################
@@ -382,7 +663,7 @@ az network firewall policy rule-collection-group list --policy-name vwanfwpolicy
 az network firewall policy rule-collection-group collection list --rule-collection-group-name ruleset01 --policy-name vwanfwpolicy -g $rg -o table
 az network firewall policy rule-collection-group collection list --rule-collection-group-name ruleset01 --policy-name vwanfwpolicy -g $rg
 # Effective routes
-az network nic show-effective-route-table -n branch1-vmVMNic -g $rg -o table
+az network nic show-effective-route-table -n spoke11-vmVMNic -g $rg -o table
 rt_id=$(az network vhub route-table show -n defaultRouteTable -g $rg --vhub hub1 --query id -o tsv)
 az network vhub get-effective-routes --resource-type RouteTable --resource-id $rt_id -n hub1 -g $rg
 az network vhub get-effective-routes --resource-type RouteTable --resource-id $rt_id -n hub1 -g $rg --query 'value[].addressPrefixes[]' -o tsv
@@ -398,18 +679,25 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $username@$branch2_ip "sh ip
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $username@$branch2_ip "sh ip route bgp"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $username@$branch2_ip "sh ip bgp neighbors 172.22.10.12 advertised-routes"
 # Connectivity tests
+spoke11_pip=$(az network public-ip show -n spoke11-pip -g $rg --query ipAddress -o tsv)
+spoke12_pip=$(az network public-ip show -n spoke12-pip -g $rg --query ipAddress -o tsv)
+spoke21_pip=$(az network public-ip show -n spoke21-pip -g $rg --query ipAddress -o tsv)
+spoke22_pip=$(az network public-ip show -n spoke22-pip -g $rg --query ipAddress -o tsv)
+branch1_vm_pip=$(az network public-ip show -n branch1-vm-pip -g $rg --query ipAddress -o tsv)
+branch2_vm_pip=$(az network public-ip show -n branch2-vm-pip -g $rg --query ipAddress -o tsv)
 # From
 from_pip_name=spoke11-pip
 from_pip_name=branch1-pip
-from_pip=$(az network public-ip show -n $from_pip_name -g $rg --query ipAddress -o tsv)
+from_pip=$(az network public-ip show -n $from_pip_name -g $rg --query ipAddress -o tsv) && echo $from_pip
 # To
-to_ip=$(az vm list-ip-addresses -n spoke22-vm -g $rg --query '[0].virtualMachine.network.privateIpAddresses[0]' -o tsv)
+to_ip=$(az vm list-ip-addresses -n branch1-vm -g $rg --query '[0].virtualMachine.network.privateIpAddresses[0]' -o tsv) && echo $to_ip
 to_ip=$branch1_bgp_ip
 to_ip=$branch2_bgp_ip
 to_ip=1.1.1.1
 # Test
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $username@$from_pip "ping $to_ip -c 3"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $username@$from_pip "nc -vz $to_ip 22"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $username@$from_pip "curl -s http://$to_ip"
 ssh -J $username@$from_pip $username@$to_ip
 
 ###########################
@@ -440,3 +728,14 @@ fw_app_logs_query='AzureDiagnostics
 //| where Action == "Deny" 
 | take 20'
 az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_logs_query -o tsv
+
+###########
+# Cleanup #
+###########
+
+# Lines are commented so that not executed accidentally
+# az group delete -n $rg -y --no-wait
+# az network watcher connection-monitor delete -n spoke11-$location1 -l $location1
+# az network watcher connection-monitor delete -n branch1-$location1 -l $location1
+# az network watcher connection-monitor delete -n spoke21-$location2 -l $location2
+# az network watcher connection-monitor delete -n branch2-$location2 -l $location2
