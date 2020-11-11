@@ -1,0 +1,67 @@
+############################################################################
+# Created by Jose Moreno
+# November 2020
+#
+# Examples for adding certificates to AKV
+############################################################################
+
+# Variables
+akv_name=erjositoKeyvault
+cert_name=cloudtroopernet
+pem_file="./yourcert.pem"
+key_file="./yourkey.key"
+key_password="your_key_password"
+
+# Combine PEM and key in one pfx file (pkcs#12)
+pfx_file=".${pem_file}.pfx"
+openssl pkcs12 -export -in $pem_file -inkey $key_file -out $pfx_file -passin pass:$key_password -passout pass:$key_password
+
+# Add certificate
+az keyvault certificate import --vault-name $akv_name -n $cert_name \
+    -f $pfx_file --password $key_password \
+    -p "$(az keyvault certificate get-default-policy)"
+
+# Verify
+az keyvault certificate list --vault-name $akv_name -o table
+
+#####################
+# Cert with Web App #
+#####################
+
+# Create Web App
+rg=certtest
+location=westeurope
+svcplan_name=webappplan
+app_name=web-$RANDOM
+image=gcr.io/kuar-demo/kuard-amd64:blue
+az group create -n $rg -l $location
+az appservice plan create -n $svcplan_name -g $rg --sku B1 --is-linux
+az webapp create -n $app_name -g $rg -p $svcplan_name --deployment-container-image-name $image
+az webapp config appsettings set -n $app_name -g $rg --settings "WEBSITES_PORT=8080"
+Set-AzureRmKeyVaultAccessPolicy -VaultName akurmitestvault -ServicePrincipalName abfa0a7c-a6b6-4736-8310-5855508787cd -PermissionsToSecrets get
+az keyvault set-policy -n $akv_name --spn abfa0a7c-a6b6-4736-8310-5855508787cd \
+    --secret-permissions get \
+    --key-permissions get \
+    --certificate-permissions get
+az webapp config ssl import -n $app_name -g $rg --key-vault $akv_name --key-vault-certificate-name $cert_name
+cert_thumbprint=$(az webapp config ssl list -g $rg --query '[0].thumbprint' -o tsv)
+az webapp restart -n $app_name -g $rg
+app_hostname=$(az webapp show -n $app_name -g $rg --query defaultHostName -o tsv)
+# Update DNS name
+dns_zone_name=your_domain.com
+dns_zone_rg=$(az network dns zone list --query "[?name=='$dns_zone_name'].resourceGroup" -o tsv)
+echo "Adding CNAME record ${app_hostname}.${dns_zone_name} for $app_hostname"
+az network dns record-set cname set-record -z $dns_zone_name -g $dns_zone_rg -n $app_name -c $app_hostname
+app_fqdn="${app_name}.${dns_zone_name}"
+# Add custom domain to web app
+az webapp config hostname add --webapp-name $app_name -g $rg --hostname $app_fqdn
+az webapp config ssl bind -n $app_name -g $rg --certificate-thumbprint $cert_thumbprint --ssl-type SNI
+az webapp update -n $app_name -g $rg --https-only true
+# Test
+echo "Visit with your browser the URL https://${app_fqdn}"
+# Cleanup test
+az group delete -n $rg -y --no-wait
+
+# Cleanup certificate
+# az keyvault certificate delete --vault-name $akv_name -n $cert_name
+# az keyvault certificate purge --vault-name $akv_name -n $cert_name

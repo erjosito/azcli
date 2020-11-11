@@ -64,7 +64,7 @@ az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan \
     --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --ip-address $branch1_ip --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100
 az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
-    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels nohub1 --internet-security true
+    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default --internet-security true
 
 # Create CSR to simulate branch2
 az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys --public-ip-address branch2-pip --public-ip-address-allocation static --vnet-name branch2 --vnet-address-prefix $branch2_prefix --subnet nva --subnet-address-prefix $branch2_subnet --private-ip-address $branch2_bgp_ip
@@ -73,7 +73,7 @@ az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan \
     --asn $branch2_asn --bgp-peering-address $branch2_bgp_ip --ip-address $branch2_ip --address-prefixes ${branch2_ip}/32
 az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 \
     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
-    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id  --labels nohub2 --internet-security true
+    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id  --labels default --internet-security true
 
 # Configure branches (CSRs)
 
@@ -267,7 +267,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --adm
     --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 \
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --remote-vnet spoke${spoke_id}-$location1 \
-    --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub2_default_rt_id
+    --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default
 
 # Spoke12 in location1
 spoke_id=12
@@ -277,7 +277,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --adm
     --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 \
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --remote-vnet spoke${spoke_id}-$location1 \
-    --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub2_default_rt_id
+    --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default
 
 # Spoke21 in location2
 spoke_id=21
@@ -287,7 +287,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --adm
     --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location2 \
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
-    --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels ''
+    --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id --labels default
 
 # Spoke22 in location2
 spoke_id=22
@@ -297,7 +297,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --adm
     --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location2 \
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
-    --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels ''
+    --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id --labels default
 
 # Backdoor for access from the testing device over the Internet
 myip=$(curl -s4 ifconfig.co)
