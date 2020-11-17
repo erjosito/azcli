@@ -29,21 +29,21 @@ publisher=cisco
 offer=cisco-csr-1000v
 sku=16_12-byol
 version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
-branch1_prefix=172.21.200.0/24
-branch1_prefix_long="172.21.200.0 255.255.255.0"
-branch1_subnet=172.21.200.0/26
-branch1_gateway=172.21.200.1
-branch1_bgp_ip=172.21.200.10
+branch1_prefix=172.21.0.0/24
+branch1_prefix_long="172.21.0.0 255.255.255.0"
+branch1_subnet=172.21.0.0/26
+branch1_gateway=172.21.0.1
+branch1_bgp_ip=172.21.0.10
 branch1_asn=65501
-branch1_vm_subnet=172.21.200.64/26
-branch2_prefix=172.22.200.0/24
-branch2_prefix_long="172.22.200.0 255.255.255.0"
-branch2_subnet=172.22.200.0/26
-branch2_gateway=172.22.200.1
-branch2_bgp_ip=172.22.200.10
-branch2_2ary_bgp_ip=172.22.200.20
+branch1_vm_subnet=172.21.0.64/26
+branch2_prefix=172.22.0.0/24
+branch2_prefix_long="172.22.0.0 255.255.255.0"
+branch2_subnet=172.22.0.0/26
+branch2_gateway=172.22.0.1
+branch2_bgp_ip=172.22.0.10
+branch2_2ary_bgp_ip=172.22.0.20
 branch2_asn=65502
-branch2_vm_subnet=172.22.200.64/26
+branch2_vm_subnet=172.22.0.64/26
 
 # Start: create RT
 az group create -n $rg -l $location1
@@ -370,8 +370,8 @@ az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --
 spoke_id=21
 vnet_prefix=10.2.1.0/24
 subnet_prefix=10.2.1.0/26
-az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 --nsg $nsg1_name --size $vm_size \
+az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location2 --nsg $nsg2_name --size $vm_size \
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
@@ -381,14 +381,15 @@ az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --
 spoke_id=22
 vnet_prefix=10.2.2.0/24
 subnet_prefix=10.2.2.0/26
-az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location1 --nsg $nsg1_name --size $vm_size \
+az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location2 --nsg $nsg2_name --size $vm_size \
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
     --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id --labels default
 
 # Backdoor for access from the testing device over the Internet
+# An alternative would be creating DNAT rules in the AzFWs
 myip=$(curl -s4 ifconfig.co)
 az network route-table create -n spokes-$location1 -g $rg -l $location1
 az network route-table route create -n mypc -g $rg --route-table-name spokes-$location1 --address-prefix "${myip}/32" --next-hop-type Internet
@@ -443,6 +444,23 @@ for vm_name in ${vm_names[@]}; do
     vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
     az network nic update --ids $vm_nic_id --ip-forwarding
 done
+
+# Secure traffic through the firewall
+# This is the config deployed by the FW Mgr, except the static routes in default (they have been configured above)
+az network vhub connection create -n spoke11 -g $rg --vhub-name hub1 --remote-vnet spoke11-$location1 \
+    --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_none_rt_id --labels none
+az network vhub connection create -n spoke12 -g $rg --vhub-name hub1 --remote-vnet spoke12-$location1 \
+    --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_none_rt_id --labels none
+az network vhub connection create -n spoke21 -g $rg --vhub-name hub2 --remote-vnet spoke21-$location2 \
+    --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_none_rt_id --labels none
+az network vhub connection create -n spoke22 -g $rg --vhub-name hub2 --remote-vnet spoke22-$location2 \
+    --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_none_rt_id --labels none
+az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
+    --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true \
+    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_none_rt_id --labels default hub2vnet
+az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 \
+    --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true \
+    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_none_rt_id --labels default hub1vnet
 
 
 ######################
