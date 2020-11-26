@@ -457,10 +457,10 @@ az network vhub connection create -n spoke22 -g $rg --vhub-name hub2 --remote-vn
     --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_none_rt_id --labels none
 az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true \
-    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_none_rt_id --labels default hub2vnet
+    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_none_rt_id --labels default
 az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 \
     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true \
-    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_none_rt_id --labels default hub1vnet
+    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_none_rt_id --labels default
 
 
 ######################

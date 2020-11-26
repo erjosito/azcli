@@ -1,0 +1,9 @@
+###############################################
+# Azure Devops with Azure CLI
+#
+# Sample commands with the azure-devops extension
+#
+# Jose Moreno, November 2020
+###############################################
+
+az devops boards -h
