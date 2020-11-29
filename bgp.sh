@@ -2,19 +2,33 @@
 
 ############################################################
 # Create a BGP lab in Azure using VNGs and/or Cisco CSR NVAs
-# Jose Moreno, August 2020
+# Syntax:
+#    bgp.sh <router_list> <connection_list> <resource_group_name> <azure_region> <IKE pre-shared key>
+#  - <router_list> is a comma-separated list of devices to deploy. Each device takes the form "id:type:asn"
+#       "id" is a unique integer to identify the device
+#       "type" is either vng or csr
+#       "asn" is the BGP ASN to be configured on that device
+#  - <connection_list> is a comma-separated list of the devices to connect to each other. Each
+#       connection takes the form "device1_id:device2_id"
+#  - <resource_group_name>: all devices will be created in this resource group in the active Azure subscription
+#  - <azure_region>: all devices will be created in this Azure region
+#  - <pre-shared key>: this key will be used as pre-shared key for the IPsec connections, as well as for the
+#       password of usernames in CSR (additionally to SSH key auth)
 #
 # Examples:
+#
 # * Basic example with 1 VNG connected to one CSR
-#   bash bgp.sh "1:vng:65501,2:csr:65502" "1:2" mylab northeurope mypresharedkey
+#     bgp.sh "1:vng:65501,2:csr:65502" "1:2" mylab northeurope mypresharedkey
 # * 4 CSRs connected in full mesh
-#   bash bgp.sh "1:csr:65501,2:csr:65502,3:csr:65503,4:csr:65504" "1:2,1:3,2:4,3:4,1:4,2:3" mylab northeurope mypresharedkey
+#     bgp.sh "1:csr:65501,2:csr:65502,3:csr:65503,4:csr:65504" "1:2,1:3,2:4,3:4,1:4,2:3" mylab northeurope mypresharedkey
 # * 2 VNGs and 2 CSRs connected in full mesh
-#   bash bgp.sh "1:vng:65001,2:vng:65002,3:csr:65100,4:csr:65100" "1:2,1:3,1:4,2:4,2:3,3:4" mylab northeurope mypresharedkey
+#     bgp.sh "1:vng:65001,2:vng:65002,3:csr:65100,4:csr:65100" "1:2,1:3,1:4,2:4,2:3,3:4" mylab northeurope mypresharedkey
 # * Environment simulating 2 ExpressRoute locations (note you cannot use the 12076 ASN in Local Gateways)
-#   bash bgp.sh "1:vng:65515,2:vng:65515,3:csr:22076,4:csr:22076,5:csr:65001,6:csr:65002" "1:3,1:4,2:3,2:4,3:5,4:6,5:6" mylab northeurope mypresharedkey
+#     bgp.sh "1:vng:65515,2:vng:65515,3:csr:22076,4:csr:22076,5:csr:65001,6:csr:65002" "1:3,1:4,2:3,2:4,3:5,4:6,5:6" mylab northeurope mypresharedkey
 #
 # bash and zsh tested
+#
+# Jose Moreno, August 2020
 ############################################################
 
 # Waits until a resourced finishes provisioning
@@ -433,14 +447,13 @@ function connect_csrs () {
 
 # Configure logging
 function init_log () {
-    logws_created=$(az monitor log-analytics workspace list -g "$rg" --query '[0].name' -o tsv)
-    if [[ -z $logws_created ]]
+    logws_name=$(az monitor log-analytics workspace list -g "$rg" --query '[0].name' -o tsv 2>/dev/null)
+    if [[ -z "$logws_name" ]]
     then
         logws_name=log$RANDOM
         echo "Creating LA workspace $logws_name..."
-        az monitor log-analytics workspace create -n $logws_name -g "$rg" >/dev/null
+        az monitor log-analytics workspace create -n $logws_name -g "$rg" >/dev/null 2>/dev/null
     else
-        logws_name=$(az monitor log-analytics workspace list -g "$rg" --query '[0].name' -o tsv)  # In case the log analytics workspace already exists
         echo "Found log analytics workspace $logws_name"
     fi
     logws_id=$(az resource list -g "$rg" -n "$logws_name" --query '[].id' -o tsv)
