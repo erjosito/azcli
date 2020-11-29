@@ -57,11 +57,14 @@ function wait_until_finished () {
 }
 
 # Remove special characters and empty lines from string
+# Used in case the SSH session to IOS returns invalid characters (like CR aka 0x0d), but that doesnt seem to be the case,
+#  so left to remove empty strings for the time being
 function clean_string () {
-    # Remove special characters
-    output=$(echo $1 | tr -dc '[:alnum:]\ \.\,\n')
-    # Remove empty lines
-    output=$(echo "$output" | awk NF)
+    output=$1
+    # output=$(echo $output | tr '\r' '\n')                   # Replace \r with \n
+    output=$(echo "$output" | tr -d '\r')                   # Delete \r
+    # output=$(echo $output | tr -dc '[:alnum:]\ \.\,\n')     # Remove special characters
+    output=$(echo "$output" | awk NF)                       # Remove empty lines
     echo "$output"
 }
 
@@ -114,16 +117,37 @@ function create_vng () {
     vnet_name=vng${id}
     vnet_prefix=10.${id}.0.0/16
     subnet_prefix=10.${id}.0.0/24
-    echo "Creating vnet $vnet_name and public IPs..."
+    test_vm_name=testvm${id}
+    test_vm_size=Standard_B1s
+    test_vm_subnet_prefix=10.${id}.1.0/24
+    # Create vnet
+    echo "Creating vnet $vnet_name..."
     az network vnet create -g "$rg" -n "$vnet_name" --address-prefix "$vnet_prefix" --subnet-name GatewaySubnet --subnet-prefix "$subnet_prefix" >/dev/null
-    az network public-ip create -g "$rg" -n "pip${id}a" >/dev/null
-    az network public-ip create -g "$rg" -n "pip${id}b" >/dev/null
+    # Create test VM (to be able to see effective routes)
+    # Not possible to create a test VM while a gateway is Updating, therefore starting the VM creation before the gateway
+    test_vm_id=$(az vm show -n "$test_vm_name" -g "$rg" --query id -o tsv 2>/dev/null)
+    if [[ -z "$test_vm_id" ]]
+    then
+        echo "Creating test virtual machine $test_vm_name in vnet $vnet_name in new subnet $test_vm_subnet_prefix..."
+        az network vnet subnet create --vnet-name "$vnet_name" -g "$rg" -n testvm --address-prefixes "$test_vm_subnet_prefix" >/dev/null
+        # Not using $psk as password because it might not fulfill the password requirements for Azure VMs
+        az vm create -n "$test_vm_name" -g "$rg" -l "$location" --image UbuntuLTS --size "$test_vm_size" \
+            --generate-ssh-keys --public-ip-address "${test_vm_name}-pip" --public-ip-address-allocation static \
+            --vnet-name "$vnet_name" --subnet testvm --no-wait
+    else
+        echo "Virtual machine $test_vm_name already exists"
+    fi
+    # Create PIPs for gateway (this gives time as well for the test VM NICs to be created and attached to the subnet)
+    echo "Creating public IP addresses for gateway vng${id}..."
+    az network public-ip create -g "$rg" -n "vng${id}a" >/dev/null
+    az network public-ip create -g "$rg" -n "vng${id}b" >/dev/null
+    # Create VNG
     vng_id=$(az network vnet-gateway show -n "vng${id}" -g "$rg" --query id -o tsv 2>/dev/null)
     if [[ -z "${vng_id}" ]]
     then
         echo "Creating VNG vng${id}..."
         az network vnet-gateway create -g "$rg" --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased \
-        --vnet "$vnet_name" -n "vng${id}" --asn "$asn" --public-ip-address "pip${id}a" "pip${id}b" --no-wait
+        --vnet "$vnet_name" -n "vng${id}" --asn "$asn" --public-ip-address "vng${id}a" "vng${id}b" --no-wait
     else
         echo "VNG vng${id} already exists"
     fi
@@ -314,7 +338,7 @@ function sh_csr_int () {
 function ssh_csr () {
     csr_id=$1
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress 2>/dev/null)
-    ssh "$csr_ip" "$2"
+    ssh "$csr_ip"
 }
 
 # Deploy baseline VPN and BGP config to a Cisco CSR
@@ -567,8 +591,8 @@ function verify_router () {
         echo "VM csr${id}-nva status is ${vm_status}, public IP is ${ip}"
     else
         gw_status=$(az network vnet-gateway show -n "vng${id}" -g "$rg" --query provisioningState -o tsv)
-        # ip_a=$(az network public-ip show -n "pip${id}a" -g "$rg" --query ipAddress -o tsv)
-        # ip_b=$(az network public-ip show -n "pip${id}b" -g "$rg" --query ipAddress -o tsv)
+        # ip_a=$(az network public-ip show -n "vng${id}a" -g "$rg" --query ipAddress -o tsv)
+        # ip_b=$(az network public-ip show -n "vng${id}b" -g "$rg" --query ipAddress -o tsv)
         # echo "Gateway vng${id} status is ${gw_status}, public IPs are ${ip_a} and ${ip_b}"
         echo "Gateway vng${id} status is ${gw_status}"
     fi
