@@ -17,13 +17,13 @@
 #
 # Examples:
 #
-# * Basic example with 1 VNG connected to one CSR
+# Basic example with 1 VNG connected to one CSR:
 #     bgp.sh "1:vng:65501,2:csr:65502" "1:2" mylab northeurope mypresharedkey
-# * 4 CSRs connected in full mesh
+# 4 CSRs connected in full mesh:
 #     bgp.sh "1:csr:65501,2:csr:65502,3:csr:65503,4:csr:65504" "1:2,1:3,2:4,3:4,1:4,2:3" mylab northeurope mypresharedkey
-# * 2 VNGs and 2 CSRs connected in full mesh
+# 2 VNGs and 2 CSRs connected in full mesh:
 #     bgp.sh "1:vng:65001,2:vng:65002,3:csr:65100,4:csr:65100" "1:2,1:3,1:4,2:4,2:3,3:4" mylab northeurope mypresharedkey
-# * Environment simulating 2 ExpressRoute locations (note you cannot use the 12076 ASN in Local Gateways)
+# Environment simulating 2 ExpressRoute locations (note you cannot use the 12076 ASN in Local Gateways):
 #     bgp.sh "1:vng:65515,2:vng:65515,3:csr:22076,4:csr:22076,5:csr:65001,6:csr:65002" "1:3,1:4,2:3,2:4,3:5,4:6,5:6" mylab northeurope mypresharedkey
 #
 # bash and zsh tested
@@ -31,7 +31,7 @@
 # Jose Moreno, August 2020
 ############################################################
 
-# Waits until a resourced finishes provisioning
+# Waits until a resource finishes provisioning
 # Example: wait_until_finished <resource_id> 
 function wait_until_finished () {
      wait_interval=60
@@ -577,19 +577,19 @@ function verify_router () {
 # Showing BGP neighbors for a certain router
 function show_bgp_neighbors () {
     router=$1
-    echo "Verifying $router..."
+    echo "Getting BGP neighbors for router $router..."
     type=$(get_router_type  "$router")
     id=$(get_router_id  "$router")
     if [[ "$type" == "csr" ]]
     then
         ip=$(az network public-ip show -n "csr${id}-pip" -g "$rg" --query ipAddress -o tsv)
-        echo "BGP neighbors for csr${id}-nva (${ip}):"
         neighbors=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$ip" "show ip bgp summary | begin Neighbor" 2>/dev/null)
+        echo "BGP neighbors for csr${id}-nva (${ip}):"
         clean_string "$neighbors"
     else
+        neighbors=$(az network vnet-gateway list-bgp-peer-status -n "vng${id}" -g "$rg" -o table 2>/dev/null)
         echo "BGP neighbors for vng${id}:"
-        neighbors=$(az network vnet-gateway list-bgp-peer-status -n "vng${id}" -g "$rg" -o tsv 2>/dev/null)
-        clean_string "$neighbors"
+        echo "$neighbors"
     fi
 }
 
@@ -728,6 +728,27 @@ do
 done
 echo "All dependencies checked successfully"
 
+# Verify az is logged in
+subscription_name=$(az account show --query name -o tsv 2>/dev/null)
+if [[ -z "$subscription_name" ]]
+then
+    echo "It seems you are not logged into Azure with the Azure CLI. Please use \"az login\" before trying this script again"
+    exit
+fi
+
+# Verify required az extensions installed
+for extension_name in "log-analytics"
+do
+    extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+    if [[ -z "$extension_version" ]]
+    then
+        echo "It seems that the Azure CLI extension \"$extension_name\" is not installed. Please install it with \"az extension add\" before trying this script again"
+        exit
+    else
+        echo "Azure CLI extension \"$extension_name\" found with version $extension_version"
+    fi
+done
+
 # Create lab variable from arguments, or use default
 if [ -n "$BASH_VERSION" ]; then
     echo "It looks like running under BASH"
@@ -747,7 +768,6 @@ if [[ -n "$2" ]]
 then
     # echo "Converting CSV string to array: $2"
     connections=($(convert_csv_to_array "$2"))
-    # echo ""${#connections[@]}" connections identified"
 else
     echo "Using sample values for connections"
     connections=("1:2" "1:3" "2:4" "3:4")
@@ -775,7 +795,8 @@ else
 fi
 
 # Ask confirmation before starting creating stuff
-read -rsn1 -p"Press any key to start creating Azure resources...";echo
+[[ $BASH_VERSION ]] && read -rsn1 -p"Press any key to start creating Azure resources into Azure subscription \"$subscription_name\"...";echo
+[[ $ZSH_VERSION ]] && read -krs "?Press any key to start creating Azure resources into Azure subscription \"$subscription_name\"...";echo
 
 # Create resource group
 echo "Creating resource group $rg..."
