@@ -35,14 +35,20 @@ function wait_until_finished () {
      then
         echo "Something really bad happened..."
      else
-        # run_time=$(expr `date +%s` - "$start_time")
         run_time=$(("$(date +%s)" - "$start_time"))
-        # ((minutes=${run_time}/60))
-        # ((seconds=${run_time}%60))
         ((minutes=run_time/60))
         ((seconds=run_time%60))
         echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
      fi
+}
+
+# Remove special characters and empty lines from string
+function clean_string () {
+    # Remove special characters
+    output=$(echo $1 | tr -dc '[:alnum:]\ \.\,\n')
+    # Remove empty lines
+    output=$(echo "$output" | awk NF)
+    echo "$output"
 }
 
 # Wait until a public IP address answers via SSH
@@ -53,20 +59,18 @@ function wait_until_csr_available () {
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" --query ipAddress -o tsv)
     echo "Waiting for IP address $csr_ip to answer over SSH..."
     start_time=$(date +%s)
-    # ssh_command="pwd"  # Using something that works both in IOS and Linux
-    ssh_command="show version | include uptime"  # A bit more info (contains VM name and uptime)
+    ssh_command="show version | include uptime"  # 'show version' contains VM name and uptime
     ssh_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" "$ssh_command" 2>/dev/null)
     until [[ -n "$ssh_output" ]]
     do
         sleep $wait_interval
-        ssh_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" "$ssh_command")
+        ssh_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" "$ssh_command" 2>/dev/null)
     done
-    # run_time=$(expr `date +%s` - "$start_time")
     run_time=$(("$(date +%s)" - "$start_time"))
     ((minutes=run_time/60))
     ((seconds=run_time%60))
     echo "IP address $csr_ip is available (wait time $minutes minutes and $seconds seconds). Answer to SSH command \"$ssh_command\":"
-    echo "$ssh_output"
+    clean_string "$ssh_output"
 }
 
 # Wait until all VNGs in the router list finish provisioning
@@ -289,7 +293,7 @@ function connect_csr () {
 function sh_csr_int () {
     csr_id=$1
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress 2>/dev/null)
-    ssh "$csr_ip" -o StrictHostKeyChecking=no "sh ip int b"
+    ssh -n -o StrictHostKeyChecking=no "$csr_ip" "sh ip int b" 2>/dev/null
 }
 
 # Open an interactive SSH session to a CSR
@@ -314,8 +318,12 @@ function config_csr_base () {
     echo "Our IP seems to be $myip"
     default_gateway="10.20${csr_id}.0.1"
     echo "Configuring CSR ${csr_ip} for VPN and BGP..."
+    username=$(whoami)
+    password=$psk
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
     config t
+      username ${username} password 0 ${password}
+      no ip domain lookup
       crypto ikev2 keyring azure-keyring
       crypto ikev2 proposal azure-proposal
         encryption aes-cbc-256 aes-cbc-128 3des
@@ -346,7 +354,9 @@ function config_csr_base () {
         bgp router-id interface GigabitEthernet1
         bgp log-neighbor-changes
         redistribute connected
-      ip route $myip 255.255.255.255 $default_gateway
+      ip route ${myip} 255.255.255.255 ${default_gateway}
+      line vty 0 15
+        exec-timeout 0 0
     end
     wr mem
 EOF
@@ -375,29 +385,29 @@ function config_csr_tunnel () {
     asn=$(get_router_asn_from_id "${csr_id}")
     default_gateway="10.20${csr_id}.0.1"
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
-    echo "Configuring tunnel $tunnel_id in CSR ${csr_ip}..."
+    echo "Configuring tunnel ${tunnel_id} in CSR ${csr_ip}..."
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
     config t
       crypto ikev2 keyring azure-keyring
-        peer $public_ip
-          address $public_ip
-          pre-shared-key $psk
+        peer ${public_ip}
+          address ${public_ip}
+          pre-shared-key ${psk}
       crypto ikev2 profile azure-profile
-        match identity remote address $public_ip 255.255.255.255
-      crypto isakmp key $psk address $public_ip
+        match identity remote address ${public_ip} 255.255.255.255
+      crypto isakmp key ${psk} address ${public_ip}
       interface Tunnel${tunnel_id}
         ip unnumbered GigabitEthernet1
         ip tcp adjust-mss 1350
         tunnel source GigabitEthernet1
         tunnel mode ipsec ipv4
-        tunnel destination $public_ip
-        tunnel protection ipsec profile $ipsec_profile
-      router bgp $asn
-        neighbor $private_ip remote-as $remote_asn
-        neighbor $private_ip ebgp-multihop 5
-        neighbor $private_ip update-source GigabitEthernet1
-      ip route $private_ip 255.255.255.255 Tunnel${tunnel_id}
-      ip route $public_ip 255.255.255.255 $default_gateway
+        tunnel destination ${public_ip}
+        tunnel protection ipsec profile ${ipsec_profile}
+      router bgp ${asn}
+        neighbor ${private_ip} remote-as ${remote_asn}
+        neighbor ${private_ip} ebgp-multihop 5
+        neighbor ${private_ip} update-source GigabitEthernet1
+      ip route ${private_ip} 255.255.255.255 Tunnel${tunnel_id}
+      ip route ${public_ip} 255.255.255.255 ${default_gateway}
     end
     wr mem
 EOF
@@ -562,11 +572,11 @@ function show_bgp_neighbors () {
         ip=$(az network public-ip show -n "csr${id}-pip" -g "$rg" --query ipAddress -o tsv)
         echo "BGP neighbors for csr${id}-nva (${ip}):"
         neighbors=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$ip" "show ip bgp summary | begin Neighbor" 2>/dev/null)
-        echo "$neighbors"
+        clean_string "$neighbors"
     else
         echo "BGP neighbors for vng${id}:"
         neighbors=$(az network vnet-gateway list-bgp-peer-status -n "vng${id}" -g "$rg" -o tsv 2>/dev/null)
-        echo "$neighbors"
+        clean_string "$neighbors"
     fi
 }
 
@@ -693,7 +703,8 @@ function convert_csv_to_array () {
 # Main #
 ########
 
-for binary in "ssh" "jq" "az"
+# Verify software dependencies
+for binary in "ssh" "jq" "az" "awk"
 do
     binary_path=$(which "$binary")
     if [[ -z "$binary_path" ]]
@@ -751,7 +762,6 @@ else
 fi
 
 # Ask confirmation before starting creating stuff
-# read -r -p "Press enter to start creating Azure resources"
 read -rsn1 -p"Press any key to start creating Azure resources...";echo
 
 # Create resource group
@@ -784,14 +794,12 @@ config_gw_logging
 for connection in "${connections[@]}"
 do
     create_connection "$connection"
-    echo
 done
 
 # Verify VMs/VNGs exist
 for router in "${routers[@]}"
 do
     show_bgp_neighbors "$router"
-    echo
 done
 
 # Finish
