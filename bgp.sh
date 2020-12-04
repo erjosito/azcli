@@ -519,6 +519,7 @@ function config_csr_base () {
         bgp log-neighbor-changes
         redistribute ospf 100 route-map O2B
         redistribute static route-map S2B
+        maximum-paths eibgp 4
       router ospf 100
         log-adjacency-changes
         passive-interface default
@@ -598,11 +599,30 @@ EOF
         config t
           router bgp ${asn}
             neighbor ${private_ip} remote-as ${remote_asn}
-            neighbor ${private_ip} ebgp-multihop 5
             neighbor ${private_ip} update-source GigabitEthernet1
         end
         wr mem
 EOF
+      if [[ "$asn" == "$remote_asn" ]]
+      then
+        # iBGP
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+            config t
+              router bgp ${asn}
+                neighbor ${private_ip} next-hop-self
+            end
+            wr mem
+EOF
+      else
+        # eBGP
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+            config t
+              router bgp ${asn}
+                neighbor ${private_ip} ebgp-multihop 5
+            end
+            wr mem
+EOF
+      fi
     elif [[ "$cx_type" == "ospf" ]] || [[ "$cx_type" == "bgpospf" ]]
     then
       echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
@@ -611,6 +631,17 @@ EOF
           router ospf 100
             no passive-interface Tunnel${tunnel_id}
             network 10.${csr_id}.0.0 255.255.0.0 area 0
+        end
+        wr mem
+EOF
+    elif [[ "$cx_type" == "static" ]]  ## Not used
+    then
+      echo "Configuring static routes for tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      remote_id=$(echo "$tunnel_id" | head -c 2 | tail -c 1) # This only works with a max of 9 routers
+      echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+        config t
+          ip route 10.${remote_id}.0.0 255.255.0.0 Tunnel${tunnel_id}
         end
         wr mem
 EOF

@@ -112,7 +112,7 @@ az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name -
 # az network vnet subnet create -g $rg --vnet-name $vnet_name -n $vmss_subnet_name --address-prefixes $vmss_subnet_prefix_v6
 # az network vnet subnet create -g $rg --vnet-name $vnet_name -n $vm_subnet_name --address-prefixes $vm_subnet_prefix_v6
 
-# Assuming a dual stack vnet, create specific subnets for IPv4-only and IPv6-only
+# Optional: Assuming a dual stack vnet, create specific subnets for IPv4-only and IPv6-only
 # These subnets are for testing, additionally to the NVA/VM/VMSS subnets
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n $ipv4_subnet_name --address-prefix $ipv4_subnet_prefix
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n $ipv6_subnet_name --address-prefix $ipv6_subnet_prefix
