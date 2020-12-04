@@ -42,7 +42,7 @@ ds_subnet_name=dual-stack
 ds_subnet_prefix_ipv4=192.168.12.0/24
 ds_subnet_prefix_ipv6=ace:cab:deca:12::/64
 vmss_subnet_prefix_v4=192.168.1.0/24
-cloudinit_filename=cloudinit-apache2.txt
+cloudinit_filename='/tmp/cloudinit-apache2.txt'
 nsg_name=vmss-nsg
 vmss_subnet_name=vmss
 vmss_subnet_prefix_v4=192.168.1.0/24
@@ -118,18 +118,21 @@ az network vnet subnet create -g $rg --vnet-name $vnet_name -n $ipv4_subnet_name
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n $ipv6_subnet_name --address-prefix $ipv6_subnet_prefix
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n $ds_subnet_name --address-prefixes $ds_subnet_prefix_ipv4 $ds_subnet_prefix_ipv6
 
-# Create PIPs
+# Create PIPs (all created as standard SKUs)
 az network public-ip create -n $vmss_pipv4_name -g $rg --sku Standard --allocation-method static --version IPv4
 az network public-ip create -n $vmss_pipv6_name -g $rg --sku Standard --allocation-method static --version IPv6
 az network public-ip create -n $vm_pipv4_name -g $rg --sku Standard --allocation-method static --version IPv4
 az network public-ip create -n $vm_pipv6_name -g $rg --sku Standard --allocation-method static --version IPv6
-vm_pipv4_ip=$(az network public-ip show -n $vm_pipv4_name -g $rg --query ipAddress -o tsv)
-vm_pipv6_ip=$(az network public-ip show -n $vm_pipv6_name -g $rg --query ipAddress -o tsv)
+vm_pipv4_ip=$(az network public-ip show -n $vm_pipv4_name -g $rg --query ipAddress -o tsv) && echo $vm_pipv4_ip
+vm_pipv6_ip=$(az network public-ip show -n $vm_pipv6_name -g $rg --query ipAddress -o tsv) && echo $vm_pipv6_ip
 
 # Create NSG allowing inbound SSH and 80 to the ipv6 prefix
+# Note that specifying all addresses as '*' defaults to IPv4 (rule #510). In order to allow IPv6 you need to specify at least one IPv6 range (like in rule #520)
 az network nsg create -n $nsg_name -g $rg
 az network nsg rule create -n ssh --nsg-name $nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
-az network nsg rule create -n web --nsg-name $nsg_name -g $rg --priority 510 --destination-address-prefixes $vnet_prefix_v6 --destination-port-ranges 80 --access Allow --protocol Tcp
+az network nsg rule create -n webstar --nsg-name $nsg_name -g $rg --priority 510 --destination-address-prefixes '*' --destination-port-ranges 80 --access Allow --protocol Tcp
+az network nsg rule create -n webv6 --nsg-name $nsg_name -g $rg --priority 520 --destination-address-prefixes $vnet_prefix_v6 --destination-port-ranges 80 --access Allow --protocol Tcp
+az network nsg rule list --nsg-name $nsg_name -g $rg -o table
 
 # Optionally: create additional vnet to peer
 peer_vnet_name=peer
@@ -143,19 +146,29 @@ az network vnet subnet create -g $rg --vnet-name $peer_vnet_name -n $peer_subnet
 az network vnet peering create -n vnet2peer -g $rg --vnet-name $vnet_name --remote-vnet $peer_vnet_name --allow-vnet-access --allow-forwarded-traffic
 az network vnet peering create -n peer2vnet -g $rg --vnet-name $peer_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic
 
+# Create cloudinit file
+cat << 'EOF' > $cloudinit_filename
+#cloud-config
+runcmd:
+  - apt-get update
+  - apt-get install -y apache2
+EOF
+
 
 ########
 #  VM  #
 ########
 
-# Create VM (ipv4-only with no PIP, add ipv6 later with IPv6 PIP)
+# Create VM (ipv4-only with no PIP, ipv6 added next with IPv6 PIP)
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku --custom-data $cloudinit_filename \
    --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $nsg_name --public-ip-address ""
 nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 nic_name=$(echo $nic_id | cut -d/ -f 9)
 az network nic ip-config create -n ipv6Config --nic-name $nic_name -g $rg --vnet-name $vnet_name --subnet $vm_subnet_name --private-ip-address-version IPv6 --public-ip-address $vm_pipv6_name
+az vm list-ip-addresses -n $vm_name -g $rg -o table
+az network nic list-effective-nsg -n $nic_name -g $rg
 
-# Add PIPv4 (you can use this method to add a PIP to the correct ipconfig)
+# Optionally, add PIPv4 (you can use this method to add a PIP to the correct ipconfig)
 ipconfig_version=IPv4
 ipconfig_name=$(az network nic ip-config list --nic-name $nic_name -g $rg --query "[?privateIpAddressVersion=='${ipconfig_version}'].{Name:name}" -o tsv)
 az network nic ip-config update -n $ipconfig_name --nic-name $nic_name -g $rg --public-ip-address $vm_pipv4_name
@@ -252,27 +265,27 @@ ssh $vm_pipv4_ip "ip -6 route"
 ########
 
 # Create VMSS
-# ToDo: Using a cloudinit file to install apache
 # VMSS creation like this will fail if vnet is IPv6-only
-# Optionally use the parameter " --public-ip-per-vm", but ILPIPs are today IPv4-only :(
 az vmss create -n $vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys \
     --vm-sku $vmss_sku --instance-count $vmss_vm_count --custom-data $cloudinit_filename \
     --vnet-name $vnet_name --subnet $vmss_subnet_name --nsg $nsg_name \
     --lb-sku $vmss_lb_sku --lb $vmss_lb_name --lb-nat-pool-name $vmss_lb_natpool --public-ip-address $vmss_pipv4_name
 
 # Optionally, create VMSS without LB
+# The AZs are another trick to force Standard PIPs/ALB
 az vmss create -n $vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys \
     --vm-sku $vmss_sku --instance-count $vmss_vm_count --custom-data $cloudinit_filename \
     --vnet-name $vnet_name --subnet $vmss_subnet_name --nsg $nsg_name \
-    --lb "" --public-ip-per-vm --zones 1 2 3
+    --lb "" --public-ip-per-vm --zones 1 2 3 --no-wait
 
-# Combining Standard LB with ILPIP iwll not work (SKU mismatch)
+# Combining Standard LB with ILPIP will not work (SKU mismatch, because the created IPv4 ILPIPs are basic)
 az vmss create -n $vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys \
     --vm-sku $vmss_sku --instance-count $vmss_vm_count --custom-data $cloudinit_filename \
     --vnet-name $vnet_name --subnet $vmss_subnet_name --nsg $nsg_name \
     --lb-sku $vmss_lb_sku --lb $vmss_lb_name --lb-nat-pool-name $vmss_lb_natpool --public-ip-per-vm
 
 # Add IPv6 ALB frontend, probe, backend and LB rule
+# You can do this on a VMSS with a standard ALB, or without any ALB
 backend_name_v4=$(az network lb address-pool list --lb-name $vmss_lb_name -g $rg --query '[0].name' -o tsv)
 backend_name_v6=backendv6
 frontend_name_v4=$(az network lb frontend-ip list --lb-name $vmss_lb_name -g $rg --query '[0].name' -o tsv)
