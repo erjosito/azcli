@@ -29,7 +29,8 @@ az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix --subn
 # az network vnet subnet create --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --address-prefixes 10.13.123.0/24
 
 # Create PIP
-az network public-ip create -g $rg -n $appgw_pipname --sku Standard
+allocation_method=Static
+az network public-ip create -g $rg -n $appgw_pipname --sku Standard --allocation-method $allocation_method
 #fqdn=$(az network public-ip show -g $rg -n $appgw_pipname --query dnsSettings.fqdn -o tsv)
 
 # Optionally, create NSG and attach it to the subnet

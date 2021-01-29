@@ -53,10 +53,35 @@ az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-m
 az network nsg create -n $vm_nsg_name -g $rg
 az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
 az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
-wget $vm_cloudinit_url -O $vm_cloudinit_filename
+az network nsg rule create -n https --nsg-name $vm_nsg_name -g $rg --priority 520 --destination-port-ranges 443 --access Allow --protocol Tcp
+#wget $vm_cloudinit_url -O $vm_cloudinit_filename
+cat <<EOF > $vm_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update && apt install -y python3-pip
+  - pip3 install flask
+  - wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
+  - python3 /root/myip.py &
+EOF
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
    --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
    --custom-data $vm_cloudinit_filename --no-wait
+
+# PWSH to create AzFW policy with TLS
+# See https://docs.microsoft.com/en-us/powershell/module/az.network/new-azfirewallpolicy?view=azps-5.4.0#example-4--4--create-policy-with-intrusion-detection--identity-and-transport-security
+select-azsubscription -subscriptionid e7da9914-9b05-4891-893c-546cb7b0422e
+$rg = "azfwappgw"
+$location = "eastus"
+$bypass = New-AzFirewallPolicyIntrusionDetectionBypassTraffic -Name "bypass-setting" -Protocol "TCP" -DestinationPort "80" -SourceAddress "10.0.0.0/8" -DestinationAddress "10.0.0.0/8"
+$signatureOverride = New-AzFirewallPolicyIntrusionDetectionSignatureOverride -Id "123456798" -Mode "Deny"
+$intrusionDetection = New-AzFirewallPolicyIntrusionDetection -Mode "Alert" -SignatureOverride $signatureOverride -BypassTraffic $bypass 
+$userAssignedIdentity = '/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourcegroups/azfwappgw/providers/Microsoft.ManagedIdentity/userAssignedIdentities/fwid'
+$secretId = "https://erjositoKeyvault.vault.azure.net/secrets/selfsignedcapfx"
+# New-AzFirewallPolicy -Name azfwpolicy -Location $location -ResourceGroup $rg -SkuTier "Premium" -IntrusionDetection $intrusionDetection -TransportSecurityName tsName -TransportSecurityKeyVaultSecretId $secretId -UserAssignedIdentityId $userAssignedIdentity
+# Modify existing policy
+$policy=get-azfirewallpolicy -resourcegroupname $rg -name azfwpolicy
+$policy | Set-AzFirewallPolicy -SkuTier "Premium" -IntrusionDetection $intrusionDetection -TransportSecurityName tsName -TransportSecurityKeyVaultSecretId $secretId -UserAssignedIdentityId $userAssignedIdentity
+
 
 # Deploy AzFW
 az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location
@@ -66,7 +91,7 @@ azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
 az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
     --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
-            {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
+            {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
 az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name
 az network firewall update -n $azfw_name -g $rg
 azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
@@ -76,7 +101,7 @@ az network firewall application-rule create -f $azfw_name -g $rg -c AllowAll --p
     --target-fqdns "*" --source-addresses $vnet_prefix -n Allow-all --priority 200 --action Allow
 
 # DNAT rules for the test VM
-vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv)
+vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv) && echo $vm_private_ip
 az network firewall nat-rule create -n SSH-to-VM -f $azfw_name -g $rg \
     --destination-addresses $azfw_pip_address --destination-ports 22 --protocols Tcp --translated-address $vm_private_ip --translated-port 22 \
     --source-addresses '*' -c VMTraffic --priority 200 --action Dnat
@@ -85,11 +110,8 @@ az network firewall nat-rule create -n Web-to-VM -f $azfw_name -g $rg \
     --source-addresses '*' -c VMTraffic
 
 # Verify Linux VM deployed correctly and SSH is working fine
-vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
-# ssh-keyscan -H $vm_pip_address >> ~/.ssh/known_hosts
-# ssh $vm_pip_address "ip a"
-
-# Verify API is working
+vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
 curl ${vm_pip_address}:8080/api/healthcheck
 curl ${vm_pip_address}:8080/api/ip
 

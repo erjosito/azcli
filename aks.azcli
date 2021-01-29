@@ -6,7 +6,7 @@
 #################################
 
 # Variables
-rg=akstest1
+rg=akstest
 location=westeurope
 keyvaultname=erjositoKeyvault
 keyvault_rg=myKeyvault
@@ -15,16 +15,15 @@ wait_interval=5s
 aks_name=aks
 aks_rbac=yes
 aks_service_cidr=10.0.0.0/16
-vmsize=Standard_B2ms
-vm_size=Standard_B2ms
-preview_version=no
+vm_size=Standard_D2_v3    # Other possible values: Standard_B2ms, Standard_D2_v3
+preview_version=yes
 # Vnet
 vnet_name=aksVnet
 vnet_prefix=10.13.0.0/16
 aks_subnet_name=aks
-aks_subnet_prefix=10.13.76.0/26
+aks_subnet_prefix=10.13.76.0/24  # Min /25 with Azure CNI!
 aks2_subnet_name=aks2ndpool
-aks2_subnet_prefix=10.13.75.0/26
+aks2_subnet_prefix=10.13.75.0/24
 vm_subnet_name=vm
 vm_subnet_prefix=10.13.1.0/24
 appgw_subnet_name=AppGateway
@@ -135,7 +134,9 @@ az aks create -g $rg -n $aks_name -l $location \
     --no-wait
 
 # Other options you can use in the previous command
-    # --enable-private-cluster \
+    # --enable-private-cluster
+    # --enable-cluster-autoscaler --min-count 1 --max-count 4 \
+    # --cluster-autoscaler-profile scan-interval=30s \
     # --dns-name-prefix cloudtrooper \
 
 #########################
@@ -162,14 +163,81 @@ az aks list -o table
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl get nodes
 
+######################
+# Update the cluster #
+######################
+
+# Enable monitoring addon
+az aks enable-addons -g $rg -n $aks_name --addons monitoring --workspace-resource-id "$logws_id"
+
+# Add cluster autoscaler (requires the monitoring addon)
+az aks update -g $rg -n $aks_name --enable-cluster-autoscaler --min-count 1 --max-count 4
+
+# Modify autoscaler profile (see https://docs.microsoft.com/azure/aks/cluster-autoscaler#using-the-autoscaler-profile)
+az aks update -g $rg -n $aks_name --cluster-autoscaler-profile scale-down-unneeded-time=1m
+
+# Add diag settings for cluster logs
+aks_id=$(az aks show -n $aks_name -g $rg --query id -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $aks_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "kube-apiserver", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "kube-audit", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "kube-audit-admin", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "kube-controller-manager", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "kube-scheduler", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "cluster-autoscaler", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "guard", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
 
 #####################
 # Add a second pool #
 #####################
 
 az network vnet subnet create -g $rg -n $aks2_subnet_name --vnet-name $vnet_name --address-prefix $aks2_subnet_prefix
+vm_size=Standard_DS3_v2
 aks2_subnet_id=$(az network vnet subnet show -n $aks2_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 az aks nodepool add --cluster-name $aks_name -g $rg -n pool2 --node-count 1 -s $vm_size \
     --enable-cluster-autoscaler --min-count 1 --max-count 2 \
-    -k $k8s_version --mode User --vnet-subnet-id $aks2_subnet_id
+    -k $k8s_version --mode User --vnet-subnet-id $aks2_subnet_id \
+    --node-osdisk-type Ephemeral
 az aks nodepool list --cluster-name $aks_name -g $rg -o table
+
+###########################
+# Deploy sample workloads #
+###########################
+
+az aks get-credentials -n $aks_name -g $rg --overwrite
+kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=10
+kubectl scale deployment kuard --replicas=5
+
+###########################
+# Logs from Azure Monitor #
+###########################
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+# Log category summary
+summary='AzureDiagnostics
+| summarize count() by Category'
+az monitor log-analytics query -w $logws_customerid --analytics-query $summary -o tsv
+# Cluster autoscaler (see https://docs.microsoft.com/en-us/azure/aks/view-master-logs)
+ca_query='AzureDiagnostics
+| where Category == "cluster-autoscaler"
+//| project log_s
+| take 20 '
+az monitor log-analytics query -w $logws_customerid --analytics-query $ca_query -o tsv
+# Kube scheduler
+sched_query='AzureDiagnostics
+| where Category == "kube-scheduler"
+//| project log_s
+| take 20 '
+az monitor log-analytics query -w $logws_customerid --analytics-query $sched_query -o tsv
+# audit-admin (from our IP)
+myip=$(curl -s4 ifconfig.co)
+admin_query='AzureDiagnostics
+| where TimeGenerated > ago(1d) 
+| where Category == "kube-audit-admin"
+| extend log_j = parse_json(log_s)
+| extend log_kind = log_j.kind, log_verb = log_j.verb, log_sourceIP = log_j.sourceIPs[0], log_username= log_j.user.username
+| extend log_object_resource=log_j.objectRef.resource, log_object_subresource=log_j.objectRef.subresource, log_object_name=log_j.objectRef.name, log_object_namespace=log_j.objectRef.namespace
+| project TimeGenerated, log_sourceIP, log_kind, log_verb, log_username, log_object_resource,log_object_subresource,log_object_name, log_object_namespace
+| where log_sourceIP == "'$myip'"
+| take 20 '
+az monitor log-analytics query -w $logws_customerid --analytics-query $admin_query -o tsv

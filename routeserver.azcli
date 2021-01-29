@@ -1,0 +1,425 @@
+# variables
+rg=routeserver
+location=westeurope
+vnet_name=routeserver
+vnet_prefix=10.0.0.0/16
+subnet_name=routeserver
+subnet_prefix=10.0.0.0/24
+vr_name=myRouteServer
+# GatewaySubnet
+gw_subnet_prefix=10.0.254.0/24
+# CSR
+csr_subnet_name=csr
+csr_subnet_prefix=10.0.1.0/24
+csr_default_gw=10.0.1.1
+csr_bgp_ip=10.0.1.10
+# FW NVA
+fw_subnet_name=fw
+fw_subnet_prefix=10.0.2.0/24
+
+# Create Vnet
+az group create -n $rg -l $location
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $subnet_name --subnet-prefix $subnet_prefix
+
+# Create peered vnets with Ubuntu VM
+# spoke 1
+spoke1_name=spoke1
+spoke1_prefix=10.1.0.0/16
+spoke1_subnet_name=vm
+spoke1_subnet_prefix=10.1.0.0/24
+az network vnet create -g $rg -n $spoke1_name --address-prefix $spoke1_prefix --subnet-name $spoke1_subnet_name --subnet-prefix $spoke1_subnet_prefix -l $location
+az network vnet peering create -n hubtospoke1 -g $rg --vnet-name $vnet_name --remote-vnet $spoke1_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
+az network vnet peering create -n spoke1tohub -g $rg --vnet-name $spoke1_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
+az vm create -n spoke1-vm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address spoke1-vm-pip --vnet-name $spoke1_name --size Standard_B1s --subnet vm
+spoke1_ip=$(az network public-ip show -n spoke1-vm-pip --query ipAddress -o tsv -g $rg)
+spoke1_nic_id=$(az vm show -n spoke1-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke1_private_ip=$(az network nic show --ids $spoke1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke1_private_ip
+
+# spoke 2
+spoke2_name=spoke2
+spoke2_prefix=10.2.0.0/16
+spoke2_subnet_name=vm
+spoke2_subnet_prefix=10.2.0.0/24
+az network vnet create -g $rg -n $spoke2_name --address-prefix $spoke2_prefix --subnet-name $spoke2_subnet_name --subnet-prefix $spoke2_subnet_prefix -l $location
+az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $vnet_name --remote-vnet $spoke2_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
+az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke2_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
+az vm create -n spoke2-vm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address spoke2-vm-pip --vnet-name $spoke2_name --size Standard_B1s --subnet vm
+spoke2_ip=$(az network public-ip show -n spoke2-vm-pip --query ipAddress -o tsv -g $rg)
+spoke2_nic_id=$(az vm show -n spoke2-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke2_private_ip=$(az network nic show --ids $spoke2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke2_private_ip
+
+# Create hub subnets (no subnet can be created while the route server is being provisioned)
+az network vnet subnet create -n $csr_subnet_name --address-prefix $csr_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n $fw_subnet_name --address-prefix $fw_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefix --vnet-name $vnet_name -g $rg
+
+# Create Route Server
+subnet_id=$(az network vnet subnet show -n $subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az network vrouter create -n $vr_name -g $rg --hosted-subnet $subnet_id -l $location --no-wait
+
+# Get info (once created)
+vr_ip1=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $vr_ip1
+vr_ip2=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $vr_ip2
+vr_asn=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $vr_asn
+
+# Create CSR
+# Variables
+csr_asn=65515
+publisher=cisco
+offer=cisco-csr-1000v
+sku=16_12-byol
+csr_username=jose
+csr_password=Microsoft123!
+
+# Create CSR as NVA
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+az vm image terms accept --urn ${publisher}:${offer}:${sku}:${version}
+az vm create -n csr-nva -g $rg -l $location \
+    --image ${publisher}:${offer}:${sku}:${version} \
+    --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
+    --public-ip-address csr-pip --public-ip-address-allocation static \
+    --vnet-name $vnet_name --subnet $csr_subnet_name \
+    --private-ip-address $csr_bgp_ip
+csr_nic_id=$(az vm show -n csr-nva -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $csr_nic_id --ip-forwarding
+
+# Configure CSR with BGP
+csr_ip=$(az network public-ip show -n csr-pip --query ipAddress -o tsv -g $rg)
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip <<EOF
+config t
+    no ip domain lookup
+    interface Loopback 0
+        ip address 1.1.1.1 255.255.255.255
+    router bgp ${csr_asn}
+        network 1.1.1.1 mask 255.255.255.255
+        neighbor $vr_ip1 remote-as $vr_asn
+        neighbor $vr_ip1 ebgp-multihop 2
+        neighbor $vr_ip2 remote-as $vr_asn
+        neighbor $vr_ip2 ebgp-multihop 2
+    ip route $vr_ip1 255.255.255.255 $csr_default_gw
+    ip route $vr_ip2 255.255.255.255 $csr_default_gw
+end
+wr mem
+EOF
+
+# Route Server is reachable over ICMP :)
+ssh $csr_ip "ping $vr_ip1"
+
+# Create peering
+az network vrouter peering create --vrouter-name $vr_name -g $rg --peer-ip $csr_bgp_ip --peer-asn $csr_asn -n csr
+
+# Check effective routes in peered VNets
+az network nic show-effective-route-table -n spoke1-vmVMNic -g $rg -o table
+az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o table
+# iBGP, with network statement. Note that the next hop is the CSR, not the VR:
+# Source                 State    Address Prefix    Next Hop Type          Next Hop IP
+# ---------------------  -------  ----------------  ---------------------  -------------
+# VirtualNetworkGateway  Active   1.1.1.1/32        VirtualNetworkGateway  10.0.1.10
+
+# Measure route injection time
+# Create route in CSR
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip <<EOF
+config t
+    interface Loopback 10
+        ip address 10.10.10.10 255.255.255.255
+    router bgp 65500
+        network 10.10.10.10 mask 255.255.255.255
+end
+EOF
+start_time=$(date +%s)
+echo "Interface created in CSR, now waiting for route to appear..."
+route=$(az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
+until [[ -n "$route" ]]
+do
+    route=$(az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
+done
+finish_time=$(date +%s)
+run_time=$(($finish_time - $start_time))
+((minutes=run_time/60))
+((seconds=run_time%60))
+echo "Route appeared after $minutes minutes and $seconds seconds"
+# Result: around 30-45s
+
+# Measure route removal time
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip <<EOF
+config t
+    no interface Loopback10
+    router bgp 65500
+        no network 10.10.10.10 mask 255.255.255.255
+end
+EOF
+start_time=$(date +%s)
+echo "Interface deleted in CSR, now waiting for route to disappear..."
+route=$(az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
+until [[ -z "$route" ]]
+do
+    route=$(az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
+done
+finish_time=$(date +%s)
+run_time=$(($finish_time - $start_time))
+((minutes=run_time/60))
+((seconds=run_time%60))
+echo "Route disappeared after $minutes minutes and $seconds seconds"
+# Result: around 20-30s
+
+# Check BGP in the NVA
+ssh $csr_ip "sh ip bgp summary"
+ssh $csr_ip "sh ip bgp"
+ssh $csr_ip "sh ip route bgp"
+ssh $csr_ip "sh ip bgp neig $vr_ip1 advertised-routes"
+ssh $csr_ip "sh ip bgp neig $vr_ip1 routes"
+
+# Connectivity to spoke
+spokevm_ip=$(az network public-ip show -n spoke-vm-pip --query ipAddress -o tsv -g $rg)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spokevm_ip "ping 1.1.1.1 -c 5"
+
+# Spoke-to-spoke connectivity
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip <<EOF
+config t
+    ip route 10.0.0.0 255.0.0.0 $csr_default_gw
+    router bgp ${csr_asn}
+        no redistribute static
+        network 10.0.0.0 mask 255.0.0.0
+end
+wr mem
+EOF
+
+# Verify connectivity
+# ICMP
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_ip "ping $spoke1_private_ip -c 5"
+# SSH from spoke to spoke (using one of them as jump host)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $spoke1_ip $spoke2_private_ip "ip a"
+
+# Note the routes are injected in the NVA subnet too!
+# Routes from NVA1 are not visible in NVA2's NIC:
+# az network nic show-effective-route-table -n csr2-nvaVMNic -g $rg -o table
+# Source                 State    Address Prefix    Next Hop Type          Next Hop IP
+# ---------------------  -------  ----------------  ---------------------  -------------
+# VirtualNetworkGateway  Active   1.1.1.1/32        VirtualNetworkGateway  10.0.1.10
+
+# If routing to the Internet, a RT with DisableGWPropagation in the NVA subnet would be required
+
+######################################
+# Redundancy with AS path prepending #
+######################################
+
+# 2 NVAs, eBGP one with ASpath prepending: only one route:
+# az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o table
+# Source                 State    Address Prefix    Next Hop Type          Next Hop IP
+# ---------------------  -------  ----------------  ---------------------  -------------
+# VirtualNetworkGateway  Active   1.1.1.1/32        VirtualNetworkGateway  10.0.1.10
+
+# If the 1ary appliance is rebooted, the other route would appear:
+# az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o table
+# Source                 State    Address Prefix    Next Hop Type          Next Hop IP
+# ---------------------  -------  ----------------  ---------------------  -------------
+# VirtualNetworkGateway  Active   1.1.1.1/32        VirtualNetworkGateway  10.0.1.20
+
+# When the 1ary appliance comes back, the previous route is there again
+# az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o table
+# Source                 State    Address Prefix    Next Hop Type          Next Hop IP
+# ---------------------  -------  ----------------  ---------------------  -------------
+# VirtualNetworkGateway  Active   1.1.1.1/32        VirtualNetworkGateway  10.0.1.10
+
+
+#############
+# Third NVA #
+#############
+
+# TL;DR: not working, the nexthop for routes injected by the BGP NVA is always going to be itself
+# To do: change this to test Quagga on Linux
+
+# Create peered vnet with Ubuntu VM
+fw_name=ubuntufw
+fw_pip=${fw_name}-pip
+spoke_name=spoke
+az vm create -n $fw_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address $fw_pip --vnet-name $vnet_name --size Standard_B1s --subnet $fw_subnet_name
+fw_nic_id=$(az vm show -n $fw_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $fw_nic_id --ip-forwarding
+fw_pip_ip=$(az network public-ip show -n $fw_pip -g $rg --query ipAddress -o tsv) && echo $fw_pip_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_pip_ip "sudo sysctl net.ipv4.ip_forward"
+fw_private_ip=$(az network nic show --ids $fw_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $fw_private_ip
+
+# Inject routes from CSR into the VR
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip <<EOF
+config t
+    ip route 10.0.0.0 255.0.0.0 $fw_private_ip
+    ip route $fw_private_ip 255.255.255.255 $csr_default_gw
+    router bgp ${csr_asn}
+        redistribute static
+        no network 10.0.0.0 mask 255.0.0.0
+end
+wr mem
+EOF
+az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o table
+# Next hop is always the CSR, regardless if advertised via network or redistribute, if eBGP or iBGP.
+# Even if hte CSR announces it with the right next hop, the RS seems to override the next hop:
+# csr-nva#sh ip bgp neig 10.0.0.4 advertised-routes             
+# BGP table version is 30, local router ID is 10.10.10.10
+# Status codes: s suppressed, d damped, h history, * valid, > best, i - internal, 
+#               r RIB-failure, S Stale, m multipath, b backup-path, f RT-Filter, 
+#               x best-external, a additional-path, c RIB-compressed, 
+#               t secondary path, L long-lived-stale,
+# Origin codes: i - IGP, e - EGP, ? - incomplete
+# RPKI validation codes: V valid, I invalid, N Not found
+
+#      Network          Next Hop            Metric LocPrf Weight Path
+#  *>   10.0.0.0         10.0.2.4                 0         32768 ?
+# Get-AzVirtualRouterPeerLearnedRoute -ResourceGroupName routeserver -virtualroutername myRouteServer -peername csr | ft
+# LocalAddress Network          NextHop   SourcePeer Origin AsPath Weight
+# ------------ -------          -------   ---------- ------ ------ ------
+# 10.0.0.4     10.0.0.0/8       10.0.1.10 10.0.1.10  IBgp           32768
+
+################
+# ExpressRoute #
+################
+
+# Create ER and ER Gateway
+ergw_name=ergw
+ergw_pip="${ergw_name}-pip"
+er_location=germanywestcentral
+er_pop=Frankfurt
+er_provider=Megaport
+er_circuit_name=tester
+az network public-ip create -g $rg -n $ergw_pip --allocation-method Dynamic --sku Basic
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix
+az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $vnet_name --public-ip-addresses $ergw_pip --no-wait
+az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg \
+    --bandwidth 50 --provider $er_provider -l $er_location --sku-family MeteredData --sku-tier Standard
+# After provisioning circuit in Megaport portal continue
+circuit_id=$(az network express-route list --query '[0].id' -o tsv)
+az network vpn-connection create -n erconnection -g $rg --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
+
+# Configure Route Server to exchange routes with Vnet Gateways
+az network vrouter update -n $vr_name -g $rg --set allowBranchToBranchTraffic=true
+
+# BGP neighbors of ER gateway should show the two Route Server instances
+az network vnet-gateway list-bgp-peer-status -n $ergw_name -g $rg -o table
+
+#######
+# VPN #
+#######
+
+# Azure VPN Gateway gets created in Failed state in my RG, not sure where the problem is 
+
+# Create VPN Gateway
+gw_subnet_prefix=10.0.254.0/24
+vpngw_name=vpngw
+vpngw_asn=65500
+vpngw_pip="${vpngw_name}-pip"
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix
+az network public-ip create -g $rg -n $vpngw_pip --allocation-method Dynamic --sku Basic
+az network vnet-gateway create -g "$rg" --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased \
+            --vnet "$vnet_name" -n $vpngw_name --asn "$vpngw_asn" --public-ip-address $vpngw_pip --no-wait
+
+# Create CSR to simulate onprem
+nva_size=Standard_B2ms
+onprem_vnet_prefix=192.168.0.0/16
+onprem_subnet_prefix=192.168.0.0/24
+onprem_bgp_ip=192.168.0.10
+publisher=cisco
+offer=cisco-csr-1000v
+sku=16_12-byol
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
+az vm create -n onprem-csr -g "$rg" -l "$location" --image "${publisher}:${offer}:${sku}:${version}" --size "$nva_size" \
+    --generate-ssh-keys --public-ip-address "onprem-csr-pip" --public-ip-address-allocation static \
+    --vnet-name onprem --vnet-address-prefix "$onprem_vnet_prefix" --subnet nva --subnet-address-prefix "$onprem_subnet_prefix" \
+    --private-ip-address "$onprem_bgp_ip"
+
+# Create local network gateway and connection
+onprem_csr_ip=$(az network public-ip show -n onprem-csr-pip -g $rg --query ipAddress -o tsv)
+onprem_bgp_asn=65200
+ipsec_psk=Microsoft123!
+az network local-gateway create -g "$rg" -n onprem-csr --gateway-ip-address "$onprem_csr_ip" \
+    --local-address-prefixes "${onprem_bgp_ip}/32" --asn "$onprem_bgp_asn" --bgp-peering-address "$onprem_bgp_ip" --peer-weight 0
+az network vpn-connection create -n "onprem" -g "$rg" --vnet-gateway1 "$vpngw_name" \
+    --shared-key "$ipsec_psk" --local-gateway2 "onprem-csr" --enable-bgp
+
+# Configure onprem CSR for VPN
+onprem_default_gw=192.168.0.1
+vpngw_pip_ip=$(az network public-ip show -n $vpngw_pip -g $rg --query ipAddress -o tsv)
+vpngw_bgp_ip=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.)
+vpngw_bgp_asn=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.asn)
+onprem_asn=65200
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$onprem_csr_ip"
+    config t
+      crypto ikev2 proposal azure-proposal
+        encryption aes-cbc-256 aes-cbc-128 3des
+        integrity sha1
+        group 2
+      crypto ikev2 policy azure-policy
+        proposal azure-proposal
+      crypto ikev2 profile azure-profile
+        match address local interface GigabitEthernet1
+        authentication remote pre-share
+        authentication local pre-share
+        keyring local azure-keyring
+      crypto ipsec transform-set azure-ipsec-proposal-set esp-aes 256 esp-sha-hmac
+        mode tunnel
+      crypto ipsec profile azure-vti
+        set security-association lifetime kilobytes 102400000
+        set transform-set azure-ipsec-proposal-set
+        set ikev2-profile azure-profile
+      crypto isakmp policy 1
+        encr aes
+        authentication pre-share
+        group 14
+      crypto ipsec transform-set csr-ts esp-aes esp-sha-hmac
+        mode tunnel
+      crypto ikev2 keyring azure-keyring
+        peer ${vpngw_pip_ip}
+          address ${vpngw_pip_ip}
+          pre-shared-key ${ipsec_psk}
+      crypto ikev2 profile azure-profile
+        match identity remote address ${vpngw_pip_ip} 255.255.255.255
+      crypto isakmp key ${psk} address ${vpngw_pip_ip}
+      interface Tunnel0
+        ip unnumbered GigabitEthernet1
+        ip tcp adjust-mss 1350
+        tunnel source GigabitEthernet1
+        tunnel mode ipsec ipv4
+        tunnel destination ${vpngw_pip_ip}
+        tunnel protection ipsec profile azure-vti
+      router bgp ${onprem_asn}
+        bgp router-id interface GigabitEthernet1
+        bgp log-neighbor-changes
+        redistribute ospf 100 route-map O2B
+        redistribute static route-map S2B
+        maximum-paths eibgp 4
+        neighbor ${vpngw_bgp_ip} remote-as ${vpngw_bgp_asn}
+        neighbor ${vpngw_bgp_ip} update-source GigabitEthernet1
+        neighbor ${vpngw_bgp_ip} ebgp-multihop 5
+      ip route ${vpngw_bgp_ip} 255.255.255.255 Tunnel0
+      ip route ${vpngw_pip_ip} 255.255.255.255 ${onprem_default_gw}
+    end
+    wr mem
+EOF
+
+###############
+# Diagnostics #
+###############
+
+az network vrouter list -g $rg -o table
+az network vrouter show -n $vr_name -g $rg
+az network vrouter peering list --vrouter-name $vr_name -g $rg -o table
+az network vrouter peering show -n csr --vrouter-name $vr_name -g $rg
+
+########################
+# REST not working yet #
+########################
+
+# REST: vRouter
+subscription=$(az account show --query id -o tsv)
+version=2020-07-01
+url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualRouters/${vr_name}?api-version=${version}"
+url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualHubs/${vr_name}?api-version=${version}"
+az rest --method get --url $url
+
+# REST: peering
+subscription=$(az account show --query id -o tsv)
+version=2020-07-01
+url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualRouters/${vr_name}/peerings/csr?api-version=${version}"
+az rest --method get --url $url

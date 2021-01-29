@@ -1,14 +1,22 @@
+# Create/retrieve SP ID and secret for a given purpose from AKV
+# If it doesnt exist, it will create it
+
+# Variables
+keyvault_name=erjositoKeyvault
+keyvault_rg=keyvaults   # Only required if new AKV is to be created
+keyvault_loc=westeurope # Only required if new AKV is to be created
+purpose=test
+
 # Day zero: create Azure Key Vault if required
-keyvault_name=joseakv-airs
-keyvault_rg=keyvaults # Only required if new AKV is to be created
-get_kvname=$(az keyvault list -o tsv --query '[?name=="'$keyvault_name'"].name')
-if [[ -n ${get_kvname} ]]
+keyvault_rg_found=$(az keyvault list -o tsv --query '[?name=="'$keyvault_name'"].resourceGroup')
+if [[ -n ${keyvault_rg_found} ]]
 then
-    echo "AKV ${keyvault_name} found"
+    echo "AKV ${keyvault_name} found in resource group $keyvault_rg_found"
+    keyvault_rg="$keyvault_rg_found"
 else
     echo "Creating AKV ${keyvault_name} in RG ${keyvault_rg}..."
-    az group create -n $keyvault_rg -l $location
-    az keyvault create -n $keyvault_name -g $keyvault_rg -l $location
+    az group create -n $keyvault_rg -l $keyvault_loc
+    az keyvault create -n $keyvault_name -g $keyvault_rg -l $keyvault_loc
     user_name=$(az account show --query 'user.name' -o tsv)
     echo "Setting policies for user ${user_name}..."
     az keyvault set-policy -n $keyvault_name -g $keyvault_rg --upn $user_name \
@@ -18,27 +26,33 @@ else
         --storage-permissions backup delete deletesas get getsas list listsas purge recover regeneratekey restore set setsas update
 fi
 
-# First time: create SP and store the app id and secret as AKV secrets. You need to do this only **once**
-keyvault_name=joseakv-airs
-purpose=appgw
-keyvault_appid_secret_name=$purpose-sp-appid
-keyvault_password_secret_name=$purpose-sp-secret
-sp_name=$purpose
-sp_output=$(az ad sp create-for-rbac --name $sp_name --skip-assignment 2>/dev/null)
-sp_app_id=$(echo $sp_output | jq -r '.appId')
-sp_app_secret=$(echo $sp_output | jq -r '.password')
-az keyvault secret set --vault-name $keyvault_name --name $keyvault_appid_secret_name --value $sp_app_id
-az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $sp_app_secret
-# Assign  Azure RBAC roles (example a RG) or AKV policy (example certificate/secret get if the SP should be able to retrieve certs)
-rg_name=my-rg
-rg_id=$(az group show -n $rg_name --query id -o tsv)
-az role assignment create --scope $rg_id --assignee $sp_app_id --role Contributor
-az keyvault set-policy -n $keyvault_name --object-id $sp_app_id --certificate-permissions get --secret-permissions get
-
-# Next time: get SP details from AKV
-purpose=aks
-keyvault_name=joseakv-airs
+# Get SP details from AKV
+keyvault_name=erjositoKeyvault
 keyvault_appid_secret_name=$purpose-sp-appid
 keyvault_password_secret_name=$purpose-sp-secret
 sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
 sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
+
+# If either is blank, create new SP with the required name
+if [[ -z "$sp_app_id" ]] || [[ -z "$sp_app_secret" ]]
+then
+    # Create new SP
+    sp_name=$purpose
+    sp_output=$(az ad sp create-for-rbac --name $sp_name --skip-assignment 2>/dev/null)
+    sp_app_id=$(echo $sp_output | jq -r '.appId')
+    sp_app_secret=$(echo $sp_output | jq -r '.password')
+    az keyvault secret set --vault-name $keyvault_name --name $keyvault_appid_secret_name --value $sp_app_id
+    az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $sp_app_secret
+    # Optionally, assign  Azure RBAC roles (example a RG) or AKV policy (example certificate/secret get if the SP should be able to retrieve certs)
+    # rg_name=my-rg
+    # rg_id=$(az group show -n $rg_name --query id -o tsv)
+    # az role assignment create --scope $rg_id --assignee $sp_app_id --role Contributor
+    # az keyvault set-policy -n $keyvault_name --object-id $sp_app_id --certificate-permissions get --secret-permissions get
+fi
+
+
+
+
+# Try to login as service principal
+tenant=$(az account show --query tenantId -o tsv)
+az login --service-principal -u $sp_app_id -p $sp_app_secret --tenant $tenant

@@ -1,0 +1,64 @@
+############################################################################
+# Created by Jose Moreno
+# December 2020
+#
+# Using ACI+certbot to generate certs and put them on AKV
+############################################################################
+
+# Variables
+akv_name=erjositoKeyvault
+aci_name=certbot
+image=erjosito/certbot-azcli:1.0
+rg=acicertbot
+location=westeurope
+dns_zone=cloudtrooper.net
+dns_hostname=certbot
+domain="${dns_hostname}.${dns_zone}"
+email_address=jomore@microsoft.com
+id_name=certbotid
+
+# Create RG and user identity
+az group create -n $rg -l $location
+id_resid=$(az identity show -n $id_name -g $rg --query id -o tsv)
+if [[ -z "$id_resid" ]]
+then
+    echo "Creating user identity ${id_name}..."
+    az identity create -n $id_name -g $rg
+    id_spid=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
+    id_resid=$(az identity show -n $id_name -g $rg --query id -o tsv)
+    az keyvault set-policy -n $akv_name --object-id $id_spid \
+        --secret-permissions get list set \
+        --certificate-permissions create import list setissuers update \
+        --key-permissions create get import sign verify
+    dns_zone_id=$(az network dns zone list --query "[?name=='$dns_zone'].id" -o tsv)
+    if [[ -n "$dns_zone_id" ]]
+    then
+        echo "DNS zone $dns_zone found, resource ID $dns_zone_id, creating role assignment..."
+        az role assignment create --scope $dns_zone_id --assignee $id_spid --role "DNS Zone Contributor"
+    else
+        echo "DNS zone $dns_zone not found"
+    fi
+else
+    echo "User identity ${id_name} found, ID is $id_resid"
+fi
+
+# Run container
+# az container create -n $aci_name -g $rg -l $location --image $image --assign-identity $id_resid \
+#   -e "DOMAIN=$domain" "EMAIL=$email_address" "AKV=$akv_name" "DEBUG=yes" "STAGING=yes"
+az container create -n $aci_name -g $rg -l $location --image $image --assign-identity $id_resid \
+  -e "DOMAIN=$domain" "EMAIL=$email_address" "AKV=$akv_name"
+
+# Events/Logs
+az container logs -n $aci_name -g $rg 
+az container show -n $aci_name -g $rg --query 'instanceView.events'
+az container show -n $aci_name -g $rg --query 'containers[0].instanceView.events'
+
+# Cert
+az keyvault certificate show -n $(echo $domain | tr -d '.') --vault-name $akv_name
+
+# Cleanup container
+az container delete -n $aci_name -g $rg -y
+# Cleanup cert
+az keyvault certificate delete -n $(echo $domain | tr -d '.') --vault-name $akv_name
+sleep 5
+az keyvault certificate purge -n $(echo $domain | tr -d '.') --vault-name $akv_name

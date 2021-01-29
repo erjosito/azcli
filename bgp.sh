@@ -81,11 +81,11 @@ function wait_until_csr_available () {
     echo "Waiting for CSR${csr_id} with IP address $csr_ip to answer over SSH..."
     start_time=$(date +%s)
     ssh_command="show version | include uptime"  # 'show version' contains VM name and uptime
-    ssh_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" "$ssh_command" 2>/dev/null)
+    ssh_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" "$ssh_command" 2>/dev/null)
     until [[ -n "$ssh_output" ]]
     do
         sleep $wait_interval
-        ssh_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" "$ssh_command" 2>/dev/null)
+        ssh_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" "$ssh_command" 2>/dev/null)
     done
     run_time=$(("$(date +%s)" - "$start_time"))
     ((minutes=run_time/60))
@@ -342,7 +342,6 @@ function create_vm_in_csr_vnet () {
     echo "Enabling IP forwarding for $csr_name..."
     csr_nic_id=$(az vm show -n "$csr_name-nva" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
     az network nic update --ids $csr_nic_id --ip-forwarding >/dev/null
-
 }
 
 function accept_csr_terms () {
@@ -450,14 +449,13 @@ function connect_csr () {
         az network vpn-connection create -n "vng${gw2_id}tocsr${csr_id}" -g "$rg" --vnet-gateway1 "vng${gw2_id}" \
             --shared-key "$psk" --local-gateway2 "csr${csr_id}" $bgp_option >/dev/null 2>&1
     fi
-
 }
 
 # Run "show interface ip brief" on CSR
 function sh_csr_int () {
     csr_id=$1
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress 2>/dev/null)
-    ssh -n -o StrictHostKeyChecking=no "$csr_ip" "sh ip int b" 2>/dev/null
+    ssh -n -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" "sh ip int b" 2>/dev/null
 }
 
 # Open an interactive SSH session to a CSR
@@ -484,7 +482,7 @@ function config_csr_base () {
     echo "Configuring CSR ${csr_ip} for VPN and BGP..."
     username=$(whoami)
     password=$psk
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" >/dev/null 2>&1 <<EOF
     config t
       username ${username} password 0 ${password}
       no ip domain lookup
@@ -571,7 +569,7 @@ function config_csr_tunnel () {
     default_gateway="10.${csr_id}.0.1"
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
     echo "Configuring tunnel ${tunnel_id} in CSR ${csr_ip}..."
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" >/dev/null 2>&1 <<EOF
     config t
       crypto ikev2 keyring azure-keyring
         peer ${public_ip}
@@ -595,7 +593,7 @@ EOF
     if [[ -z "$cx_type" ]] || [[ "$cx_type" == "bgp" ]] || [[ "$cx_type" == "bgpospf" ]]
     then
       echo "Configuring BGP on tunnel ${tunnel_id} in CSR ${csr_ip}..."
-      ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" >/dev/null 2>&1 <<EOF
         config t
           router bgp ${asn}
             neighbor ${private_ip} remote-as ${remote_asn}
@@ -606,7 +604,7 @@ EOF
       if [[ "$asn" == "$remote_asn" ]]
       then
         # iBGP
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" >/dev/null 2>&1 <<EOF
             config t
               router bgp ${asn}
                 neighbor ${private_ip} next-hop-self
@@ -615,7 +613,7 @@ EOF
 EOF
       else
         # eBGP
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" >/dev/null 2>&1 <<EOF
             config t
               router bgp ${asn}
                 neighbor ${private_ip} ebgp-multihop 5
@@ -626,7 +624,7 @@ EOF
     elif [[ "$cx_type" == "ospf" ]] || [[ "$cx_type" == "bgpospf" ]]
     then
       echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
-      ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" >/dev/null 2>&1 <<EOF
         config t
           router ospf 100
             no passive-interface Tunnel${tunnel_id}
@@ -639,7 +637,7 @@ EOF
       echo "Configuring static routes for tunnel ${tunnel_id} in CSR ${csr_ip}..."
       remote_id=$(echo "$tunnel_id" | head -c 2 | tail -c 1) # This only works with a max of 9 routers
       echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
-      ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$csr_ip" >/dev/null 2>&1 <<EOF
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$csr_ip" >/dev/null 2>&1 <<EOF
         config t
           ip route 10.${remote_id}.0.0 255.255.0.0 Tunnel${tunnel_id}
         end
@@ -811,7 +809,7 @@ function show_bgp_neighbors () {
     if [[ "$type" == "csr" ]]
     then
         ip=$(az network public-ip show -n "csr${id}-pip" -g "$rg" --query ipAddress -o tsv)
-        neighbors=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$ip" "show ip bgp summary | begin Neighbor" 2>/dev/null)
+        neighbors=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$ip" "show ip bgp summary | begin Neighbor" 2>/dev/null)
         echo "BGP neighbors for csr${id}-nva (${ip}):"
         clean_string "$neighbors"
     else
@@ -1033,11 +1031,11 @@ else
 fi
 
 # Ask confirmation before starting creating stuff
-[[ $BASH_VERSION ]] && read -rsn1 -p"Press any key to start creating Azure resources into Azure subscription \"$subscription_name\"...";echo
-[[ $ZSH_VERSION ]] && read -krs "?Press any key to start creating Azure resources into Azure subscription \"$subscription_name\"...";echo
+# [[ $BASH_VERSION ]] && read -rsn1 -p"Press any key to start creating Azure resources into Azure subscription \"$subscription_name\"...";echo
+# [[ $ZSH_VERSION ]] && read -krs "?Press any key to start creating Azure resources into Azure subscription \"$subscription_name\"...";echo
 
 # Create resource group
-echo "Creating resource group $rg..."
+echo "Creating resource group \"$rg\" in subscription \"$subscription_name\"..."
 az group create -n "$rg" -l "$location" >/dev/null
 
 # Accept CSR image terms

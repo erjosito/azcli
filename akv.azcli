@@ -7,10 +7,16 @@
 
 # Variables
 akv_name=erjositoKeyvault
-cert_name=cloudtroopernet
+
+########################
+# Import cert into AKV #
+########################
+
+# Variables
 pem_file="./yourcert.pem"
 key_file="./yourkey.key"
 key_password="your_key_password"
+cert_name=cloudtroopernet
 
 # Combine PEM and key in one pfx file (pkcs#12)
 pfx_file=".${pem_file}.pfx"
@@ -18,27 +24,133 @@ openssl pkcs12 -export -in $pem_file -inkey $key_file -out $pfx_file -passin pas
 
 # Add certificate
 az keyvault certificate import --vault-name $akv_name -n $cert_name \
-    -f $pfx_file --password $key_password \
-    -p "$(az keyvault certificate get-default-policy)"
+    -f $pfx_file --password $key_password
 
 # Verify
 az keyvault certificate list --vault-name $akv_name -o table
 
 #####################
+# Self-signed cert  #
+#####################
+
+# Variables
+cert_name=myselfsignedcert
+
+# Generate default cert policy
+default_policy="$(az keyvault certificate get-default-policy)"
+# Change cert subject
+default_policy=$(echo $default_policy | jq '.x509CertificateProperties.subject = "CN=selfsigned.cloudtrooper.net"')
+# Generate self-signed cert
+az keyvault certificate create --vault-name $akv_name -n $cert_name -p $default_policy 
+
+##############################
+# Generate cert with certbot #
+##############################
+
+# Install certbot and/or azure plugin
+# For example: https://github.com/dlapiduz/certbot-azure
+
+# Get SP with permission to Azure DNS zone
+purpose=certbot
+dns_zone="cloudtrooper.net"
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
+sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
+# If either is blank, create new SP with the required name
+if [[ -z "$sp_app_id" ]] || [[ -z "$sp_app_secret" ]]
+then
+    # Create new SP
+    sp_name=$purpose
+    sp_output=$(az ad sp create-for-rbac --name $sp_name --skip-assignment 2>/dev/null)
+    sp_app_id=$(echo $sp_output | jq -r '.appId')
+    sp_app_secret=$(echo $sp_output | jq -r '.password')
+    az keyvault secret set --vault-name $keyvault_name --name $keyvault_appid_secret_name --value $sp_app_id
+    az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $sp_app_secret
+    # Assign  Azure RBAC roles (example a RG) or AKV policy (example certificate/secret get if the SP should be able to retrieve certs)
+    dns_zone_id=$(az network dns zone list --query "[?name=='$dns_zone'].id" -o tsv)
+    if [[ -n "$dns_zone_id" ]]
+    then
+        echo "DNS zone $dns_zone found, resource ID $dns_zone_id, creating role assignment..."
+        az role assignment create --scope $dns_zone_id --assignee $sp_app_id --role "DNS Zone Contributor"
+        dns_zone_rg=$(az network dns zone list --query "[?name=='$dns_zone'].resourceGroup" -o tsv)
+    else
+        echo "DNS zone $dns_zone not found"
+    fi
+fi
+
+# Create auth and cleanup scripts for certbot
+auth_script="/tmp/certbot_auth.sh"
+cat << 'EOF' > $auth_script
+#!/bin/bash
+echo "Receiving values from certbot:"
+echo " - CERTBOT_VALIDATION: $CERTBOT_VALIDATION"
+echo " - CERTBOT_DOMAIN:     $CERTBOT_DOMAIN"
+DNS_ZONE_NAME=$(expr match "$CERTBOT_DOMAIN" '.*\.\(.*\..*\)')
+DNS_ZONE_RG=$(az network dns zone list --query "[?name=='$DNS_ZONE_NAME'].resourceGroup" -o tsv)
+echo " - DNS ZONE:           $DNS_ZONE_NAME"
+echo " - DNS RG:             $DNS_ZONE_RG"
+suffix=".${DNS_ZONE_NAME}"
+record_name=_acme-challenge.${CERTBOT_DOMAIN%"$suffix"}
+echo "Creating record $record_name in DNS zone $DNS_ZONE_NAME..."
+az network dns record-set txt create -n "$record_name" -z "$DNS_ZONE_NAME" -g $DNS_ZONE_RG --ttl 30
+az network dns record-set txt add-record -n "$record_name" -z "$DNS_ZONE_NAME" -g "$DNS_ZONE_RG" -v "$CERTBOT_VALIDATION"
+EOF
+chmod +x $auth_script
+cleanup_script="/tmp/certbot_cleanup.sh"
+cat << 'EOF' > $cleanup_script
+#!/bin/bash
+echo "Receiving values from certbot:"
+echo " - CERTBOT_VALIDATION: $CERTBOT_VALIDATION"
+echo " - CERTBOT_DOMAIN:     $CERTBOT_DOMAIN"
+DNS_ZONE_NAME=$(expr match "$CERTBOT_DOMAIN" '.*\.\(.*\..*\)')
+DNS_ZONE_RG=$(az network dns zone list --query "[?name=='$DNS_ZONE_NAME'].resourceGroup" -o tsv)
+echo " - DNS ZONE:           $DNS_ZONE_NAME"
+echo " - DNS RG:             $DNS_ZONE_RG"
+suffix=".${DNS_ZONE_NAME}"
+record_name=_acme-challenge.${CERTBOT_DOMAIN%"$suffix"}
+echo "Deleting record $record_name from DNS zone $DNS_ZONE_NAME..."
+az network dns record-set txt delete -n "$record_name" -z "$DNS_ZONE_NAME" -g "$DNS_ZONE_RG"
+EOF
+chmod +x $cleanup_script
+
+# Generate cert with certbot
+email_address="jomore@microsoft.com"
+sudo certbot certonly -n -d certbot.cloudtrooper.net --manual -m $email_address --preferred-challenges=dns \
+    --manual-public-ip-logging-ok \
+    --manual-auth-hook $auth_script --manual-cleanup-hook $cleanup_script
+
+#####################
 # Cert with Web App #
 #####################
 
-# Create Web App
+# This script creates a webapp and assigns a pre-existing cert in AKV
+
+# Variables
 rg=certtest
 location=westeurope
 svcplan_name=webappplan
-app_name=web-$RANDOM
+app_name=web$RANDOM
 image=gcr.io/kuar-demo/kuard-amd64:blue
+tcp_port=8080
+dns_zone_name=cloudtrooper.net
+app_dns_name=$app_name
+domain="${app_dns_name}.${dns_zone}"
+email_address=jomore@microsoft.com
+id_name=certbotid
+id_rg=acicertbot
+
+# Create cert with ACI
+id_resid=$(az identity show -n $id_name -g $id_rg --query id -o tsv)
+az container create -n certbot -g $rg -l $location --image erjosito/certbot-azcli:1.0 --assign-identity $id_resid \
+  -e "DOMAIN=$domain" "EMAIL=$email_address" "AKV=$akv_name"
+cert_name=$(echo $domain | tr -d '.')  # the container will create a cert with the domain name removing the dots (.)
+
+# Create Web App
 az group create -n $rg -l $location
 az appservice plan create -n $svcplan_name -g $rg --sku B1 --is-linux
 az webapp create -n $app_name -g $rg -p $svcplan_name --deployment-container-image-name $image
-az webapp config appsettings set -n $app_name -g $rg --settings "WEBSITES_PORT=8080"
-Set-AzureRmKeyVaultAccessPolicy -VaultName akurmitestvault -ServicePrincipalName abfa0a7c-a6b6-4736-8310-5855508787cd -PermissionsToSecrets get
+az webapp config appsettings set -n $app_name -g $rg --settings "WEBSITES_PORT=${tcp_port}"
 az keyvault set-policy -n $akv_name --spn abfa0a7c-a6b6-4736-8310-5855508787cd \
     --secret-permissions get \
     --key-permissions get \
@@ -48,20 +160,24 @@ cert_thumbprint=$(az webapp config ssl list -g $rg --query '[0].thumbprint' -o t
 az webapp restart -n $app_name -g $rg
 app_hostname=$(az webapp show -n $app_name -g $rg --query defaultHostName -o tsv)
 # Update DNS name
-dns_zone_name=your_domain.com
 dns_zone_rg=$(az network dns zone list --query "[?name=='$dns_zone_name'].resourceGroup" -o tsv)
-echo "Adding CNAME record ${app_hostname}.${dns_zone_name} for $app_hostname"
-az network dns record-set cname set-record -z $dns_zone_name -g $dns_zone_rg -n $app_name -c $app_hostname
-app_fqdn="${app_name}.${dns_zone_name}"
+echo "Adding CNAME record ${app_dns_name}.${dns_zone_name} for Webapp $app_hostname"
+az network dns record-set cname set-record -z $dns_zone_name -g $dns_zone_rg -n $app_dns_name -c $app_hostname
+app_fqdn="${app_dns_name}.${dns_zone_name}"
 # Add custom domain to web app
 az webapp config hostname add --webapp-name $app_name -g $rg --hostname $app_fqdn
 az webapp config ssl bind -n $app_name -g $rg --certificate-thumbprint $cert_thumbprint --ssl-type SNI
 az webapp update -n $app_name -g $rg --https-only true
 # Test
 echo "Visit with your browser the URL https://${app_fqdn}"
-# Cleanup test
-az group delete -n $rg -y --no-wait
 
-# Cleanup certificate
-# az keyvault certificate delete --vault-name $akv_name -n $cert_name
-# az keyvault certificate purge --vault-name $akv_name -n $cert_name
+###########
+# DANGER! #
+###########
+
+# Cleanup
+az group delete -n $rg -y --no-wait
+az keyvault certificate delete --vault-name $akv_name -n $cert_name
+sleep 5
+az keyvault certificate purge --vault-name $akv_name -n $cert_name
+az network dns record-set cname delete -z $dns_zone_name -g $dns_zone_rg -n $app_dns_name -y

@@ -172,6 +172,7 @@ az network nic list-effective-nsg -n $nic_name -g $rg
 ipconfig_version=IPv4
 ipconfig_name=$(az network nic ip-config list --nic-name $nic_name -g $rg --query "[?privateIpAddressVersion=='${ipconfig_version}'].{Name:name}" -o tsv)
 az network nic ip-config update -n $ipconfig_name --nic-name $nic_name -g $rg --public-ip-address $vm_pipv4_name
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pipv4_ip" "ip a"
 
 # Create VM (ipv6-only) -> Does NOT work
 # With IPv6 PIP and static private IPv6 does not work
