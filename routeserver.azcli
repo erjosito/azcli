@@ -21,6 +21,20 @@ fw_subnet_prefix=10.0.2.0/24
 az group create -n $rg -l $location
 az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $subnet_name --subnet-prefix $subnet_prefix
 
+# Create hub subnets (no subnet can be created while the route server is being provisioned)
+az network vnet subnet create -n $csr_subnet_name --address-prefix $csr_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n $fw_subnet_name --address-prefix $fw_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefix --vnet-name $vnet_name -g $rg
+
+# Create Route Server
+subnet_id=$(az network vnet subnet show -n $subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az network vrouter create -n $vr_name -g $rg --hosted-subnet $subnet_id -l $location --no-wait
+
+# Get info (once created)
+vr_ip1=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $vr_ip1
+vr_ip2=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $vr_ip2
+vr_asn=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $vr_asn
+
 # Create peered vnets with Ubuntu VM
 # spoke 1
 spoke1_name=spoke1
@@ -50,19 +64,6 @@ spoke2_ip=$(az network public-ip show -n spoke2-vm-pip --query ipAddress -o tsv 
 spoke2_nic_id=$(az vm show -n spoke2-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 spoke2_private_ip=$(az network nic show --ids $spoke2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke2_private_ip
 
-# Create hub subnets (no subnet can be created while the route server is being provisioned)
-az network vnet subnet create -n $csr_subnet_name --address-prefix $csr_subnet_prefix --vnet-name $vnet_name -g $rg
-az network vnet subnet create -n $fw_subnet_name --address-prefix $fw_subnet_prefix --vnet-name $vnet_name -g $rg
-az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefix --vnet-name $vnet_name -g $rg
-
-# Create Route Server
-subnet_id=$(az network vnet subnet show -n $subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-az network vrouter create -n $vr_name -g $rg --hosted-subnet $subnet_id -l $location --no-wait
-
-# Get info (once created)
-vr_ip1=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $vr_ip1
-vr_ip2=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $vr_ip2
-vr_asn=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $vr_asn
 
 # Create CSR
 # Variables
