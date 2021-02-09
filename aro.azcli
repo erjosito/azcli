@@ -1,0 +1,420 @@
+# Deploy ARO and install extension
+# az provider register -n Microsoft.RedHatOpenShift --wait
+# az extension add -n aro --index https://az.aroapp.io/preview
+
+# Variables
+rg=aro
+cluster_name=aro
+cluster_rg=${cluster_name}-$RANDOM
+location=northeurope
+vnet_name=arovnet
+vnet_prefix=192.168.0.0/24
+workers_subnet_name=workers
+workers_subnet_prefix=192.168.0.0/27
+masters_subnet_name=masters
+masters_subnet_prefix=192.168.0.32/27
+appgw_subnet_name=ApplicationGatewaySubnet
+appgw_subnet_prefix=192.168.0.96/28
+vm_subnet_name=vm
+vm_subnet_prefix=192.168.0.96/28
+sql_subnet_name=sql
+sql_subnet_prefix=192.168.0.112/28
+ilb_subnet_name=apps
+ilb_subnet_prefix=192.168.0.128/28
+anf_subnet_name=anf
+anf_subnet_prefix=192.168.0.192/27
+master_vm_size=Standard_D8s_v3
+worker_vm_size=Standard_D4s_v3
+worker_vm_count=3
+pod_cidr=10.128.0.0/14
+service_cidr=172.30.0.0/16
+ingress_visibility=Private
+api_visibility=Private
+domain=cloudtrooper.net  # Assumes you own this domain and have it managed by Azure DNS
+custom_domain=yes
+nat_gateway=no           # Just for testing, this is not supported
+
+# Create RG if it did not exist
+rg_location=$(az group show -n $rg --query location -o tsv)
+if [[ -z "$rg_location" ]]
+then
+  echo "Creating RG ${rg} in ${location}..."
+  az group create -n $rg -l $location
+else
+  if [[ ${rg_location} == ${location} ]]
+  then
+    echo "RG $rg already exists in $rg_location"
+  else
+    echo "RG $rg already exists, but in $rg_location instead of the specified location $location"
+  fi
+fi
+
+# Create vnet if it did not exist
+vnet_location=$(az network vnet show -n $vnet_name -g $rg --query location -o tsv 2>/dev/null)
+if [[ -z "${vnet_location}" ]]
+then
+  echo "Creating Virtual Network..."
+  az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $workers_subnet_name --subnet-prefixes $workers_subnet_prefix
+  az network vnet subnet create -n $masters_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $masters_subnet_prefix
+  az network vnet subnet update -n $masters_subnet_name -g $rg --vnet-name $vnet_name --disable-private-link-service-network-policies true
+  masters_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $masters_subnet_name --query id -o tsv)
+  az network vnet subnet update -n $masters_subnet_name -g $rg --vnet-name $vnet_name --service-endpoints Microsoft.ContainerRegistry
+  az network vnet subnet update -n $workers_subnet_name -g $rg --vnet-name $vnet_name --service-endpoints Microsoft.ContainerRegistry
+else
+  echo "Vnet $vnet_name already exists"
+fi
+
+if [[ "$nat_gateway" == "yes" ]]
+then
+  echo "Creating NAT Gateway..."
+  az network public-ip create -n nat-pip -g $rg --sku Standard
+  az network nat gateway create -n aronatgw -g $rg \
+    --public-ip-addresses nat-pip --idle-timeout 10
+  az network vnet subnet update -n $workers_subnet_name --vnet-name $vnet_name -g $rg --nat-gateway aronatgw
+  # az network vnet subnet update -n $masters_subnet_name --vnet-name $vnet_name -g $rg --nat-gateway aronatgw
+fi
+
+# Service Principal: retrieve from AKV
+purpose=aro
+keyvault_name=erjositoKeyvault
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
+sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
+
+# If no SP could be retrieved from AKV, create one
+if [[ -z "$sp_app_id" ]] || [[ -z "$sp_app_secret" ]]
+then
+  echo "Creating service principal credentials and storing in AKV $keyvault_name..."
+  purpose=aro
+  keyvault_name=erjositoKeyvault
+  keyvault_appid_secret_name=$purpose-sp-appid
+  keyvault_password_secret_name=$purpose-sp-secret
+  sp_name=$purpose
+  sp_output=$(az ad sp create-for-rbac --name $sp_name --skip-assignment)
+  sp_app_id=$(echo $sp_output | jq -r '.appId')
+  sp_app_secret=$(echo $sp_output | jq -r '.password')
+  az keyvault secret set --vault-name $keyvault_name --name $keyvault_appid_secret_name --value $sp_app_id
+  az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $sp_app_secret
+else
+  echo "Service principal credentials successfully retrieved from AKV $keyvault_name"
+fi
+# Assign permissions to the vnet for the SP
+vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+az role assignment create --scope $vnet_id --assignee $sp_app_id --role 'Network Contributor'
+
+# Show credentials expiration date
+sp_credentials_enddate=$(az ad sp credential list --id $sp_app_id --query '[].endDate' -o tsv)
+echo "Service principal credentials expiration: $sp_credentials_enddate"
+
+# Get pull secret
+akv_name=joseakv-airs
+akv_secret_name=openshift-pull-secret
+pull_secret=$(az keyvault secret show -n $akv_secret_name --vault-name $akv_name --query value -o tsv)
+if [[ -z "${pull_secret}" ]]
+then
+  echo "Pull secret could not be retrieved from AKV $akv_name"
+  pullsecret_flag=""
+else
+  echo "Pull secret successfully retrieved from AKV $akv_name"
+  pullsecret_flag="--pull-secret $pull_secret"
+fi
+
+# Add optionally the flag for custom domain
+if [[ "${custom_domain}" == "yes" ]]
+then
+  domain_flag="--domain $domain"
+else
+  domain_flag=""
+fi
+
+# Create cluster (detailed)
+# The '(z)' trick for the variable flags is something zsh specific
+echo "Creating ARO cluster, this is going to take some minutes..."
+az aro create -n $cluster_name -g $rg --worker-subnet workers --master-subnet masters --vnet $vnet_name \
+  --master-vm-size $master_vm_size --worker-vm-size $worker_vm_size --worker-count $worker_vm_count \
+  --worker-vm-disk-size-gb 128 \
+  --client-id $sp_app_id --client-secret $sp_app_secret \
+  --ingress-visibility $ingress_visibility --apiserver-visibility $api_visibility \
+  --tags sampletag1=value1 sampletag2=value2 \
+  --cluster-resource-group $cluster_rg \
+  --pod-cidr $pod_cidr --service-cidr $service_cidr ${(z)domain_flag} ${(z)pullsecret_flag}
+#############
+#  Cleanup  #
+#############
+
+function cleanup_aro {
+  if [[ "$nat_gateway" == "yes" ]]
+  then
+    echo "Cleaning up nat gateway..."
+    az network vnet subnet update -n $workers_subnet_name --vnet-name $vnet_name -g $rg --nat-gateway ""
+    az network vnet subnet update -n $masters_subnet_name --vnet-name $vnet_name -g $rg --nat-gateway ""
+    az network nat gateway delete -n aronatgw -g $rg
+    az network public-ip delete -n nat-pip -g $rg
+  fi
+  echo "Deleting ARO cluster..."
+  az aro delete -n $cluster_name -g $rg -y --no-wait
+}
+
+###################
+#    DNS setup    #
+###################
+
+# Configure DNS if custom_domain was selected and API visibility is public
+if [[ "${custom_domain}" == "yes" ]] && [[ "$api_visibility" == "Public" ]]
+then
+  dns_zone_name=cloudtrooper.net
+  dns_subdomain=aro
+  dns_console_hostname=console-openshift-console.apps
+  dns_oauth_hostname=oauth-openshift.apps
+  dns_api_hostname=api
+  dns_zone_rg=$(az network dns zone list --query "[?name=='$dns_zone_name'].resourceGroup" -o tsv)
+  aro_api_ip=$(az aro show -n $cluster_name -g $rg --query 'apiserverProfile.ip' -o tsv)
+  aro_ingress_ip=$(az aro show -n $cluster_name -g $rg --query 'ingressProfiles[0].ip' -o tsv)
+  dns_console_fqdn=$dns_console_hostname.$dns_subdomain.$dns_zone_name
+  dns_oauth_fqdn=$dns_oauth_hostname.$dns_subdomain.$dns_zone_name
+  dns_api_fqdn=$dns_api_hostname.$dns_subdomain.$dns_zone_name
+  echo "Adding A record $dns_console_fqdn for IP $aro_ingress_ip"
+  az network dns record-set a delete -z $dns_zone_name -g $dns_zone_rg -n $dns_console_hostname.$dns_subdomain -y
+  az network dns record-set a add-record -z $dns_zone_name -g $dns_zone_rg -n $dns_console_hostname.$dns_subdomain -a $aro_ingress_ip
+  echo "Adding A record $dns_api_fqdn for IP $aro_api_ip"
+  az network dns record-set a delete -z $dns_zone_name -g $dns_zone_rg -n $dns_api_hostname.$dns_subdomain -y
+  az network dns record-set a add-record -z $dns_zone_name -g $dns_zone_rg -n $dns_api_hostname.$dns_subdomain -a $aro_api_ip
+  echo "Adding A record $dns_oauth_fqdn for IP $aro_ingress_ip"
+  az network dns record-set a delete -z $dns_zone_name -g $dns_zone_rg -n $dns_oauth_hostname.$dns_subdomain -y
+  az network dns record-set a add-record -z $dns_zone_name -g $dns_zone_rg -n $dns_oauth_hostname.$dns_subdomain -a $aro_ingress_ip
+  nslookup $dns_console_fqdn
+  nslookup $dns_oauth_fqdn
+  nslookup $dns_api_fqdn
+  # Verify records
+  az network dns record-set list -z $dns_zone_name -g $dns_zone_rg -o table
+  echo "A records for $dns_api_fqdn:"
+  az network dns record-set a show -z $dns_zone_name -g $dns_zone_rg -n $dns_api_hostname.$dns_subdomain --query arecords -o table
+  echo "A records for $dns_console_fqdn:"
+  az network dns record-set a show -z $dns_zone_name -g $dns_zone_rg -n $dns_console_hostname.$dns_subdomain --query arecords -o table
+  echo "A records for $dns_oauth_fqdn"
+  az network dns record-set a show -z $dns_zone_name -g $dns_zone_rg -n $dns_oauth_hostname.$dns_subdomain --query arecords -o table
+else
+  echo "No custom domain specified, no DNS records need to be added"
+fi
+
+###################
+#    Login    #
+###################
+
+# Credentials
+# az aro list-credentials -n $cluster_name -g $rg
+aro_usr=$(az aro list-credentials -n $cluster_name -g $rg --query kubeadminUsername -o tsv)
+aro_pwd=$(az aro list-credentials -n $cluster_name -g $rg --query kubeadminPassword -o tsv)
+aro_api_url=$(az aro show -n $cluster_name -g $rg --query 'apiserverProfile.url' -o tsv)
+oc login $aro_api_url -u $aro_usr -p $aro_pwd
+# echo "Login with the command \"oc login $aro_api_url -u $aro_usr -p $aro_pwd\""
+# oc login $aro_api_url -u $aro_usr -p $aro_pwd --insecure-skip-tls-verify=true
+# echo "$aro_usr / $aro_pwd"
+
+# Console
+aro_console_url=$(az aro show -n $cluster_name -g $rg --query 'consoleProfile.url' -o tsv)
+echo "Connect to $aro_console_url, password is $aro_pwd"
+
+# URLs:
+# echo "API: $aro_api_url"
+# echo "Console: $aro_console_url"
+
+##################################
+# Deploy sample app (public API) #
+##################################
+
+project_name=kuard
+oc new-project $project_name
+oc new-app --docker-image gcr.io/kuar-demo/kuard-amd64:1
+oc expose dc kuard-amd64 --port 8080 --type=LoadBalancer --name=kuardilb --dry-run -o yaml | awk '1;/metadata:/{ print "  annotations:\n    service.beta.kubernetes.io/azure-load-balancer-internal: \"true\"" }' | oc create -f -
+# Expose with a svc (internal ALB in different subnet)
+ilb_subnet_name=apps
+oc expose dc kuard-amd64 --port 8080 --type=LoadBalancer --name=kuard --dry-run -o yaml | awk '1;/metadata:/{ print "  annotations:\n    service.beta.kubernetes.io/azure-load-balancer-internal: \"true\"\n    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: \"'${ilb_subnet_name}'\"" }' | oc create -f -
+# Exposing ClusterIP Svc over a route
+oc expose svc kuardilb
+
+#####################
+#        VM         #
+#####################
+
+# You might need a VM in the vnet for some purposes:
+# - Jump host in a private cluster
+# - Custom DNS server/forwarder
+# - Test connectivity
+
+if [[ "$api_visibility" == "Private" ]]
+then
+
+  # Deploy Ubuntu 18.04 VM and get its public IP address
+  vm_name=apivm
+  vm_nsg_name=${vm_name}-nsg
+  vm_pip_name=${vm_name}-pip
+  vm_disk_name=${vm_name}-disk0
+  vm_sku=Standard_B2ms
+  publisher=Canonical
+  offer=UbuntuServer
+  sku=18.04-LTS
+  image_urn=$(az vm image list -p $publisher -f $offer -s $sku -l $location --query '[0].urn' -o tsv)
+  az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix
+  # az vm create -n testvm -g $rg --image ubuntuLTS --generate-ssh-keys --public-ip-address testvm-pip --vnet-name $vnet_name --subnet $vm_subnet_name
+  az vm create -n $vm_name -g $rg -l $location --image $image_urn --size $vm_sku --generate-ssh-keys \
+    --os-disk-name $vm_disk_name --os-disk-size-gb 32 \
+    --vnet-name $vnet_name --subnet $vm_subnet_name \
+    --nsg $vm_nsg_name --nsg-rule SSH --public-ip-address $vm_pip_name
+  vm_pip_ip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+  # Test access to VM
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "ip a"
+  # Install Azure CLI
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash"
+  # Install kubectl
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "sudo apt-get update && sudo apt-get install -y apt-transport-https"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" 'echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee -a /etc/apt/sources.list.d/kubernetes.list'
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "sudo apt-get update"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "sudo apt-get install -y kubectl"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "kubectl version"
+  # Download oc
+  oc_url="https://github.com/openshift/origin/releases/download/v3.11.0/openshift-origin-client-tools-v3.11.0-0cbc58b-linux-64bit.tar.gz"
+  oc_file="openshift-origin-client-tools-v3.11.0-0cbc58b-linux-64bit.tar.gz"
+  oc_dir="openshift-origin-client-tools-v3.11.0-0cbc58b-linux-64bit"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "wget $oc_url"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "tar xvf $oc_file"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "ls ./$oc_dir"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc login $aro_url -u $aro_user -p $aro_pwd"
+  # Cluster-info
+  aro_usr=$(az aro list-credentials -n $cluster_name -g $rg --query kubeadminUsername -o tsv) && echo "$aro_usr"
+  aro_pwd=$(az aro list-credentials -n $cluster_name -g $rg --query kubeadminPassword -o tsv)
+  aro_api_url=$(az aro show -n $cluster_name -g $rg --query 'apiserverProfile.url' -o tsv) && echo "$aro_api_url"
+  aro_api_ip=$(az aro show -n $cluster_name -g $rg --query 'apiserverProfile.ip' -o tsv) && echo "$aro_api_ip"
+  router_ip=$(az aro show -n $cluster_name -g $rg --query 'ingressProfiles[0].ip' -o tsv) && echo "$router_ip"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "sudo sed -i \"\$ a $aro_api_ip $aro_api_url\" /etc/hosts"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc login $aro_api_url -u $aro_usr -p $aro_pwd --insecure-skip-tls-verify"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/kubectl cluster-info"
+  domain=$(az aro show -n $cluster_name -g $rg --query 'clusterProfile.domain' -o tsv)
+  aro_api_fqdn=api.${domain}.${location}.aroapp.io
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "nslookup $aro_api_fqdn"
+  # Router info
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc get svc --all-namespaces | grep LoadBalancer"
+  # Install a DNS server and configure a sample IP in the hosts file, to test resolution from the ARO cluster
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "sudo apt update && sudo apt -y install dnsmasq"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "sudo sed -i \"\$ a 1.2.3.4 myserver.onprem.contoso.com\" /etc/hosts"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "cat /etc/hosts"
+  # Configure private DNS zones for the apps and the API
+  # The API is already registered by the cluster, no need to do it again
+  # az network private-dns zone create -n "$domain" -g "$rg"
+  # az network private-dns record-set a add-record --record-set-name api -z $domain -g $rg -a $aro_api_ip
+  # az network private-dns link vnet create -g $rg -z $domain -n arodomain --virtual-network $vnet_name --registration-enabled false
+  az network private-dns zone create -n "apps.${domain}" -g "$rg"
+  az network private-dns record-set a add-record --record-set-name '*' -z "apps.${domain}" -g $rg -a $router_ip
+  az network private-dns link vnet create -g $rg -z "apps.${domain}" -n arorouter --virtual-network $vnet_name --registration-enabled false
+fi
+
+###################################
+# Deploy sample app (private API) #
+###################################
+
+if [[ "$api_visibility" == "Private" ]]
+then
+
+  # Example: kuard
+  project_name=kuard
+  image=gcr.io/kuar-demo/kuard-amd64:1
+  # Example: whoami api
+  project_name=whoami
+  image=erjosito/sqlapi:1.0
+
+  # Go
+  app_name="$project_name"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc new-project $project_name"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc new-app --docker-image $image --name $app_name"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc get dc"
+  # Exposing over ILB
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc expose dc $app_name --port 8080 --type=LoadBalancer --name=$app_name --dry-run -o yaml | awk '1;/metadata:/{ print "  annotations:\n    service.beta.kubernetes.io/azure-load-balancer-internal: \"true\"" }' | oc create -f -"
+  # Exposing over clusterip Svc should not be required
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc expose dc $app_name --port 8080 --type=ClusterIP --name=$app_name"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc get svc"
+  # Exposing ClusterIP Svc over a route
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc expose svc $app_name"
+  app_url=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc get route $app_name -o json" | jq -r '.spec.host')
+  # Test reachability to API
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "curl -s http://{$app_url}/api/ip"
+  # Configure DNS operator
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc get dns.operator/default -o yaml"
+  # Test DNS resolution from cluster
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "curl -s http://{$app_url}/api/dns?fqdn=google.com"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "curl -s http://{$app_url}/api/dns?fqdn=myserver.onprem.contoso.com"
+fi
+
+###############################
+# Azure SQL with private link #
+###############################
+
+# Create Azure SQL Server and DB
+sql_server_name=sqlserver$RANDOM
+sql_db_name=mydb
+sql_username=azure
+sql_password=Microsoft123!
+az sql server create -n $sql_server_name -g $rg -l $location --admin-user $sql_username --admin-password $sql_password
+sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName)
+az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait
+
+# Create subnet for private link
+az network vnet subnet create -n $sql_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $sql_subnet_prefix
+
+# Create endpoint
+sql_endpoint_name=sqlep
+sql_server_id=$(az sql server show -n $sql_server_name -g $rg -o tsv --query id)
+az network vnet subnet update -n $sql_subnet_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
+az network private-endpoint create -n $sql_endpoint_name -g $rg --vnet-name $vnet_name --subnet $sql_subnet_name --private-connection-resource-id $sql_server_id --group-ids sqlServer --connection-name sqlConnection
+sql_nic_id=$(az network private-endpoint show -n $sql_endpoint_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
+sql_endpoint_ip=$(az network nic show --ids $sql_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+echo "The SQL Server is reachable over the private IP address ${sql_endpoint_ip}"
+
+# Create private DNS zone
+dns_zone_name=privatelink.database.windows.net
+az network private-dns zone create -n $dns_zone_name -g $rg 
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n myDnsLink --virtual-network $vnet_name --registration-enabled false
+az network private-dns record-set a create -n $sql_server_name -z $dns_zone_name -g $rg
+az network private-dns record-set a add-record --record-set-name $sql_server_name -z $dns_zone_name -g $rg -a $sql_endpoint_ip
+
+
+#######################
+#     Troubleshoot    #
+#######################
+
+az aro show -n $cluster_name -g $rg --query 'consoleProfile.url' -o tsv
+az aro list-credentials -n $cluster_name -g $rg -o table
+
+# Check the LBs in the node RG
+node_rg_id=$(az aro show -n $cluster_name -g $rg --query 'clusterProfile.resourceGroupId' -o tsv)
+node_rg_name=$(echo $node_rg_id | cut -d/ -f 5)
+az network lb list -g $node_rg_name -o table
+az network lb frontend-ip list --lb-name aro -g $node_rg_name -o table # No public IP should be visible here if private
+az network lb frontend-ip list --lb-name aro-public-lb -g $node_rg_name -o table # No public IP should be visible here if private
+az network lb frontend-ip list --lb-name aro-internal -g $node_rg_name -o table # A private IP should be visible
+az network lb frontend-ip list --lb-name aro-internal-lb -g $node_rg_name -o table # A private IP should be visible here
+
+# Check subnet settings
+az network vnet subnet show --vnet-name $vnet_name -n workers -g $rg --query 'natGateway.id' -o tsv
+az network vnet subnet show --vnet-name $vnet_name -n masters -g $rg --query 'natGateway.id' -o tsv
+
+###############
+#   Cleanup   #
+###############
+
+# Delete NAT gateway
+az network vnet subnet update -n $workers_subnet_name --vnet-name $vnet_name -g $rg --nat-gateway ""
+az network vnet subnet update -n $masters_subnet_name --vnet-name $vnet_name -g $rg --nat-gateway ""
+az network nat gateway delete -n aronatgw -g $rg
+
+# Delete cluster (remove first subnet config such as UDRs or NAT gw)
+az aro delete -n $cluster_name -g $rg -y --no-wait
+
+# Delete other objects
+az vm delete -n $vm_name -g $rg
+az vm disk delete -n $vm_disk_name -g $rg
+az sql server delete -n $sql_server_name -g $rg
+
+# Sledge hammer: delete whole group
+#az group delete -n $rg -y --no-wait

@@ -158,7 +158,7 @@ function create_vng () {
         az network vnet subnet create --vnet-name "$vnet_name" -g "$rg" -n testvm --address-prefixes "$test_vm_subnet_prefix" >/dev/null
         # Not using $psk as password because it might not fulfill the password requirements for Azure VMs
         az vm create -n "$test_vm_name" -g "$rg" -l "$location" --image UbuntuLTS --size "$test_vm_size" \
-            --generate-ssh-keys \
+            --generate-ssh-keys --authentication-type all --admin-username "$default_username" --admin-password "$psk" \
             --public-ip-address "${test_vm_name}-pip" --public-ip-address-allocation static \
             --vnet-name "$vnet_name" --subnet testvm --no-wait 2>/dev/null
     else
