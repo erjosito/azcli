@@ -15,13 +15,13 @@ wait_interval=5s
 aks_name=aks
 aks_rbac=yes
 aks_service_cidr=10.0.0.0/16
-vm_size=Standard_D2_v3    # Other possible values: Standard_B2ms, Standard_D2_v3
+vm_size=Standard_B2ms    # Other possible values: Standard_B2ms, Standard_D2_v3
 preview_version=yes
 # Vnet
 vnet_name=aksVnet
 vnet_prefix=10.13.0.0/16
 aks_subnet_name=aks
-aks_subnet_prefix=10.13.76.0/24  # Min /25 with Azure CNI!
+aks_subnet_prefix=10.13.76.0/26  # Min /25 with Azure CNI!
 aks2_subnet_name=aks2ndpool
 aks2_subnet_prefix=10.13.75.0/24
 vm_subnet_name=vm
@@ -129,8 +129,9 @@ az aks create -g $rg -n $aks_name -l $location \
     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys \
     --service-principal $sp_app_id --client-secret $sp_app_secret --skip-subnet-role-assignment \
     --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
-    --network-policy calico --load-balancer-sku Standard \
+    --network-policy '' --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
+    --node-osdisk-type ephemeral --node-osdisk-size 30 \
     --no-wait
 
 # Other options you can use in the previous command
@@ -138,6 +139,7 @@ az aks create -g $rg -n $aks_name -l $location \
     # --enable-cluster-autoscaler --min-count 1 --max-count 4 \
     # --cluster-autoscaler-profile scan-interval=30s \
     # --dns-name-prefix cloudtrooper \
+    # --node-osdisk-type ephemeral --node-osdisk-size 30 \
 
 #########################
 # With managed identity #

@@ -158,7 +158,7 @@ function create_vng () {
         az network vnet subnet create --vnet-name "$vnet_name" -g "$rg" -n testvm --address-prefixes "$test_vm_subnet_prefix" >/dev/null
         # Not using $psk as password because it might not fulfill the password requirements for Azure VMs
         az vm create -n "$test_vm_name" -g "$rg" -l "$location" --image UbuntuLTS --size "$test_vm_size" \
-            --generate-ssh-keys --authentication-type all --admin-username "$default_username" --admin-password "$psk" \
+            --generate-ssh-keys \
             --public-ip-address "${test_vm_name}-pip" --public-ip-address-allocation static \
             --vnet-name "$vnet_name" --subnet testvm --no-wait 2>/dev/null
     else
@@ -520,28 +520,9 @@ function config_csr_base () {
       router bgp $asn
         bgp router-id interface GigabitEthernet1
         bgp log-neighbor-changes
-        redistribute ospf 100 route-map O2B
-        redistribute static route-map S2B
         maximum-paths eibgp 4
-      router ospf 100
-        log-adjacency-changes
-        passive-interface default
-        redistribute bgp 65100 route-map B2O
-        redistribute static route-map S2O
       ip route ${myip} 255.255.255.255 ${default_gateway}
       ip route 10.${csr_id}.0.0 255.255.0.0 ${default_gateway}
-      route-map B2O
-        match ip address prefix-list B2O
-      route-map S2O
-        match ip address prefix-list S2O
-      route-map O2B
-        match ip address prefix-list O2B
-      route-map S2B
-        match ip address prefix-list S2B
-      ip prefix-list B2O permit 0.0.0.0/0 ge 16 le 16
-      ip prefix-list O2B permit 0.0.0.0/0 ge 16 le 16
-      ip prefix-list S2B permit 10.${csr_id}.0.0/16
-      ip prefix-list S2O permit 10.${csr_id}.0.0/16
       line vty 0 15
         exec-timeout 0 0
     end
@@ -933,6 +914,14 @@ function config_csrs_base () {
     done
 }
 
+# Add an additional users to each test VM
+function add_users_to_vms () {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[?contains(name,'testvm')].name")
+    while IFS= read -r vm_name; do
+        az vm user update -g $rg -u "$default_username" -p "$psk" -n "$vm_name"
+    done <<< "$vm_list"
+}
+
 # Converts a CSV list to a shell array
 function convert_csv_to_array () {
     if [ -n "$BASH_VERSION" ]; then
@@ -942,6 +931,37 @@ function convert_csv_to_array () {
     fi
     IFS=',' read -r"${arr_opt}" myarray <<< "$1"
     echo "${myarray[@]}"
+}
+
+# Checks that the PSK complies with password rules for VMs
+# Returns a message if the password is not compliant with pasword rules, returns nothing if it is
+function check_password () {
+    password_to_check=$1
+    password_to_check_len=${#password_to_check}
+    # Length
+    if [ "$password_to_check_len" -lt 12 ]; then
+        echo "$password_to_check is shorter than 12 characters"
+    else
+        # Special characters
+        if [[ -z $(echo "$password_to_check" | tr -d "[:alnum:]") ]]; then
+            echo "$password_to_check does not contain non alphanumeric characters"
+        else
+            # Numbers
+            if [[ -z $(echo "$password_to_check" | tr -cd "0-9") ]]; then
+                echo "$password_to_check does not contain numbers"
+            else
+                # Lower case
+                if [[ -z $(echo "$password_to_check" | tr -cd "a-z") ]]; then
+                    echo "$password_to_check does not contain lower case characters"
+                else
+                    # Upper case
+                    if [[ -z $(echo "$password_to_check" | tr -cd "A-Z") ]]; then
+                        echo "$password_to_check does not contain upper case characters"
+                    fi
+                fi
+            fi
+        fi
+    fi
 }
 
 # Verify certain things:
@@ -1033,6 +1053,11 @@ fi
 if [[ -n "$5" ]]
 then
     psk=$5
+    if [[ -n "$(check_password $psk)" ]]
+    then
+        echo "$(check_password $psk)"
+        exit 1
+    fi
 else
     psk=Microsoft123!
     echo "No preshared key specified in the command line, using $psk"
@@ -1087,7 +1112,7 @@ do
 done
 
 # Finish
-echo "Your resources should be ready to use in resource group $rg. Enjoy!"
+echo "Your resources should be ready to use in resource group $rg. Username/password for access is ${default_username}/${psk}. Enjoy!"
 
 ################################
 # Sample diagnostics commands: #
