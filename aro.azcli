@@ -281,7 +281,7 @@ then
   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "wget $oc_url"
   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "tar xvf $oc_file"
   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "ls ./$oc_dir"
-  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc login $aro_url -u $aro_user -p $aro_pwd"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc login $aro_api_url -u $aro_user -p $aro_pwd"
   # Cluster-info
   aro_usr=$(az aro list-credentials -n $cluster_name -g $rg --query kubeadminUsername -o tsv) && echo "$aro_usr"
   aro_pwd=$(az aro list-credentials -n $cluster_name -g $rg --query kubeadminPassword -o tsv)
@@ -340,9 +340,16 @@ then
   # Test reachability to API
   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "curl -s http://{$app_url}/api/ip"
   # Configure DNS operator
-  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc get dns.operator/default -o yaml"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/oc version"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/kubectl get dns.operator/default -o yaml"
+  vm_private_ip=$(az vm list-ip-addresses -n $vm_name -g $rg --query '[0].virtualMachine.network.privateIpAddresses[0]' -o tsv) && echo $vm_private_ip
+  # Does not work!
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/kubectl get dns.operator/default -o yaml | sed \
+      's/spec: {}/spec:\\n  servers:\\n  - name: contoso\\n    zones:\\n      - onprem.contoso.com\\n    forwardPlugin:\\n      upstreams:\\n        - $vm_private_ip/g' | ./$oc_dir/kubectl replace -f -"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "./$oc_dir/kubectl get dns.operator/default -o yaml"
   # Test DNS resolution from cluster
   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "curl -s http://{$app_url}/api/dns?fqdn=google.com"
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "ping myserver.onprem.contoso.com -c 1"
   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "curl -s http://{$app_url}/api/dns?fqdn=myserver.onprem.contoso.com"
 fi
 

@@ -1,47 +1,142 @@
 # variables
 rg=routeserver
 location=westeurope
-vnet_name=routeserver
-vnet_prefix=10.0.0.0/16
-subnet_name=routeserver
-subnet_prefix=10.0.0.0/24
-vr_name=myRouteServer
+vnet_name=hub
+vnet_prefix=10.1.0.0/16
+subnet_name=RouteServerSubnet
+subnet_prefix=10.1.0.0/24
+rs_name=myRouteServer
+vm_subnet_name=vm
+vm_subnet_prefix=10.1.3.0/24
 # GatewaySubnet
-gw_subnet_prefix=10.0.254.0/24
+gw_subnet_prefix=10.1.254.0/24
 # CSR
 csr_subnet_name=csr
-csr_subnet_prefix=10.0.1.0/24
-csr_default_gw=10.0.1.1
-csr_bgp_ip=10.0.1.10
-# FW NVA
-fw_subnet_name=fw
-fw_subnet_prefix=10.0.2.0/24
+csr_subnet_prefix=10.1.1.0/24
+hub_csr_default_gw=10.1.1.1
+hub_csr_bgp_ip=10.1.1.10
+# 2ary NIC for CSR
+csr2_subnet_name=csr2
+csr2_subnet_prefix=10.1.2.0/24
 
 # Create Vnet
 az group create -n $rg -l $location
 az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $subnet_name --subnet-prefix $subnet_prefix
 
-# Create hub subnets (no subnet can be created while the route server is being provisioned)
+# Create subnets (no subnet can be created while the route server is being provisioned)
 az network vnet subnet create -n $csr_subnet_name --address-prefix $csr_subnet_prefix --vnet-name $vnet_name -g $rg
-az network vnet subnet create -n $fw_subnet_name --address-prefix $fw_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n $csr2_subnet_name --address-prefix $csr2_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n $vm_subnet_name --address-prefix $vm_subnet_prefix --vnet-name $vnet_name -g $rg
 az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefix --vnet-name $vnet_name -g $rg
 
 # Create Route Server
 subnet_id=$(az network vnet subnet show -n $subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-az network vrouter create -n $vr_name -g $rg --hosted-subnet $subnet_id -l $location --no-wait
+az network routeserver create -n $rs_name -g $rg --hosted-subnet $subnet_id -l $location
+az network routeserver update -g $rs_name -n <your-rs> --allow-b2b-traffic true
 
 # Get info (once created)
-vr_ip1=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $vr_ip1
-vr_ip2=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $vr_ip2
-vr_asn=$(az network vrouter show -n $vr_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $vr_asn
+rs_ip1=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
+rs_ip2=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
+rs_asn=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
+
+
+# Create VM in hub
+az vm create -n hub-vm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address hub-vm-pip --vnet-name $vnet_name --size Standard_B1s --subnet $vm_subnet_name
+hub_vm_ip=$(az network public-ip show -n hub-vm-pip --query ipAddress -o tsv -g $rg)
+hub_vm_nic_id=$(az vm show -n spoke1-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+hub_vm_private_ip=$(az network nic show --ids $hub_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke1_private_ip
+
+# Create CSR in hub
+# Variables
+publisher=cisco
+offer=cisco-csr-1000v
+sku=16_12-byol
+csr_username=jose
+csr_password=Microsoft123!
+
+# Create hub CSR as NVA
+hub_csr_asn=65001
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+az vm image terms accept --urn ${publisher}:${offer}:${sku}:${version}
+az vm create -n hub-nva -g $rg -l $location \
+    --image ${publisher}:${offer}:${sku}:${version} \
+    --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
+    --public-ip-address hub-nva-pip --public-ip-address-allocation static \
+    --vnet-name $vnet_name --subnet $csr_subnet_name \
+    --private-ip-address $hub_csr_bgp_ip
+hub_csr_nic_id=$(az vm show -n hub-nva -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $hub_csr_nic_id --ip-forwarding
+
+# Configure hub CSR with BGP
+hub_csr_ip=$(az network public-ip show -n hub-nva-pip --query ipAddress -o tsv -g $rg)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr_ip "sh ip int b"
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr_ip <<EOF
+config t
+    no ip domain lookup
+    interface Loopback 0
+        ip address 1.1.1.1 255.255.255.255
+    router bgp ${hub_csr_asn}
+        network 1.1.1.1 mask 255.255.255.255
+        neighbor $rs_ip1 remote-as $rs_asn
+        neighbor $rs_ip1 ebgp-multihop 2
+        neighbor $rs_ip2 remote-as $rs_asn
+        neighbor $rs_ip2 ebgp-multihop 2
+    ip route $rs_ip1 255.255.255.255 $csr_default_gw
+    ip route $rs_ip2 255.255.255.255 $csr_default_gw
+end
+wr mem
+EOF
+
+# Test hub csr
+# Route Server is reachable over ICMP :)
+ssh $hub_nva_ip "ping $rs_ip1"
+# Create peering
+az network routeserver peering create --routeserver-name $rs_name -g $rg --peer-ip $hub_csr_bgp_ip --peer-asn $hub_csr_asn -n hub
+
+# OPTIONAL: Inject default route from the hub's NVA:
+az network route-table create -n hubnva -g $rg -l $location --disable-bgp-route-propagation
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $csr_subnet_name --route-table hubnva
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr_ip <<EOF
+config t
+    ip route 0.0.0.0 128.0.0.0  $hub_csr_default_gw
+    ip route 128.0.0.0 128.0.0.0  $hub_csr_default_gw
+    router bgp ${hub_csr_asn}
+        network 0.0.0.0 mask 128.0.0.0
+        network 128.0.0.0 mask 128.0.0.0
+        default-information originate
+end
+wr mem
+EOF
+# Patch NVA's NSG to allow incoming traffic from Vnet to Internet, and incoming from 8.8.8.8 and ifconfig.co
+hub_csr_nic_id=$(az vm show -n hub-nva -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+hub_nva_nsg_id=$(az network nic show --ids $hub_csr_nic_id --query 'networkSecurityGroup.id' -o tsv)
+hub_nva_nsg_name=$(basename $hub_nva_nsg_id)
+az network nsg rule create -n Vnet2Internet --nsg-name $hub_nva_nsg_name -g $rg \
+  --protocol '*' --access Allow --priority 100 --direction Inbound \
+  --source-address-prefixes VirtualNetwork --source-port-ranges '*' \
+  --destination-address-prefixes Internet --destination-port-ranges '*'
+az network nsg rule create -n Internet2Vnet --nsg-name $hub_nva_nsg_name -g $rg \
+  --protocol '*' --access Allow --priority 110 --direction Inbound \
+  --source-address-prefixes 8.8.8.8/32 104.21.25.86/32 172.67.133.228/32 --source-port-ranges '*' \
+  --destination-address-prefixes VirtualNetwork --destination-port-ranges '*'
+az network nsg rule create -n Internet2VnetInside --nsg-name $hub_nva_nsg_name -g $rg \
+  --protocol '*' --access Allow --priority 110 --direction Outbound \
+  --source-address-prefixes 8.8.8.8/32 104.21.25.86/32 172.67.133.228/32 --source-port-ranges '*' \
+  --destination-address-prefixes VirtualNetwork --destination-port-ranges '*'
 
 # Create peered vnets with Ubuntu VM
 # spoke 1
 spoke1_name=spoke1
-spoke1_prefix=10.1.0.0/16
-spoke1_subnet_name=vm
-spoke1_subnet_prefix=10.1.0.0/24
-az network vnet create -g $rg -n $spoke1_name --address-prefix $spoke1_prefix --subnet-name $spoke1_subnet_name --subnet-prefix $spoke1_subnet_prefix -l $location
+spoke1_prefix=10.11.0.0/16
+spoke1_vm_subnet_name=vm
+spoke1_vm_subnet_prefix=10.11.0.0/24
+spoke1_csr_subnet_name=csr
+spoke1_csr_subnet_prefix=10.11.1.0/24
+az network vnet create -g $rg -n $spoke1_name --address-prefix $spoke1_prefix --subnet-name $spoke1_vm_subnet_name --subnet-prefix $spoke1_vm_subnet_prefix -l $location
+az network vnet subnet create -n $spoke1_csr_subnet_name --address-prefix $spoke1_csr_subnet_prefix --vnet-name $spoke1_name -g $rg
+# az network vnet peering delete -n hubtospoke1 -g $rg --vnet-name $vnet_name
+# az network vnet peering delete -n spoke1tohub -g $rg --vnet-name $spoke1_name
 az network vnet peering create -n hubtospoke1 -g $rg --vnet-name $vnet_name --remote-vnet $spoke1_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
 az network vnet peering create -n spoke1tohub -g $rg --vnet-name $spoke1_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
 az vm create -n spoke1-vm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
@@ -52,9 +147,9 @@ spoke1_private_ip=$(az network nic show --ids $spoke1_nic_id --query 'ipConfigur
 
 # spoke 2
 spoke2_name=spoke2
-spoke2_prefix=10.2.0.0/16
+spoke2_prefix=10.12.0.0/16
 spoke2_subnet_name=vm
-spoke2_subnet_prefix=10.2.0.0/24
+spoke2_subnet_prefix=10.12.0.0/24
 az network vnet create -g $rg -n $spoke2_name --address-prefix $spoke2_prefix --subnet-name $spoke2_subnet_name --subnet-prefix $spoke2_subnet_prefix -l $location
 az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $vnet_name --remote-vnet $spoke2_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
 az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke2_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
@@ -64,52 +159,56 @@ spoke2_ip=$(az network public-ip show -n spoke2-vm-pip --query ipAddress -o tsv 
 spoke2_nic_id=$(az vm show -n spoke2-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 spoke2_private_ip=$(az network nic show --ids $spoke2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke2_private_ip
 
+# effective routes
+az network nic show-effective-route-table -n spoke1-vmVMNic -g $rg -o table
 
-# Create CSR
+# Create CSR in spoke1  **OPTIONAL**
 # Variables
-csr_asn=65515
+spoke1_csr_asn=65011
 publisher=cisco
 offer=cisco-csr-1000v
 sku=16_12-byol
 csr_username=jose
 csr_password=Microsoft123!
+spoke1_csr_default_gw=10.11.1.1
+spoke1_csr_bgp_ip=10.11.1.10
 
-# Create CSR as NVA
+# Create spoke1 CSR as NVA
 version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
 az vm image terms accept --urn ${publisher}:${offer}:${sku}:${version}
-az vm create -n csr-nva -g $rg -l $location \
+az vm create -n spoke1-nva -g $rg -l $location \
     --image ${publisher}:${offer}:${sku}:${version} \
     --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
-    --public-ip-address csr-pip --public-ip-address-allocation static \
-    --vnet-name $vnet_name --subnet $csr_subnet_name \
-    --private-ip-address $csr_bgp_ip
-csr_nic_id=$(az vm show -n csr-nva -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-az network nic update --ids $csr_nic_id --ip-forwarding
+    --public-ip-address spoke1-nva-pip --public-ip-address-allocation static \
+    --vnet-name $spoke1_name --subnet $spoke1_csr_subnet_name \
+    --private-ip-address $spoke1_csr_bgp_ip
+spoke1_csr_nic_id=$(az vm show -n spoke1-nva -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $spoke1_csr_nic_id --ip-forwarding
 
-# Configure CSR with BGP
-csr_ip=$(az network public-ip show -n csr-pip --query ipAddress -o tsv -g $rg)
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip <<EOF
+# Configure spoke1 CSR with BGP
+spoke1_csr_ip=$(az network public-ip show -n spoke1-nva-pip --query ipAddress -o tsv -g $rg) && echo $spoke1_csr_ip
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_csr_ip <<EOF
 config t
     no ip domain lookup
     interface Loopback 0
         ip address 1.1.1.1 255.255.255.255
-    router bgp ${csr_asn}
+    router bgp ${spoke1_csr_asn}
         network 1.1.1.1 mask 255.255.255.255
-        neighbor $vr_ip1 remote-as $vr_asn
-        neighbor $vr_ip1 ebgp-multihop 2
-        neighbor $vr_ip2 remote-as $vr_asn
-        neighbor $vr_ip2 ebgp-multihop 2
-    ip route $vr_ip1 255.255.255.255 $csr_default_gw
-    ip route $vr_ip2 255.255.255.255 $csr_default_gw
+        neighbor $rs_ip1 remote-as $rs_asn
+        neighbor $rs_ip1 ebgp-multihop 2
+        neighbor $rs_ip2 remote-as $rs_asn
+        neighbor $rs_ip2 ebgp-multihop 2
+    ip route $rs_ip1 255.255.255.255 $spoke1_csr_default_gw
+    ip route $rs_ip2 255.255.255.255 $spoke1_csr_default_gw
 end
 wr mem
 EOF
 
+# Test spoke1 csr
 # Route Server is reachable over ICMP :)
-ssh $csr_ip "ping $vr_ip1"
-
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_csr_ip" "ping $rs_ip1"
 # Create peering
-az network vrouter peering create --vrouter-name $vr_name -g $rg --peer-ip $csr_bgp_ip --peer-asn $csr_asn -n csr
+az network routeserver peering create --routeserver-name $rs_name -g $rg --peer-ip $spoke1_csr_bgp_ip --peer-asn $spoke1_csr_asn -n csr
 
 # Check effective routes in peered VNets
 az network nic show-effective-route-table -n spoke1-vmVMNic -g $rg -o table
@@ -169,8 +268,8 @@ echo "Route disappeared after $minutes minutes and $seconds seconds"
 ssh $csr_ip "sh ip bgp summary"
 ssh $csr_ip "sh ip bgp"
 ssh $csr_ip "sh ip route bgp"
-ssh $csr_ip "sh ip bgp neig $vr_ip1 advertised-routes"
-ssh $csr_ip "sh ip bgp neig $vr_ip1 routes"
+ssh $csr_ip "sh ip bgp neig $rs_ip1 advertised-routes"
+ssh $csr_ip "sh ip bgp neig $rs_ip1 routes"
 
 # Connectivity to spoke
 spokevm_ip=$(az network public-ip show -n spoke-vm-pip --query ipAddress -o tsv -g $rg)
@@ -226,7 +325,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $spoke1_ip $spoke2_privat
 
 
 #############
-# Third NVA #
+# Linux NVA #
 #############
 
 # TL;DR: not working, the nexthop for routes injected by the BGP NVA is always going to be itself
@@ -295,7 +394,7 @@ circuit_id=$(az network express-route list --query '[0].id' -o tsv)
 az network vpn-connection create -n erconnection -g $rg --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
 
 # Configure Route Server to exchange routes with Vnet Gateways
-az network vrouter update -n $vr_name -g $rg --set allowBranchToBranchTraffic=true
+az network routeserver update -n $rs_name -g $rg --set allowBranchToBranchTraffic=true
 
 # BGP neighbors of ER gateway should show the two Route Server instances
 az network vnet-gateway list-bgp-peer-status -n $ergw_name -g $rg -o table
@@ -403,24 +502,24 @@ EOF
 # Diagnostics #
 ###############
 
-az network vrouter list -g $rg -o table
-az network vrouter show -n $vr_name -g $rg
-az network vrouter peering list --vrouter-name $vr_name -g $rg -o table
-az network vrouter peering show -n csr --vrouter-name $vr_name -g $rg
+az network routeserver list -g $rg -o table
+az network routeserver show -n $rs_name -g $rg
+az network routeserver peering list --routeserver-name $rs_name -g $rg -o table
+az network routeserver peering show -n csr --routeserver-name $rs_name -g $rg
 
 ########################
 # REST not working yet #
 ########################
 
-# REST: vRouter
+# REST: routeserver
 subscription=$(az account show --query id -o tsv)
 version=2020-07-01
-url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualRouters/${vr_name}?api-version=${version}"
-url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualHubs/${vr_name}?api-version=${version}"
+url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualRouters/${rs_name}?api-version=${version}"
+url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualHubs/${rs_name}?api-version=${version}"
 az rest --method get --url $url
 
 # REST: peering
 subscription=$(az account show --query id -o tsv)
 version=2020-07-01
-url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualRouters/${vr_name}/peerings/csr?api-version=${version}"
-az rest --method get --url $url
+url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualRouters/${rs_name}/peerings/csr?api-version=${version}"
+az rest --method get --url $rl

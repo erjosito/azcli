@@ -353,10 +353,16 @@ function accept_csr_terms () {
     # Accept terms
     echo "Accepting image terms for ${publisher}:${offer}:${sku}:${version}..."
     az vm image terms accept --urn "${publisher}:${offer}:${sku}:${version}" >/dev/null
+    # Verify
+    status=$(az vm image terms show --urn "${publisher}:${offer}:${sku}:${version}" --query accepted -o tsv 2>/dev/null)
+    if [[ "$status" != "true" ]]
+    then
+        echo "Marketplace image terms for ${publisher}:${offer}:${sku}:${version} could not be accepted, do you have access at the subscription level?"
+        exit
+    fi
 }
 
-
-# Creates a CSR NVA to simulate an onprem device
+# Creates a CSR NVA
 # Example: create_csr 1
 function create_csr () {
     csr_id=$1
@@ -995,7 +1001,7 @@ function perform_system_checks () {
         extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
         if [[ -z "$extension_version" ]]
         then
-            echo "It seems that the Azure CLI extension \"$extension_name\" is not installed. Please install it with \"az extension add\" before trying this script again"
+            echo "It seems that the Azure CLI extension \"$extension_name\" is not installed. Please install it with \"az extension add -n $extension_name\" before trying this script again"
             exit
         else
             echo "Azure CLI extension \"$extension_name\" found with version $extension_version"
@@ -1067,12 +1073,12 @@ fi
 # [[ $BASH_VERSION ]] && read -rsn1 -p"Press any key to start creating Azure resources into Azure subscription \"$subscription_name\"...";echo
 # [[ $ZSH_VERSION ]] && read -krs "?Press any key to start creating Azure resources into Azure subscription \"$subscription_name\"...";echo
 
+# Accept CSR image terms
+accept_csr_terms
+
 # Create resource group
 echo "Creating resource group \"$rg\" in subscription \"$subscription_name\"..."
 az group create -n "$rg" -l "$location" >/dev/null
-
-# Accept CSR image terms
-accept_csr_terms
 
 # Deploy CSRs and VNGs
 # echo "Routers array: $routers"
