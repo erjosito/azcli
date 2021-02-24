@@ -39,7 +39,6 @@ rs_ip1=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIp
 rs_ip2=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
 rs_asn=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
 
-
 # Create VM in hub
 az vm create -n hub-vm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
     --public-ip-address hub-vm-pip --vnet-name $vnet_name --size Standard_B1s --subnet $vm_subnet_name
@@ -162,62 +161,6 @@ spoke2_private_ip=$(az network nic show --ids $spoke2_nic_id --query 'ipConfigur
 # effective routes
 az network nic show-effective-route-table -n spoke1-vmVMNic -g $rg -o table
 
-# Create CSR in spoke1  **OPTIONAL**
-# Variables
-spoke1_csr_asn=65011
-publisher=cisco
-offer=cisco-csr-1000v
-sku=16_12-byol
-csr_username=jose
-csr_password=Microsoft123!
-spoke1_csr_default_gw=10.11.1.1
-spoke1_csr_bgp_ip=10.11.1.10
-
-# Create spoke1 CSR as NVA
-version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
-az vm image terms accept --urn ${publisher}:${offer}:${sku}:${version}
-az vm create -n spoke1-nva -g $rg -l $location \
-    --image ${publisher}:${offer}:${sku}:${version} \
-    --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
-    --public-ip-address spoke1-nva-pip --public-ip-address-allocation static \
-    --vnet-name $spoke1_name --subnet $spoke1_csr_subnet_name \
-    --private-ip-address $spoke1_csr_bgp_ip
-spoke1_csr_nic_id=$(az vm show -n spoke1-nva -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-az network nic update --ids $spoke1_csr_nic_id --ip-forwarding
-
-# Configure spoke1 CSR with BGP
-spoke1_csr_ip=$(az network public-ip show -n spoke1-nva-pip --query ipAddress -o tsv -g $rg) && echo $spoke1_csr_ip
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_csr_ip <<EOF
-config t
-    no ip domain lookup
-    interface Loopback 0
-        ip address 1.1.1.1 255.255.255.255
-    router bgp ${spoke1_csr_asn}
-        network 1.1.1.1 mask 255.255.255.255
-        neighbor $rs_ip1 remote-as $rs_asn
-        neighbor $rs_ip1 ebgp-multihop 2
-        neighbor $rs_ip2 remote-as $rs_asn
-        neighbor $rs_ip2 ebgp-multihop 2
-    ip route $rs_ip1 255.255.255.255 $spoke1_csr_default_gw
-    ip route $rs_ip2 255.255.255.255 $spoke1_csr_default_gw
-end
-wr mem
-EOF
-
-# Test spoke1 csr
-# Route Server is reachable over ICMP :)
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_csr_ip" "ping $rs_ip1"
-# Create peering
-az network routeserver peering create --routeserver-name $rs_name -g $rg --peer-ip $spoke1_csr_bgp_ip --peer-asn $spoke1_csr_asn -n csr
-
-# Check effective routes in peered VNets
-az network nic show-effective-route-table -n spoke1-vmVMNic -g $rg -o table
-az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o table
-# iBGP, with network statement. Note that the next hop is the CSR, not the VR:
-# Source                 State    Address Prefix    Next Hop Type          Next Hop IP
-# ---------------------  -------  ----------------  ---------------------  -------------
-# VirtualNetworkGateway  Active   1.1.1.1/32        VirtualNetworkGateway  10.0.1.10
-
 # Measure route injection time
 # Create route in CSR
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip <<EOF
@@ -329,32 +272,80 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $spoke1_ip $spoke2_privat
 #############
 
 # TL;DR: not working, the nexthop for routes injected by the BGP NVA is always going to be itself
-# To do: change this to test Quagga on Linux
+# To do: change this to test Quagga/Bird on Linux
 
-# Create peered vnet with Ubuntu VM
-fw_name=ubuntufw
-fw_pip=${fw_name}-pip
-spoke_name=spoke
-az vm create -n $fw_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
-    --public-ip-address $fw_pip --vnet-name $vnet_name --size Standard_B1s --subnet $fw_subnet_name
-fw_nic_id=$(az vm show -n $fw_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-az network nic update --ids $fw_nic_id --ip-forwarding
-fw_pip_ip=$(az network public-ip show -n $fw_pip -g $rg --query ipAddress -o tsv) && echo $fw_pip_ip
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_pip_ip "sudo sysctl net.ipv4.ip_forward"
-fw_private_ip=$(az network nic show --ids $fw_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $fw_private_ip
+# Reference:
+# https://www.atlantic.net/vps-hosting/how-to-install-and-configure-strongswan-vpn-on-ubuntu-18-04/
 
-# Inject routes from CSR into the VR
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no $csr_ip <<EOF
-config t
-    ip route 10.0.0.0 255.0.0.0 $fw_private_ip
-    ip route $fw_private_ip 255.255.255.255 $csr_default_gw
-    router bgp ${csr_asn}
-        redistribute static
-        no network 10.0.0.0 mask 255.0.0.0
-end
-wr mem
+# Create Ubuntu VM with Bird and StrongSwan
+linuxnva_subnet_name=linuxnva
+linuxnva_subnet_prefix=10.1.10.0/24
+linuxnva_name=ubuntufw
+linuxnva_pip=${linuxnva_name}-pip
+linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
+cat <<EOF > $linuxnva_cloudinit_file
+#cloud-config
+runcmd:
+  - apt update && apt install -y bird strongswan libcharon-extra-plugins strongswan-pki
+  - sysctl -w net.ipv4.ip_forward=1
 EOF
-az network nic show-effective-route-table -n spoke2-vmVMNic -g $rg -o table
+az network vnet subnet create --vnet-name $vnet_name --name $linuxnva_subnet_name -g $rg --address-prefixes $linuxnva_subnet_prefix
+az vm create -n $linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address $linuxnva_pip --vnet-name $vnet_name --size Standard_B1s --subnet $linuxnva_subnet_name \
+    --custom-data $linuxnva_cloudinit_file 
+linuxnva_nic_id=$(az vm show -n $linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $linuxnva_nic_id --ip-forwarding
+linuxnva_pip_ip=$(az network public-ip show -n $linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $linuxnva_pip_ip
+linuxnva_private_ip=$(az network nic show --ids $linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $linuxnva_private_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "systemctl status bird"
+linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}')
+
+# Bird config file
+bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+log syslog all;
+router id $linuxnva_private_ip;
+protocol device {
+        scan time 10;           # Scan interfaces every 10 seconds
+}
+# Disable automatically generating direct routes to all network interfaces.
+protocol direct {
+        disabled;               # Disable by default
+}
+# Forbid synchronizing BIRD routing tables with the OS kernel.
+protocol kernel {
+        ipv4 {                    # Connect protocol to IPv4 table by channel
+                import none;      # Import to table, default is import all
+                export none;      # Export to protocol. default is export none
+        };
+}
+# Static IPv4 routes.
+protocol static {
+      ipv4;
+      route 2.2.2.2/32 via $linuxnva_default_gw;
+}
+# BGP peers
+protocol bgp uplink0 {
+      description "BGP uplink 0";
+      local $linuxnva_private_ip as 65002;
+      neighbor $rs_ip1 as $rs_asn;
+      ipv4 {
+              import filter {accept;};
+              export filter {accept;};
+      };
+}
+protocol bgp uplink1 {
+      description "BGP uplink 1";
+      local $linuxnva_private_ip as 65002;
+      neighbor $rs_ip2 as $rs_asn;
+      ipv4 {
+              import filter {accept;};
+              export filter {accept;};
+      };
+}
+EOF
+
 # Next hop is always the CSR, regardless if advertised via network or redistribute, if eBGP or iBGP.
 # Even if hte CSR announces it with the right next hop, the RS seems to override the next hop:
 # csr-nva#sh ip bgp neig 10.0.0.4 advertised-routes             
