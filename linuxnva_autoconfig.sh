@@ -30,9 +30,9 @@ then
             remote_ip=$(echo "$line" | cut -d, -f 4)
             if_name=$(echo "$line" | cut -d, -f 5)
             if_mark=$(echo "$line" | cut -d, -f 6)
-            ip tunnel add "$if_name" local "$local_ip" remote "$remote_pip" mode vti key "$if_mark"
-            ip link set up dev "$if_name"
-            sysctl -w "net.ipv4.conf.${if_name}.disable_policy=1"
+            sudo ip tunnel add "$if_name" local "$local_ip" remote "$remote_pip" mode vti key "$if_mark"
+            sudo ip link set up dev "$if_name"
+            sudo sysctl -w "net.ipv4.conf.${if_name}.disable_policy=1"
             sudo ip route add "${remote_ip}/32" dev "${if_name}"
             sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf
         done <./vti.csv.new

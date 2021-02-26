@@ -264,7 +264,6 @@ if [[ "$linuxnva_autodeploy" == "yes" ]]
 then
     upload_file $linuxnva_guid $psk_file_a ipsec.secrets
     upload_file $linuxnva_guid $ipsec_file_a ipsec.conf
-    # upload_file $azure_nva_guid $bird_config_file_a bird.conf
     list_files $linuxnva_guid
 else
     username=$(whoami)
@@ -278,7 +277,6 @@ if [[ "$onprem_linuxnva_autodeploy" == "yes" ]]
 then
     upload_file $onprem_linuxnva_guid $psk_file_b ipsec.secrets
     upload_file $onprem_linuxnva_guid $ipsec_file_b ipsec.conf
-    # upload_file $onprem_linuxnva_guid $bird_config_file_a bird.conf
     list_files $onprem_linuxnva_guid
 else
     username=$(whoami)
@@ -369,7 +367,7 @@ fi
 
 if [[ "$onprem_linuxnva_autodeploy" == "yes" ]]
 then
-    upload_file $onprem_linuxnva_guid $bird_config_file_a bird.conf
+    upload_file $onprem_linuxnva_guid $bird_config_file_b bird.conf
     list_files $onprem_linuxnva_guid
 else
     username=$(whoami)
