@@ -35,6 +35,7 @@ then
             sudo sysctl -w "net.ipv4.conf.${if_name}.disable_policy=1"
             sudo ip route add "${remote_ip}/32" dev "${if_name}"
             sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf
+            sudo systemctl restart ipsec
         done <./vti.csv.new
         mv ./vti.csv.new ./vti.csv
     else

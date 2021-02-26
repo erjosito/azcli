@@ -57,6 +57,14 @@ function download_files () {
     echo "Downloading from $url..."
     wget $url -O ./ipsec.conf
 }
+function first_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
 
 # Create Ubuntu NVA with Bird and StrongSwan
 linuxnva_asn=65001
@@ -105,9 +113,12 @@ linuxnva_nic_id=$(az vm show -n $linuxnva_name -g "$rg" --query 'networkProfile.
 az network nic update --ids $linuxnva_nic_id --ip-forwarding
 linuxnva_pip_ip=$(az network public-ip show -n $linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $linuxnva_pip_ip
 linuxnva_private_ip=$(az network nic show --ids $linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $linuxnva_private_ip
-linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $linuxnva_default_gw
-# sleep 30  # It can take some time for the bird/ipsec daemons to start
+# linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $linuxnva_default_gw
+linuxnva_default_gw=$(first_ip "$linuxnva_subnet_prefix") && echo $linuxnva_default_gw
+sleep 30  # It can take some time for the bird/ipsec daemons to start
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo systemctl status bird2"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo birdc show status"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo systemctl status ipsec"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo ipsec status"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo ls -al /root/"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo crontab -l"
@@ -169,8 +180,9 @@ onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'n
 az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding
 onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $onprem_linuxnva_pip_ip
 onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $onprem_linuxnva_private_ip
-onprem_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $onprem_linuxnva_default_gw
-# sleep 30  # It can take some time for the bird/ipsec daemons to start
+# onprem_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $onprem_linuxnva_default_gw
+onprem_linuxnva_default_gw=$(first_ip "$onprem_nva_subnet_prefix") && echo $onprem_linuxnva_default_gw
+sleep 30  # It can take some time for the bird/ipsec daemons to start
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show status"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ipsec status"
 
@@ -286,16 +298,6 @@ else
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart ipsec"
 fi
 
-# IPsec Diagnostics
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "ip a"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ip a"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "systemctl status ipsec"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status ipsec"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo ipsec status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ipsec status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "ping $onprem_linuxnva_private_ip -c 5"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping $linuxnva_private_ip -c 5"
-
 # Configure BGP with Bird (azure)
 bird_config_file_a=/tmp/bird.conf.a
 cat <<EOF > $bird_config_file_a
@@ -309,11 +311,13 @@ protocol direct {
 }
 protocol kernel {
       import all;
-      export none;
+      export all;
 }
 protocol static {
+      import all;
       route 1.1.1.1/32 via $linuxnva_default_gw;
       route $subnet_prefix via $linuxnva_default_gw;
+      route ${onprem_linuxnva_private_ip}/32 via "vti0";
 }
 protocol bgp uplink0 {
       description "BGP to Azure";
@@ -321,7 +325,10 @@ protocol bgp uplink0 {
       local $linuxnva_private_ip as $linuxnva_asn;
       neighbor $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
           import filter {accept;};
-          export filter {accept;};
+          export filter {
+            if (net = ${onprem_linuxnva_private_ip}/32) then { reject; }
+            accept;
+          };
 }
 EOF
 # Configure BGP with Bird (onprem)
@@ -337,11 +344,13 @@ protocol direct {
 }
 protocol kernel {
       import all;
-      export none;
+      export all;
 }
 protocol static {
+      import all;
       route 2.2.2.2/32 via $onprem_linuxnva_default_gw;
       route $onprem_nva_subnet_prefix via $onprem_linuxnva_default_gw;
+      route ${linuxnva_private_ip}/32 via "vti0";
 }
 protocol bgp uplink0 {
       description "BGP to Azure";
@@ -349,14 +358,17 @@ protocol bgp uplink0 {
       local $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
       neighbor $linuxnva_private_ip as $linuxnva_asn;
           import filter {accept;};
-          export filter {accept;};
+          export filter {
+            if (net = ${linuxnva_private_ip}/32) then { reject; }
+            accept;
+          };
 }
 EOF
 
 # Deploy config files
 if [[ "$linuxnva_autodeploy" == "yes" ]]
 then
-    upload_file $azure_nva_guid $bird_config_file_a bird.conf
+    upload_file $linuxnva_guid $bird_config_file_a bird.conf
     list_files $linuxnva_guid
 else
     username=$(whoami)
@@ -376,12 +388,37 @@ else
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart bird"
 fi
 
+# Wait 1 minute to make sure the config is applied
+sleep 60
+
+# IPsec Diagnostics
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "netstat -rnv"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "systemctl status ipsec"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo ipsec status"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "ping $onprem_linuxnva_private_ip -c 5"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "netstat -rnv"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status ipsec"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ipsec status"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping $linuxnva_private_ip -c 5"
+
 # BGP Diagnostics
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "systemctl status bird"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo birdc show status"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo birdc show protocols uplink0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo birdc show protocol all uplink0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo birdc show route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo birdc show route protocol uplink0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo birdc show route export uplink0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo birdc show route where net ~2.2.2.2/32 all"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "netstat -rnv"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status bird"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo birdc show protocols uplink0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols uplink0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocol all uplink0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show route protocol uplink0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show route export uplink0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show route where net ~2.2.2.2/32 all"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "netstat -rnv"
