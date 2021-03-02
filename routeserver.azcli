@@ -1,4 +1,4 @@
-# variables
+# Variables
 rg=routeserver
 location=westeurope
 vnet_name=hub

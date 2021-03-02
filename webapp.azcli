@@ -1,0 +1,173 @@
+# Resource group
+rg=appweblab
+location=westeurope
+az group create -n $rg -l $location
+create_appgw=yes
+private_link=no
+aad_auth=yes
+
+# Create Windows Web App for API
+svcplan_name=webappplan
+app_name_api=api-$RANDOM
+az appservice plan create -n $svcplan_name -g $rg --sku B1
+# Update svc plan if required
+az appservice plan update -n $svcplan_name -g $rg --sku S1
+# Create web app (see `az webapp list-runtimes` for the runtimes)
+az webapp create -n $app_name_api -g $rg -p $svcplan_name  -r "aspnet|V4.7"
+app_url=$(az webapp show -n $app_name_api -g $rg --query defaultHostName -o tsv)
+echo "Web app url is https://${app_url}"
+
+# Load app
+app_file_url=https://raw.githubusercontent.com/jelledruyts/InspectorGadget/master/Page/default.aspx
+app_file_name=default.aspx
+wget $app_file_url -O $app_file_name
+creds=($(az webapp deployment list-publishing-profiles -n $app_name_api -g $rg --query "[?contains(publishMethod, 'FTP')].[publishUrl,userName,userPWD]" --output tsv))
+# curl -T $app_file_name -u ${creds[1]}:${creds[2]} ${creds[0]}/
+curl -T $app_file_name -u ${creds[2]}:${creds[3]} ${creds[1]}/
+echo "Check out this URL: http://${app_url}/${app_file_name}"
+
+# Private Link
+if [[ "$private_link" == "yes" ]]
+then
+    # Azure SQL
+    sql_server_name=myserver$RANDOM
+    sql_db_name=mydb
+    sql_username=azure
+    sql_password=Microsoft123!
+    az sql server create -n $sql_server_name -g $rg -l $location --admin-user $sql_username --admin-password $sql_password
+    az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait
+    # Optionally test for serverless SKU
+    # az sql db update -g $rg -s $sql_server_name -n $sql_db_name --edition GeneralPurpose --min-capacity 1 --capacity 4 --family Gen5 --compute-model Serverless --auto-pause-delay 1440
+    sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName)
+
+    # Create Vnet
+    vnet_name=myvnet
+    vnet_prefix=192.168.0.0/16
+    subnet_sql_name=sql
+    subnet_sql_prefix=192.168.2.0/24
+    subnet_webapp_be_name=webapp-be
+    subnet_webapp_be_prefix=192.168.5.0/24
+    az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_sql_name --address-prefix $subnet_sql_prefix
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_webapp_be_name --address-prefix $subnet_webapp_be_prefix
+
+    # Create vnet integration
+    az webapp vnet-integration add -n $app_name_api -g $rg --vnet $vnet_name --subnet $subnet_webapp_be_name
+    # Verify
+    az webapp vnet-integration list -n $app_name_api -g $rg -o table
+
+    # Update Firewall
+    # az webapp show -n api-26567 -g $rg --query outboundIpAddresses
+    # Creating one rule for each outbound IP: not implemented yet. Workaround: fully open
+    az sql server firewall-rule create -g $rg -s $sql_server_name -n permitAny --start-ip-address "0.0.0.0" --end-ip-address "255.255.255.255"
+    az sql server firewall-rule list -g $rg -s $sql_server_name -o table
+
+    # Get connection string
+    db_client_type=ado.net
+    az sql db show-connection-string -n $sql_db_name -s $sql_server_name -c $db_client_type -o tsv | awk '{sub(/<username>/,"'$sql_username'")}1' | awk '{sub(/<password>/,"'$sql_password'")}1'
+
+    # Send Query over the web app GUI to SELECT CONNECTIONPROPERTY('client_net_address'). This should work, since it is going over the public IP at this time
+
+    # Create SQL private endpoint (note that there is no integration with private DNS from the CLI)
+    endpoint_name=mysqlep
+    sql_server_id=$(az sql server show -n $sql_server_name -g $rg -o tsv --query id)
+    az network vnet subnet update -n $subnet_sql_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
+    az network private-endpoint create -n $endpoint_name -g $rg --vnet-name $vnet_name --subnet $subnet_sql_name --private-connection-resource-id $sql_server_id --group-ids sqlServer --connection-name sqlConnection
+    # Get private endpoint ip
+    nic_id=$(az network private-endpoint show -n $endpoint_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
+    sql_endpoint_ip=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "Private IP address for SQL server ${sql_server_name}: ${sql_endpoint_ip}"
+
+    # Create Azure DNS private zone and records: database.windows.net
+    dns_zone_name=database.windows.net
+    az network private-dns zone create -n $dns_zone_name -g $rg 
+    az network private-dns link vnet create -g $rg -z $dns_zone_name -n myDnsLink --virtual-network $vnet_name --registration-enabled false
+    # Create record (private dns zone integration not working in the CLI)
+    az network private-dns record-set a create -n $sql_server_name -z $dns_zone_name -g $rg
+    az network private-dns record-set a add-record --record-set-name $sql_server_name -z $dns_zone_name -g $rg -a $sql_endpoint_ip
+    # Verification: list recordsets in the zone
+    az network private-dns record-set list -z $dns_zone_name -g $rg -o table
+    az network private-dns record-set a show -n $sql_server_name -z $dns_zone_name -g $rg --query aRecords -o table
+
+    # Create DNS server VM
+    subnet_dns_name=dns-vm
+    subnet_dns_prefix=192.168.53.0/24
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_dns_name --address-prefix $subnet_dns_prefix
+    dnsserver_name=dnsserver
+    dnsserver_pip_name=dns-vm-pip
+    dnsserver_size=Standard_D2_v3
+    az vm create -n $dnsserver_name -g $rg --vnet-name $vnet_name --subnet $subnet_dns_name --public-ip-address $dnsserver_pip_name --generate-ssh-keys --image ubuntuLTS --priority Low --size $dnsserver_size --no-wait
+    dnsserver_ip=$(az network public-ip show -n $dnsserver_pip_name -g $rg --query ipAddress -o tsv)
+    dnsserver_nic_id=$(az vm show -n $dnsserver_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    dnsserver_privateip=$(az network nic show --ids $dnsserver_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "DNS server deployed to $dnsserver_privateip, $dnsserver_ip"
+    echo "IP configuration of the VM:"
+    ssh $dnsserver_ip "ip a"
+    ssh $dnsserver_ip "sudo apt -y install apache2 dnsmasq"
+
+    # Configure web app for DNS - Option 1:
+    # DNS server as server for the vnet (required only if not setting the app setting)
+    az network vnet update -n $vnet_name -g $g --dns-servers $dnsserver_privateip
+    # Bounce the vnet integration to take the new DNS config
+    az webapp vnet-integration delete -n $app_name_api -g $rg 
+    az webapp vnet-integration add -n $app_name_api -g $rg --vnet $vnet_name --subnet $subnet_webapp_be_name
+
+    # Configure web app for DNS - Option 2:
+    # Change web app DNS settings (https://www.azuretechguy.com/how-to-change-the-dns-server-in-azure-app-service)
+    az webapp config appsettings set -n $app_name_api -g $rg --settings "WEBSITE_DNS_SERVER=${dnsserver_privateip}
+    az webapp restart -n $app_name_api -g $rg
+
+    # Send Query over the app to SELECT CONNECTIONPROPERTY('client_net_address'). Now we should be using the private IP
+
+fi
+
+if [[ "$create_appgw" == "yes "]]
+then
+    appgw_pipname=appgwpip
+    dnsname=kuardgw
+    dnszone=cloudtrooper.net
+    dnsrg=dns
+    appgw_name=appgw
+    sku=Standard_v2
+    cookie=Disabled
+    backenddnsname=webapp
+    backendfqdn="$backenddnsname"."$dnszone"
+    vnet_name=appgw
+    vnet_prefix=10.0.0.0/16
+    appgw_subnet_name=AppGateway
+    appgw_subnet_prefix=10.0.0.0/24
+    aci_subnet_name=aci
+    aci_subnet_prefix=10.0.1.0/24
+    appgw_nsg_name=appgw
+    log_storage_account=appgwlog$RANDOM
+
+    # Create vnet
+    az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix --subnet-name $appgw_subnet_name --subnet-prefix $appgw_subnet_prefix
+
+    # Alternatively create subnet in the vnet
+    # az network vnet subnet create --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --address-prefixes 10.13.123.0/24
+
+    # Create PIP
+    allocation_method=Static
+    az network public-ip create -g $rg -n $appgw_pipname --sku Standard --allocation-method $allocation_method
+    #fqdn=$(az network public-ip show -g $rg -n $appgw_pipname --query dnsSettings.fqdn -o tsv)
+
+    # Create GW with sample config for port 80
+    az network application-gateway create -g $rg -n $appgw_name --capacity 2 --sku $sku \
+        --frontend-port 80 --routing-rule-type basic \
+        --http-settings-port 80 --http-settings-protocol Http \
+        --public-ip-address $appgw_pipname --vnet-name $vnet_name --subnet $appgw_subnet_name \
+        --servers "$app_url" \
+        --no-wait
+fi
+
+if [[ "$aad_auth" == "yes" ]]
+then
+    # Update app with new callback url
+    # cluster_fqdn=$(az aro show -n $cluster_name -g $rg --query clusterProfile.domain -o tsv)
+    domain=$(az aro list -g $rg --query '[0].clusterProfile.domain' -o tsv)
+    location=$(az aro list -g $rg --query '[0].location' -o tsv)
+    cluster_fqdn=https://oauth-openshift.apps.${domain}.${location}.aroapp.io/oauth2callback/AAD
+    echo "Running command: az ad app update --id $app_id --reply-urls \"${cluster_fqdn}\""
+    az ad app update --id $app_id --reply-urls "${cluster_fqdn}"
+fi
