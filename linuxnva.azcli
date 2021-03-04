@@ -131,7 +131,7 @@ runcmd:
   - sysctl -w net.ipv4.ip_forward=1
   - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
   - sysctl -w net.ipv4.conf.all.send_redirects = 0
-  - sudo ip link set up dev eth1
+  - ip link set up dev eth1
   - dhclient eth1 -v
   - ip route add 0.0.0.0/0 via $linuxnva_default_gw
   - ip route add $vnet_prefix via $linuxnva_default_gw2
@@ -154,11 +154,6 @@ az vm create -n $linuxnva_name -g $rg -l $location --image "${publisher}:${offer
      --size ${vm_size} --custom-data "$linuxnva_cloudinit_file" --nics "${linuxnva_name}-nic0" "${linuxnva_name}-nic1"
 linuxnva_pip_ip=$(az network public-ip show -n $linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $linuxnva_pip_ip
 linuxnva_private_ip=$(az network nic show -n "${linuxnva_name}-nic0" -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $linuxnva_private_ip
-
-# Bring up secondary interface (this seems to be required!!!)
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo ip link set up dev eth1"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "sudo dhclient eth1 -v"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linuxnva_pip_ip "ip a"
 
 # Send all RFC1918 from the VM to the NVA
 linuxnva_private_ip2=$(az network nic show -n "${linuxnva_name}-nic1" -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $linuxnva_private_ip
@@ -228,14 +223,12 @@ az network nsg rule create -n IKE --nsg-name "${onprem_linuxnva_name}-nsg" -g $r
 az network nsg rule create -n IPsec --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp
 az network nsg rule create -n ICMP --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
 az vm create -n $onprem_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
-    --public-ip-address $onprem_linuxnva_pip --vnet-name $onprem_vnet_name --size Standard_B1s --subnet $onprem_nva_subnet_name \
+    --public-ip-address $onprem_linuxnva_pip --vnet-name $onprem_vnet_name --size $vm_size --subnet $onprem_nva_subnet_name \
     --custom-data $linuxnva_cloudinit_file --private-ip-address "$onprem_linuxnva_ip" --nsg "${onprem_linuxnva_name}-nsg"
 onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding
-# az network nic update --ids $onprem_linuxnva_nic_id --network-security-group "${onprem_linuxnva_name}-nsg"
 onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $onprem_linuxnva_pip_ip
 onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $onprem_linuxnva_private_ip
-# onprem_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $onprem_linuxnva_default_gw
 onprem_linuxnva_default_gw=$(first_ip "$onprem_nva_subnet_prefix") && echo $onprem_linuxnva_default_gw
 sleep 30  # It can take some time for the bird/ipsec daemons to start
 
@@ -360,7 +353,7 @@ protocol device {
         scan time 10;
 }
 protocol direct {
-      #disabled;
+      disabled;
 }
 protocol kernel {
       preference 254;
@@ -398,7 +391,7 @@ protocol device {
         scan time 10;
 }
 protocol direct {
-      #disabled;
+      disabled;
 }
 protocol kernel {
       preference 254;

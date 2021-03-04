@@ -76,7 +76,7 @@ az feature register --name AKS-IngressApplicationGatewayAddon --namespace micros
 state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/AKS-IngressApplicationGatewayAddon')].properties.state" -o tsv)
 echo "Waiting for feature to finish registering"
 wait_interval=15
-until [[ "$state" == "Succeeded" ]]
+until [[ "$state" == "Registered" ]]
 do
     sleep $wait_interval
     state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/AKS-IngressApplicationGatewayAddon')].properties.state" -o tsv)
@@ -132,10 +132,12 @@ az aks create -g $rg -n $aks_name -l $location \
     --network-policy '' --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
     --node-osdisk-type ephemeral --node-osdisk-size 30 \
+    --enable-pod-security-policy \
     --no-wait
 
 # Other options you can use in the previous command
-    # --enable-private-cluster
+    # --enable-private-cluster \
+    # --enable-pod-security-policy \
     # --enable-cluster-autoscaler --min-count 1 --max-count 4 \
     # --cluster-autoscaler-profile scan-interval=30s \
     # --dns-name-prefix cloudtrooper \
@@ -164,6 +166,13 @@ wait_until_finished $aks_id
 az aks list -o table
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl get nodes
+
+######################
+#    Azure Advisor   #
+######################
+
+aks_id=$(az aks show -n $aks_name -g $rg --query id -o tsv)
+az advisor recommendation list --ids $aks_id -o table
 
 ######################
 # Update the cluster #
