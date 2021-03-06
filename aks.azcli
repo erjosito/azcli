@@ -67,21 +67,36 @@ function wait_until_finished {
      fi
 }
 
-##################
-# Enable feature #
-##################
+###################
+# Enable features #
+###################
 
-# This will not be required after preview any more
-az feature register --name AKS-IngressApplicationGatewayAddon --namespace microsoft.containerservice
-state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/AKS-IngressApplicationGatewayAddon')].properties.state" -o tsv)
-echo "Waiting for feature to finish registering"
-wait_interval=15
-until [[ "$state" == "Registered" ]]
-do
-    sleep $wait_interval
-    state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/AKS-IngressApplicationGatewayAddon')].properties.state" -o tsv)
-done
-az provider register --namespace Microsoft.ContainerService
+function enableAksFeature () {
+    feature_name=$1
+    state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
+    if [[ "$state" == "Registered" ]]
+    then
+        echo "$feature_name is already registered"
+    else
+        echo "Registering feature $feature_name..."
+        az feature register --name "$feature_name" --namespace microsoft.containerservice
+        state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
+        echo "Waiting for feature $feature_name to finish registering..."
+        wait_interval=15
+        until [[ "$state" == "Registered" ]]
+        do
+            sleep $wait_interval
+            state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
+            echo "Current registration status for feature $feature_name is $state"
+        done
+        echo "Registering resource provider Microsoft.ContainerService now..."
+        az provider register --namespace Microsoft.ContainerService
+    fi
+}
+
+enableAksFeature "AKS-IngressApplicationGatewayAddon"
+enableAksFeature "EnablePodIdentityPreview"
+enableAksFeature "MigrateToMSIClusterPreview"
 
 ########
 # Main #
@@ -198,6 +213,61 @@ az monitor diagnostic-settings create -n mydiag --resource $aks_id --workspace $
             {"category": "kube-scheduler", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
             {"category": "cluster-autoscaler", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
             {"category": "guard", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+
+# Migrate to MSI
+az aks update -g $rg -n $aks_name --enable-managed-identity -y
+
+# Pod identity
+id_name=apppodid
+az identity create --resource-group $rg --name $id_name
+id_client_id="$(az identity show -g $rg -n $id_name --query clientId -o tsv)" && echo $id_client_id
+id_arm_id="$(az identity show -g $rg -n $id_name --query id -o tsv)" && echo $id_arm_id
+az aks update -n $aks_name -g $rg --enable-pod-identity
+podid_ns=default
+az aks pod-identity add -g $rg --cluster-name $aks_name --namespace $podid_ns --name $id_name --identity-resource-id $id_arm_id
+node_rg=$(az aks show -n $aks_name -g $rg --query nodeResourceGroup -o tsv) && echo $node_rg
+node_rg_id=$(az group show -n $node_rg --query id -o tsv) && echo $node_rg_id
+rg_id=$(az group show -n $rg --query id -o tsv) && echo $rg_id
+az role assignment create --role "Reader" --assignee "$id_client_id" --scope $node_rg_id
+az role assignment create --role "Reader" --assignee "$id_client_id" --scope $rg_id
+subscription_id=$(az account show --query id -o tsv) && echo $subscription_id
+yaml_file=/tmp/podid.yaml
+cat <<EOF > $yaml_file
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo
+  labels:
+    aadpodidbinding: $id_name
+spec:
+  containers:
+  - name: demo
+    image: mcr.microsoft.com/oss/azure/aad-pod-identity/demo:v1.6.3
+    args:
+      - --subscriptionid=$subscription_id
+      - --clientid=$id_client_id
+      - --resourcegroup=$rg
+    env:
+      - name: MY_POD_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+      - name: MY_POD_NAMESPACE
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.namespace
+      - name: MY_POD_IP
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
+  nodeSelector:
+    kubernetes.io/os: linux
+EOF
+kubectl apply -f $yaml_file --namespace $podid_ns
+kubectl logs demo --follow --namespace $podid_ns
+az aks pod-identity list --cluster-name $aks_name -g $rg -o table
+az aks pod-identity exception list --cluster-name $aks_name -g $rg -o table
+
 
 #####################
 # Add a second pool #

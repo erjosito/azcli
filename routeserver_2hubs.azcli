@@ -221,10 +221,12 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip li
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link set vxlan0 up"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip addr add ${hub1_nva_overlay_ip}/30 dev vxlan0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip route add $hub2_nva_private_ip/32 via $hub1_nva_default_gw"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ifconfig eth0 mtu 1600"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip link add vxlan0 type vxlan id 1 remote $hub1_nva_private_ip dstport 4789 dev eth0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip link set vxlan0 up"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip addr add ${hub2_nva_overlay_ip}/30 dev vxlan0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip route add $hub1_nva_private_ip/32 via $hub2_nva_default_gw"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ifconfig eth0 mtu 1600"
 
 # RS adjacencies
 az network routeserver peering create --vrouter-name $hub1_rs_name -g $rg --peer-ip $hub1_nva_private_ip --peer-asn $hub1_nva_asn -n $hub1_nva_name
@@ -250,18 +252,9 @@ protocol static {
       route $hub2_nva_overlay_ip/32 via "vxlan0";
       route $hub1_spoke_summary via $hub1_nva_default_gw;
 }
-function AS_OVERRIDE() {
-    # Not using, but left as reference
-    bgp_path.empty;
-    bgp_path.prepend($hub1_nva_asn);
-    return true;
-}
 template bgp PEERS {
     local as $hub1_nva_asn;
     multihop;
-    #import all;
-    #export where AS_OVERRIDE();
-    #export all;
 }
 filter TO_RS {
       # Drop long prefixes
@@ -291,12 +284,6 @@ hub1_nva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pi
 scp $bird_config_file "${hub1_nva_pip_ip}:/home/${hub1_nva_user}/bird.conf"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo mv /home/${hub1_nva_user}/bird.conf /etc/bird/bird.conf"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo systemctl restart bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "systemctl status bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show route"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols all"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols rs0"
 
 # Hub2 NVA bird config file
 bird_config_file=/tmp/bird.conf
@@ -318,11 +305,6 @@ protocol static {
       route $hub1_nva_overlay_ip/32 via "vxlan0";
       route $hub2_spoke_summary via $hub2_nva_default_gw;
 }
-function AS_OVERRIDE() {
-    bgp_path.empty;
-    bgp_path.prepend($hub2_nva_asn);
-    return true;
-}
 filter TO_RS {
       # Drop long prefixes
       if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
@@ -331,9 +313,6 @@ filter TO_RS {
 template bgp PEERS {
     local as $hub2_nva_asn;
     multihop;
-    #import all;
-    #export where AS_OVERRIDE();
-    #export all;
 }
 protocol bgp rs0 from PEERS {
       description "RouteServer instance 0";
@@ -358,12 +337,10 @@ hub2_nva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pi
 scp $bird_config_file "${hub2_nva_pip_ip}:/home/${hub2_nva_user}/bird.conf"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo mv /home/${hub2_nva_user}/bird.conf /etc/bird/bird.conf"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo systemctl restart bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "systemctl status bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show route"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show protocols"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show protocols all"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show protocols all rs0"
+
+##############################
+#        Diagnostics         #
+##############################
 
 # Vnet peerings
 az network vnet peering list --vnet-name $hub1_vnet_name -g $rg -o table
@@ -373,6 +350,10 @@ az network vnet peering list --vnet-name $hub2_vnet_name -g $rg -o table
 az network vnet peering list --vnet-name $spoke21_vnet_name -g $rg -o table
 az network vnet peering list --vnet-name $spoke22_vnet_name -g $rg -o table
 
+# VXLAN interfaces
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ip a"
+
 # BGP adjacencies
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show protocols"
@@ -381,13 +362,18 @@ az network routeserver peering list --vrouter-name $hub2_rs_name -g $rg -o table
 
 # BGP route tables in NVA
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show route all 10.2.0.0/16"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols all rs0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show route all $spoke21_vnet_prefix"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "netstat -rnv"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show route"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show protocols"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show protocols all rs0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show route all $spoke21_vnet_prefix"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "netstat -rnv"
 
 # BGP route tables in RS
 az network routeserver peering list-learned-routes -n hub1nva --vrouter-name $hub1_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
@@ -407,6 +393,7 @@ az network nic show-effective-route-table --ids $spoke22_vm_nic_id -o table
 
 # Connectivity tests
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping $hub2_nva_private_ip -c 5"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping $hub2_nva_private_ip -c 5 -M do -s 1572"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping $hub2_nva_overlay_ip -c 5"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping $spoke22_vm_private_ip -c 5"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ping $spoke22_vm_private_ip -c 5"
@@ -415,7 +402,214 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke11_vm_pip "ping $spoke
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke21_vm_pip "ping $spoke22_vm_private_ip -c 5"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke21_vm_pip "ping $spoke12_vm_private_ip -c 5"
 
-# Cleanup
+##############################
+# Optional: 2ary NVA in hub2 #
+##############################
+
+# Create NVA2 in hub2
+hub2_nva2_name=hub2nva2
+hub2_nva2_pip=${hub2_nva2_name}-pip
+az vm create -n $hub2_nva2_name -g $rg -l $hub2_location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address $hub2_nva2_pip --vnet-name $hub2_vnet_name --size $nva_size --subnet $hub2_nva_subnet_name \
+    --custom-data $nva_cloudinit_file --nsg $hub2_nsg_name
+hub2_nva2_nic_id=$(az vm show -n $hub2_nva2_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $hub2_nva2_nic_id --ip-forwarding
+hub2_nva2_pip_ip=$(az network public-ip show -n $hub2_nva2_pip -g $rg --query ipAddress -o tsv) && echo $hub2_nva2_pip_ip
+hub2_nva2_private_ip=$(az network nic show --ids $hub2_nva2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub2_nva2_private_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "ip a"
+
+# VXLAN tunnels between hub1-nva and hub2-nva2
+hub1_nva2_overlay_ip=192.168.0.5
+hub2_nva2_overlay_ip=192.168.0.6
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link add vxlan1 type vxlan id 2 remote $hub2_nva2_private_ip dstport 4789 dev eth0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link set vxlan1 up"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip addr add ${hub1_nva2_overlay_ip}/30 dev vxlan1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip route add $hub2_nva2_private_ip/32 via $hub1_nva_default_gw"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo ip link add vxlan1 type vxlan id 2 remote $hub1_nva_private_ip dstport 4789 dev eth0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo ip link set vxlan1 up"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo ip addr add ${hub2_nva2_overlay_ip}/30 dev vxlan1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo ip route add $hub1_nva_private_ip/32 via $hub2_nva_default_gw"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo ifconfig eth0 mtu 1600"
+
+# RS adjacencies
+az network routeserver peering create --vrouter-name $hub2_rs_name -g $rg --peer-ip $hub2_nva2_private_ip --peer-asn $hub2_nva_asn -n $hub2_nva2_name
+
+# Hub1 NVA bird config file
+bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+log syslog all;
+router id $hub1_nva_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      export where source != RTS_STATIC;
+}
+protocol static {
+      route $hub1_rs_ip1/32 via $hub1_nva_default_gw;
+      route $hub1_rs_ip2/32 via $hub1_nva_default_gw;
+      route $hub2_nva_overlay_ip/32 via "vxlan0";
+      route $hub2_nva2_overlay_ip/32 via "vxlan1";
+      route $hub1_spoke_summary via $hub1_nva_default_gw;
+}
+template bgp PEERS {
+    local as $hub1_nva_asn;
+    multihop;
+}
+filter TO_RS {
+      # Drop long prefixes
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      else accept;
+}
+protocol bgp rs0 from PEERS {
+      description "RouteServer instance 0";
+      neighbor $hub1_rs_ip1 as $hub1_rs_asn;
+      import all;
+      export filter TO_RS;
+}
+protocol bgp rs1 from PEERS {
+      description "RouteServer instance 1";
+      neighbor $hub1_rs_ip2 as $hub1_rs_asn;
+      import all;
+      export filter TO_RS;
+}
+protocol bgp hub2a from PEERS {
+      description "Hub 2 NVA 1ary";
+      neighbor $hub2_nva_overlay_ip as $hub2_nva_asn;
+      import all;
+      export all;
+}
+protocol bgp hub2b from PEERS {
+      description "Hub 2 NVA 2ary";
+      neighbor $hub2_nva2_overlay_ip as $hub2_nva_asn;
+      import all;
+      export all;
+}
+EOF
+hub1_nva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "whoami") && echo $hub1_nva_user
+scp $bird_config_file "${hub1_nva_pip_ip}:/home/${hub1_nva_user}/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo mv /home/${hub1_nva_user}/bird.conf /etc/bird/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo systemctl restart bird"
+
+# Hub2 NVA bird config file
+bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+log syslog all;
+router id $hub2_nva_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      export where source != RTS_STATIC;
+}
+protocol static {
+      route $hub2_rs_ip1/32 via $hub2_nva_default_gw;
+      route $hub2_rs_ip2/32 via $hub2_nva_default_gw;
+      route $hub1_nva_overlay_ip/32 via "vxlan0";
+      route $hub2_spoke_summary via $hub2_nva_default_gw;
+}
+filter TO_RS {
+      # Drop long prefixes
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      else accept;
+}
+template bgp PEERS {
+    local as $hub2_nva_asn;
+    multihop;
+}
+protocol bgp rs0 from PEERS {
+      description "RouteServer instance 0";
+      neighbor $hub2_rs_ip1 as $hub2_rs_asn;
+      import all;
+      export filter TO_RS;
+}
+protocol bgp rs1 from PEERS {
+      description "RouteServer instance 1";
+      neighbor $hub2_rs_ip2 as $hub2_rs_asn;
+      import all;
+      export filter TO_RS;
+}
+protocol bgp hub1 from PEERS {
+      description "Hub 1 NVA";
+      neighbor $hub1_nva_overlay_ip as $hub1_nva_asn;
+      import all;
+      export all;
+}
+EOF
+hub2_nva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "whoami") && echo $hub2_nva_user
+scp $bird_config_file "${hub2_nva_pip_ip}:/home/${hub2_nva_user}/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo mv /home/${hub2_nva_user}/bird.conf /etc/bird/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo systemctl restart bird"
+
+# Hub2 NVA2 bird config file
+bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+log syslog all;
+router id $hub2_nva_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      export where source != RTS_STATIC;
+}
+protocol static {
+      route $hub2_rs_ip1/32 via $hub2_nva_default_gw;
+      route $hub2_rs_ip2/32 via $hub2_nva_default_gw;
+      route $hub1_nva2_overlay_ip/32 via "vxlan1";
+      route $hub2_spoke_summary via $hub2_nva_default_gw;
+}
+filter TO_RS {
+      # Drop long prefixes
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      else {
+          bgp_path.prepend($hub2_nva_asn);
+          accept;
+      }
+}
+template bgp PEERS {
+    local as $hub2_nva_asn;
+    multihop;
+}
+protocol bgp rs0 from PEERS {
+      description "RouteServer instance 0";
+      neighbor $hub2_rs_ip1 as $hub2_rs_asn;
+      import all;
+      export filter TO_RS;
+}
+protocol bgp rs1 from PEERS {
+      description "RouteServer instance 1";
+      neighbor $hub2_rs_ip2 as $hub2_rs_asn;
+      import all;
+      export filter TO_RS;
+}
+protocol bgp hub1 from PEERS {
+      description "Hub 1 NVA";
+      neighbor $hub1_nva2_overlay_ip as $hub1_nva_asn;
+      import all;
+      export filter {
+          bgp_path.prepend($hub2_nva_asn);
+          accept;
+      };
+}
+EOF
+hub2_nva2_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "whoami") && echo $hub2_nva_user
+scp $bird_config_file "${hub2_nva2_pip_ip}:/home/${hub2_nva2_user}/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo mv /home/${hub2_nva_user}/bird.conf /etc/bird/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo systemctl restart bird"
+
+###########
+# Cleanup #
+###########
+
 # az network routeserver peering delete --vrouter-name $hub1_rs_name -g $rg -n $hub1_nva_name -y
 # az network routeserver peering delete --vrouter-name $hub2_rs_name -g $rg -n $hub2_nva_name -y
 # az network routeserver delete -n  $hub1_rs_name -g $rg -y
