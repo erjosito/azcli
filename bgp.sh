@@ -329,8 +329,9 @@ function create_vm_in_csr_vnet () {
     if [[ -z "$test_vm_id" ]]
     then
         echo "Creating VM $vm_name in vnet $vnet_name..."
-        az vm create -n "$vm_name" -g "$rg" -l "$location" --image ubuntuLTS --generate-ssh-keys \
-            --public-ip-address "${vm_name}-pip" --vnet-name "$vnet_name" --size $vm_size \
+        az vm create -n "$vm_name" -g "$rg" -l "$location" --image ubuntuLTS --size $vm_size \
+            --generate-ssh-keys --authentication-type all --admin-username "$default_username" --admin-password "$psk" \
+            --public-ip-address "${vm_name}-pip" --vnet-name "$vnet_name" --public-ip-address-allocation static \
             --subnet "$vm_subnet_name" --subnet-address-prefix "$vm_subnet_prefix" --no-wait 2>/dev/null
         az network route-table create -n "$rt_name" -g "$rg" -l "$location" >/dev/null
         az network route-table route create -n localrange -g "$rg" --route-table-name "$rt_name" \
