@@ -1,0 +1,18 @@
+#################################################
+# Commands to look into defined service tags
+# Two use cases:
+# 1. Find the service tag for an IP
+# 2. Look for the IPs in a set of service tags
+#################################################
+
+
+# Commands are restricted to a certain location
+location=westeurope
+
+# Find to wich service tag an IP belongs
+# This is doing a basic contains, not too sophisticated
+az network list-service-tags -l $location -o json | jq -r '.values[] | select(.properties.addressPrefixes[] | contains("13.92.84.128")) | .name'
+
+# Find the IPs of a service tag
+az network list-service-tags -l $location -o json | jq -r '.values[] | select(.name == "GatewayManager.EastUS") | [.name,.properties.addressPrefixes]'
+az network list-service-tags -l $location -o json | jq -r '.values[] | select(.name | contains("GatewayManager")) | [.name,.properties.addressPrefixes]'

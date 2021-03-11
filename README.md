@@ -7,3 +7,5 @@ The scripts have been tested using zsh, so they will not work in Windows. Regard
 The testing that has gone in each scenario is limited, so please do not expect them to work flawlessly.
 
 It is recommended to open the files in Visual Studio Code with the Azure CLI extension installed (so that you get IntelliSense support for Azure CLI commands), and open a terminal (a WSL one if you are working on a Windows machine) to test the different commands step by step.
+
+To download the scripts you can either clone the whole repo with `git clone https://github.com/erjosito/azcli` or download specific files with `wget "https://raw.githubusercontent.com/erjosito/azcli/master/routeserver_2hubs.azcli" -O <filename>.sh`.

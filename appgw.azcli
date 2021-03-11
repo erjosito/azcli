@@ -28,6 +28,19 @@ az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix --subn
 # Alternatively create subnet in the vnet
 # az network vnet subnet create --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --address-prefixes 10.13.123.0/24
 
+# Create Log Analytics Workspace
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    echo "Creating new Log Analytics workspace"
+    logws_name=log$RANDOM
+    az monitor log-analytics workspace create -n $logws_name -g $rg
+else
+    echo "Log Analytics workspace $logws_name found"
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+
 # Create PIP
 allocation_method=Static
 az network public-ip create -g $rg -n $appgw_pipname --sku Standard --allocation-method $allocation_method
@@ -68,12 +81,15 @@ az network nsg rule create --nsg-name $appgw_nsg_name -n 'Deny_Internet_in' -g $
 #     --description 'Default deny' \
 #     --priority 1000 --access Deny  --direction Outbound --protocol '*' \
 #     --destination-address-prefixes 'Internet' --destination-port-ranges '*'
-# Configure NSG flow logging to storage
+# Configure NSG flow logging 
 az storage account create -n $log_storage_account -g $rg --sku Standard_LRS --kind StorageV2
-# Configure NSG flow logs: GO TO THE PORTAL!!!!
+az network watcher flow-log create -l $location -n flowlog-$location -g $rg \
+    --nsg $appgw_nsg_name --storage-account $log_storage_account --log-version 2 --retention 7 \
+    --workspace $logws_id --interval 10 --traffic-analytics true
 flowlog_id=$(az network nsg show -n $appgw_nsg_name -g $rg --query 'flowLogs[0].id' -o tsv)
 az resource show --id $flowlog_id --query properties
-# Attach to subnet
+
+# Attach NSG to subnet
 az network vnet subnet update --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --nsg $appgw_nsg_name
 
 # Create GW with sample config for port 80
@@ -166,6 +182,10 @@ echo "$sp_app_id retrieved for Azure Key Vault access"
 #     --key-vault-secret-id https://erjositokeyvault.vault.azure.net/secrets/cloudtroopernet/9498f25b036e40739b36e5b30ea112bd
 az network application-gateway ssl-cert create -g $rg --gateway-name $appgw_name -n starcloudtrooper \
   --cert-file ~/certs/cloudtrooper.net/star_cloudtrooper_net.p7b --cert-password Microsoft123!
+
+# Upgrade / Downgrade
+az network application-gateway update -g $rg -n $appgw_name --sku WAF_v2
+az network application-gateway update -g $rg -n $appgw_name --sku Standard_v2  # Not working!
 
 # Troubleshoot
 az network application-gateway list -g $rg -o table
