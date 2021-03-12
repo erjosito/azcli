@@ -227,14 +227,13 @@ else
   az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $fw_dns_name -a $azfw_pip_address
 fi
 
-# Verify Linux VM deployed correctly and SSH is working fine
-# vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
+# Verify Linux VM deployed correctly and SSH through AzFW is working fine
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "ip a"
-curl ${vm_pip_address}:8080/api/healthcheck
-curl ${vm_pip_address}:8080/api/ip
+curl ${fw_dns_fqdn}:8080/api/healthcheck
+curl ${fw_dns_fqdn}:8080/api/ip
 
 # Install nginx for SSL termination
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo apt install -y nginx"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "sudo apt install -y nginx"
 nginx_config_file=/tmp/nginx.conf
 cat <<EOF > $nginx_config_file
 worker_processes auto;
@@ -261,7 +260,7 @@ http {
             proxy_set_header Connection "";
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
             # proxy_set_header X-Forwarded-For \$remote_addr;
             proxy_buffer_size          128k;
             proxy_buffers              4 256k;
@@ -270,20 +269,21 @@ http {
     }
 }
 EOF
-scp "$nginx_config_file" "${vm_pip_address}:~/"
+scp "$nginx_config_file" "${fw_dns_fqdn}:~/"
 # Put public certs in NGINX. Note: you need to have some public certs in advance
 cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper_chain.pem"
 key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper.key"
-scp "$cert_file" "${vm_pip_address}:~/ssl.crt"
-scp "$key_file" "${vm_pip_address}:~/ssl.key"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo mv ./* /etc/nginx/"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "systemctl status nginx"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo systemctl restart nginx"
+scp "$cert_file" "${fw_dns_fqdn}:~/ssl.crt"
+scp "$key_file" "${fw_dns_fqdn}:~/ssl.key"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "sudo mv ./* /etc/nginx/"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "systemctl status nginx"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "sudo systemctl restart nginx"
 
-# Create A record in public domain
+# Create A record in public domain for direct access to the VM (only works without default route)
+vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
 public_domain=cloudtrooper.net
 vm_dns_name='appgwfw-vm'
-public_dns_rg=$(az network dns zone list --query "[?name=='$public_domain'].resourceGroup" -o tsv)
+public_dns_rg=$(az network dns zone list --query "[?name=='$public_domain'].resourceGroup" -o tsv) && echo $public_dns_rg
 if [[ -z "$public_dns_rg" ]]
 then
   echo "ERROR: I could not find the public DNS zone $public_domain in subscription $sub_name"
@@ -301,16 +301,18 @@ else
   az network dns record-set a create -g $public_dns_rg -z cloudtrooper.net -n $vm_dns_name
   az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $vm_dns_name -a $vm_pip_address
 fi
+# Test direct access to the VM over SSL
 vm_fqdn="${vm_dns_name}.${public_domain}" && echo $vm_fqdn
 curl -k "https://${vm_fqdn}/api/healthcheck"
+curl -k "https://${fw_dns_fqdn}/api/healthcheck"
 
 # Test file uploads
 test_file="/tmp/testfile"
 echo $(tr -dc a-zA-Z0-9 </dev/urandom 2>/dev/null| head -c 25) >$test_file
-curl -k -F "file=@${test_file}" "https://${vm_fqdn}/api/filesize"
+curl -k -F "file=@${test_file}" "https://${fw_dns_fqdn}/api/filesize"
 bad_file="/tmp/badfile"
 wget "https://secure.eicar.org/eicar.com" -O $bad_file
-curl -k -F "file=@${bad_file}" "https://${vm_fqdn}/api/filesize"
+curl -k -F "file=@${bad_file}" "https://${fw_dns_fqdn}/api/filesize"
 
 ######################
 # Deploy App Gateway #
