@@ -1,0 +1,71 @@
+###############################################
+# Create new Domain from freenom.com,
+# and wildcard cert from LetsEncrypt.
+#
+# Goal is to offer some infrastructure
+# to test without domains/certs.
+#
+# Prereqs:
+# - rapidapi key (stored in AKV): create in rapidapi.com
+###############################################
+
+#######################
+# Work in progress!!! #
+#######################
+
+# Auxiliary functions
+urlencode() {
+    # urlencode <string>
+    old_lc_collate=$LC_COLLATE
+    LC_COLLATE=C
+    local length="${#1}"
+    for (( i = 0; i < length; i++ )); do
+        local c="${1:$i:1}"
+        case $c in
+            [a-zA-Z0-9.~_-]) printf '%s' "$c" ;;
+            *) printf '%%%02X' "'$c" ;;
+        esac
+    done
+    LC_COLLATE=$old_lc_collate
+}
+
+urldecode() {
+    # urldecode <string>
+    local url_encoded="${1//+/ }"
+    printf '%b' "${url_encoded//%/\\x}"
+}
+
+# Generate free domain
+# domainr API doc: https://domainr.com/docs/api
+
+# Get rapidapi key from AKV
+rapidapi_akv_name=erjositoKeyVault
+akv_rapidapi_key_secret_name=freenom-username
+# Use this to store your rapidapi key in AKV for the first time
+# az keyvault secret set -n $akv_rapidapi_key_secret_name --value 'your_rapid_api_key' --vault-name $freenom_akv_name
+rapidapi_key=$(az keyvault secret show --vault-name $freenom_akv_name -n $akv_rapidapi_key_secret_name --query 'value' -o tsv)
+if [[ -z "$rapidapi_key" ]]
+then
+    echo "ERROR: No RapidAPI key found in Key Vault $rapidapi_akv_name"
+    # exit 1
+else
+    echo "INFO: RapidAPI key retrieved successfully from AKV $rapidapi_akv_name"
+fi
+
+# free domainr service
+domainr_host="domainr.p.rapidapi.com"
+
+# Check domain status
+unique_string=$RANDOM
+domain_suffix="gq"
+domain="azlab-${unique_string}.${domain_suffix}"
+domain_encoded=$(urlencode $domain)
+domain_status=$(curl -s -X GET "https://${domainr_host}/v2/status?mashape-key=${rapidapi_key}&domain=${domain_encoded}")
+echo $domain_status
+request_status=$(echo $domain_status | jq -r '.status')
+if [[ "$request_status" == "error" ]]
+then
+    echo "ERROR: $(echo $domain_status | jq -r '.error')"
+else
+    echo "INFO: blah blah"
+fi

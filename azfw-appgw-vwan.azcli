@@ -5,6 +5,9 @@
 # The script creates AzFW and AppGW, plus some VMs for testing
 # AzFW will be integrated in VWAN
 #
+# Requirements:
+# - Public domain registered with Azure DNS
+# - Public cert for that domain
 ############################################################################
 
 # Variables
@@ -16,6 +19,7 @@ vwan_hub1_prefix=192.168.0.0/23
 azfw_name=myazfw
 azfw_pip_name=myazfw-pip
 azfw_policy_name=myazfw_policy
+# AppGW
 appgw_vnet_name=appgw
 appgw_vnet_prefix=10.11.0.0/16
 appgw_subnet_name=ApplicationGatewaySubnet
@@ -27,7 +31,7 @@ appgw_cookie=Disabled
 appgw_backenddnsname=kuard
 appgw_backendfqdn="$backenddnsname"."$dnszone"
 appgw_rt_name=appgw
-logws_name=log$RANDOM
+# Web server
 vm_vnet_name=web
 vm_vnet_prefix=10.12.0.0/16
 vm_name=testvmlinux
@@ -39,6 +43,15 @@ vm_cloudinit_filename=/tmp/cloudinit-whoami.txt
 vm_cloudinit_url=https://raw.githubusercontent.com/erjosito/azcli/master/cloudinit-whoami.txt
 vm_rt_name=vm
 vm_nsg_name=vm-nsg
+# Common Services
+cs_vnet_name=cs
+cs_vnet_prefix=10.13.0.0/16
+dns_vm_name=dns
+dns_vm_pip_name=dns-pip
+dns_vm_sku=Standard_B1s
+dns_subnet_name=dns
+dns_subnet_prefix=10.13.1.0/24
+dns_nsg_name=dns-nsg
 
 # RG, VWAN and vnet
 az group create -n $rg -l $location1
@@ -46,15 +59,25 @@ az network vwan create -n $vwan -g $rg -l $location1 --branch-to-branch-traffic 
 az network vhub create -n hub1 -g $rg --vwan $vwan -l $location1 --address-prefix $vwan_hub1_prefix
 az network vnet create -n $appgw_vnet_name -g $rg --address-prefixes $appgw_vnet_prefix --subnet-name $appgw_subnet_name --subnet-prefixes $appgw_subnet_prefix -l $location1
 az network vnet create -n $vm_vnet_name -g $rg --address-prefixes $vm_vnet_prefix --subnet-name $vm_subnet_name --subnet-prefixes $vm_subnet_prefix -l $location1
+az network vnet create -n $cs_vnet_name -g $rg --address-prefixes $cs_vnet_prefix --subnet-name $dns_subnet_name --subnet-prefixes $dns_subnet_prefix -l $location1
 hub1_default_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n defaultRouteTable --query id -o tsv)
 az network vhub connection create -n $appgw_vnet_name -g $rg --vhub-name hub1 --remote-vnet $appgw_vnet_name \
     --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default
 az network vhub connection create -n $vm_vnet_name -g $rg --vhub-name hub1 --remote-vnet $vm_vnet_name \
     --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default
+az network vhub connection create -n $cs_vnet_name -g $rg --vhub-name hub1 --remote-vnet $cs_vnet_name \
+    --internet-security true --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default
 
 # Create Log Analytics workspace
-# logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv)  # Retrieve the WS name if it already existed
-az monitor log-analytics workspace create -n $logws_name -g $rg
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    logws_name=log$RANDOM
+    echo "INFO: Creating log analytics workspace ${logws_name}..."
+    az monitor log-analytics workspace create -n $logws_name -g $rg
+else
+    echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+fi
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 
@@ -64,6 +87,7 @@ az network nsg create -n $vm_nsg_name -g $rg
 az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
 az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
 az network nsg rule create -n https --nsg-name $vm_nsg_name -g $rg --priority 520 --destination-port-ranges 443 --access Allow --protocol Tcp
+az network nsg rule create -n web80 --nsg-name $vm_nsg_name -g $rg --priority 530 --destination-port-ranges 80 --access Allow --protocol Tcp
 #wget $vm_cloudinit_url -O $vm_cloudinit_filename
 cat <<EOF > $vm_cloudinit_filename
 #cloud-config
@@ -164,18 +188,22 @@ az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace 
 
 # Outgoing app rule for all FQDNs
 az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 100
+# App rule for SSL/HTTP
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-    --name permitVnet --collection-priority 200 --action Allow --rule-name permitVnet --rule-type ApplicationRule --description "Permit HTTP traffic from VNet" \
-    --target-fqdns '*' --source-addresses $vnet_prefix --protocols Http=8080 Https=443 --enable-tls-inspection
-az network firewall policy rule-collection-group collection rule add --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-    --collection-name permitVnet --name permitDnatTraffic --rule-type ApplicationRule --description "Permit HTTP traffic from Internet" \
+    --name permitAppGW --collection-priority 200 --action Allow --rule-name permitVnet --rule-type ApplicationRule --description "Permit HTTP traffic" \
     --target-fqdns '*' --source-addresses '*' --protocols Http=8080 Https=443 --enable-tls-inspection
+az network firewall policy rule-collection-group collection rule add --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+    --collection-name PermitAppGW --name permit80 --description "Permit HTTP traffic on TCP80" --rule-type ApplicationRule \
+    --target-fqdns '*' --source-addresses '*' --protocols Http=80
+# Net rule for ICMP
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name NetworkTraffic --collection-priority 150 --action Allow --rule-name permitIcmp --rule-type NetworkRule --description "Permit intra-vnet ICMP traffic" \
-    --destination-addresses "$vnet_prefix" --destination-ports '*' --source-addresses "$vnet_prefix" --ip-protocols 'Icmp'
+    --destination-addresses '*' --destination-ports '*' --source-addresses '*' --ip-protocols 'Icmp'
+# Optional net rule for 8080 (to check if IDPS works even if allowed by net rules)
 az network firewall policy rule-collection-group collection rule add --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --collection-name NetworkTraffic --name permit8080 --description "Permit HTTP traffic on TCP8080" --rule-type NetworkRule \
-    --destination-addresses "$vnet_prefix" --destination-ports 8080 --source-addresses "$vnet_prefix" --ip-protocols 'TCP'
+    --destination-addresses "$vm_vnet_prefix" --destination-ports 8080 --source-addresses "$appgw_vnet_prefix" --ip-protocols 'TCP'
+# Sample for delete rule
 # az network firewall policy rule-collection-group collection rule remove --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
 #     --collection-name NetworkTraffic --name permit8080
 
@@ -206,34 +234,34 @@ az network nic show-effective-route-table --ids $vm_nic_id -o table
 
 # Create public DNS record for AzFW's public IP
 public_domain=cloudtrooper.net
-fw_dns_name='appgwfw-fw'
-fw_dns_fqdn="${fw_dns_name}.${public_domain}"
+azfw_dns_name='appgwfw-fw'
+azfw_fqdn="${azfw_dns_name}.${public_domain}"
 public_dns_rg=$(az network dns zone list --query "[?name=='$public_domain'].resourceGroup" -o tsv)
 if [[ -z "$public_dns_rg" ]]
 then
   echo "ERROR: I could not find the public DNS zone $public_domain in subscription $sub_name"
 else
   # First, remove any existing A-record if already exists
-  a_record_set=$(az network dns record-set a show -n "$fw_dns_name" -z "$public_domain" -g "$public_dns_rg" -o tsv --query id 2>/dev/null)
+  a_record_set=$(az network dns record-set a show -n "$azfw_dns_name" -z "$public_domain" -g "$public_dns_rg" -o tsv --query id 2>/dev/null)
   if [[ -n "$a_record_set" ]]
   then
-    echo "Deleting existing A record for ${fw_dns_name}.${public_domain}..."
-    az network dns record-set a delete -n "$fw_dns_name" -z "$public_domain" -g "$public_dns_rg" -y
+    echo "Deleting existing A record for ${azfw_dns_name}.${public_domain}..."
+    az network dns record-set a delete -n "$azfw_dns_name" -z "$public_domain" -g "$public_dns_rg" -y
   else
     echo "No conflicting A records found in ${public_domain}"
   fi
   # Now create new A record
-  az network dns record-set a create -g $public_dns_rg -z cloudtrooper.net -n $fw_dns_name
-  az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $fw_dns_name -a $azfw_pip_address
+  az network dns record-set a create -g $public_dns_rg -z cloudtrooper.net -n $azfw_dns_name
+  az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $azfw_dns_name -a $azfw_pip_address
 fi
 
 # Verify Linux VM deployed correctly and SSH through AzFW is working fine
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "ip a"
-curl ${fw_dns_fqdn}:8080/api/healthcheck
-curl ${fw_dns_fqdn}:8080/api/ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azfw_fqdn "ip a"
+curl ${azfw_fqdn}:8080/api/healthcheck
+curl ${azfw_fqdn}:8080/api/ip
 
 # Install nginx for SSL termination
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "sudo apt install -y nginx"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azfw_fqdn "sudo apt install -y nginx"
 nginx_config_file=/tmp/nginx.conf
 cat <<EOF > $nginx_config_file
 worker_processes auto;
@@ -243,6 +271,7 @@ events {
 pid        /var/run/nginx.pid;
 http {
     server {
+        listen 80;
         listen [::]:443 ssl;
         listen 443 ssl;
         server_name localhost;
@@ -269,15 +298,15 @@ http {
     }
 }
 EOF
-scp "$nginx_config_file" "${fw_dns_fqdn}:~/"
+scp "$nginx_config_file" "${azfw_fqdn}:~/"
 # Put public certs in NGINX. Note: you need to have some public certs in advance
 cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper_chain.pem"
 key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper.key"
-scp "$cert_file" "${fw_dns_fqdn}:~/ssl.crt"
-scp "$key_file" "${fw_dns_fqdn}:~/ssl.key"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "sudo mv ./* /etc/nginx/"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "systemctl status nginx"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $fw_dns_fqdn "sudo systemctl restart nginx"
+scp "$cert_file" "${azfw_fqdn}:~/ssl.crt"
+scp "$key_file" "${azfw_fqdn}:~/ssl.key"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azfw_fqdn "sudo mv ./* /etc/nginx/"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azfw_fqdn "systemctl status nginx"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azfw_fqdn "sudo systemctl restart nginx"
 
 # Create A record in public domain for direct access to the VM (only works without default route)
 vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
@@ -304,36 +333,76 @@ fi
 # Test direct access to the VM over SSL
 vm_fqdn="${vm_dns_name}.${public_domain}" && echo $vm_fqdn
 curl -k "https://${vm_fqdn}/api/healthcheck"
-curl -k "https://${fw_dns_fqdn}/api/healthcheck"
+curl -k "https://${azfw_fqdn}/api/healthcheck"
+
+# Test IDPS with Agent header
+curl -k -A "BlackSun" "https://${azfw_fqdn}/api/healthcheck"
+curl -k -A "BlackSun" "http://${azfw_fqdn}:8080/api/healthcheck"
+az network firewall policy update -n $azfw_policy_name -g $rg --idps-mode Deny
+curl -k -A "BlackSun" "https://${azfw_fqdn}/api/healthcheck"  # TLS inspection not enabled yet
+curl -k -A "BlackSun" "http://${azfw_fqdn}:8080/api/healthcheck"
 
 # Test file uploads
+# Note Eicar file is not filtered out by IDPS, it is more  a virus than a bad signature
 test_file="/tmp/testfile"
 echo $(tr -dc a-zA-Z0-9 </dev/urandom 2>/dev/null| head -c 25) >$test_file
-curl -k -F "file=@${test_file}" "https://${fw_dns_fqdn}/api/filesize"
+curl -k -F "data=@${test_file}" "https://${azfw_fqdn}/api/filesize"
 bad_file="/tmp/badfile"
 wget "https://secure.eicar.org/eicar.com" -O $bad_file
-curl -k -F "file=@${bad_file}" "https://${fw_dns_fqdn}/api/filesize"
+curl -k -F "data=@${bad_file}" "https://${azfw_fqdn}/api/filesize"
+bad_file="/tmp/badfile"
+echo 'uid=0(root) gid=0(root) groups=0(root)' >$bad_file
+curl -k -F "data=@${bad_file}" "http://${azfw_fqdn}:8080/api/filesize"
+
+######################
+# Deploy DNS server  #
+######################
+
+# Linux vm with dnsmask in the common services vnet
+cat <<EOF > $vm_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update && apt install -y dnsmasq
+EOF
+az vm create -n $dns_vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $dns_vm_sku -l $location1 \
+   --vnet-name $cs_vnet_name --subnet $dns_subnet_name --nsg $dns_nsg_name --public-ip-address $dns_vm_pip_name \
+   --custom-data $vm_cloudinit_filename
+dns_private_ip=$(az vm show -g $rg -n $dns_vm_name -d --query privateIps -o tsv) && echo $dns_private_ip
+
+# Configure DNS resolution for a specific host name (suffixed "privatezone"). When the AppGW sets this hostname
+#   the AzFW will use DNS to resolve to the private IP
+az network private-dns zone create -n $public_domain -g $rg
+az network private-dns record-set a add-record --record-set-name "${vm_dns_name}-privatezone" -z $public_domain -g $rg -a $vm_private_ip
+vm_privatezone_fqdn="${vm_dns_name}-privatezone.${public_domain}"
+# Associate private DNS zone to Common Services vnet
+az network private-dns link vnet create -g $rg -z $public_domain -n $cs_vnet_name --virtual-network $cs_vnet_name --registration-enabled false
+
+# Configure AzFW to use the dnsmasq resolver
+az network firewall policy update -n $azfw_policy_name -g $rg --dns-servers $dns_private_ip
 
 ######################
 # Deploy App Gateway #
 ######################
 
-# Split DNS
-az network private-dns zone create -n $public_domain -g $rg
-az network private-dns record-set a add-record --record-set-name $vm_dns_name -z $public_domain -g $rg -a $vm_private_ip
-az network private-dns record-set a add-record --record-set-name "${vm_dns_name}-private" -z $public_domain -g $rg -a $vm_private_ip
-az network private-dns link vnet create -g $rg -z $public_domain -n myDnsLink --virtual-network $vnet_name --registration-enabled false
-
 # Create GW with sample config for port 8080
-az network public-ip create -g $rg -n $appgw_pip_name --sku standard --allocation-method static -l $location
-appgw_pip_address=$(az network public-ip show -g $rg -n $appgw_pip_name --query ipAddress -o tsv)
+az network public-ip create -g $rg -n $appgw_pip_name --sku standard --allocation-method static -l $location1
+appgw_pip_address=$(az network public-ip show -g $rg -n $appgw_pip_name --query ipAddress -o tsv) && echo $appgw_pip_address
 az network application-gateway create -g $rg -n $appgw_name --capacity 2 --sku $appgw_sku \
     --frontend-port 8080 --routing-rule-type basic \
-    --servers $vm_fqdn --http-settings-port 8080 --http-settings-protocol Http \
-    --sku Standard_v2 --min-capacity 1 --max-capacity 2 \
-    --public-ip-address $appgw_pip_name --vnet-name $vnet_name --subnet $appgw_subnet_name
+    --servers $vm_private_ip --http-settings-port 8080 --http-settings-protocol Http \
+    --sku Standard_v2 --min-capacity 1 --max-capacity 2 -l $location1 \
+    --public-ip-address $appgw_pip_name --vnet-name $appgw_vnet_name --subnet $appgw_subnet_name
+
+# Add probe with custom path
+az network application-gateway probe create -g "$rg" --gateway-name "$appgw_name" \
+--name testvmprobe8080 --protocol Http --host-name-from-http-settings --match-status-codes 200-399 --port 8080 --path /api/healthcheck
+default_settings_name=$(az network application-gateway http-settings list -g "$rg" --gateway-name "$appgw_name" --query '[0].name' -o tsv) && echo $default_settings_name
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" -n $default_settings_name \
+--host-name ${vm_fqdn} --probe testvmprobe8080 
 
 # Import certs from AKV
+# ToDo: change and do the AppGW-AKV integration with managed identity
+akv_name=erjositoKeyvault
 cert_name=cloudtroopernet
 cert_id=$(az network application-gateway ssl-cert show -n "$cert_name" --gateway-name "$appgw_name" -g "$rg" --query id -o tsv 2>/dev/null)
 if [[ -z "$cert_id" ]]
@@ -350,7 +419,7 @@ else
     echo "Cert $cert_name already exists in application gateway $appgw_name"
 fi
 
-# Root cert from firewall
+# Root cert from firewall (self-signed, generated previously in the script)
 root_cert_id=$(az network application-gateway ssl-cert show -n azfwroot --gateway-name "$appgw_name" -g "$rg" --query id -o tsv 2>/dev/null)
 if [[ -z "$root_cert_id" ]]
 then
@@ -358,15 +427,6 @@ then
 else
     echo "Root certificate already present in Application Gateway $appgw_name"
 fi
-
-# Intermediate CA cert from firewall
-# root_cert_id=$(az network application-gateway ssl-cert show -n azfwinter --gateway-name "$appgw_name" -g "$rg" --query id -o tsv 2>/dev/null)
-# if [[ -z "$root_cert_id" ]]
-# then
-#     az network application-gateway root-cert create -g "$rg" --gateway-name "$appgw_name" --name azfwinter --cert-file "$interCA_cert" -o none
-# else
-#     echo "Intermediate certificate already present in Application Gateway $appgw_name"
-# fi
 
 # HTTP Settings and probe
 echo "Creating probe and HTTP settings..."
@@ -392,21 +452,6 @@ az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace
         {"category": "ApplicationGatewayPerformanceLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
         {"category": "ApplicationGatewayFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
 
-# Implement routing to AzFW
-# RT for the AppGW subnet
-azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo $azfw_private_ip
-appgw_rt_name=appgwrt
-az network route-table create --name "$appgw_rt_name" --resource-group "$rg" --location "$location"
-az network route-table route create  --route-table-name $appgw_rt_name -g $rg --address-prefix $vm_subnet_prefix --name "ToVMSubnet"  --next-hop-type VirtualAppliance --next-hop-ip-address "$azfw_private_ip"
-az network vnet subnet update --name $appgw_subnet_name --route-table $appgw_rt_name --vnet-name $vnet_name --resource-group $rg
-
-# RT in the VM subnet required if using network rules
-rt_name=vmrt
-az network route-table create --name "$rt_name" --resource-group "$rg" --location "$location"
-az network route-table route create  --route-table-name $rt_name -g $rg --address-prefix $appgw_subnet_prefix --name "ToAppGWSubnet"  --next-hop-type VirtualAppliance --next-hop-ip-address "$azfw_private_ip"
-az network route-table route create  --route-table-name $rt_name -g $rg --address-prefix $vm_subnet_prefix --name "intrasubnet"  --next-hop-type VirtualAppliance --next-hop-ip-address "$azfw_private_ip"
-az network vnet subnet update --name $vm_subnet_name --route-table $rt_name --vnet-name $vnet_name --resource-group $rg
-
 # Create A record in public domain for AppGW
 public_domain=cloudtrooper.net
 appgw_dns_name='appgwfw-gw'
@@ -429,9 +474,112 @@ else
   az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $appgw_dns_name -a $appgw_pip_address
 fi
 
-# Verify access to the app over the App Gateway
-appgw_fqdn="${appgw_dns_name}.${public_domain}" && echo $vm_fqdn
+# Change the SSL HTTP settings to trust well-known root CAs
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" \
+    --name testvmsettings --set trustedRootCertificates=null
+
+# Verify access to the app over the App Gateway (backend not going through AzFW yet)
+appgw_fqdn="${appgw_dns_name}.${public_domain}" && echo $appgw_fqdn
+curl "http://${appgw_fqdn}:8080/api/healthcheck"
 curl -k "https://${appgw_fqdn}/api/healthcheck"
+
+# Implement routing through AzFW, setting static route in hub RT and both vnet connections to propagate to None
+azfw_id=$(az network vhub show -n hub1 -g $rg --query 'azureFirewall.id' -o tsv) && echo $azfw_id
+az network vhub route-table route add -n defaultRouteTable --vhub-name hub1 -g $rg \
+    --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" \
+    --next-hop-type ResourceId --next-hop $azfw_id
+# Test a more specific route for the case where the AppGW and the VM are in the same subnet
+az network vhub route-table route add -n defaultRouteTable --vhub-name hub1 -g $rg \
+    --route-name websubnet --destination-type CIDR --destinations "$vm_subnet_prefix" \
+    --next-hop-type ResourceId --next-hop $azfw_id
+hub1_none_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n noneRouteTable --query id -o tsv)
+az network vhub connection update --vhub-name hub1 -g $rg -n $appgw_vnet_name --propagated "$hub1_none_rt_id" --labels none
+az network vhub connection update --vhub-name hub1 -g $rg -n $vm_vnet_name --propagated "$hub1_none_rt_id" --labels none
+az network vhub connection update --vhub-name hub1 -g $rg -n $cs_vnet_name --propagated "$hub1_none_rt_id" --labels none
+
+# Leave default propagation disabled, to allow for direct access to the VMs if required
+az network vhub connection update --vhub-name hub1 -g $rg -n $appgw_vnet_name --set enableInternetSecurity=false
+az network vhub connection update --vhub-name hub1 -g $rg -n $vm_vnet_name --set enableInternetSecurity=false
+az network vhub connection update --vhub-name hub1 -g $rg -n $cs_vnet_name --set enableInternetSecurity=false
+
+# Set trusted root cert to the self-signed root cert of the AzFW (and give time for VWAN routing to converge)
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" \
+    --name testvmsettings --root-certs azfwroot
+
+# Verify application over AppGW and AzFW
+curl "http://${appgw_fqdn}:8080/api/healthcheck"
+curl -k "https://${appgw_fqdn}/api/healthcheck"
+curl -k -A "BlackSun" "https://${appgw_fqdn}/api/healthcheck"
+
+# Disable lower case header IDPS signatures in AzFW
+az network firewall policy intrusion-detection add --policy-name $azfw_policy_name -g $rg --mode Off --signature-id 2845390
+az network firewall policy intrusion-detection add --policy-name $azfw_policy_name -g $rg --mode Off --signature-id 2845391
+
+################################
+# DNS resolution of private IP #
+################################
+
+# Adding private IP address resolution for hostname inserted by AppGW
+# Since no private DNS zone can be attached to the vhub where the AzFW is, using public DNS resolution :(
+public_domain=cloudtrooper.net
+vm_private_dns_name='appgwfw-vm-private'
+public_dns_rg=$(az network dns zone list --query "[?name=='$public_domain'].resourceGroup" -o tsv) && echo $public_dns_rg
+if [[ -z "$public_dns_rg" ]]
+then
+  echo "ERROR: I could not find the public DNS zone $public_domain in subscription $sub_name"
+else
+  # First, remove any existing A-record if already exists
+  a_record_set=$(az network dns record-set a show -n "$vm_private_dns_name" -z "$public_domain" -g "$public_dns_rg" -o tsv --query id 2>/dev/null)
+  if [[ -n "$a_record_set" ]]
+  then
+    echo "Deleting existing A record for ${vm_private_dns_name}.${public_domain}..."
+    az network dns record-set a delete -n "$vm_private_dns_name" -z "$public_domain" -g "$public_dns_rg" -y
+  else
+    echo "No conflicting A records found in ${public_domain}"
+  fi
+  # Now create new A record
+  az network dns record-set a create -g $public_dns_rg -z cloudtrooper.net -n $vm_private_dns_name
+  az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $vm_private_dns_name -a $vm_private_ip
+fi
+vm_private_fqdn="${vm_private_dns_name}.${public_domain}" && echo $vm_private_fqdn
+
+# Now change the HTTP settings in the AppGW to the FQDN resolved by the public DNS zone to the private IP
+default_settings_name=$(az network application-gateway http-settings list -g "$rg" --gateway-name "$appgw_name" --query '[0].name' -o tsv) && echo $default_settings_name
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" -n $default_settings_name --host-name ${vm_private_fqdn}
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" -n testvmsettings --host-name ${vm_private_fqdn}
+
+# Test
+curl "http://${appgw_fqdn}:8080/api/healthcheck"
+curl -k "https://${appgw_fqdn}/api/healthcheck"
+
+# To see DNS failures in the AzFW, change the hostname to a bogus FQDN
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" -n $default_settings_name --host-name "thisisbogus8080.${public_domain}"
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" -n testvmsettings --host-name "thisisbogus443.${public_domain}"
+
+# Change the hostname to the one resolved by the DNS private zone, change the hostname to an FQDN defined there (suffix "privatezone")
+# Note you need to specify the port in the HOST header, if not the standard 80/443
+az network application-gateway probe update -g "$rg" --gateway-name "$appgw_name" --name testvmprobe8080 \
+  --host "${vm_privatezone_fqdn}:8080" --port 8080 --host-name-from-http-settings false ### NOT WORKING!!!
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" -n $default_settings_name --host-name "${vm_privatezone_fqdn}:8080"
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" -n testvmsettings --host-name ${vm_privatezone_fqdn}
+
+
+###################
+# Test Windows VM #
+###################
+
+# You can optionally use this VM to connect to the linux VM over HTTPS and test certificates, from the AppGW's VNet,
+#   or to test the AppGW effective routes
+win_subnet_name=winvm
+win_subnet_prefix=10.11.10.0/24
+win_user=$(whoami)
+win_password=Microsoft123!
+win_vm_name=testvmwin
+win_vm_sku=Standard_B2ms
+win_pip_name=testvmwin-pip
+az network vnet subnet create -g $rg -n $win_subnet_name --vnet-name $appgw_vnet_name --address-prefix $win_subnet_prefix
+az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $win_user --admin-password $win_password --size $win_vm_sku \
+   --vnet-name $appgw_vnet_name --subnet $win_subnet_name --public-ip-address $win_pip_name
 
 ########################
 # Query AzMonitor logs #
@@ -465,68 +613,12 @@ query='AzureDiagnostics
 az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
 # AppGW Access Logs
 query_acc='AzureDiagnostics 
-| where TimeGenerated >= ago(1d) 
+| where TimeGenerated >= ago(5m) 
 | where ResourceType == "APPLICATIONGATEWAYS" 
 | where Category == "ApplicationGatewayAccessLog"
-//| project TimeStamp_s, ClientIP_s, Host_s
+| project timeStamp_t, clientIP_s, clientPort_d, host_s, originalHost_s, serverRouted_s, httpMethod_s
 | take 20'
 az monitor log-analytics query -w $logws_customerid --analytics-query $query_acc -o tsv
-
-
-###################
-# Test Windows VM #
-###################
-
-# You can use this VM to connect to the linux VM over HTTPS and test certificates
-win_user=$(whoami)
-win_password=Microsoft123!
-win_vm_name=testvmwin
-win_vm_sku=Standard_B2ms
-win_pip_name=testvmwin-pip
-az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $win_user --admin-password $win_password --size $win_vm_sku \
-   --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $win_pip_name
-
-#################
-# Test Analyzer #
-#################
-
-# Create peered vnet with Ubuntu VM
-nva_subnet_name=nva
-nva_subnet_prefix=192.168.10.0/24
-nva_name=ubuntufw
-nva_pip=${nva_name}-pip
-nva_size=Standard_B1s
-az network vnet subnet create --vnet-name $vnet_name --name $nva_subnet_name -g $rg --address-prefixes $nva_subnet_prefix
-az vm create -n $nva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
-    --public-ip-address $nva_pip --vnet-name $vnet_name --size $nva_size --subnet $nva_subnet_name
-nva_nic_id=$(az vm show -n $nva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-az network nic update --ids $nva_nic_id --ip-forwarding
-nva_pip_ip=$(az network public-ip show -n $nva_pip -g $rg --query ipAddress -o tsv) && echo $nva_pip_ip
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo sysctl -w net.ipv4.ip_forward=1"
-nva_private_ip=$(az network nic show --ids $nva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nva_private_ip
-
-# Send traffic between AppGW and AzFW to the NVA
-# RT in the AzFW Subnet
-azfw_rt_name=azfwrt
-az network route-table create --name "$azfw_rt_name" --resource-group "$rg" --location "$location"
-az network route-table route create  --route-table-name $azfw_rt_name -g $rg --address-prefix $appgw_subnet_prefix --name "ToAppGWSubnet"  --next-hop-type VirtualAppliance --next-hop-ip-address "$nva_private_ip"
-az network route-table route create  --route-table-name $azfw_rt_name -g $rg --address-prefix '0.0.0.0/0' --name "Defaultroute"  --next-hop-type Internet
-az network vnet subnet update --name $azfw_subnet_name --route-table $azfw_rt_name --vnet-name $vnet_name --resource-group $rg
-# Change AppGW RT
-appgw_rt_name=appgwrt
-az network route-table route update --route-table-name $appgw_rt_name -g $rg --address-prefix $vm_subnet_prefix --name "ToVMSubnet"  --next-hop-type VirtualAppliance --next-hop-ip-address "$nva_private_ip"
-# RT in the NVA Subnet
-nva_rt_name=nvart
-az network route-table create --name "$nva_rt_name" --resource-group "$rg" --location "$location"
-az network route-table route create --route-table-name $nva_rt_name -g $rg --address-prefix $vm_subnet_prefix --name "ToVMSubnet"  --next-hop-type VirtualAppliance --next-hop-ip-address "$azfw_private_ip"
-az network vnet subnet update --name $nva_subnet_name --route-table $nva_rt_name --vnet-name $vnet_name --resource-group $rg
-
-# Capture traffic on port 8080
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo tcpdump -n port 8080"
-
-# Restablish normal traffic flow
-az network vnet subnet update --name $azfw_subnet_name --route-table '' --vnet-name $vnet_name --resource-group $rg
-az network route-table route update --route-table-name $appgw_rt_name -g $rg --address-prefix $vm_subnet_prefix --name "ToVMSubnet"  --next-hop-type VirtualAppliance --next-hop-ip-address "$azfw_private_ip"
 
 ###############
 # Diagnostics #
@@ -537,6 +629,11 @@ az network public-ip list -g $rg -o table
 
 # Virtual Machines
 az vm list -g $rg -o table
+az vm list-ip-addresses -g $rg -o table
+web_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+win_nic_id=$(az vm show -n $win_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $web_nic_id -o table
+az network nic show-effective-route-table --ids $win_nic_id -o table
 
 # Azure Firewall
 az network firewall nat-rule collection list -f $azfw_name -g $rg -o table
@@ -563,35 +660,31 @@ az network application-gateway rule show -g $appgw_rg --gateway-name $appgw_name
 az network application-gateway url-path-map list -g $appgw_rg --gateway-name $appgw_name -o table
 az network application-gateway http-settings list -g $appgw_rg --gateway-name $appgw_name -o table
 
+##############################
+# Power on/off VMs and AppGW #
+##############################
+
+# Off
+az vm deallocate --no-wait -g $rg -n $vm_name
+az vm deallocate --no-wait -g $rg -n $win_vm_name
+az vm deallocate --no-wait -g $rg -n $dns_vm_name
+az network application-gateway stop -n $appgw_name -g $rg
+
+# On
+az vm start --no-wait -g $rg -n $vm_name
+az vm start --no-wait -g $rg -n $win_vm_name
+az vm start --no-wait -g $rg -n $dns_vm_name
+az network application-gateway start -n $appgw_name -g $rg
+
+###############
+# Cleanup all #
+###############
+
 # Delete VM
-vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-vm_disk_id=$(az vm show -n $vm_name -g $rg --query 'storageProfile.osDisk.managedDisk.id' -o tsv)
-az vm delete -n $vm_name -g $rg -y
-az disk delete --ids $vm_disk_id -y
-az network nic delete --ids $vm_nic_id
+# vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+# vm_disk_id=$(az vm show -n $vm_name -g $rg --query 'storageProfile.osDisk.managedDisk.id' -o tsv)
+# az vm delete -n $vm_name -g $rg -y
+# az disk delete --ids $vm_disk_id -y
+# az network nic delete --ids $vm_nic_id
 
-# Cleanup all
-az group delete -n $rg -y --no-wait
-
-################################ WORK IN PROGRES ############################################
-
-# APIM Gateway 
-apim_subnet_name=APIMSubnet
-apim_subnet_prefix=192.168.210.0/24
-apim_sku=Developer  # The Premium SKU offers multi-region on top
-apim_vnet_type=Internal
-apim_name=apim$RANDOM
-apim_publisher_email=admin@contoso.com
-apim_publisher_name=Contoso
-
-az network vnet subnet create -g $rg -n $apim_subnet_name --vnet-name $vnet_name --address-prefix $apim_subnet_prefix
-apim_subnet_id=$(az network vnet subnet show -n $apim_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-# This takes 34m!
-az apim create -n $apim_name -g $rg \
-  --publisher-email $apim_publisher_email --publisher-name $apim_publisher_name \
-  --sku-name $apim_sku --virtual-network $apim_vnet_type
-# And this another 23m
-az apim update -n $apim_name -g $rg \
-  --set virtualNetworkType=$apim_vnet_type \
-  --set virtualNetworkConfiguration.subnetResourceId=$apim_subnet_id
-##############################################################################################
+# az group delete -n $rg -y --no-wait

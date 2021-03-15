@@ -66,6 +66,24 @@ def healthcheck():
         except Exception as e:
           return jsonify(str(e))
 
+# Route to uplode file and return file size
+@app.route('/api/filesize', methods=['POST'])
+def getsize():
+    try:
+      uploaded_file = request.files['data']
+      if uploaded_file:
+          f = uploaded_file.read()
+          msg = {
+             'size': len(f)
+          }
+      else:
+         msg = {
+             'size': 'unknown'
+         }
+      return jsonify(msg)
+    except Exception as e:
+        return jsonify(str(e))
+
 # Flask route to provide the container's IP address
 @app.route("/api/dns", methods=['GET'])
 def dns():

@@ -1,0 +1,359 @@
+##############################################################
+#
+# This script demonstrates how to configure Linux NVAs in 
+#   Azure with BGP (bird) and VPN (StrongSwan) on Ubuntu 18.04.
+#
+# An NVA in Azure will inject a 0.0.0.0/0 to the RS, a VPN
+#   to onprem will be simulated with a 2nd Linux NVA.
+#
+# Jose Moreno, March 2021
+##############################################################
+
+# Variables
+rg=nva
+location=westeurope
+vnet_name=hub
+vnet_prefix=10.1.0.0/16
+gw_subnet_name=GatewaySubnet
+gw_subnet_prefix=10.1.0.0/24
+vpngw_asn=65501
+rs_subnet_name=RouteServersubnet
+rs_subnet_prefix=10.1.1.0/24
+nva_subnet_name=nva
+nva_subnet_prefix=10.1.2.0/24
+vm_subnet_name=vm
+vm_subnet_prefix=10.1.10.0/24
+vm_size=Standard_B1s
+onprem_vnet_name=onprem
+onprem_vnet_prefix=10.2.0.0/16
+onprem_nva_subnet_name=nva
+onprem_nva_subnet_prefix=10.2.2.0/24
+publisher=Canonical
+offer=UbuntuServer
+sku=18.04-LTS
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
+psk=Microsoft123!
+# psk=$(openssl rand -base64 64)
+# psk=${vpn_psk//$'\n'/}  # Remove line breaks
+
+
+# Auxiliary function to get the first IP of a subnet (default gateway)
+function first_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
+
+# Create Vnet
+az group create -n $rg -l $location
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $gw_subnet_name --address-prefix $gw_subnet_prefix
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $rs_subnet_name --address-prefix $rs_subnet_prefix
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $nva_subnet_name --address-prefix $nva_subnet_prefix
+az network vnet create -g $rg -n $onprem_vnet_name --address-prefix $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefix $onprem_nva_subnet_prefix
+
+# Start VNG creation
+az network public-ip create -g $rg -n vpngw-pipa --sku Basic --allocation-method Dynamic -l $location
+az network public-ip create -g $rg -n vpngw-pipb --sku Basic --allocation-method Dynamic -l $location
+az network vnet-gateway create -g "$rg" --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet $vnet_name -n vpngw --asn $vpngw_asn --public-ip-address vpngw-pipa vpngw-pipb --no-wait
+
+# Create VM for testing purposes
+azurevm_name=azurevm
+azurevm_pip_name="${azurevm_name}-pip"
+az network nsg create -n "${azurevm_name}-nsg" -g $rg
+az network nsg rule create -n SSH --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n ICMP --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
+az vm create -n $azurevm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${azurevm_name}-nsg" \
+    --public-ip-address $azurevm_pip_name --vnet-name $vnet_name --size $vm_size --subnet $vm_subnet_name
+azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddress -o tsv -g $rg) && echo $azurevm_pip_ip
+azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+azurevm_private_ip=$(az network nic show --ids $azurevm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $azurevm_private_ip
+
+# Create Azure NVA with Bird and StrongSwan (only Bird is required for this scenario)
+nva_asn=65001
+nva_name=nva
+nva_pip=${nva_name}-pip
+nva_cloudinit_file=/tmp/nva_cloudinit.txt
+nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
+nva_default_gw2=$(first_ip "$nva_subnet2_prefix") && echo $nva_default_gw2
+cat <<EOF > $nva_cloudinit_file
+#cloud-config
+runcmd:
+  - apt update
+  - UCF_FORCE_CONFOLD=1 DEBIAN_FRONTEND=noninteractive apt install -y bird strongswan --fix-missing
+  - sysctl -w net.ipv4.ip_forward=1
+  - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
+  - sysctl -w net.ipv4.conf.all.send_redirects = 0
+EOF
+az network nsg create -n "${nva_name}-nsg" -g $rg
+az network nsg rule create -n SSH --nsg-name "${nva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n IKE --nsg-name "${nva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp
+az network nsg rule create -n IPsec --nsg-name "${nva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp
+az network nsg rule create -n ICMP --nsg-name "${nva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
+az network public-ip create -g $rg -n "$nva_pip" --allocation-method Dynamic --sku Basic
+az network nic create -n "${nva_name}-nic0" -g $rg --vnet-name $vnet_name --subnet $nva_subnet_name --network-security-group "${nva_name}-nsg" --public-ip-address "$nva_pip" --ip-forwarding
+az vm create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
+     --size ${vm_size} --custom-data "$nva_cloudinit_file" --nics "${nva_name}-nic0"
+nva_pip_ip=$(az network public-ip show -n $nva_pip -g $rg --query ipAddress -o tsv) && echo $nva_pip_ip
+nva_private_ip=$(az network nic show -n "${nva_name}-nic0" -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nva_private_ip
+
+# Simulation of onprem with a different Azure VNet and NVA
+onprem_nva_asn=65002
+onprem_nva_name=onpremnva
+onprem_nva_pip=${onprem_nva_name}-pip
+nva_cloudinit_file=/tmp/nva_cloudinit.txt
+cat <<EOF > $nva_cloudinit_file
+#cloud-config
+runcmd:
+  - apt update
+  - UCF_FORCE_CONFOLD=1 DEBIAN_FRONTEND=noninteractive apt install -y bird strongswan --fix-missing
+  - sysctl -w net.ipv4.ip_forward=1
+  - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
+  - sysctl -w net.ipv4.conf.all.send_redirects = 0
+EOF
+az network nsg create -n "${onprem_nva_name}-nsg" -g $rg
+az network nsg rule create -n SSH --nsg-name "${onprem_nva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n IKE --nsg-name "${onprem_nva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp
+az network nsg rule create -n IPsec --nsg-name "${onprem_nva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp
+az network nsg rule create -n ICMP --nsg-name "${onprem_nva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
+az vm create -n $onprem_nva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address $onprem_nva_pip --vnet-name $onprem_vnet_name --size $vm_size --subnet $onprem_nva_subnet_name \
+    --custom-data $nva_cloudinit_file --nsg "${onprem_nva_name}-nsg"
+onprem_nva_nic_id=$(az vm show -n $onprem_nva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $onprem_nva_nic_id --ip-forwarding
+onprem_nva_pip_ip=$(az network public-ip show -n $onprem_nva_pip -g $rg --query ipAddress -o tsv) && echo $onprem_nva_pip_ip
+onprem_nva_private_ip=$(az network nic show --ids $onprem_nva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $onprem_nva_private_ip
+onprem_nva_default_gw=$(first_ip "$onprem_nva_subnet_prefix") && echo $onprem_nva_default_gw
+sleep 30  # It can take some time for the bird/ipsec daemons to start
+
+# Create Local Network Gateway
+az network local-gateway create -g "$rg" -n onprem --gateway-ip-address "$onprem_nva_pip_ip" \
+    --local-address-prefixes "${onprem_nva_private_ip}/32" --asn "$onprem_nva_asn" --bgp-peering-address "$onprem_nva_private_ip" --peer-weight 0
+
+# Wait until VNet GW is successfully provisioned
+# Logic could be better, see for example function in aks.azcli
+vpngw_state=''
+until [[ "$vpngw_state" == "Successful" ]]
+do
+    sleep 15
+    vpngw_state=$(az network vnet-gateway show -n vpngw -g $rg --query provisioningState -o tsv) && echo $vpngw_state
+done
+
+# Create VPN connection
+az network vpn-connection create -n onprem -g $rg -l $location --vnet-gateway1 vpngw --local-gateway2 onprem --shared-key $psk --enable-bgp
+
+# Deploy RS (no --no-wait option)
+rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az network routeserver create -n rs -g $rg --hosted-subnet $rs_subnet_id -l $location
+az network routeserver update -n rs -g $rg --allow-b2b-traffic
+
+# Configure StrongSwan VPN in onprem NVA
+# See https://blog.sys4.de/routing-based-vpn-with-strongswan-de.html
+# See https://wiki.strongswan.org/projects/strongswan/wiki/RouteBasedVPN
+vpngw_asn=$(az network vnet-gateway show -n vpngw -g $rg --query 'bgpSettings.asn' -o tsv)
+vpngw_pip_0=$(az network vnet-gateway show -n vpngw -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_pip_0
+vpngw_private_ip_0=$(az network vnet-gateway show -n vpngw -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_0
+vpngw_pip_1=$(az network vnet-gateway show -n vpngw -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_pip_1
+vpngw_private_ip_1=$(az network vnet-gateway show -n vpngw -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_1
+
+echo "Configuring VPN between Azure:${vpngw_pip_0}/${vpngw_private_ip_0} and B:${onprem_nva_pip_ip}/${onprem_nva_private_ip}..."
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo ip tunnel add vti0 local $onprem_nva_private_ip remote $vpngw_pip_0 mode vti key 12"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo ip link set up dev vti0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo ip route add ${vpngw_private_ip_0}/32 dev vti0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
+# Config files
+psk_file=/tmp/ipsec.secrets
+cat <<EOF > $psk_file
+$onprem_nva_pip_ip $vpngw_pip_0 : PSK "$psk"
+EOF
+ipsec_file=/tmp/ipsec.conf
+cat <<EOF > $ipsec_file
+config setup
+        charondebug="all"
+        uniqueids=yes
+        strictcrlpolicy=no
+conn to-azure
+  authby=secret
+  leftid=$onprem_nva_pip_ip
+  leftsubnet=0.0.0.0/0
+  right=$vpngw_pip_0
+  rightsubnet=0.0.0.0/0
+  ike=aes256-sha2_256-modp1024!
+  esp=aes256-sha2_256!
+  keyingtries=0
+  ikelifetime=1h
+  lifetime=8h
+  dpddelay=30
+  dpdtimeout=120
+  dpdaction=restart
+  auto=start
+  mark=12
+EOF
+# Copy files to NVA and restart ipsec daemon
+username=$(whoami)
+scp $psk_file $onprem_nva_pip_ip:/home/$username/ipsec.secrets
+scp $ipsec_file $onprem_nva_pip_ip:/home/$username/ipsec.conf
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo mv ./ipsec.* /etc/"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo systemctl restart ipsec"
+
+# Configure BGP with Bird (azure NVA to RS)
+rs_asn=$(az network routeserver show -n rs -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
+rs_ip1=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
+rs_ip2=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
+bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+log syslog all;
+router id $nva_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      preference 254;
+      learn;
+      merge paths on;
+      # These filters are wrong, just leave here for the time being
+      import filter {
+          if net ~ ${rs_ip1}/32 then accept;
+          else reject;
+      };
+      export filter {
+          if net ~ ${rs_ip1}/32 then reject;
+          else accept;
+      };
+}
+protocol static {
+      import all;
+      route 1.1.1.1/32 via $nva_default_gw;
+      route $vnet_prefix via $nva_default_gw;
+}
+protocol bgp rs0 {
+      description "RouteServer instance 0";
+      multihop;
+      local $nva_private_ip as $nva_asn;
+      neighbor $rs_ip1 as $rs_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+protocol bgp rs1 {
+      description "Route Server instance 1";
+      multihop;
+      local $nva_private_ip as $nva_asn;
+      neighbor $rs_ip2 as $rs_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+EOF
+username=$(whoami)
+scp $bird_config_file "${nva_pip_ip}:/home/${username}/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo systemctl restart bird"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "systemctl status bird"
+
+# Add peering to RS
+az network routeserver peering create --routeserver rs -g $rg --peer-ip $nva_private_ip --peer-asn $nva_asn -n $nva_name
+
+# Configure BGP with Bird (onprem NVA to VPNGW)
+bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+log syslog all;
+router id $nva_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      preference 254;
+      learn;
+      merge paths on;
+      import filter {
+          if net ~ ${vpngw_private_ip_0}/32 then accept;
+          else reject;
+      };
+      export filter {
+          if net ~ ${vpngw_private_ip_0}/32 then reject;
+          else accept;
+      };
+}
+protocol static {
+      import all;
+      route 2.2.2.2/32 via $onprem_nva_default_gw;
+      route $onprem_vnet_prefix via $onprem_nva_default_gw;
+}
+protocol bgp vpngw0 {
+      description "VPN Gateway instance 0";
+      multihop;
+      local $onprem_nva_private_ip as $onprem_nva_asn;
+      neighbor $vpngw_private_ip_0 as $vpngw_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+EOF
+username=$(whoami)
+scp $bird_config_file "${onprem_nva_pip_ip}:/home/${username}/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo systemctl restart bird"
+
+# Wait 1 minute to make sure the config is applied
+sleep 60
+
+# File diagnostics
+list_files $nva_guid
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo crontab -l"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo ls -l /root/"
+list_files $onprem_nva_guid
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo crontab -l"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo ls -l /root/"
+
+# IPsec Diagnostics (onprem NVA to VPNGW)
+az network vpn-connection show -g $rg -n onprem --query '[connectionStatus,ingressBytesTransferred,egressBytesTransferred]' -o tsv
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "netstat -rnv"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "systemctl status ipsec"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo ipsec status"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "ping $vpngw_private_ip_0 -c 5"
+
+# BGP Diagnostics (bird)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "systemctl status bird"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo birdc show status"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo birdc show protocols"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo birdc show protocols rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo birdc show protocol all rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo birdc show route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo birdc show route protocol rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo birdc show route export rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo birdc show route where net ~2.2.2.2/32 all"  # 2.2.2.2/32 is advertised by the onprem NVA
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "netstat -rnv"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "systemctl status bird"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo birdc show status"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo birdc show protocols vpngw0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo birdc show protocol all vpngw0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo birdc show route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo birdc show route protocol vpngw0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo birdc show route export vpngw0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "sudo birdc show route where net ~1.1.1.1/32 all"  # 1.1.1.1/32 is advertised by the Azure NVA
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "netstat -rnv"
+
+# BGP Diagnostics (Azure)
+az network routeserver peering list --routeserver rs -g $rg -o table
+az network routeserver peering list-learned-routes -n $nva_name --routeserver rs -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list-advertised-routes -n $nva_name --routeserver rs -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network vnet-gateway list-bgp-peer-status -n vpngw -g $rg -o table
+az network vnet-gateway list-learned-routes -n vpngw -g $rg -o table
+az network vnet-gateway list-advertised-routes -n vpngw -g $rg --peer $onprem_nva_private_ip -o table
+
+# Effective routes
+nva_nic_id=$(az vm show -n $nva_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $azurevm_nic_id -o table
+az network nic show-effective-route-table --ids $nva_nic_id -o table
+
+# Ping from onprem to Azure VM
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_nva_pip_ip "ping $azurevm_private_ip -c 5"
