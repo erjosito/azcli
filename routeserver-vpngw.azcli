@@ -291,8 +291,8 @@ protocol static {
       # Vnet prefix
       route $vnet_prefix via $nva_default_gw;
       # More specific prefixes to send internal traffic through NVA
-      route $onprem_nva_subnet_prefix via $nva_default_gw;
-      route $vm_subnet_prefix via $nva_default_gw;
+      #route $onprem_nva_subnet_prefix via $nva_default_gw;
+      #route $vm_subnet_prefix via $nva_default_gw;
 }
 protocol bgp rs0 {
       description "RouteServer instance 0";
@@ -322,7 +322,7 @@ nva_rt_name=nva
 az network route-table create -n $nva_rt_name -g $rg -l $location
 az network route-table route create --route-table-name $nva_rt_name -g $rg --address-prefix '0.0.0.0/1' --name "Default1"  --next-hop-type Internet
 az network route-table route create --route-table-name $nva_rt_name -g $rg --address-prefix '128.0.0.0/1' --name "Default2"  --next-hop-type Internet
-# az network route-table route create --route-table-name $nva_rt_name -g $rg --address-prefix $onprem_nva_subnet_prefix --name "OnpremOverride" --next-hop-type VirtualNetworkGateway
+# az network route-table route create --route-table-name $nva_rt_name -g $rg --address-prefix $onprem_nva_subnet_prefix --name "OnpremOverride" --next-hop-type VirtualNetworkGateway  # Does not work
 az network vnet subnet update -g $rg --vnet-name $vnet_name -n $nva_subnet_name --route-table $nva_rt_name
 
 # Protect the VPNGW from learning default routes: NOT REQUIRED!
