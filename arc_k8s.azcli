@@ -12,17 +12,17 @@
 #############################
 
 # Variables
-rg=aksengine
+k8s_rg=aksengine
 location=westeurope
-az group create -n $rg -l $location
+az group create -n $k8s_rg -l $location
 
 # Install AKS engine
 # Go here: https://github.com/Azure/aks-engine/releases/latest
-# Example with v0.61.0
-aksengine_tmp=/tmp/aksengine.tar.gz
-wget https://github.com/Azure/aks-engine/releases/download/v0.61.0/aks-engine-v0.61.0-linux-amd64.tar.gz -O $aksengine_tmp
-tar xfvz $aksengine_tmp -C /tmp/
-sudo cp /tmp/aks-engine-v0.61.0-linux-amd64/aks-engine /usr/local/bin
+# Example with v0.61.0:
+# aksengine_tmp=/tmp/aksengine.tar.gz
+# wget https://github.com/Azure/aks-engine/releases/download/v0.61.0/aks-engine-v0.61.0-linux-amd64.tar.gz -O $aksengine_tmp
+# tar xfvz $aksengine_tmp -C /tmp/
+# sudo cp /tmp/aks-engine-v0.61.0-linux-amd64/aks-engine /usr/local/bin
 
 # Retrieve Service Principal form your AKV, required for AKS engine
 purpose=aksengine
@@ -48,7 +48,7 @@ then
 fi
 
 # Grant access to the SP to the new RG
-scope=$(az group show -n $rg --query id -o tsv)
+scope=$(az group show -n $k8s_rg --query id -o tsv)
 assignee=$(az ad sp show --id $sp_app_id --query objectId -o tsv)
 az role assignment create --scope $scope --role Contributor --assignee $assignee
 
@@ -75,7 +75,7 @@ cat <<EOF > $aksengine_cluster_file
     "agentPoolProfiles": [
       {
         "name": "agentpool1",
-        "count": 3,
+        "count": 2,
         "vmSize": "$aksengine_vm_size"
       }
     ],
@@ -105,7 +105,7 @@ output_dir=/tmp/aksengine
 rm -rf $output_dir   # The output directory cannot exist
 aks-engine deploy --subscription-id $subscription \
     --dns-prefix $domain \
-    --resource-group $rg \
+    --resource-group $k8s_rg \
     --location $location \
     --api-model $aksengine_cluster_file \
     --client-id $sp_app_id \
@@ -115,7 +115,7 @@ aks-engine deploy --subscription-id $subscription \
     --output-directory $output_dir
 
 # There are different ways to access the cluster
-# Exporting the KUBECONFIG variable is required by the command "az k8sconfiguration create"
+# Exporting the KUBECONFIG variable is required by the command "az k8s-configuration create"
 export KUBECONFIG="$output_dir/kubeconfig/kubeconfig.$location.json" 
 kubectl get node
 # The alias is a little dirty trick for lazy persons like me
@@ -132,8 +132,8 @@ az extension add -n connectedk8s
 # Create the ARC resource
 arc_rg=k8sarc
 az group create -n $arc_rg -l $location
-arcname=myaksengine
-az connectedk8s connect --name $arcname -g $arc_rg
+arc_name=myaksengine
+az connectedk8s connect --name $arc_name -g $arc_rg
 
 # Diagnostics
 az connectedk8s list -g $arc_rg -o table
@@ -142,13 +142,16 @@ az connectedk8s list -g $arc_rg -o table
 # Gitops in an arc-enabled cluster #
 ####################################
 
+# Add CLI extension
+az extension add -n k8s-configuration
+
 # Create a cluster-level operator
 repo_url="https://github.com/erjosito/arc-k8s-test/" # Feel free to use your own repo here
 cfg_name=gitops-config
 namespace=$cfg_name
-az k8sconfiguration create \
+az k8s-configuration create \
     --name $cfg_name \
-    --cluster-name $arcname --resource-group $arc_rg \
+    --cluster-name $arc_name --resource-group $arc_rg \
     --operator-instance-name $cfg_name \
     --operator-namespace $namespace \
     --repository-url $repo_url \
@@ -157,15 +160,15 @@ az k8sconfiguration create \
 # cluster-type can be either "connectedClusters" (for ARC clusters) or "managedClusters" (for AKS)
 
 # Diagnostics
-az k8sconfiguration show -n $cfg_name -c $arcname -g $arc_rg --cluster-type connectedClusters
+az k8s-configuration show -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters
 kubectl -n $namespace get deploy -o wide
 
 # Optional: update operator to enable helm or change the repo URL
-az k8sconfiguration update -n $cfg_name -c $arcname -g $arc_rg --cluster-type connectedClusters --enable-helm-operator
-az k8sconfiguration update -n $cfg_name -c $arcname -g $arc_rg --cluster-type connectedClusters -u $repo_url
+az k8s-configuration update -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters --enable-helm-operator
+az k8s-configuration update -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters -u $repo_url
 
 # Optional: delete configuration
-az k8sconfiguration delete -n $cfg_name -c $arcname -g $arc_rg --cluster-type connectedClusters
+az k8s-configuration delete -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters
 
 ##########################################
 # Azure Monitor for Arc-enabled clusters #
@@ -187,15 +190,19 @@ logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $ar
 # Enabling monitoring
 enable_script=/tmp/enable-monitoring.sh
 curl -o $enable_script -L https://aka.ms/enable-monitoring-bash-script
-arc_id=$(az connectedk8s show -n $arcname -g $arc_rg -o tsv --query id) && echo $arc_id
-
-# Enabling monitoring
+arc_id=$(az connectedk8s show -n $arc_name -g $arc_rg -o tsv --query id) && echo $arc_id
 bash $enable_script --resource-id $arc_id --workspace-id $logws_id
 
-# Notes
-# If you get an error like "Error: mcr.microsoft.com/azuremonitor/containerinsights/preview/azuremonitor-containers:2.8.2: not found", you can revert to a previous version by updating
-#     the installation script.
-#     URL to verify manifest versions: https://mcr.microsoft.com/v2/azuremonitor/containerinsights/preview/azuremonitor-containers/tags/list
+# Uninstall
+# disable_script=/tmp/disable-monitoring.sh
+# curl -o $disable_script -L https://aka.ms/disable-monitoring-bash-script
+# bash $disable_script --resource-id $arc_id --workspace-id $logws_id
+
+# See https://github.com/Azure/azure-arc-kubernetes-preview/blob/master/docs/k8s-extensions.md
+
+# Enable extensions
+# az k8s-extension create --cluster-name $arc_name --resource-group $arc_rg --cluster-type connectedClusters \
+#     --extension-type Microsoft.AzureMonitor.Containers --name azuremonitor-containers --configuration-settings logAnalyticsWorkspaceResourceID=$logws_id
 
 # Getting logs (sample query)
 query='ContainerLog
@@ -203,6 +210,7 @@ query='ContainerLog
 | project TimeGenerated, LogEntry, ContainerID
 | take 20'
 az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+
 
 #########################################
 # Azure Policy for Arc-enabled clusters #
@@ -267,5 +275,5 @@ az policy assignment list --scope $arc_id -o table
 # Cleanup #
 ###########
 
-# az group delete -y --no-wait -n $rg
+# az group delete -y --no-wait -n $k8s_rg
 # az group delete -y --no-wait -n $arc_rg
