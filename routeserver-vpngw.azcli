@@ -110,7 +110,6 @@ nva_name=nva
 nva_pip=${nva_name}-pip
 nva_cloudinit_file=/tmp/nva_cloudinit.txt
 nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
-nva_default_gw2=$(first_ip "$nva_subnet2_prefix") && echo $nva_default_gw2
 cat <<EOF > $nva_cloudinit_file
 #cloud-config
 runcmd:

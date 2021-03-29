@@ -7,9 +7,7 @@
 
 # Variables
 rg=akstest
-location=westeurope
-keyvaultname=erjositoKeyvault
-keyvault_rg=myKeyvault
+location=westcentralus
 wait_interval=5s
 # AKS
 aks_name=aks
@@ -24,6 +22,8 @@ aks_subnet_name=aks
 aks_subnet_prefix=10.13.76.0/26  # Min /25 with Azure CNI!
 aks2_subnet_name=aks2ndpool
 aks2_subnet_prefix=10.13.75.0/24
+pod_subnet_name=pods
+pod_subnet_prefix=10.13.80.0/24
 vm_subnet_name=vm
 vm_subnet_prefix=10.13.1.0/24
 appgw_subnet_name=AppGateway
@@ -34,8 +34,9 @@ db_subnet_prefix=10.13.50.0/24
 akslb_subnet_prefix=10.13.77.0/24
 arm_subnet_prefix=10.13.79.0/24
 aci_subnet_prefix=10.13.100.0/24
+# Identity
+use_msi=yes
 # Other
-logws_name=log$RANDOM
 kv_name=erjositoKeyvault
 acr_name=erjositoAcr
 
@@ -97,6 +98,9 @@ function enableAksFeature () {
 enableAksFeature "AKS-IngressApplicationGatewayAddon"
 enableAksFeature "EnablePodIdentityPreview"
 enableAksFeature "MigrateToMSIClusterPreview"
+enableAksFeature "PodSubnetPreview"
+
+az extension update -n aks-preview
 
 ########
 # Main #
@@ -104,13 +108,27 @@ enableAksFeature "MigrateToMSIClusterPreview"
 
 # Create RG, LA workspace, vnet, AKS
 az group create -n $rg -l $location
-az monitor log-analytics workspace create -n $logws_name -g $rg
-logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 acr_rg=$(az acr list -o tsv --query "[?name=='$acr_name'].resourceGroup")
 acr_id=$(az acr show -n erjositoAcr -g $acr_rg --query id -o tsv)
 az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location
 az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix
+az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix
 aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+
+# Create LA workspace
+# Create Log Analytics workspace
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    logws_name=log$RANDOM
+    echo "INFO: Creating log analytics workspace ${logws_name}..."
+    az monitor log-analytics workspace create -n $logws_name -g $rg
+else
+    echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 
 # Get latest supported/preview version
 k8s_versions=$(az aks get-versions -l $location -o json)
@@ -123,31 +141,45 @@ else
     echo "Latest supported k8s version (not in preview) in $rg_location is $k8s_version"
 fi
 
-#####################
-# With existing SPs #
-#####################
+# Setting identity flags (managed identity or SP)
+if [[ "$use_msi" == no ]]
+then
+    # Get SP from AKV
+    keyvault_name=joseakv-airs
+    purpose=aks
+    keyvault_appid_secret_name=$purpose-sp-appid
+    keyvault_password_secret_name=$purpose-sp-secret
+    sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv) && echo $sp_app_id
+    sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
 
-# Get SP from AKV
-keyvault_name=joseakv-airs
-purpose=aks
-keyvault_appid_secret_name=$purpose-sp-appid
-keyvault_password_secret_name=$purpose-sp-secret
-sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv) && echo $sp_app_id
-sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
-
-# Assign contributor role to the vnet
-vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
-az role assignment create --scope $vnet_id --assignee $sp_app_id --role Contributor
+    # Assign contributor role to the vnet
+    vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+    az role assignment create --scope $vnet_id --assignee $sp_app_id --role Contributor
+    # az aks create flags
+    identity_options="--service-principal $sp_app_id --client-secret $sp_app_secret --skip-subnet-role-assignment"
+else
+    # User identity
+    id_name=aksid
+    az identity create -n $id_name -g $rg
+    id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
+    id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
+    vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+    az role assignment create --scope $vnet_id --assignee $id_principal_id --role Contributor
+    # User identity
+    identity_options="--enable-managed-identity --assign-identity $id_id"
+    # System identity
+    # identity_options="--enable-managed-identity"
+fi
 
 # Create AKS
 az aks create -g $rg -n $aks_name -l $location \
-    -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys \
-    --service-principal $sp_app_id --client-secret $sp_app_secret --skip-subnet-role-assignment \
+    -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
+    ${(z)identity_options} \
     --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
     --network-policy '' --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
+    --pod-subnet-id $pod_subnet_id \
     --node-osdisk-type ephemeral --node-osdisk-size 30 \
-    --enable-pod-security-policy \
     --no-wait
 
 # Other options you can use in the previous command
@@ -157,18 +189,6 @@ az aks create -g $rg -n $aks_name -l $location \
     # --cluster-autoscaler-profile scan-interval=30s \
     # --dns-name-prefix cloudtrooper \
     # --node-osdisk-type ephemeral --node-osdisk-size 30 \
-
-#########################
-# With managed identity #
-#########################
-
-# az aks create -g $rg -n $aks_name -l $location \
-#     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys \
-#     --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
-#     --network-policy calico --load-balancer-sku Standard \
-#     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
-#     --enable-managed-identity \
-#     --no-wait
 
 ########
 # Wait #
@@ -182,15 +202,83 @@ az aks list -o table
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl get nodes
 
-######################
-#    Azure Advisor   #
-######################
+###########################
+# Deploy sample workloads #
+###########################
+
+az aks get-credentials -n $aks_name -g $rg --overwrite
+kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=1
+kubectl create deployment sqlapi --image=erjosito/sqlapi:1.0 --port=8080 --replicas=1
+
+##############################
+# Daemonset to install stuff #
+##############################
+
+kubectl create ns node-installer
+yaml_file=/tmp/podid.yaml
+cat <<EOF > $yaml_file
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sample-installer-config
+  namespace: node-installer
+data:
+  install.sh: |
+    #!/bin/bash
+    # echo "Updating repositories..."
+    # sudo touch /var/lib/man-db/auto-update
+    # apt-get update
+    # echo "Installing sample app..."
+    # apt-get install cowsay -y
+    echo "Restarting containerd..."
+    # service containerd restart
+    systemctl restart containerd
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: installer
+  namespace: node-installer
+spec:
+  selector:
+    matchLabels:
+      job: installer
+  template:
+    metadata:
+      labels:
+        job: installer
+    spec:
+      hostPID: true
+      restartPolicy: Always
+      containers:
+      - image: patnaikshekhar/node-installer:1.3
+        name: installer
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: install-script
+          mountPath: /tmp
+        - name: host-mount
+          mountPath: /host
+      volumes:
+      - name: install-script
+        configMap:
+          name: sample-installer-config
+      - name: host-mount
+        hostPath:
+          path: /tmp/install
+EOF
+kubectl apply -f $yaml_file
+
+#####################
+#   Azure Advisor   #
+#####################
 
 aks_id=$(az aks show -n $aks_name -g $rg --query id -o tsv)
 az advisor recommendation list --ids $aks_id -o table
 
 ######################
-# Update the cluster #
+# Modify the cluster #
 ######################
 
 # Enable monitoring addon
@@ -282,13 +370,29 @@ az aks nodepool add --cluster-name $aks_name -g $rg -n pool2 --node-count 1 -s $
     --node-osdisk-type Ephemeral
 az aks nodepool list --cluster-name $aks_name -g $rg -o table
 
-###########################
-# Deploy sample workloads #
-###########################
+#########
+# kured #
+#########
 
-az aks get-credentials -n $aks_name -g $rg --overwrite
-kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=10
-kubectl scale deployment kuard --replicas=5
+helm repo add kured https://weaveworks.github.io/kured
+helm repo update
+kubectl create namespace kured
+helm install kured kured/kured --namespace kured --set nodeSelector."beta\.kubernetes\.io/os"=linux
+
+#######################
+# Jump host / test VM #
+#######################
+
+vm_name=testvm
+vm_pip_name=testvm-pip
+vm_sku=Standard_B1s
+az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name --address-prefix $vm_subnet_prefix
+az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku -l $location \
+   --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $vm_pip_name
+vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
+node_ip=$(kubectl get node -o json | jq -r '.items[0].status.addresses[] | select(.type=="InternalIP") | .address') && echo $node_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -m hmac-sha2-512 -J $vm_pip_address $node_ip "ip a"
 
 ###########################
 # Logs from Azure Monitor #

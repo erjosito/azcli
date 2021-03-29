@@ -1,0 +1,271 @@
+########################################################
+# Script to deploy different features of Arc-enabled
+#    k8s clusters, for demo or training purposes.
+#
+# Jose Moreno
+# March 2021
+########################################################
+
+
+#############################
+# Deploy aks-engine cluster #
+#############################
+
+# Variables
+rg=aksengine
+location=westeurope
+az group create -n $rg -l $location
+
+# Install AKS engine
+# Go here: https://github.com/Azure/aks-engine/releases/latest
+# Example with v0.61.0
+aksengine_tmp=/tmp/aksengine.tar.gz
+wget https://github.com/Azure/aks-engine/releases/download/v0.61.0/aks-engine-v0.61.0-linux-amd64.tar.gz -O $aksengine_tmp
+tar xfvz $aksengine_tmp -C /tmp/
+sudo cp /tmp/aks-engine-v0.61.0-linux-amd64/aks-engine /usr/local/bin
+
+# Retrieve Service Principal form your AKV, required for AKS engine
+purpose=aksengine
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+keyvault_name=erjositoKeyvault
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv 2>/dev/null)
+sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv 2>/dev/null)
+
+# If they could not be retrieved, generate new ones
+if [[ -z "$sp_app_id" ]] || [[ -z "$sp_app_secret" ]]
+then
+    echo "No SP for AKS-engine could be found in AKV $keyvault_name, generating new ones..."
+    sp_name=$purpose
+    sp_output=$(az ad sp create-for-rbac --name $sp_name --skip-assignment 2>/dev/null)
+    sp_app_id=$(echo $sp_output | jq -r '.appId')
+    sp_app_secret=$(echo $sp_output | jq -r '.password')
+    # Store the created app ID and secret in an AKV
+    az keyvault secret set --vault-name $keyvault_name -n $keyvault_appid_secret_name --value $sp_app_id
+    az keyvault secret set --vault-name $keyvault_name -n $keyvault_password_secret_name --value $sp_app_secret
+fi
+
+# Grant access to the SP to the new RG
+scope=$(az group show -n $rg --query id -o tsv)
+assignee=$(az ad sp show --id $sp_app_id --query objectId -o tsv)
+az role assignment create --scope $scope --role Contributor --assignee $assignee
+
+# Retrieve example JSON file describing a basic cluster
+url=https://raw.githubusercontent.com/Azure/aks-engine/master/examples/kubernetes.json
+aksengine_cluster_file="/tmp/aksengine_cluster.json" 
+wget $url -O $aksengine_cluster_file
+# You can modify the kubernetes.json file, for example with smaller VM sizes such as Standard_B2ms
+
+# Optionally we can create a cluster file from scratch:
+aksengine_vm_size=Standard_B2ms
+cat <<EOF > $aksengine_cluster_file
+{
+  "apiVersion": "vlabs",
+  "properties": {
+    "orchestratorProfile": {
+      "orchestratorType": "Kubernetes"
+    },
+    "masterProfile": {
+      "count": 1,
+      "dnsPrefix": "",
+      "vmSize": "$aksengine_vm_size"
+    },
+    "agentPoolProfiles": [
+      {
+        "name": "agentpool1",
+        "count": 3,
+        "vmSize": "$aksengine_vm_size"
+      }
+    ],
+    "linuxProfile": {
+      "adminUsername": "azureuser",
+      "ssh": {
+        "publicKeys": [
+          {
+            "keyData": ""
+          }
+        ]
+      }
+    },
+    "servicePrincipalProfile": {
+      "clientId": "",
+      "secret": ""
+    }
+  }
+}
+EOF
+
+# Create AKS-engine cluster
+# You might need to install aks-engine from https://github.com/Azure/aks-engine/blob/master/docs/tutorials/quickstart.md
+subscription=$(az account show --query id -o tsv)
+domain=abc$RANDOM
+output_dir=/tmp/aksengine
+rm -rf $output_dir   # The output directory cannot exist
+aks-engine deploy --subscription-id $subscription \
+    --dns-prefix $domain \
+    --resource-group $rg \
+    --location $location \
+    --api-model $aksengine_cluster_file \
+    --client-id $sp_app_id \
+    --client-secret $sp_app_secret \
+    --set servicePrincipalProfile.clientId=$sp_app_id \
+    --set servicePrincipalProfile.secret="$sp_app_secret" \
+    --output-directory $output_dir
+
+# There are different ways to access the cluster
+# Exporting the KUBECONFIG variable is required by the command "az k8sconfiguration create"
+export KUBECONFIG="$output_dir/kubeconfig/kubeconfig.$location.json" 
+kubectl get node
+# The alias is a little dirty trick for lazy persons like me
+# alias ke="kubectl --kubeconfig ./_output/$domain/kubeconfig/kubeconfig.$location.json" 
+
+
+############################
+# Enabling cluster for Arc #
+############################
+
+# Az CLI extension
+az extension add -n connectedk8s
+
+# Create the ARC resource
+arc_rg=k8sarc
+az group create -n $arc_rg -l $location
+arcname=myaksengine
+az connectedk8s connect --name $arcname -g $arc_rg
+
+# Diagnostics
+az connectedk8s list -g $arc_rg -o table
+
+####################################
+# Gitops in an arc-enabled cluster #
+####################################
+
+# Create a cluster-level operator
+repo_url="https://github.com/erjosito/arc-k8s-test/" # Feel free to use your own repo here
+cfg_name=gitops-config
+namespace=$cfg_name
+az k8sconfiguration create \
+    --name $cfg_name \
+    --cluster-name $arcname --resource-group $arc_rg \
+    --operator-instance-name $cfg_name \
+    --operator-namespace $namespace \
+    --repository-url $repo_url \
+    --scope cluster \
+    --cluster-type connectedClusters
+# cluster-type can be either "connectedClusters" (for ARC clusters) or "managedClusters" (for AKS)
+
+# Diagnostics
+az k8sconfiguration show -n $cfg_name -c $arcname -g $arc_rg --cluster-type connectedClusters
+kubectl -n $namespace get deploy -o wide
+
+# Optional: update operator to enable helm or change the repo URL
+az k8sconfiguration update -n $cfg_name -c $arcname -g $arc_rg --cluster-type connectedClusters --enable-helm-operator
+az k8sconfiguration update -n $cfg_name -c $arcname -g $arc_rg --cluster-type connectedClusters -u $repo_url
+
+# Optional: delete configuration
+az k8sconfiguration delete -n $cfg_name -c $arcname -g $arc_rg --cluster-type connectedClusters
+
+##########################################
+# Azure Monitor for Arc-enabled clusters #
+##########################################
+
+# Az CLI extension
+az extension add -n log-analytics
+
+# Create Log Analytics workspace
+logws_name=$(az monitor log-analytics workspace list -g $arc_rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
+if [[ -z "$logws_name" ]]
+then
+    logws_name=log$RANDOM
+    az monitor log-analytics workspace create -n $logws_name -g $arc_rg
+fi
+logws_id=$(az resource list -g $arc_rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $arc_rg --query customerId -o tsv)
+
+# Enabling monitoring
+enable_script=/tmp/enable-monitoring.sh
+curl -o $enable_script -L https://aka.ms/enable-monitoring-bash-script
+arc_id=$(az connectedk8s show -n $arcname -g $arc_rg -o tsv --query id) && echo $arc_id
+
+# Enabling monitoring
+bash $enable_script --resource-id $arc_id --workspace-id $logws_id
+
+# Notes
+# If you get an error like "Error: mcr.microsoft.com/azuremonitor/containerinsights/preview/azuremonitor-containers:2.8.2: not found", you can revert to a previous version by updating
+#     the installation script.
+#     URL to verify manifest versions: https://mcr.microsoft.com/v2/azuremonitor/containerinsights/preview/azuremonitor-containers/tags/list
+
+# Getting logs (sample query)
+query='ContainerLog
+| where TimeGenerated > ago(5m)
+| project TimeGenerated, LogEntry, ContainerID
+| take 20'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+
+#########################################
+# Azure Policy for Arc-enabled clusters #
+#########################################
+
+# Required only once
+az provider register --namespace Microsoft.PolicyInsights
+
+# We will use the same SP as we did for AKS Engine, in prod you would use something else
+scope=$arc_id
+role="Policy Insights Data Writer (Preview)"
+assignee=$(az ad sp show --id $sp_app_id --query objectId -o tsv) && echo $assignee
+az role assignment create --scope $scope --role $role --assignee $assignee
+tenant_id=$(az account show --query tenantId -o tsv) && echo $tenant_id
+subscription_id=$(az account show --query id -o tsv) && echo $subscription_id
+
+# Deploy Helm chart
+helm repo add azure-policy https://raw.githubusercontent.com/Azure/azure-policy/master/extensions/policy-addon-kubernetes/helm-charts
+helm repo update
+helm install azure-policy-addon azure-policy/azure-policy-addon-arc-clusters \
+    --set azurepolicy.env.resourceid=$arc_id \
+    --set azurepolicy.env.clientid=$sp_app_id \
+    --set azurepolicy.env.clientsecret=$sp_app_secret \
+    --set azurepolicy.env.tenantid=$tenant_id
+
+# Sample policy 1: no public ALB
+policy_name=$(az policy definition list --subscription $subscription_id --query "[?contains(displayName,'Kubernetes clusters should use internal load balancers')].name" -o tsv) && echo $policy_name
+az policy assignment create -n noPublicLBresource --policy $policy_name --scope $arc_id
+
+# Sample policy 2: no privileged containers
+policy_name=$(az policy definition list --subscription $subscription_id --query "[?contains(displayName,'Kubernetes cluster should not allow privileged containers')].name" -o tsv) && echo $policy_name
+az policy assignment create -n noPrivilegedContainers --policy $policy_name --scope $arc_id
+yaml_file=/tmp/privileged.yml
+cat <<EOF > $yaml_file
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-privileged
+spec:
+  containers:
+    - name: nginx-privileged
+      image: mcr.microsoft.com/oss/nginx/nginx:1.15.5-alpine
+      securityContext:
+        privileged: true
+EOF
+kubectl apply -f $yaml_file  # You should receive an error: Error from server ([denied by azurepolicy-container-no-privilege-73b124012cd393825d53]
+
+# Verify policy state (WORK IN PROGRESS WITH THE CLI -> PORTAL IS PREFERRED)
+assignment1_id=$(az policy assignment show -n noPublicLBresource --scope $arc_id --query id -o tsv) && echo $assignment1_id
+assignment2_id=$(az policy assignment show -n noPrivilegedContainers --scope $arc_id --query id -o tsv) && echo $assignment2_id
+# az policy state list --resource $arc_id -o table
+# az policy state list --resource $arc_id -o table --top 5 --order-by "timestamp desc, policyAssignmentName asc" --select "timestamp, policyDefinitionId"
+# az policy state list --resource $arc_id -o table --top 5 --apply "groupby((policyAssignmentId, policySetDefinitionId,policyDefinitionReferenceId, policyDefinitionId), aggregate($count as numStates))"
+az policy state summarize --resource $arc_id -o table
+
+# Diagnostics
+kubectl get pods -n gatekeeper-system
+kubectl get constrainttemplate
+az policy assignment list --scope $arc_id -o table
+
+###########
+# Cleanup #
+###########
+
+# az group delete -y --no-wait -n $rg
+# az group delete -y --no-wait -n $arc_rg

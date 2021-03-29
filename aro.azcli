@@ -28,10 +28,10 @@ worker_vm_size=Standard_D4s_v3
 worker_vm_count=3
 pod_cidr=10.128.0.0/14
 service_cidr=172.30.0.0/16
-ingress_visibility=Private
-api_visibility=Private
+ingress_visibility=Public
+api_visibility=Public
 domain=cloudtrooper.net  # Assumes you own this domain and have it managed by Azure DNS
-custom_domain=yes
+custom_domain=no
 nat_gateway=no           # Just for testing, this is not supported
 
 # Create RG if it did not exist
@@ -139,6 +139,7 @@ az aro create -n $cluster_name -g $rg --worker-subnet workers --master-subnet ma
   --tags sampletag1=value1 sampletag2=value2 \
   --cluster-resource-group $cluster_rg \
   --pod-cidr $pod_cidr --service-cidr $service_cidr ${(z)domain_flag} ${(z)pullsecret_flag}
+
 #############
 #  Cleanup  #
 #############
@@ -227,12 +228,62 @@ echo "Connect to $aro_console_url, password is $aro_pwd"
 project_name=kuard
 oc new-project $project_name
 oc new-app --docker-image gcr.io/kuar-demo/kuard-amd64:1
+# Expose with clusterIP and router
+oc expose dc kuard-amd64 --port 8080 --name kuard
+oc expose svc kuard --name kuard
+
+# Expose with an internal ALB
 oc expose dc kuard-amd64 --port 8080 --type=LoadBalancer --name=kuardilb --dry-run -o yaml | awk '1;/metadata:/{ print "  annotations:\n    service.beta.kubernetes.io/azure-load-balancer-internal: \"true\"" }' | oc create -f -
-# Expose with a svc (internal ALB in different subnet)
+# Expose with an internal ALB in different subnet
 ilb_subnet_name=apps
 oc expose dc kuard-amd64 --port 8080 --type=LoadBalancer --name=kuard --dry-run -o yaml | awk '1;/metadata:/{ print "  annotations:\n    service.beta.kubernetes.io/azure-load-balancer-internal: \"true\"\n    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: \"'${ilb_subnet_name}'\"" }' | oc create -f -
 # Exposing ClusterIP Svc over a route
 oc expose svc kuardilb
+
+###########################
+#   Container Insights    #
+###########################
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    logws_name=log$RANDOM
+    echo "INFO: Creating log analytics workspace ${logws_name}..."
+    az monitor log-analytics workspace create -n $logws_name -g $rg
+else
+    echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+aro_id=$(az aro show -n $cluster_name -g $rg --query id -o tsv) && echo $aro_id
+curl -o /tmp/enable-monitoring.sh -L https://aka.ms/enable-monitoring-bash-script
+bash /tmp/enable-monitoring.sh --resource-id $aro_id --workspace-id $logws_id
+
+
+
+##################################
+#      Deploy second router      #
+##################################
+
+domain=$(az aro show -n $cluster_name -g $rg --query 'clusterProfile.domain' -o tsv) && echo $domain
+yaml_file=/tmp/router.yml
+cat <<EOF > $yaml_file
+apiVersion: operator.openshift.io/v1
+kind: IngressController
+metadata:
+  namespace: openshift-ingress-operator
+  name: internal
+spec:
+  domain: intapps.${domain}.northeurope.aroapp.io
+  endpointPublishingStrategy:
+    type: LoadBalancerService
+    loadBalancer:
+      scope: Internal
+  namespaceSelector:
+    matchLabels:
+      type: internal
+EOF
+oc apply -f $yaml_file
+# oc delete -f $yaml_file
 
 #####################
 #        VM         #
