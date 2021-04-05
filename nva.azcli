@@ -298,7 +298,10 @@ az keyvault secret set -n 'bgp-logws-key' --value $logws_key --vault-name $akv_n
 # Install python software to report BGP updates to Azure Log Analytics
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo apt install -y python3-pip"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo pip3 install mrtparse azure-keyvault-secrets azure-identity"
-
+script_url="https://raw.githubusercontent.com/erjosito/azcli/master/mrt2azmon.py"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "wget $script_url"
+cmd="/usr/bin/python3 /home/${username}/mrt2azmon.py -v erjositoKeyvault"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "(crontab -l 2>/dev/null; echo '* * * * * $cmd') | crontab -"
 
 # Test adding a spoke to the vnet, which should inject a new IP into BGP, and generate some BGP logs
 test_spoke_name=testspoke

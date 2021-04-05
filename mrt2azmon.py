@@ -117,31 +117,37 @@ def main(argv):
     # Debug: print configuration
     print('INFO: Log Analytics workspace is', logws_id, 'and key is', logws_key)
 
-    # Move mrt_file to temp_mrt_file, and append it to the consolidated_mrt_file
-    os.system(f'mv {mrt_file} {temp_mrt_file}')
-    os.system(f'touch {mrt_file}')
-    os.system(f'chmod 666 {mrt_file}')
-    os.system(f'cat {temp_mrt_file} >> {consolidated_mrt_file}')
+    # Only do something if file is actually not empty
+    if os.stat(mrt_file).st_size > 0:
 
-    # Analyze temp MRT file and dump JSON into a flattened string variable
-    body=None
-    for entry in mrtparse.Reader(temp_mrt_file):
-        bgp_entry=flatten(entry.data)
-        if body == None:
-            body = '['
-            body += json.dumps(bgp_entry)
+        # Move mrt_file to temp_mrt_file, and append it to the consolidated_mrt_file
+        os.system(f'mv {mrt_file} {temp_mrt_file}')
+        os.system(f'touch {mrt_file}')
+        os.system(f'chmod 666 {mrt_file}')
+        os.system(f'cat {temp_mrt_file} >> {consolidated_mrt_file}')
+
+        # Analyze temp MRT file and dump JSON into a flattened string variable
+        body=None
+        for entry in mrtparse.Reader(temp_mrt_file):
+            bgp_entry=flatten(entry.data)
+            bgp_entry['raw']=str(json.dumps(entry.data))   # Add raw JSON for troubleshooting
+            if body == None:
+                body = '['
+                body += json.dumps(bgp_entry)
+            else:
+                body += ',\n'
+                body += json.dumps(bgp_entry)
+        body += ']'
+
+        if dry_run:
+            # Print the JSON variable
+            print('INFO: Dry-run mode. Data to send:')
+            print(body)
         else:
-            body += ',\n'
-            body += json.dumps(bgp_entry)
-    body += ']'
-
-    if dry_run:
-        # Print the JSON variable
-        print('INFO: Dry-run mode. Data to send:')
-        print(body)
+            # Send message to Azure Monitor
+            post_data(logws_id, logws_key, body, 'BgpAnalytics')
     else:
-        # Send message to Azure Monitor
-        post_data(logws_id, logws_key, body, 'BgpAnalytics')
+        print ('INFO: MRT file {mrt_file} is empty, not sending any logs')
 
 if __name__ == "__main__":
    main(sys.argv[1:])
