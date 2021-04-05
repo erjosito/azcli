@@ -125,14 +125,22 @@ def main(argv):
         # Analyze temp MRT file and dump JSON into a flattened string variable
         body=None
         for entry in mrtparse.Reader(temp_mrt_file):
-            bgp_entry=flatten(entry.data)
-            bgp_entry['raw']=str(json.dumps(entry.data))   # Add raw JSON for troubleshooting
-            if body == None:
-                body = '['
-                body += json.dumps(bgp_entry)
-            else:
-                body += ',\n'
-                body += json.dumps(bgp_entry)
+            # Do not log keepalives
+            add_entry = True
+            try:
+                if entry.data['bgp_message']['type'][1] == 'KEEPALIVE':
+                    add_entry = False
+            except:
+                pass
+            if add_entry:
+                bgp_entry=flatten(entry.data)
+                bgp_entry['raw']=str(json.dumps(entry.data))   # Add raw JSON for troubleshooting
+                if body == None:
+                    body = '['
+                    body += json.dumps(bgp_entry)
+                else:
+                    body += ',\n'
+                    body += json.dumps(bgp_entry)
         body += ']'
 
         if dry_run:
