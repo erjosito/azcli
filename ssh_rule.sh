@@ -16,9 +16,14 @@ function deny_ssh () {
         echo "Getting NSG for VM $ssh_vm_name in RG $ssh_rg..."
         ssh_nic_id=$(az vm show -n $ssh_vm_name -g $ssh_rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
         ssh_nsg_id=$(az network nic show --ids $ssh_nic_id --query 'networkSecurityGroup.id' -o tsv)
-        ssh_nsg_name=$(basename $ssh_nsg_id)
-        echo "Adding SSH-deny rule to NSG $ssh_nsg_name for VM $ssh_vm_name in RG $ssh_rg..."
-        az network nsg rule create -n $rule_name --nsg-name $ssh_nsg_name -g $ssh_rg --priority $rule_prio --destination-port-ranges 22 --access Deny --protocol Tcp -o none
+        if [[ -z "$ssh_nsg_id" ]]
+        then
+            echo "No NSG could be found for NIC $ssh_nic_id"
+        else
+            ssh_nsg_name=$(basename $ssh_nsg_id)
+            echo "Adding SSH-deny rule to NSG $ssh_nsg_name for VM $ssh_vm_name in RG $ssh_rg..."
+            az network nsg rule create -n $rule_name --nsg-name $ssh_nsg_name -g $ssh_rg --priority $rule_prio --destination-port-ranges 22 --access Deny --protocol Tcp -o none
+        fi
     done <<< "$vm_list"
 }
 
@@ -30,9 +35,33 @@ function allow_ssh () {
         echo "Getting NSG for VM $ssh_vm_name in RG $ssh_rg..."
         ssh_nic_id=$(az vm show -n $ssh_vm_name -g $ssh_rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
         ssh_nsg_id=$(az network nic show --ids $ssh_nic_id --query 'networkSecurityGroup.id' -o tsv)
-        ssh_nsg_name=$(basename $ssh_nsg_id)
-        echo "Adding SSH-allow rule to NSG $ssh_nsg_name for VM $ssh_vm_name in RG $ssh_rg..."
-        az network nsg rule create -n $rule_name --nsg-name $ssh_nsg_name -g $ssh_rg --priority $rule_prio --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+        if [[ -z "$ssh_nsg_id" ]]
+        then
+            echo "No NSG could be found for NIC $ssh_nic_id"
+        else
+            ssh_nsg_name=$(basename $ssh_nsg_id)
+            echo "Adding SSH-allow rule to NSG $ssh_nsg_name for VM $ssh_vm_name in RG $ssh_rg..."
+            az network nsg rule create -n $rule_name --nsg-name $ssh_nsg_name -g $ssh_rg --priority $rule_prio --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+        fi
+    done <<< "$vm_list"
+}
+
+# Function to inject an allow rule for SSH
+function delete_ssh_rule () {
+    while IFS= read -r vm; do
+        ssh_vm_name=$(echo $vm | cut -f1 -d$'\t')
+        ssh_rg=$(echo $vm | cut -f2 -d$'\t')
+        echo "Getting NSG for VM $ssh_vm_name in RG $ssh_rg..."
+        ssh_nic_id=$(az vm show -n $ssh_vm_name -g $ssh_rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        ssh_nsg_id=$(az network nic show --ids $ssh_nic_id --query 'networkSecurityGroup.id' -o tsv)
+        if [[ -z "$ssh_nsg_id" ]]
+        then
+            echo "No NSG could be found for NIC $ssh_nic_id"
+        else
+            ssh_nsg_name=$(basename $ssh_nsg_id)
+            echo "Deleting SSH-allow rule from NSG $ssh_nsg_name for VM $ssh_vm_name in RG $ssh_rg..."
+            az network nsg rule delete -n $rule_name --nsg-name $ssh_nsg_name -g $ssh_rg -o none
+        fi
     done <<< "$vm_list"
 }
 
@@ -84,5 +113,8 @@ case $action in
         ;;
     deny|Deny|drop|Drop)
         deny_ssh
+        ;;
+    delete|remove)
+        delete_ssh_rule
         ;;
 esac

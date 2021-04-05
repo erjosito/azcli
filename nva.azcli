@@ -19,13 +19,11 @@ vm_subnet_prefix=192.168.2.0/24
 vm_nsg_name=vm-nsg
 vm_sku=Standard_B1s
 vm_pip_name=vm_pip
-vm_cloudinit_filename=cloudinit-apache2.txt
 # NVA
 nva_subnet_name=nva
 nva_subnet_prefix=192.168.50.0/24
 nva_name=nva01
-nva_nsg_name=vm-nsg
-nva_cloudinit_filename=cloudinit-iptables.txt
+nva_nsg_name=nva-nsg
 nva_sku=Standard_B1s
 nva_pip_name=nva_pip
 nva_lb_sku=Standard
@@ -45,6 +43,10 @@ nva_lb_int_backend_name=backend-lb
 nva_inbound_rule_name=inbound
 lb_probe_name=SSHprobe
 lb_probe_port=22
+# RS
+rs_subnet_name=RouteServerSubnet
+rs_subnet_prefix=192.168.0.0/24
+rs_name=rs
 
 # Create RG
 az group create -n $rg -l $location
@@ -68,9 +70,31 @@ az network nsg create -n $nva_nsg_name -g $rg
 az network nsg rule create -n ssh --nsg-name $nva_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
 az network nsg rule create -n web --nsg-name $nva_nsg_name -g $rg --priority 510 --destination-port-ranges 80 --access Allow --protocol Tcp
 
-# Create NVA and VM
+# Create VM
+vm_cloudinit_filename=/tmp/vm_cloudinit.txt
+cat <<EOF > $vm_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt-get update
+  - apt-get install -y apache2
+EOF
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku --custom-data $vm_cloudinit_filename \
    --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address "" --no-wait
+
+# Create NVA
+nva_cloudinit_filename=/tmp/nva_cloudinit.txt
+cat <<EOF > $nva_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update
+  - UCF_FORCE_CONFOLD=1 DEBIAN_FRONTEND=noninteractive apt install -y bird strongswan --fix-missing
+  - sysctl -w net.ipv4.ip_forward=1
+  - sysctl -w net.ipv6.conf.all.forwarding=1
+  - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
+  - sysctl -w net.ipv4.conf.all.send_redirects = 0
+  - iptables -A FORWARD -j ACCEPT
+  - iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+EOF
 az vm create -n $nva_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $nva_sku --custom-data $nva_cloudinit_filename \
    --vnet-name $vnet_name --subnet $nva_subnet_name --nsg $nva_nsg_name --public-ip-address "" --no-wait
 
@@ -118,19 +142,178 @@ az network route-table route create -n default --route-table vm -g $rg \
 az network vnet subnet update -n $vm_subnet_name --vnet-name $vnet_name -g $rg --route-table vm
 
 # SSH test into the NVA
-nva_lb_ext_pip_ip=$(az network public-ip show -n $nva_lb_ext_pip -g $rg --query ipAddress -o tsv)
-ssh -p 1022 $nva_lb_ext_pip_ip "ip a"
+nva_lb_ext_pip_ip=$(az network public-ip show -n $nva_lb_ext_pip -g $rg --query ipAddress -o tsv) && echo $nva_lb_ext_pip_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "ip a"
 
 # SSH test into the VM using the NVA as jump host
 vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 vm_nic_name=$(echo $vm_nic_id | cut -d/ -f 9)
-vm_private_ip=$(az network nic show -n $vm_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-ssh -J ${nva_lb_ext_pip_ip}:1022 $vm_private_ip "ip a"
+vm_private_ip=$(az network nic show -n $vm_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $vm_private_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J ${nva_lb_ext_pip_ip}:1022 $vm_private_ip "ip a"
 
 # Verify outbound traffic from the NVA and the VM
-ssh -p 1022 $nva_lb_ext_pip_ip "curl -s4 ifconfig.co"
-ssh -J ${nva_lb_ext_pip_ip}:1022 $vm_private_ip "curl -s4 ifconfig.co"
-echo "The previous outputs should be the outbound NAT PIP $nva_outbound_pip_ip"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "curl -s4 ifconfig.co"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J ${nva_lb_ext_pip_ip}:1022 $vm_private_ip "curl -s4 ifconfig.co"
+echo "Both previous outputs should be the outbound NAT PIP $nva_outbound_pip_ip"
+
+#################
+# Log Analytics #
+#################
+
+# Create Log Analytics workspace
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
+if [[ -z "$logws_name" ]]
+then
+    echo "No Log Analytics workspace found, creating one..."
+    logws_name=log$RANDOM
+    az monitor log-analytics workspace create -n $logws_name -g $rg
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv) && echo $logws_id
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv) && echo $logws_customerid
+logws_key=$(az monitor log-analytics workspace get-shared-keys -n $logws_name -g $rg --query primarySharedKey -o tsv)
+
+# Onboard NVA VM to Log Analytics
+url="https://raw.githubusercontent.com/Microsoft/OMS-Agent-for-Linux/master/installer/scripts/onboard_agent.sh"
+ssh -p 1022 $nva_lb_ext_pip_ip "wget $url && sh onboard_agent.sh -w $logws_customerid -s $logws_key"
+
+# You need to enable custom logs via the portal
+
+# Query NVA logs
+query_syslog='Syslog
+| where TimeGenerated >= ago(1h)
+| take 10'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_syslog -o tsv
+
+#################
+# NSG Flow Logs #
+#################
+
+# Create Storage Account
+storage_account_name=$(az storage account list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the storage account name if it already existed
+if [[ -z "$storage_account_name" ]]
+then
+    echo "No Storage Account found, creating one..."
+    storage_account_name=storage$RANDOM
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2
+fi
+storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
+
+# Enable flow logs for both NSGs (VM and NVA)
+az network watcher flow-log create -l $location -n "flowlog-vm-$location" -g $rg \
+    --nsg $vm_nsg_name --storage-account $storage_account_name --log-version 2 --retention 7 \
+    --workspace $logws_id --interval 10 --traffic-analytics true
+az network watcher flow-log create -l $location -n "flowlog-nva-$location" -g $rg \
+    --nsg $nva_nsg_name --storage-account $storage_account_name --log-version 2 --retention 7 \
+    --workspace $logws_id --interval 10 --traffic-analytics true
+
+# Query NSG Flow Logs
+query_flowlog='AzureNetworkAnalytics_CL
+| where TimeGenerated >= ago(1h)
+| where SubType_s == "FlowLog"
+//| where DeniedInFlows_d > 0 or DeniedOutFlows_d > 0
+//| where SrcIP_s == "1.2.3.4"
+| project NSGName=split(NSGList_s, "/")[2],NSGRules_s,DeniedInFlows_d,DeniedOutFlows_d,SrcIP_s,DestIP_s,DestPort_d,L7Protocol_s
+| take 20'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_flowlog -o tsv
+
+####################
+#   Route Server   #
+####################
+
+# Create Route Server
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $rs_subnet_name --address-prefixes $rs_subnet_prefix
+rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az network routeserver create -n $rs_name -g $rg --hosted-subnet $rs_subnet_id -l $location
+rs_asn=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
+rs_ip1=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
+rs_ip2=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
+
+# Get NVA's private IP
+nva_nic_id=$(az vm show -n $nva_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+nva_nic_name=$(echo $nva_nic_id | cut -d/ -f 9)
+nva_private_ip=$(az network nic show -n $nva_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nva_private_ip
+
+# Configure BGP on NVA
+nva_asn=65001
+mrt_file="/var/log/bird_bgp.mrt"
+bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+mrtdump protocols all;
+mrtdump $mrt_file;
+log syslog all;
+router id $nva_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      disabled;
+}
+protocol static {
+      import all;
+}
+protocol bgp rs0 {
+      description "RouteServer instance 0";
+      multihop;
+      local $nva_private_ip as $nva_asn;
+      neighbor $rs_ip1 as $rs_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+protocol bgp rs1 {
+      description "Route Server instance 1";
+      multihop;
+      local $nva_private_ip as $nva_asn;
+      neighbor $rs_ip2 as $rs_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+EOF
+username=$(whoami)
+scp -P 1022 $bird_config_file "${nva_lb_ext_pip_ip}:/home/${username}/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo touch $mrt_file"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo chmod 666 $mrt_file"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo systemctl restart bird"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "systemctl status bird"
+
+# Add RS peering to NVA
+az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $nva_private_ip --peer-asn $nva_asn -n $nva_name
+
+# Create Identity to allow access to keyvault, and assign it to the VM
+akv_name=erjositoKeyvault
+id_name=nvaid
+az identity create -n $id_name -g $rg
+id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
+az keyvault set-policy -n "$akv_name" --object-id "$id_principal_id" --secret-permissions get list 
+id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
+az vm identity assign -n $nva_name -g $rg --identities $id_name
+
+# Upload configuration details in the form of secrets in the keyvault
+az keyvault secret set -n 'bgp-logws-id' --value $logws_customerid --vault-name $akv_name
+az keyvault secret set -n 'bgp-logws-key' --value $logws_key --vault-name $akv_name
+
+# Install python software to report BGP updates to Azure Log Analytics
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo apt install -y python3-pip"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo pip3 install mrtparse azure-keyvault-secrets azure-identity"
+
+
+# Test adding a spoke to the vnet, which should inject a new IP into BGP, and generate some BGP logs
+test_spoke_name=testspoke
+test_spoke_prefix=10.13.76.0/24
+az network vnet create -g $rg -n $test_spoke_name --address-prefix $test_spoke_prefix
+az network vnet peering create -n hub2spoke -g $rg --vnet-name $vnet_name --remote-vnet $test_spoke_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
+az network vnet peering create -n spoke2hub -g $rg --vnet-name $test_spoke_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateway
+# Delete peerings
+sleep 30
+az network vnet peering delete -n hub2spoke -g $rg --vnet-name $vnet_name
+az network vnet peering delete -n spoke2hub -g $rg --vnet-name $test_spoke_name
+
+##########################
+#  Other optional tests  #
+##########################
 
 # Test: configure secondary ip in the NVA, and add a specific outbound rule
 # Goal: specific SNAT for certain workloads going through the NVA
