@@ -68,12 +68,8 @@ def flatten(d, parent_key=None, items=None):
                         items = flatten(d[key][i], parent_key=element_parent_key, items=items)
                         i += 1
                 else:
-                    if len(d[key]) == 1:
-                        items[new_key] = d[key][0]
-                    elif len(d[key]) == 2:
-                        items[new_key] = d[key][1]
-                    else:
-                        print ('WARNING: List with more than 2 literal elements, this should not have happened')
+                    separator = ' '
+                    items[new_key] = separator.join(map(str, d[key]))
         else:
             items[new_key] = d[key]
     # print (json.dumps(items))
@@ -100,7 +96,7 @@ def main(argv):
         elif opt in ("-v", "--vault-name"):
             akv_name = arg
         elif opt in ("-f", "--mrt-file"):
-            akv_name = arg
+            mrt_file = arg
     # Print vault name
     if (akv_name == None):
         print ('Options: -v <azure_key_vault_name> -f <mrt_file_name>')

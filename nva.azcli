@@ -310,7 +310,7 @@ az network vnet create -g $rg -n $test_spoke_name --address-prefix $test_spoke_p
 az network vnet peering create -n hub2spoke -g $rg --vnet-name $vnet_name --remote-vnet $test_spoke_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
 az network vnet peering create -n spoke2hub -g $rg --vnet-name $test_spoke_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateway
 # Delete peerings
-sleep 30
+sleep 60
 az network vnet peering delete -n hub2spoke -g $rg --vnet-name $vnet_name
 az network vnet peering delete -n spoke2hub -g $rg --vnet-name $test_spoke_name
 
