@@ -117,24 +117,29 @@ def main(argv):
     if os.stat(mrt_file).st_size > 0:
 
         # Move mrt_file to temp_mrt_file, and append it to the consolidated_mrt_file
-        os.system(f'mv {mrt_file} {temp_mrt_file}')
-        os.system(f'touch {mrt_file}')
-        os.system(f'chmod 666 {mrt_file}')
+        os.system(f'cat {mrt_file} >{temp_mrt_file}')
+        os.system(f'> {mrt_file}')
         os.system(f'cat {temp_mrt_file} >> {consolidated_mrt_file}')
 
         # Analyze temp MRT file and dump JSON into a flattened string variable
         body=None
+        entry_no = 0
+        keepalive_no = 0
         for entry in mrtparse.Reader(temp_mrt_file):
+            entry_no += 1
             # Do not log keepalives
             add_entry = True
             try:
                 if entry.data['bgp_message']['type'][1] == 'KEEPALIVE':
                     add_entry = False
+                    keepalive_no += 1
             except:
                 pass
             if add_entry:
                 bgp_entry=flatten(entry.data)
                 bgp_entry['raw']=str(json.dumps(entry.data))   # Add raw JSON for troubleshooting
+                if dry_run:
+                    print(bgp_entry)
                 if body == None:
                     body = '['
                     body += json.dumps(bgp_entry)
@@ -145,13 +150,14 @@ def main(argv):
 
         if dry_run:
             # Print the JSON variable
-            print('INFO: Dry-run mode. Data to send:')
-            print(body)
+            # print('INFO: Dry-run mode. Data to send:')
+            # print(body)
+            print(f'INFO: {entry_no} BGP messages analyzed, out of which {keepalive_no} were keepalives')
         else:
             # Send message to Azure Monitor
             post_data(logws_id, logws_key, body, 'BgpAnalytics')
     else:
-        print ('INFO: MRT file {mrt_file} is empty, not sending any logs')
+        print (f'INFO: MRT file {mrt_file} is empty, not sending any logs')
 
 if __name__ == "__main__":
    main(sys.argv[1:])
