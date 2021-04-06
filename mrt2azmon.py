@@ -10,6 +10,8 @@ from azure.identity import DefaultAzureCredential
 default_mrt_file = "/tmp/bird-mrtdump_bgp"
 consolidated_mrt_file = "/var/log/bird.mrt"
 temp_mrt_file = "/tmp/bird-mrtdump_bgp.tmp"
+log_type = 'BgpAnalytics'
+send_keepalives = True
 
 # Build signature to authenticate message
 # See https://docs.microsoft.com/azure/azure-monitor/logs/data-collector-api
@@ -68,8 +70,18 @@ def flatten(d, parent_key=None, items=None):
                         items = flatten(d[key][i], parent_key=element_parent_key, items=items)
                         i += 1
                 else:
-                    separator = ' '
-                    items[new_key] = separator.join(map(str, d[key]))
+                    # If it is a value, such as a list of ASN in the ASpath, concat everything
+                    if key == "value":
+                        separator = ' '
+                        items[new_key] = separator.join(map(str, d[key]))
+                    # Otherwise it might be a code/translation value pair
+                    elif len(d[key]) == 2:
+                        items[new_key + '_code'] = d[key][0]
+                        items[new_key] = d[key][1]
+                    # Otherwise, concatenate too
+                    else:
+                        separator = ' '
+                        items[new_key] = separator.join(map(str, d[key]))
         else:
             items[new_key] = d[key]
     # print (json.dumps(items))
@@ -122,7 +134,7 @@ def main(argv):
         os.system(f'cat {temp_mrt_file} >> {consolidated_mrt_file}')
 
         # Analyze temp MRT file and dump JSON into a flattened string variable
-        body=None
+        body='['
         entry_no = 0
         keepalive_no = 0
         for entry in mrtparse.Reader(temp_mrt_file):
@@ -131,7 +143,7 @@ def main(argv):
             add_entry = True
             try:
                 if entry.data['bgp_message']['type'][1] == 'KEEPALIVE':
-                    add_entry = False
+                    add_entry = send_keepalives
                     keepalive_no += 1
             except:
                 pass
@@ -140,9 +152,10 @@ def main(argv):
                 bgp_entry['raw']=str(json.dumps(entry.data))   # Add raw JSON for troubleshooting
                 if dry_run:
                     print(bgp_entry)
-                if body == None:
-                    body = '['
+                # First run
+                if body == '[':
                     body += json.dumps(bgp_entry)
+                # After the first run, append a comma and a line break to keep JSON syntax
                 else:
                     body += ',\n'
                     body += json.dumps(bgp_entry)
@@ -155,7 +168,7 @@ def main(argv):
             print(f'INFO: {entry_no} BGP messages analyzed, out of which {keepalive_no} were keepalives')
         else:
             # Send message to Azure Monitor
-            post_data(logws_id, logws_key, body, 'BgpAnalytics')
+            post_data(logws_id, logws_key, body, log_type)
     else:
         print (f'INFO: MRT file {mrt_file} is empty, not sending any logs')
 

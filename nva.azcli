@@ -47,6 +47,20 @@ lb_probe_port=22
 rs_subnet_name=RouteServerSubnet
 rs_subnet_prefix=192.168.0.0/24
 rs_name=rs
+# VNGs
+gw_subnet_name=GatewaySubnet
+gw_subnet_prefix=192.168.100.0/24
+ergw_name=ergw
+
+# Auxiliary function to get the first IP of a subnet (default gateway)
+function first_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
 
 # Create RG
 az group create -n $rg -l $location
@@ -235,11 +249,12 @@ nva_private_ip=$(az network nic show -n $nva_nic_name -g $rg --query 'ipConfigur
 
 # Configure BGP on NVA
 nva_asn=65001
-mrt_file="/var/log/bird_bgp.mrt"
+nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
+mrt_file="/tmp/bird-mrtdump_bgp"
 bird_config_file=/tmp/bird.conf
 cat <<EOF > $bird_config_file
 mrtdump protocols all;
-mrtdump $mrt_file;
+mrtdump "$mrt_file";
 log syslog all;
 router id $nva_private_ip;
 protocol device {
@@ -253,6 +268,8 @@ protocol kernel {
 }
 protocol static {
       import all;
+      route $rs_ip1/32 via $nva_default_gw;
+      route $rs_ip2/32 via $nva_default_gw;
 }
 protocol bgp rs0 {
       description "RouteServer instance 0";
@@ -278,7 +295,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo systemctl restart bird"
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "systemctl status bird"
-
+a
 # Add RS peering to NVA
 az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $nva_private_ip --peer-asn $nva_asn -n $nva_name
 
@@ -313,6 +330,50 @@ az network vnet peering create -n spoke2hub -g $rg --vnet-name $test_spoke_name 
 sleep 60
 az network vnet peering delete -n hub2spoke -g $rg --vnet-name $vnet_name
 az network vnet peering delete -n spoke2hub -g $rg --vnet-name $test_spoke_name
+
+# Test deleting and readding the RS peerings to simulate a BGP bounce
+az network routeserver peering delete --routeserver $rs_name -g $rg -n $nva_name -y
+az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $nva_private_ip --peer-asn $nva_asn -n $nva_name
+
+####################
+#   ExpressRoute   #
+####################
+
+# Variables
+er_circuit_name=nvatest
+er_pop="New York"
+er_provider=Megaport
+
+# Create ER GW and circuit
+az network vnet subnet create -n $gw_subnet_name --address-prefix $gw_subnet_prefix --vnet-name $vnet_name -g $rg
+az network public-ip create -g $rg -n "${ergw_name}-pip" --allocation-method Dynamic --sku Basic
+az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location \
+    --vnet $vnet_name --public-ip-addresses "${ergw_name}-pip" --no-wait
+az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg \
+    --bandwidth 50 Mbps --provider $er_provider -l $location --sku-family MeteredData --sku-tier Standard
+circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id
+circuit_key=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query serviceKey) && echo $circuit_key
+
+# Update RS to exchange routes with the ER Gateway
+az network routeserver update -n $rs_name -g $rg --allow-b2b-traffic
+
+# Once the circuit is Provider-Provisioned and the GW is Successful:
+az network vpn-connection create -n erconnection -g $rg --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
+
+# Diagnostics
+az network vnet-gateway show -g $rg -n $ergw_name -o tsv --query provisioningState
+az network express-route show -n $er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState
+
+# Optional: Create another VNet with a similar prefix, and attach it to the same ER circuit
+rogue_vnet_name=rogue
+rogue_vnet_prefix=192.168.64.0/22
+rogue_gw_subnet_prefix=192.168.64.0/24
+rogue_ergw_name=rogue-ergw
+az network vnet create -n $rogue_vnet_name -g $rg --address-prefixes $rogue_vnet_prefix --subnet-name GatewaySubnet --subnet-prefixes $rogue_gw_subnet_prefix
+az network public-ip create -g $rg -n "${rogue_ergw_name}-pip" --allocation-method Dynamic --sku Basic
+az network vnet-gateway create -g $rg -n $rogue_ergw_name --gateway-type ExpressRoute --sku Standard -l $location \
+    --vnet $rogue_vnet_name --public-ip-addresses "${rogue_ergw_name}-pip"
+az network vpn-connection create -n rogueerconnection -g $rg --vnet-gateway1 $rogue_ergw_name --express-route-circuit2 $circuit_id
 
 ##########################
 #  Other optional tests  #
