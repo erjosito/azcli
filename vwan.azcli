@@ -259,7 +259,7 @@ az network firewall policy rule-collection-group create -n ruleset01 --policy-na
 echo "Creating rule to allow SSH..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name mgmt --collection-priority 101 --action Allow --rule-name allowSSH --rule-type NetworkRule --description "TCP 22" \
-    --destination-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --source-addresses 10.0.0.0/8 1.1.1.1/32 2.2.2.2/32 3.3.3.3/32 --ip-protocols TCP --destination-ports 22
+    --destination-addresses '*' --source-addresses '*' --ip-protocols TCP --destination-ports 22
 # Allow ICMP
 # echo "Creating rule to allow ICMP..."
 # az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -269,19 +269,19 @@ az network firewall policy rule-collection-group collection add-filter-collectio
 echo "Creating rule to allow NTP..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
-    --destination-addresses '*' --source-addresses "10.0.0.0/8" --ip-protocols UDP --destination-ports "123"
+    --destination-addresses '*' --source-addresses '*' --ip-protocols UDP --destination-ports "123"
 # Example application collection with 2 rules (ipconfig.co, api.ipify.org)
 echo "Creating rule to allow ifconfig.co and api.ipify.org..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
-    --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443
+    --target-fqdns "ifconfig.co" --source-addresses '*' --protocols Http=80 Https=443
 az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
-    --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443 --rule-type ApplicationRule
+    --name ipify --target-fqdns "api.ipify.org" --source-addresses '*' --protocols Http=80 Https=443 --rule-type ApplicationRule
 # Example application collection with wildcards (*.ubuntu.com)
 echo "Creating rule to allow *.ubuntu.com..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name ubuntu --collection-priority 202 --action Allow --rule-name repos --rule-type ApplicationRule --description "ubuntucom" \
-    --target-fqdns '*.ubuntu.com' --source-addresses "10.0.0.0/8" --protocols Http=80 Https=443
+    --target-fqdns '*.ubuntu.com' --source-addresses '*' --protocols Http=80 Https=443
 
 # Create Azure Firewalls in the virtual hubs
 az network firewall create -n azfw1 -g $rg --vhub hub1 --policy $azfw_policy_name -l $location1 --sku AZFW_Hub --public-ip-count 1
@@ -330,10 +330,11 @@ while IFS= read -r fw_id; do
 done <<< "$fw_id_list"
 
 # Configure NAT space for firewalls
-while IFS= read -r fw_id; do
-    echo "Configuring SNAT range for AzFW $fw_id..."
-    az network firewall update --ids $fw_id --private-ranges 192.168.0.0/16
-done <<< "$fw_id_list"
+# Note this should be done in the FW Policy, not in the FW itself!
+# while IFS= read -r fw_id; do
+#     echo "Configuring SNAT range for AzFW $fw_id..."
+#     az network firewall update --ids $fw_id --private-ranges 192.168.0.0/16
+# done <<< "$fw_id_list"
 
 # Create cloudinit file:
 cloudinit_file=/tmp/cloudinit.txt
@@ -457,11 +458,13 @@ az network vhub connection create -n spoke22 -g $rg --vhub-name hub2 --remote-vn
     --internet-security true --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_none_rt_id --labels none
 az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true \
-    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_none_rt_id --labels default
+    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_none_rt_id --labels none
 az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 \
     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 --internet-security true \
-    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_none_rt_id --labels default
+    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_none_rt_id --labels none
 
+# Optional: disable branch-to-branch routing
+# az network vwan update -n $vwan -g $rg --branch-to-branch-traffic false
 
 ######################
 # Connection Monitor #
@@ -746,6 +749,14 @@ fw_app_logs_query='AzureDiagnostics
 //| where Action == "Deny" 
 | take 20'
 az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_logs_query -o tsv
+# VPN BGP GW
+bgp_query='AzureDiagnostics 
+| where ResourceType == "VPNGATEWAYS" 
+| where Category == "RouteDiagnosticLog" 
+| where TimeGenerated >= ago(24h)
+| project TimeGenerated, Message 
+| take 20'
+az monitor log-analytics query -w $logws_customerid --analytics-query $bgp_query -o tsv
 
 ###########
 # Cleanup #

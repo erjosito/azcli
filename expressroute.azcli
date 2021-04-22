@@ -1,0 +1,121 @@
+#################################
+# Commands to test ExpressRoute
+#
+# Jose Moreno, April 2021
+#################################
+
+# Variables
+rg=ertest
+location=germanywestcentral
+er_location=germanywestcentral
+er_pop=Frankfurt
+er_provider=Megaport
+er_circuit_name=tester
+ergw_name=ergw
+ergw_pip="${ergw_name}-pip"
+vnet_name=ervnet
+vnet_prefix=192.168.0.0/16
+vm_subnet_name=vm
+vm_subnet_prefix=192.168.1.0/24
+gw_subnet_prefix=192.168.0.0/24
+vm_name=azurevm
+vm_pip_name="${vm_name}-pip"
+vm_size=Standard_B1s
+
+# Create RG
+az group create -n $rg -l $location
+
+# Create ER circuit
+az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg \
+    --bandwidth 50 Mbps --provider $er_provider -l $er_location --sku-family MeteredData --sku-tier Standard
+service_key=$(az network express-route show -n $er_circuit_name -g $rg --query serviceKey -o tsv) && echo $service_key
+
+# Provision Megaport MCR in location
+if [[ -e "./megaport.sh" ]]
+then
+    ./megaport.sh -s=jomore -a=create_mcr -k=$service_key
+    sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+    ./megaport.sh -s=jomore -a=create_vxc -k=$service_key
+    sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+else
+    echo "Sorry, I cannot seem to find the script megaport.sh to interact with the Megaport API"
+fi
+
+# Create VNet and test VM
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix
+az vm create -n $vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" \
+    --public-ip-address $vm_pip_name --vnet-name $vnet_name --size $vm_size --subnet $vm_subnet_name
+
+# Create ER Gateway and connect it to circuit
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix
+az network public-ip create -g $rg -n $ergw_pip --allocation-method Dynamic --sku Basic
+az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $vnet_name --public-ip-addresses $ergw_pip
+circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id
+az network vpn-connection create -n erconnection2 -g $rg --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
+
+###################################################
+# Optional: create second Vnet to simulate onprem #
+###################################################
+
+# Variables
+onprem_er_location=germanywestcentral
+onprem_er_pop=Frankfurt
+onprem_er_provider=Megaport
+onprem_er_circuit_name=onpremer
+onprem_vnet_name=onprem
+onprem_vnet_prefix=172.16.0.0/16
+onprem_ergw_name=onpremergw
+onprem_ergw_pip="${onprem_ergw_name}-pip"
+onprem_vm_subnet_name=vm
+onprem_vm_subnet_prefix=172.16.1.0/24
+onprem_gw_subnet_prefix=172.16.0.0/24
+onprem_vm_name=onpremvm
+onprem_vm_pip_name="${onprem_vm_name}-pip"
+onprem_vm_size=Standard_B1s
+
+# Create ER circuit
+az network express-route create -n $onprem_er_circuit_name --peering-location $onprem_er_pop -g $rg \
+    --bandwidth 50 Mbps --provider $onprem_er_provider -l $onprem_er_location --sku-family MeteredData --sku-tier Standard
+onprem_service_key=$(az network express-route show -n $onprem_er_circuit_name -g $rg --query serviceKey -o tsv) && echo $onprem_service_key
+
+# Provision additional VXCs to existing MCR
+if [[ -e "./megaport.sh" ]]
+then
+    ./megaport.sh -s=jomore -a=create_vxc -k=$onprem_service_key -n=onprem
+else
+    echo "Sorry, I cannot seem to find the script megaport.sh to interact with the Megaport API"
+fi
+
+# Create VNet and test VM
+az network vnet create -g $rg -n $onprem_vnet_name --address-prefix $onprem_vnet_prefix --subnet-name $onprem_vm_subnet_name --subnet-prefix $onprem_vm_subnet_prefix
+az vm create -n $onprem_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${onprem_vm_name}-nsg" \
+    --public-ip-address $onprem_vm_pip_name --vnet-name $onprem_vnet_name --size $onprem_vm_size --subnet $onprem_vm_subnet_name
+
+# Create ER Gateway and connect it to circuit
+az network vnet subnet create -g $rg --vnet-name $onprem_vnet_name -n GatewaySubnet --address-prefix $onprem_gw_subnet_prefix
+az network public-ip create -g $rg -n $onprem_ergw_pip --allocation-method Dynamic --sku Basic
+az network vnet-gateway create -g $rg -n $onprem_ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $onprem_vnet_name --public-ip-addresses $onprem_ergw_pip
+onprem_circuit_id=$(az network express-route show -n $onprem_er_circuit_name -g $rg -o tsv --query id) && echo $onprem_circuit_id
+az network vpn-connection create -n onpremcx -g $rg --vnet-gateway1 $onprem_ergw_name --express-route-circuit2 $onprem_circuit_id
+
+#####################
+#    Diagnostics    #
+#####################
+
+./megaport.sh -q -s=jomore -a=list_live
+az network expressroute list -g $rg -o table
+az network gateway list -g $rg -o table
+vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+onprem_vm_nic_id=$(az vm show -n $onprem_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $vm_nic_id -o table
+az network nic show-effective-route-table --ids $onprem_vm_nic_id -o table
+vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
+onprem_vm_private_ip=$(az vm show -g $rg -n $onprem_vm_name -d --query privateIps -o tsv) && echo $onprem_vm_private_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ping -c 5 $onprem_vm_private_ip"
+
+#######################
+#  Cleanup - Danger!  #
+#######################
+
+# Remove MCR from Megaport
+./megaport.sh -q -s=jomore -a=delete_mcr

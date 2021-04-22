@@ -210,6 +210,37 @@ az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=1
 kubectl create deployment sqlapi --image=erjosito/sqlapi:1.0 --port=8080 --replicas=1
 
+# Service with Static PIP
+svc_pip_name=k8ssvcpip
+az network public-ip create -g $rg -n $svc_pip_name --sku Standard --allocation-method static
+svc_pip_ip=$(az network public-ip show -n $svc_pip_name -g $rg --query ipAddress -o tsv) && echo $svc_pip_ip
+svc_pip_id=$(az network public-ip show -n $svc_pip_name -g $rg --query id -o tsv) && echo $svc_pip_id
+if [[ "$use_msi" == no ]]
+then
+    client_id=$sp_app_id
+else
+    client_id=$id_principal_id
+fi
+az role assignment create --assignee $client_id --role "Network Contributor" --scope $svc_pip_id
+yaml_file=/tmp/svc.yaml
+cat <<EOF > $yaml_file
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-resource-group: $rg
+  name: kuard
+spec:
+  loadBalancerIP: $svc_pip_ip
+  type: LoadBalancer
+  ports:
+  - port: 8080
+  selector:
+    app: kuard
+EOF
+kubectl apply -f $yaml_file
+echo "Browse to http://$svc_pip_ip:8080"
+
 ##############################
 # Daemonset to install stuff #
 ##############################
@@ -305,6 +336,10 @@ az monitor diagnostic-settings create -n mydiag --resource $aks_id --workspace $
 # Migrate to MSI
 az aks update -g $rg -n $aks_name --enable-managed-identity -y
 
+#######################
+# Pod Identity - Helm #
+#######################
+
 # Pod identity
 id_name=apppodid
 az identity create --resource-group $rg --name $id_name
@@ -356,7 +391,6 @@ kubectl logs demo --follow --namespace $podid_ns
 az aks pod-identity list --cluster-name $aks_name -g $rg -o table
 az aks pod-identity exception list --cluster-name $aks_name -g $rg -o table
 
-
 #####################
 # Add a second pool #
 #####################
@@ -397,6 +431,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -m hmac-sha2-512 -J $vm_pip_
 ###########################
 # Logs from Azure Monitor #
 ###########################
+
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 # Log category summary
 summary='AzureDiagnostics
@@ -426,3 +461,13 @@ admin_query='AzureDiagnostics
 | where log_sourceIP == "'$myip'"
 | take 20 '
 az monitor log-analytics query -w $logws_customerid --analytics-query $admin_query -o tsv
+# Insights query
+insights_query='InsightsMetrics 
+//| where Namespace == "kube-system"
+//| extend TagInfo = parse_json(Tags)
+//| where TagInfo.app !startswith "istio"
+//| where TagInfo.app !startswith "cert"
+//| where TagInfo.app != ""
+| summarize count() by Namespace
+'
+az monitor log-analytics query -w $logws_customerid --analytics-query $insights_query -o tsv

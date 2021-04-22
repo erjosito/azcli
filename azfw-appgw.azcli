@@ -65,7 +65,7 @@ runcmd:
 EOF
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
    --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
-   --custom-data $vm_cloudinit_filename --no-wait
+   --custom-data $vm_cloudinit_filename
 vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv) && echo $vm_private_ip
 
 # Generate certificates
@@ -144,7 +144,7 @@ az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation
 azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
 azfw_policy_id=$(az network firewall policy show -n $azfw_policy_name -g $rg --query id -o tsv)
 az network firewall create -n $azfw_name -g $rg -l $location --sku-tier Premium --policy $azfw_policy_id # Not working yet...
-azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id) && echo $azfw_id
 az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
     --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
@@ -232,7 +232,7 @@ http {
             proxy_set_header Connection "";
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
             # proxy_set_header X-Forwarded-For \$remote_addr;
             proxy_buffer_size          128k;
             proxy_buffers              4 256k;
@@ -278,10 +278,10 @@ curl -k "https://${vm_fqdn}/api/healthcheck"
 # Test file uploads
 test_file="/tmp/testfile"
 echo $(tr -dc a-zA-Z0-9 </dev/urandom 2>/dev/null| head -c 25) >$test_file
-curl -k -F "file=@${test_file}" "https://${vm_fqdn}/api/filesize"
+curl -k -F "data=@${test_file}" "https://${vm_fqdn}/api/filesize"
 bad_file="/tmp/badfile"
 wget "https://secure.eicar.org/eicar.com" -O $bad_file
-curl -k -F "file=@${bad_file}" "https://${vm_fqdn}/api/filesize"
+curl -k -F "data=@${bad_file}" "https://${vm_fqdn}/api/filesize"
 
 ######################
 # Deploy App Gateway #
@@ -541,26 +541,3 @@ az network nic delete --ids $vm_nic_id
 
 # Cleanup all
 az group delete -n $rg -y --no-wait
-
-################################ WORK IN PROGRES ############################################
-
-# APIM Gateway 
-apim_subnet_name=APIMSubnet
-apim_subnet_prefix=192.168.210.0/24
-apim_sku=Developer  # The Premium SKU offers multi-region on top
-apim_vnet_type=Internal
-apim_name=apim$RANDOM
-apim_publisher_email=admin@contoso.com
-apim_publisher_name=Contoso
-
-az network vnet subnet create -g $rg -n $apim_subnet_name --vnet-name $vnet_name --address-prefix $apim_subnet_prefix
-apim_subnet_id=$(az network vnet subnet show -n $apim_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-# This takes 34m!
-az apim create -n $apim_name -g $rg \
-  --publisher-email $apim_publisher_email --publisher-name $apim_publisher_name \
-  --sku-name $apim_sku --virtual-network $apim_vnet_type
-# And this another 23m
-az apim update -n $apim_name -g $rg \
-  --set virtualNetworkType=$apim_vnet_type \
-  --set virtualNetworkConfiguration.subnetResourceId=$apim_subnet_id
-##############################################################################################

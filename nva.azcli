@@ -242,6 +242,15 @@ rs_asn=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAs
 rs_ip1=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
 rs_ip2=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
 
+# Send logs to AzMonitor
+# This doesnt work today: "(ResourceTypeNotSupported) The resource type 'microsoft.network/virtualhubs' does not support diagnostic settings."
+# rs_id=$(az network routeserver show -n $rs_name -g $rg --query id -o tsv) && echo $rs_id
+# az monitor diagnostic-settings create -n rsdiag --resource $rs_id --workspace $logws_id \
+#     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+#     --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+#             {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+
+
 # Get NVA's private IP
 nva_nic_id=$(az vm show -n $nva_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 nva_nic_name=$(echo $nva_nic_id | cut -d/ -f 9)
@@ -334,6 +343,7 @@ az network vnet peering delete -n spoke2hub -g $rg --vnet-name $test_spoke_name
 # Test deleting and readding the RS peerings to simulate a BGP bounce
 az network routeserver peering delete --routeserver $rs_name -g $rg -n $nva_name -y
 az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $nva_private_ip --peer-asn $nva_asn -n $nva_name
+
 
 ####################
 #   ExpressRoute   #
