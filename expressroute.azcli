@@ -118,4 +118,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ping -c 5 $
 #######################
 
 # Remove MCR from Megaport
-./megaport.sh -q -s=jomore -a=delete_mcr
+# ./megaport.sh -q -s=jomore -a=delete_mcr
+
+# Delete RG
+# az group delete -n $rg -y --no-wait

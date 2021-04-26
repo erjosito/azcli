@@ -427,6 +427,37 @@ query_app='AzureDiagnostics
 | project TimeGenerated, msg_s
 | take 100'
 az monitor log-analytics query -w $logws_customerid --analytics-query $query_app -o tsv
+# AzFW unified query
+query='AzureDiagnostics
+| where Category == "AzureFirewallNetworkRule" or Category == "AzureFirewallApplicationRule"
+| where TimeGenerated >= ago(5m) 
+| extend msg_original = msg_s
+| extend msg_s = replace(@". Action: Deny. Reason: SNI TLS extension was missing.", @" to no_data:no_data. Action: Deny. Rule Collection: default behavior. Rule: SNI TLS extension missing", msg_s)
+| extend msg_s = replace(@"No rule matched. Proceeding with default action", @"Rule Collection: default behavior. Rule: no rule matched", msg_s)
+| parse msg_s with * " Web Category: " WebCategory
+| extend msg_s = replace(@"(. Web Category:).*","", msg_s)
+| parse msg_s with * ". Rule Collection: " RuleCollection ". Rule: " Rule
+| extend msg_s = replace(@"(. Rule Collection:).*","", msg_s)
+| parse msg_s with * ". Signature: " IDSSignatureIDInt ". IDS: " IDSSignatureDescription ". Priority: " IDSPriorityInt ". Classification: " IDSClassification
+| extend msg_s = replace(@"(. Signature:).*","", msg_s)
+| parse msg_s with * " was DNAT'"'"'ed to " NatDestination
+| extend msg_s = replace(@"( was DNAT'"'"'ed to ).*",". Action: DNAT", msg_s)
+| parse msg_s with * ". ThreatIntel: " ThreatIntel
+| extend msg_s = replace(@"(. ThreatIntel:).*","", msg_s)
+| extend URL = extract(@"(Url: )(.*)(\. Action)",2,msg_s)
+| extend msg_s=replace(@"(Url: .*)(Action)",@"\2",msg_s)
+| parse msg_s with Protocol " request from " SourceIP " to " Target ". Action: " Action
+| extend 
+    SourceIP = iif(SourceIP contains ":",strcat_array(split(SourceIP,":",0),""),SourceIP),
+    SourcePort = iif(SourceIP contains ":",strcat_array(split(SourceIP,":",1),""),""),
+    Target = iif(Target contains ":",strcat_array(split(Target,":",0),""),Target),
+    TargetPort = iif(SourceIP contains ":",strcat_array(split(Target,":",1),""),""),
+    IDSSignatureID = tostring(IDSSignatureIDInt),
+    IDSPriority = tostring(IDSPriorityInt)
+| project msg_original,TimeGenerated,Protocol,SourceIP,SourcePort,Target,TargetPort,URL,Action, NatDestination, OperationName,ThreatIntel,IDSSignatureID,IDSSignatureDescription,IDSPriority,IDSClassification,RuleCollection,Rule,WebCategory
+| project-away msg_original
+| order by TimeGenerated'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
 # AppGW Log Categories
 query='AzureDiagnostics 
 | where ResourceType == "APPLICATIONGATEWAYS" 
