@@ -1,0 +1,101 @@
+############################################################################
+# Created by Jose Moreno
+# April 2021
+#
+# Creates 2 web servers and two polling VMs that will use connection monitor
+#   to check availability of each web server.
+#
+# Tested with zsh
+############################################################################
+
+
+# Variables
+rg=monitortest
+location1=westeurope
+location2=eastus
+vm_size=Standard_B1s
+
+# Create RG
+az group create -n $rg -l $location1
+
+# Create Web servers
+vm_cloudinit_filename=/tmp/cloudinit.txt
+cat <<EOF > $vm_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update && apt install -y python3-pip
+  - pip3 install flask
+  - wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
+  - python3 /root/myip.py &
+EOF
+# Location1
+vm_name="web-$location1"
+vnet_name="vnet-$location1"
+az network vnet create -g $rg -n $vnet_name --address-prefix "10.1.0.0/24" --subnet-name vm --subnet-prefix "10.1.0.0/26" -l $location1
+az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_size \
+   --vnet-name $vnet_name --subnet vm --public-ip-address "${vm_name}-pip" \
+   --custom-data $vm_cloudinit_filename -l $location1
+az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
+# Location2
+vm_name="web-$location2"
+vnet_name="vnet-$location2"
+az network vnet create -g $rg -n $vnet_name --address-prefix "10.2.0.0/24" --subnet-name vm --subnet-prefix "10.2.0.0/26" -l $location2
+az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_size \
+   --vnet-name $vnet_name --subnet vm --public-ip-address "${vm_name}-pip" \
+   --custom-data $vm_cloudinit_filename -l $location2
+az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
+
+# Create pollers
+vm_name="poller-$location1"
+vnet_name="vnet-$location1"
+az vm create -n $vm_name -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address "${vm_name}-pip" --vnet-name $vnet_name --size $vm_size --subnet vm
+az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
+vm_name="poller-$location2"
+vnet_name="vnet-$location2"
+az vm create -n $vm_name -g $rg -l $location2 --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address "${vm_name}-pip" --vnet-name $vnet_name --size $vm_size --subnet vm
+az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
+
+# Peer the vnets
+az network vnet peering create -n 1to2 -g $rg --vnet-name "vnet-${location1}" --remote-vnet "vnet-${location2}" --allow-vnet-access --allow-forwarded-traffic
+az network vnet peering create -n 2to1 -g $rg --vnet-name "vnet-${location2}" --remote-vnet "vnet-${location1}" --allow-vnet-access --allow-forwarded-traffic
+
+# VM IDs
+web1_vm_id=$(az vm show -g $rg --query id -o tsv -n "web-${location1}") && echo $web1_vm_id
+web2_vm_id=$(az vm show -g $rg --query id -o tsv -n "web-${location2}") && echo $web2_vm_id
+poller1_vm_id=$(az vm show -g $rg --query id -o tsv -n "poller-${location1}") && echo $poller1_vm_id
+poller2_vm_id=$(az vm show -g $rg --query id -o tsv -n "poller-${location2}") && echo $poller2_vm_id
+
+# Create connection monitors
+# Location1
+monitor_name="poller-$location1"
+test_name="web-$location1"
+az network watcher connection-monitor create -n $monitor_name -g $rg -l $location1 \
+    --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type AzureVM \
+    --endpoint-source-resource-id $poller1_vm_id --endpoint-source-name poller1 \
+    --endpoint-dest-resource-id $web1_vm_id --endpoint-dest-name web1 \
+    --test-config-name HttpConfig --protocol Http --http-port 8080 \
+    --http-method GET --https-prefer false --http-path '/api/healthcheck'
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
+    --resource-id $web2_vm_id --name web2 --type AzureVM --dest-test-groups $test_name
+# Location2
+monitor_name="poller-$location2"
+test_name="web-$location2"
+az network watcher connection-monitor create -n $monitor_name -g $rg -l $location2 \
+    --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type AzureVM \
+    --endpoint-source-resource-id $poller2_vm_id --endpoint-source-name poller2 \
+    --endpoint-dest-resource-id $web1_vm_id --endpoint-dest-name web1 \
+    --test-config-name HttpConfig --protocol Http --http-port 8080 \
+    --http-method GET --https-prefer false --http-path '/api/healthcheck'
+az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location2 \
+    --resource-id $web2_vm_id --name web2 --type AzureVM --dest-test-groups $test_name
+
+# Diagnostics
+az network watcher connection-monitor list -l $location1 -o table # -g flag not supported
+az network watcher connection-monitor list -l $location2 -o table # -g flag not supported
+
+# Cleanup
+# az group delete -n $rg -y --no-wait
+# az network watcher connection-monitor delete -n poller-$location1 -l $location1
+# az network watcher connection-monitor delete -n poller-$location2 -l $location2
