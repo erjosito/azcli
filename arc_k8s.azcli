@@ -14,15 +14,26 @@
 # Variables
 k8s_rg=aksengine
 location=westeurope
+arc_rg=k8sarc
+arc_name=myaksengine
+
+# Create RG for AKS engine cluster
 az group create -n $k8s_rg -l $location
 
 # Install AKS engine
 # Go here: https://github.com/Azure/aks-engine/releases/latest
 # Example with v0.61.0:
-# aksengine_tmp=/tmp/aksengine.tar.gz
-# wget https://github.com/Azure/aks-engine/releases/download/v0.61.0/aks-engine-v0.61.0-linux-amd64.tar.gz -O $aksengine_tmp
-# tar xfvz $aksengine_tmp -C /tmp/
-# sudo cp /tmp/aks-engine-v0.61.0-linux-amd64/aks-engine /usr/local/bin
+aksengine_exec=$(which aks-engine)
+if [[ -n "$aksengine_exec" ]]
+then
+    echo "aks-engine executable found in ${aksengine_exec}"
+else
+    echo "Downloading and installing aks-engine executable..."
+    aksengine_tmp=/tmp/aksengine.tar.gz
+    wget https://github.com/Azure/aks-engine/releases/download/v0.61.0/aks-engine-v0.61.0-linux-amd64.tar.gz -O $aksengine_tmp
+    tar xfvz $aksengine_tmp -C /tmp/
+    sudo cp /tmp/aks-engine-v0.61.0-linux-amd64/aks-engine /usr/local/bin
+fi
 
 # Retrieve Service Principal form your AKV, required for AKS engine
 purpose=aksengine
@@ -45,6 +56,8 @@ then
     # Store the created app ID and secret in an AKV
     az keyvault secret set --vault-name $keyvault_name -n $keyvault_appid_secret_name --value $sp_app_id
     az keyvault secret set --vault-name $keyvault_name -n $keyvault_password_secret_name --value $sp_app_secret
+else
+    echo "Service Principal $sp_app_id and secret successfully retrieved from AKV $keyvault_name"
 fi
 
 # Grant access to the SP to the new RG
@@ -52,13 +65,15 @@ scope=$(az group show -n $k8s_rg --query id -o tsv)
 assignee=$(az ad sp show --id $sp_app_id --query objectId -o tsv)
 az role assignment create --scope $scope --role Contributor --assignee $assignee
 
-# Retrieve example JSON file describing a basic cluster
-url=https://raw.githubusercontent.com/Azure/aks-engine/master/examples/kubernetes.json
+# File containing the description of the AKS engine cluster to create
 aksengine_cluster_file="/tmp/aksengine_cluster.json" 
+
+# Option1: Retrieve example JSON file describing a basic cluster
+url=https://raw.githubusercontent.com/Azure/aks-engine/master/examples/kubernetes.json
 wget $url -O $aksengine_cluster_file
 # You can modify the kubernetes.json file, for example with smaller VM sizes such as Standard_B2ms
 
-# Optionally we can create a cluster file from scratch:
+# Option 2: Create a cluster file from scratch:
 aksengine_vm_size=Standard_B2ms
 cat <<EOF > $aksengine_cluster_file
 {
@@ -97,6 +112,9 @@ cat <<EOF > $aksengine_cluster_file
 }
 EOF
 
+# Wait 30 seconds (the role assignment might need some time to propagate)
+sleep 30
+
 # Create AKS-engine cluster
 # You might need to install aks-engine from https://github.com/Azure/aks-engine/blob/master/docs/tutorials/quickstart.md
 subscription=$(az account show --query id -o tsv)
@@ -126,24 +144,72 @@ kubectl get node
 # Enabling cluster for Arc #
 ############################
 
-# Az CLI extension
-az extension add -n connectedk8s
+# Docs: https://docs.microsoft.com/en-us/azure/azure-arc/kubernetes/quickstart-connect-cluster
+
+# Az CLI extension connectedk8s
+extension_name=connectedk8s
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+if [[ -z "$extension_version" ]]
+then
+    echo "Azure CLI extension $extension_name not found, installing now..."
+    az extension add -n $extension_name
+else
+    echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
+    az extension update -n $extension_name
+fi
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+echo "Azure CLI extension $extension_name installed with version $extension_version"
+
+# Registering providers
+for provider in "Kubernetes" "KubernetesConfiguration" "ExtendedLocation"
+do
+    registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
+    if [[ "$registration_state" == "Registered" ]]
+    then
+        echo "Resource Provider Microsoft.${provider} is successfully registered with status ${registration_state}"
+    else
+        echo "It seems that provider Microsoft.${provider} is not registered, registering now..."
+        az provider register --namespace "Microsoft.${provider}"
+        wait_time=30
+        registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
+        while [[ "$registration_state" != "Registered" ]]
+        do
+            echo "Registration state for RP Microsoft.${provider} is still $registration_state..."
+            sleep $wait_time
+            registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
+        done
+        echo "Registration state for RP Microsoft.${provider} is ${registration_state}"
+    fi
+done
+echo "All resource providers successfully registered"
 
 # Create the ARC resource
-arc_rg=k8sarc
 az group create -n $arc_rg -l $location
-arc_name=myaksengine
 az connectedk8s connect --name $arc_name -g $arc_rg
 
 # Diagnostics
 az connectedk8s list -g $arc_rg -o table
+kubectl -n azure-arc get deployments,pods
 
 ####################################
 # Gitops in an arc-enabled cluster #
 ####################################
 
-# Add CLI extension
-az extension add -n k8s-configuration
+# Docs: https://docs.microsoft.com/azure/azure-arc/kubernetes/tutorial-use-gitops-connected-cluster
+
+# Az CLI extension k8s-configuration
+extension_name=k8s-configuration
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+if [[ -z "$extension_version" ]]
+then
+    echo "Azure CLI extension $extension_name not found, installing now..."
+    az extension add -n $extension_name
+else
+    echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
+    az extension update -n $extension_name
+fi
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+echo "Azure CLI extension $extension_name installed with version $extension_version"
 
 # Create a cluster-level operator
 repo_url="https://github.com/erjosito/arc-k8s-test/" # Feel free to use your own repo here
@@ -159,23 +225,36 @@ az k8s-configuration create \
     --cluster-type connectedClusters
 # cluster-type can be either "connectedClusters" (for ARC clusters) or "managedClusters" (for AKS)
 
-# Diagnostics
+# Diagnostics (you need to wait some seconds for the namespace and resources to be created)
 az k8s-configuration show -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters
 kubectl -n $namespace get deploy -o wide
 
 # Optional: update operator to enable helm or change the repo URL
-az k8s-configuration update -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters --enable-helm-operator
-az k8s-configuration update -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters -u $repo_url
+# az k8s-configuration update -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters --enable-helm-operator
+# az k8s-configuration update -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters -u $repo_url
 
 # Optional: delete configuration
-az k8s-configuration delete -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters
+# az k8s-configuration delete -n $cfg_name -c $arc_name -g $arc_rg --cluster-type connectedClusters
 
 ##########################################
 # Azure Monitor for Arc-enabled clusters #
 ##########################################
 
-# Az CLI extension
-az extension add -n log-analytics
+# Docs: https://docs.microsoft.com/en-us/azure/azure-monitor/containers/container-insights-enable-arc-enabled-clusters?toc=/azure/azure-arc/kubernetes/toc.json
+
+# Az CLI extension log-analytics
+extension_name=log-analytics
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+if [[ -z "$extension_version" ]]
+then
+    echo "Azure CLI extension $extension_name not found, installing now..."
+    az extension add -n $extension_name
+else
+    echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
+    az extension update -n $extension_name
+fi
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+echo "Azure CLI extension $extension_name installed with version $extension_version"
 
 # Create Log Analytics workspace
 logws_name=$(az monitor log-analytics workspace list -g $arc_rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
@@ -187,11 +266,11 @@ fi
 logws_id=$(az resource list -g $arc_rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $arc_rg --query customerId -o tsv)
 
-# Enabling monitoring
-enable_script=/tmp/enable-monitoring.sh
-curl -o $enable_script -L https://aka.ms/enable-monitoring-bash-script
-arc_id=$(az connectedk8s show -n $arc_name -g $arc_rg -o tsv --query id) && echo $arc_id
-bash $enable_script --resource-id $arc_id --workspace-id $logws_id
+# Enabling monitoring with enable-monitoring.sh (deprecated)
+# enable_script=/tmp/enable-monitoring.sh
+# curl -o $enable_script -L https://aka.ms/enable-monitoring-bash-script
+# arc_id=$(az connectedk8s show -n $arc_name -g $arc_rg -o tsv --query id) && echo $arc_id
+# bash $enable_script --resource-id $arc_id --workspace-id $logws_id
 
 # Uninstall
 # disable_script=/tmp/disable-monitoring.sh
@@ -204,6 +283,13 @@ bash $enable_script --resource-id $arc_id --workspace-id $logws_id
 # az k8s-extension create --cluster-name $arc_name --resource-group $arc_rg --cluster-type connectedClusters \
 #     --extension-type Microsoft.AzureMonitor.Containers --name azuremonitor-containers --configuration-settings logAnalyticsWorkspaceResourceID=$logws_id
 
+# Enabling monitoring using k8s extensions
+az k8s-extension create --name azuremonitor-containers --cluster-name $arc_name --resource-group $arc_rg --cluster-type connectedClusters \
+    --extension-type Microsoft.AzureMonitor.Containers --configuration-settings "logAnalyticsWorkspaceResourceID=${logws_id}"
+
+# Diagnostics
+az k8s-extension list -c $arc_name -g $arc_rg --cluster-type ConnectedClusters -o table
+
 # Getting logs (sample query)
 query='ContainerLog
 | where TimeGenerated > ago(5m)
@@ -211,19 +297,64 @@ query='ContainerLog
 | take 20'
 az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
 
+##################
+# Azure Defender #
+##################
+
+# Docs: https://docs.microsoft.com/en-us/azure/security-center/defender-for-kubernetes-azure-arc
+
+# Deploy defender extension to the same WS
+az k8s-extension create --name microsoft.azuredefender.kubernetes --cluster-type connectedClusters \
+    --cluster-name $arc_name --resource-group $arc_rg --extension-type microsoft.azuredefender.kubernetes \
+    --configuration-settings "logAnalyticsWorkspaceResourceID=${logws_id}"
+
+# Diagnostics
+az k8s-extension list -c $arc_name -g $arc_rg --cluster-type ConnectedClusters -o table
+
+# Simulate alerts
+kubectl get pods --namespace=asc-alerttest-662jfi039n
+
+# Check alert (can take some minutes to appear)
+az security alert list -g $arc_rg
 
 #########################################
 # Azure Policy for Arc-enabled clusters #
 #########################################
 
-# Required only once
-az provider register --namespace Microsoft.PolicyInsights
+# Docs: https://docs.microsoft.com/azure/governance/policy/concepts/policy-for-kubernetes
+
+# Registering providers
+for provider in "PolicyInsights"
+do
+    registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
+    if [[ "$registration_state" == "Registered" ]]
+    then
+        echo "Resource Provider Microsoft.${provider} is successfully registered with status ${registration_state}"
+    else
+        echo "It seems that provider Microsoft.${provider} is not registered, registering now..."
+        az provider register --namespace "Microsoft.${provider}"
+        wait_time=30
+        registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
+        while [[ "$registration_state" != "Registered" ]]
+        do
+            echo "Registration state for RP Microsoft.${provider} is still $registration_state..."
+            sleep $wait_time
+            registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
+        done
+        echo "Registration state for RP Microsoft.${provider} is ${registration_state}"
+    fi
+done
+echo "All resource providers successfully registered"
 
 # We will use the same SP as we did for AKS Engine, in prod you would use something else
+echo "Getting Arc-enabled cluster ID..."
+arc_id=$(az connectedk8s show -n $arc_name -g $arc_rg -o tsv --query id) && echo $arc_id
 scope=$arc_id
 role="Policy Insights Data Writer (Preview)"
-assignee=$(az ad sp show --id $sp_app_id --query objectId -o tsv) && echo $assignee
+assignee=$(az ad sp show --id $sp_app_id --query objectId -o tsv)
+echo "Assigning role $role for OID ${assignee} on scope ${scope}..."
 az role assignment create --scope $scope --role $role --assignee $assignee
+echo "Getting IDs for tenant and subscription..."
 tenant_id=$(az account show --query tenantId -o tsv) && echo $tenant_id
 subscription_id=$(az account show --query id -o tsv) && echo $subscription_id
 
@@ -236,13 +367,26 @@ helm install azure-policy-addon azure-policy/azure-policy-addon-arc-clusters \
     --set azurepolicy.env.clientsecret=$sp_app_secret \
     --set azurepolicy.env.tenantid=$tenant_id
 
+# Diagnostics
+kubectl get pods -n kube-system
+kubectl get pods -n gatekeeper-system
+
 # Sample policy 1: no public ALB
-policy_name=$(az policy definition list --subscription $subscription_id --query "[?contains(displayName,'Kubernetes clusters should use internal load balancers')].name" -o tsv) && echo $policy_name
-az policy assignment create -n noPublicLBresource --policy $policy_name --scope $arc_id
+policy_name=$(az policy definition list --subscription $subscription_id --query "[?contains(displayName,'Kubernetes clusters should use internal load balancers')].name" -o tsv)
+if [[ -n "$policy_name" ]]
+then
+    echo "Successfully retrieved policy name to enforce internal load balancers: ${policy_name}. Creating policy assignment..."
+    az policy assignment create -n noPublicLBresource --policy $policy_name --scope $arc_id
+fi
 
 # Sample policy 2: no privileged containers
-policy_name=$(az policy definition list --subscription $subscription_id --query "[?contains(displayName,'Kubernetes cluster should not allow privileged containers')].name" -o tsv) && echo $policy_name
-az policy assignment create -n noPrivilegedContainers --policy $policy_name --scope $arc_id
+policy_name=$(az policy definition list --subscription $subscription_id --query "[?contains(displayName,'Kubernetes cluster should not allow privileged containers')].name" -o tsv)
+if [[ -n "$policy_name" ]]
+then
+    echo "Successfully retrieved policy name to disallow privileged containers: ${policy_name}. Creating policy assignment..."
+    az policy assignment create -n noPrivilegedContainers --policy $policy_name --scope $arc_id
+    # az policy assignment create -n noPrivilegedContainers --policy $policy_name --scope $arc_id --params '{ "excludedNamespaces": {"value": [ "kube-system", "gatekeeper-system", "azure-arc", "azuredefender" ] }}'
+fi
 yaml_file=/tmp/privileged.yml
 cat <<EOF > $yaml_file
 apiVersion: v1
@@ -256,7 +400,13 @@ spec:
       securityContext:
         privileged: true
 EOF
-kubectl apply -f $yaml_file  # You should receive an error: Error from server ([denied by azurepolicy-container-no-privilege-73b124012cd393825d53]
+
+# Test: You should receive an error: Error from server ([denied by azurepolicy-container-no-privilege-73b124012cd393825d53]
+# It could take some seconds until the policy is effective
+kubectl apply -f $yaml_file
+
+# Diagnostics
+az policy assignment list --scope $arc_id -o table
 
 # Verify policy state (WORK IN PROGRESS WITH THE CLI -> PORTAL IS PREFERRED)
 assignment1_id=$(az policy assignment show -n noPublicLBresource --scope $arc_id --query id -o tsv) && echo $assignment1_id
@@ -270,6 +420,67 @@ az policy state summarize --resource $arc_id -o table
 kubectl get pods -n gatekeeper-system
 kubectl get constrainttemplate
 az policy assignment list --scope $arc_id -o table
+
+# Cleanup
+az policy assignment delete -n noPrivilegedContainers --scope $arc_id
+az policy assignment delete -n noPublicLBresource --scope $arc_id
+
+###################
+# Cluster Connect #
+###################
+
+# You need to be in default namespace!
+
+az connectedk8s enable-features --features cluster-connect -n $arc_name -g $arc_rg
+
+kubectl create serviceaccount admin-user
+kubectl create clusterrolebinding admin-user-binding --clusterrole cluster-admin --serviceaccount default:admin-user
+secret_name=$(kubectl get serviceaccount admin-user -o jsonpath='{$.secrets[0].name}')
+k8s_token=$(kubectl get secret ${secret_name} -o jsonpath='{$.data.token}' | base64 -d | sed $'s/$/\\\n/g')
+
+az connectedk8s proxy -n $arc_name -g $arc_rg --token $k8s_token
+kubectl get pods
+
+
+#########
+#  AAD  #
+#########
+
+# https://docs.microsoft.com/azure/azure-arc/kubernetes/azure-rbac
+# Admin privilege required at the AAD tenant level
+
+###################
+# Custom location #
+###################
+
+# You need to be in default namespace!
+
+# Az CLI extension customlocation
+extension_name=customlocation
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+if [[ -z "$extension_version" ]]
+then
+    echo "Azure CLI extension $extension_name not found, installing now..."
+    az extension add -n $extension_name
+else
+    echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
+    az extension update -n $extension_name
+fi
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+echo "Azure CLI extension $extension_name installed with version $extension_version"
+
+# Custom location
+az connectedk8s enable-features -n $arc_name -g $arc_rg --features cluster-connect custom-locations
+extension_name=customLocation
+az k8s-extension create --name $extension_name --extension-type microsoft.arcdataservices \
+    --cluster-type connectedClusters -c $arc_name -g $arc_rg --scope cluster --release-namespace arc \
+    --config Microsoft.CustomLocation.ServiceAccount=sa-bootstrapper
+extension_id=$(az k8s-extension show --name $extension_name --cluster-type connectedClusters -c $arc_name -g $arc_rg  --query id -o tsv) && echo $extension_id
+az customlocation create -n micasa -g $arc_rg --namespace arc --host-resource-id $arc_id --cluster-extension-ids $extension_id
+
+# Diagnostics
+az customlocation list -o table
+az customlocation list-enabled-resource-types -n micasa -g $arc_rg -o table
 
 ###########
 # Cleanup #

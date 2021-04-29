@@ -22,7 +22,8 @@ function deny_ssh () {
         else
             ssh_nsg_name=$(basename $ssh_nsg_id)
             echo "Adding SSH-deny rule to NSG $ssh_nsg_name for VM $ssh_vm_name in RG $ssh_rg..."
-            az network nsg rule create -n $rule_name --nsg-name $ssh_nsg_name -g $ssh_rg --priority $rule_prio --destination-port-ranges 22 --access Deny --protocol Tcp -o none
+            az network nsg rule create -n "${rule_prefix}SSH" --nsg-name $ssh_nsg_name -g $ssh_rg --priority $rule_prio --destination-port-ranges 22 --access Deny --protocol Tcp -o none
+            az network nsg rule create -n "${rule_prefix}RDP" --nsg-name $ssh_nsg_name -g $ssh_rg --priority $(($rule_prio+1)) --destination-port-ranges 3389 --access Deny --protocol Tcp -o none
         fi
     done <<< "$vm_list"
 }
@@ -41,7 +42,8 @@ function allow_ssh () {
         else
             ssh_nsg_name=$(basename $ssh_nsg_id)
             echo "Adding SSH-allow rule to NSG $ssh_nsg_name for VM $ssh_vm_name in RG $ssh_rg..."
-            az network nsg rule create -n $rule_name --nsg-name $ssh_nsg_name -g $ssh_rg --priority $rule_prio --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+            az network nsg rule create -n "${rule_prefix}SSH" --nsg-name $ssh_nsg_name -g $ssh_rg --priority $rule_prio --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+            az network nsg rule create -n "${rule_prefix}RDP" --nsg-name $ssh_nsg_name -g $ssh_rg --priority $(($rule_prio+1)) --destination-port-ranges 3389 --access Allow --protocol Tcp -o none
         fi
     done <<< "$vm_list"
 }
@@ -60,13 +62,14 @@ function delete_ssh_rule () {
         else
             ssh_nsg_name=$(basename $ssh_nsg_id)
             echo "Deleting SSH-allow rule from NSG $ssh_nsg_name for VM $ssh_vm_name in RG $ssh_rg..."
-            az network nsg rule delete -n $rule_name --nsg-name $ssh_nsg_name -g $ssh_rg -o none
+            az network nsg rule delete -n "${rule_prefix}SSH" --nsg-name $ssh_nsg_name -g $ssh_rg -o none
+            az network nsg rule delete -n "${rule_prefix}RDP" --nsg-name $ssh_nsg_name -g $ssh_rg -o none
         fi
     done <<< "$vm_list"
 }
 
 # Variables
-rule_name=autoSSH
+rule_prefix=auto
 rule_prio=100
 
 # Get arguments
