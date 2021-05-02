@@ -1,0 +1,156 @@
+########################################################
+# Script to deploy VMs and generate traffic between them.
+# NSG flow logs and Traffic Analytics can be used to 
+#    explore the traffic flows
+#
+# Jose Moreno
+# May 2021
+########################################################
+
+# Variables
+rg=flowlogs
+location=westeurope
+vnet_name=flowlogs
+vnet_prefix=192.168.0.0/16
+subnet_name=vm
+subnet_prefix=192.168.1.0/24
+nsg_name=flowlogs
+cloudinit_file="/tmp/cloudinit.txt"
+vm_size=Standard_B1s
+no_of_vms=4
+flows="1;2:3;4:1433:1000,1:2:80:100,3:4:443:100"  # Syntax: src:dst:port:kb/min
+
+# Some helper functions
+
+# Converts a list to a shell array
+function convert_string_to_array () {
+    # Default to comma as separator
+    if [[ -n $2 ]]
+    then
+        separator=$2
+    else
+        separator=','
+    fi
+    # Different syntax for bash and zsh
+    if [ -n "$BASH_VERSION" ]; then
+        arr_opt=a
+    elif [ -n "$ZSH_VERSION" ]; then
+        arr_opt=A
+    fi
+    # Do the split into array
+    IFS=$separator read -r"${arr_opt}" myarray <<< "$1"
+    echo "${myarray[@]}"
+}
+
+
+# Create RG, Vnet, NSG
+az group create -n $rg -l $location
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $subnet_name --subnet-prefix $subnet_prefix -l $location
+az network nsg create -n $nsg_name -g $rg -l $location
+az network nsg rule create -n allowSSHin --nsg-name $nsg_name -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
+
+# Create Log Analytics workspace
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
+if [[ -z "$logws_name" ]]
+then
+    logws_name=log$RANDOM
+    az monitor log-analytics workspace create -n $logws_name -g $rg
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+
+# Create storage account
+storage_account_name=$(az storage account list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the storage account name if it already existed
+if [[ -z "$storage_account_name" ]]
+then
+    storage_account_name=log$RANDOM
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location
+fi
+
+# Enable flow logs
+az network watcher flow-log create -l $location -n "flowlog-$location" -g $rg \
+    --nsg $nsg_name --storage-account $storage_account_name --log-version 2 --retention 7 \
+    --workspace $logws_id --interval 10 --traffic-analytics true
+
+# Generate cloudinit file to create VMs
+cat <<EOF > $cloudinit_file
+#cloud-config
+packages:
+  - jq
+  - pv
+EOF
+
+# Create VMs
+for i in {1..$no_of_vms}
+do
+    vm_name="vm$(printf "%02d" i)"
+    az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_size \
+    --vnet-name $vnet_name --subnet $subnet_name --public-ip-address "${vm_name}-pip" --nsg $nsg_name \
+    --custom-data $cloudinit_file -l $location --no-wait
+done
+
+# Wait some seconds and create JSON with required IPs
+sleep 60
+ip_json=$(az vm list-ip-addresses -g $rg -o json)
+
+# Get the private IP of a specific VM out of the output of the command "az vm list-ip-addresses"
+function get_private_ip () {
+    echo $1 | jq -r '.[] | select(.virtualMachine.name == "'$2'") | .virtualMachine.network.privateIpAddresses[0]'
+}
+
+# Get the public IP of a specific VM out of the output of the command "az vm list-ip-addresses"
+function get_public_ip () {
+    echo $1 | jq -r '.[] | select(.virtualMachine.name == "'$2'") | .virtualMachine.network.publicIpAddresses[0].ipAddress'
+}
+
+# Start traffic generation
+flows_array=($(convert_string_to_array $flows ','))
+for flow in "${flows_array[@]}"
+do
+    # echo "Processing flow $flow..."
+    sources=$(echo $flow | cut -d':' -f 1)
+    destinations=$(echo $flow | cut -d':' -f 2)
+    port=$(echo $flow | cut -d':' -f 3)
+    kb_min=$(echo $flow | cut -d':' -f 4)
+    src_array=($(convert_string_to_array $sources ';'))
+    dst_array=($(convert_string_to_array $destinations ';'))
+    for dst in $dst_array; do
+        # Start nc listening on port for destination
+        dst_vm_name="vm$(printf "%02d" $dst)"
+        dst_pip=$(get_public_ip $ip_json "$dst_vm_name")
+        dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
+        echo "Running \"nc -dlk -p ${port}\" on ${dst_vm_name}, ${dst_pip}"
+        ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "nc -dlk -p $port > /dev/null &"
+        for src in $src_array; do
+            # Configure crontab entry to send traffic every minute
+            src_vm_name="vm$(printf "%02d" $src)"
+            src_pip=$(get_public_ip $ip_json "$src_vm_name")
+            cmd='(crontab -l 2>/dev/null; echo "* * * * * dd if=/dev/urandom bs=1000 count='${kb_min}' | pv -L 10M | nc '${dst_ip}' '${port}'") | crontab -'
+            echo "Adding crontab entry for ${src_vm_name}, ${src_pip}"
+            ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "$cmd"
+        done
+    done
+done
+
+# Diagnostics
+src_vm_name=vm01
+dst_vm_name=vm03
+port=1433
+src_pip=$(get_public_ip $ip_json "$src_vm_name")
+dst_pip=$(get_public_ip $ip_json "$dst_vm_name")
+dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "crontab -l | grep \"$dst_ip $port\""
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "nc -vz $dst_ip $port"
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "ps -ef | grep \"nc -dlk -p $port\" | grep -v grep"
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "sudo netstat -tunlp | grep \":$port\""
+
+# Simulate port scan
+src_vm_name=vm01
+port=22
+src_pip=$(get_public_ip $ip_json "$src_vm_name") && echo $pip
+for i in {1..$no_of_vms}
+do
+    dst_vm_name="vm$(printf "%02d" i)"
+    dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
+    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "nc -vz $dst_ip $port"
+done

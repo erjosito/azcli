@@ -1,0 +1,105 @@
+
+# Check subscription (only whitelisted subs will work)
+az account set -s bb0a98e0-34e3-40d1-856f-899c5203df01
+
+# Deploy NVA in Virtual Hub
+nva_name=josenva
+nva_rg=josenva
+nva_location=westcentralus
+gnva_cloudinit="/tmp/nva-cloudinit.txt"
+username=$(whoami)
+public_ssh_key=$(more ~/.ssh/id_rsa.pub)
+hub_id=$(az network vhub list --query '[0].id' -o tsv) && echo $hub_id
+# RG
+az group create -n $nva_rg -l $nva_location
+# NVA
+cat <<EOF > $gnva_cloudinit
+#!/bin/bash
+useradd -m $username
+echo "$username:Microsoft123!" | chpasswd $username
+EOF
+cat <<EOF > $gnva_cloudinit
+#cloud-config
+users:
+  - default
+  - name: $username
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh-authorized-keys:
+     - $public_ssh_key
+packages:
+  - jq
+EOF
+# base64_cloudinit=$(cat $gnva_cloudinit | python3 -c 'import json, sys; print( json.dumps( sys.stdin.read() ) )' | base64)
+base64_cloudinit=$(cat $gnva_cloudinit | python3 -c 'import json, sys; print( json.dumps( sys.stdin.read() ) )')
+# base64_cloudinit=$(cat $gnva_cloudinit | base64 -w 0)
+base64_cloudinit="#!/bin/bash\n/opt/phion/bin/cloud-enable-ssh --password\necho \"root:<test>\" | /sbin/chpasswd -c SHA256\nchattr +i /etc/shadow\nchattr +i /etc/ssh/sshd_config\n"
+base64_cloudinit=$(echo "#cloud-config\nusers:\n  - default\n  - name: jose\n    sudo: ['ALL=(ALL) NOPASSWD:ALL']\n    ssh-authorized-keys:\n     - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDTYGLUfzU9cQcTKj8bhuM2va5eIddQsVg+/lzQuYk38mgjSX9pxFEtwLJ+97+M7Xmq5b+L2jbQsMgohIpZcP4WGMWPr28m/utJU6inSrtXpUk99DE99btAN32q7U4dOLLkzYR7TBKXm1G9CdNIMQIjs6CmnELwhJRHDPfEKEKrj4XXkamoowjJIjCM9FnlEW/pgtuF5YMkZcfk3K+DtxZ2S2urGrIZRSc9lFA8xzoAnZDmvbwExlqg7TlXUdmiSlpNGC0OdsxbefftuHY73Qu+Lm3oXh/WBnM3xof4GOXrFLQxhbd0VrDMxdxpxDEfp8+F1fVRXMLmcEDs8SIgqGW7\npackages:\n  - jq\n" | base64)
+base64_cloudinit=$(echo '#!/bin/bash\nuseradd -m jose\necho "jose:Microsoft123!" | chpasswd \n' | base64)
+az network virtual-appliance create -n $nva_name -g $nva_rg \
+     --scale-unit 2 \
+     --vendor Contoso_generic_test_nva \
+     --version latest \
+     --vhub $hub_id \
+     --asn 65100 \
+     --init-config "$base64_cloudinit" \
+     --tags tagExample="xyz"
+# Diagnostics
+az network virtual-appliance list --query '[].{Name:name,ResourceGroup:resourceGroup,ProvisioningState:provisioningState,AddressPrefix:addressPrefix}' -o table
+pip1=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
+pip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
+az network virtual-appliance show -n $nva_name -g $nva_rg --query cloudInitConfiguration -o tsv
+# SSH
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "ip a"
+# Cleanup
+az network virtual-appliance delete -n $nva_name -g $nva_rg -y
+
+# Test: create VMSS with cloudinit that adds a new user
+vmss_name=jose-vmss
+vmss_rg=jose-vmss-rg
+vmss_location=westcentralus
+gnva_cloudinit="/tmp/nva-cloudinit.txt"
+username=$(whoami)
+public_ssh_key=$(more ~/.ssh/id_rsa.pub)
+az group create --name $vmss_rg --location $vmss_location
+cat <<EOF > $gnva_cloudinit
+#cloud-config
+packages:
+  - jq
+runcmd:
+  - pwconv
+  - useradd -m $username
+  - echo "$username:Microsoft123!" | chpasswd $username
+EOF
+az vmss create \
+   --resource-group $vmss_rg \
+   --name $vmss_name \
+   --custom-data $gnva_cloudinit \
+   --authentication-type password \
+   --admin-username azadmin \
+   --admin-password 'Microsoft123!' \
+   --image "/subscriptions/bb0a98e0-34e3-40d1-856f-899c5203df01/resourceGroups/g_nva-image/providers/Microsoft.Compute/galleries/g_nva_gallery/images/g_nva/versions/0.1.0"
+# Connect
+cx_string=$(az vmss list-instance-connection-info -n $vmss_name -g $vmss_rg --query '"instance 1"' -o tsv)
+ip=$(echo $cx_string | cut -d: -f 1) && echo $ip
+port=$(echo $cx_string | cut -d: -f 2) && echo $port
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$ip" -p "$port" "ip a"
+# curl -H Metadata:true --noproxy "*" "http://169.254.169.254/metadata/instance?api-version=2020-09-01"
+# name=$(curl -s -H Metadata:true --noproxy "*" "http://169.254.169.254/metadata/instance?api-version=2020-09-01" | jq -r '.compute.name')
+# id=$(echo "${name: -1}")
+# Cleanup
+az vmss delete -n $vmss_name -g $vmss_rg
+
+
+# Some REST calls
+subscription_id=$(az account show --query id -o tsv)
+api_version=2020-05-01
+hub_rg=$(az network vhub list --query '[0].resourceGroup' -o tsv) && echo $hub_rg
+# List NVA SKUs (not working: NOT FOUND)
+url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs?api-version=${api_version}" 
+az rest --method GET --url $url
+# Show NVA SKU (not working: NOT FOUND)
+url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs/Contoso_generic_test_nva?api-version=${api_version}" 
+az rest --method GET --url $url
+# Show NVA
+url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualAppliances/${nva_name}?api-version=${api_version}" 
+az rest --method GET --url $url
