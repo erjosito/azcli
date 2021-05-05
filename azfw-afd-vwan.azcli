@@ -365,6 +365,15 @@ bad_file="/tmp/badfile"
 echo 'uid=0(root) gid=0(root) groups=0(root)' >$bad_file
 curl -k -F "data=@${bad_file}" "http://${azfw_fqdn}:8080/api/filesize"
 
+
+# Other bad files, check https://github.com/wicar/malware.wicar.org/tree/master/data
+bad_file="/tmp/badfile"
+# bad_file_url=https://raw.githubusercontent.com/wicar/malware.wicar.org/master/data/adobe_flash_hacking_team_uaf.html
+# bad_file_url=https://github.com/wicar/malware.wicar.org/raw/master/data/vlc_amv.amv
+bad_file_url=https://raw.githubusercontent.com/wicar/malware.wicar.org/master/data/ms10_090_ie_css_clip_ie6.html
+wget -q $bad_file_url -O $bad_file
+curl -k -F "data=@${bad_file}" "https://${appgw_fqdn}/api/filesize"
+
 ######################
 # Deploy DNS server  #
 ######################

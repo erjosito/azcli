@@ -170,6 +170,13 @@ az network firewall policy rule-collection-group collection rule add --policy-na
 # az network firewall policy rule-collection-group collection rule remove --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
 #     --collection-name NetworkTraffic --name permit8080
 
+# Disable lower case header IDPS signatures in AzFW
+az network firewall policy intrusion-detection add --policy-name $azfw_policy_name -g $rg --mode Off --signature-id 2845390
+az network firewall policy intrusion-detection add --policy-name $azfw_policy_name -g $rg --mode Off --signature-id 2845391
+# Disable signatures for ifconfig.co
+az network firewall policy intrusion-detection add --policy-name $azfw_policy_name -g $rg --mode Off --signature-id 2834195
+az network firewall policy intrusion-detection add --policy-name $azfw_policy_name -g $rg --mode Off --signature-id 2013028
+
 # DNAT rules for the test VM
 az network firewall policy rule-collection-group collection add-nat-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name NATSSL --collection-priority 110 --action DNAT --rule-name DnatSSL --description "Permit intra-vnet ICMP traffic" \
@@ -274,14 +281,6 @@ else
 fi
 vm_fqdn="${vm_dns_name}.${public_domain}" && echo $vm_fqdn
 curl -k "https://${vm_fqdn}/api/healthcheck"
-
-# Test file uploads
-test_file="/tmp/testfile"
-echo $(tr -dc a-zA-Z0-9 </dev/urandom 2>/dev/null| head -c 25) >$test_file
-curl -k -F "data=@${test_file}" "https://${vm_fqdn}/api/filesize"
-bad_file="/tmp/badfile"
-wget "https://secure.eicar.org/eicar.com" -O $bad_file
-curl -k -F "data=@${bad_file}" "https://${vm_fqdn}/api/filesize"
 
 ######################
 # Deploy App Gateway #
@@ -401,6 +400,31 @@ fi
 # Verify access to the app over the App Gateway
 appgw_fqdn="${appgw_dns_name}.${public_domain}" && echo $vm_fqdn
 curl -k "https://${appgw_fqdn}/api/healthcheck"
+
+########################
+#     File Uploads     #
+########################
+
+# Verify IDPS is blocking traffic
+curl -A "BlackSun" -k "https://${appgw_fqdn}/api/healthcheck"
+
+# Test file upload - legit file
+test_file="/tmp/testfile"
+echo $(tr -dc a-zA-Z0-9 </dev/urandom 2>/dev/null| head -c 25) >$test_file
+curl -k -F "data=@${test_file}" "https://${appgw_fqdn}/api/filesize"
+
+# Test file upload - bad file (should be blocked)
+bad_file="/tmp/badfile"
+echo 'uid=0(root) gid=0(root) groups=0(root)' >$bad_file
+curl -k -F "data=@${bad_file}" "https://${appgw_fqdn}/api/filesize"
+
+# Other bad files, check https://github.com/wicar/malware.wicar.org/tree/master/data
+# bad_file_url="https://secure.eicar.org/eicar.com"
+# bad_file_url=https://raw.githubusercontent.com/wicar/malware.wicar.org/master/data/adobe_flash_hacking_team_uaf.html
+# bad_file_url=https://github.com/wicar/malware.wicar.org/raw/master/data/vlc_amv.amv
+bad_file_url=https://raw.githubusercontent.com/wicar/malware.wicar.org/master/data/ms10_090_ie_css_clip_ie6.html
+wget -q $bad_file_url -O $bad_file
+curl -k -F "data=@${bad_file}" "https://${appgw_fqdn}/api/filesize"
 
 ########################
 # Query AzMonitor logs #

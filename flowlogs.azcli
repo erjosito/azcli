@@ -154,3 +154,4 @@ do
     dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
     ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "nc -vz $dst_ip $port"
 done
+
