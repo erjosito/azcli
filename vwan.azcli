@@ -48,7 +48,7 @@ branch2_vm_subnet=172.22.0.64/26
 # Start: create RT
 az group create -n $rg -l $location1
 
-# vwan and hubs
+# VWan and hubs
 az network vwan create -n $vwan -g $rg -l $location1 --branch-to-branch-traffic true --type Standard
 az network vhub create -n hub1 -g $rg --vwan $vwan -l $location1 --address-prefix $vwan_hub1_prefix
 az network vhub create -n hub2 -g $rg --vwan $vwan -l $location2 --address-prefix $vwan_hub2_prefix
