@@ -644,7 +644,7 @@ useradd -m $username
 echo "$username:Microsoft123!" | chpasswd $username
 usermod -aG sudo $username
 host_name=\$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2020-09-01" | jq -r '.compute.name')
-if [[ "\${HOSTNAME: -1}" == "0" ]]; then echo "\${host_name}-0123456789" > ~/license.txt; else echo "\${host_name}-9876543210" > ~/license.txt; fi
+if [[ "\${HOSTNAME: -1}" == "0" ]]; then echo "0123456789" > ~/license.txt; else echo "9876543210" > ~/license.txt; fi
 EOF
 
 

@@ -258,7 +258,145 @@ aro_id=$(az aro show -n $cluster_name -g $rg --query id -o tsv) && echo $aro_id
 curl -o /tmp/enable-monitoring.sh -L https://aka.ms/enable-monitoring-bash-script
 bash /tmp/enable-monitoring.sh --resource-id $aro_id --workspace-id $logws_id
 
+######################
+#    Pod identity    #
+######################
 
+# Option 1: using managed identity
+# ================================
+
+# Create managed identity
+id_name=podid
+id_id=$(az identity show -n $id_name -g $rg --query id -o tsv 2>/dev/null)
+if [[ -z "$id_id" ]]
+then
+    echo "Creating identity ${id_name}..."
+    az identity create -n $id_name -g $rg
+    id_id=$(az identity show -n $id_name -g $rg --query id -o tsv 2>/dev/null)
+fi
+id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
+id_client_id="$(az identity show -g $rg -n $id_name --query clientId -o tsv)"
+
+# Add permissions for Managed Identity (NOT WORKING)
+# az login --service-principal -u $sp_app_id -p $sp_app_secret --tenant $tenant_id   # Tried both with sub owner and with ARO SP
+az role assignment create --role "Managed Identity Operator" --assignee "${id_principal_id}" --scope "/subscriptions/${subscription_id}/resourcegroups/${cluster_rg}"
+az role assignment create --role "Virtual Machine Contributor" --assignee "${id_principal_id}" --scope "/subscriptions/${subscription_id}/resourcegroups/${cluster_rg}"
+az role assignment create --role "Managed Identity Operator" --assignee "${id_principal_id}" --scope "/subscriptions/${subscription_id}/resourcegroups/${rg}"
+
+# Add helm chart, get some variables
+helm repo add aad-pod-identity https://raw.githubusercontent.com/Azure/aad-pod-identity/master/charts
+subscription_id=$(az account show --query id -o tsv)
+tenant_id=$(az account show --query tenantId -o tsv)
+
+# Deploy helm chart for managed identity
+# See https://azure.github.io/aad-pod-identity/docs/configure/deploy_in_openshift/
+helm delete aad-pod-identity # If there was a previous instance of the helm chart
+helm install aad-pod-identity aad-pod-identity/aad-pod-identity \
+    --set adminsecret.cloud=AzurePublicCloud \
+    --set "adminsecret.subscriptionID=$subscription_id" \
+    --set "adminsecret.resourceGroup=$cluster_rg" \
+    --set adminsecret.vmType=vmss \
+    --set "adminsecret.tenantID=$tenant_id" \
+    --set adminsecret.clientID=msi \
+    --set adminsecret.clientSecret=msi \
+    --set-string adminsecret.useMSI=true \
+    --set "adminsecret.userAssignedMSIClientID=$id_client_id"
+
+# Option 2: using SP (the same as for cluster creation)
+# =====================================================
+
+# Add permissions for SP (NOT WORKING)
+# az login --service-principal -u $sp_app_id -p $sp_app_secret --tenant $tenant_id   # Tried both with sub owner and with ARO SP
+sp_object_id=$(az ad sp show --id $sp_app_id --query objectId -o tsv) && echo $sp_object_id
+az role assignment create --role "Managed Identity Operator" --assignee "${sp_object_id}" --scope "/subscriptions/${subscription_id}/resourcegroups/${cluster_rg}"
+az role assignment create --role "Virtual Machine Contributor" --assignee "${sp_object_id}" --scope "/subscriptions/${subscription_id}/resourcegroups/${cluster_rg}"
+az role assignment create --role "Managed Identity Operator" --assignee "${sp_object_id}" --scope "/subscriptions/${subscription_id}/resourcegroups/${rg}"
+
+# Add helm chart, get some variables
+helm repo add aad-pod-identity https://raw.githubusercontent.com/Azure/aad-pod-identity/master/charts
+subscription_id=$(az account show --query id -o tsv)
+tenant_id=$(az account show --query tenantId -o tsv)
+
+# Deploy helm chart for SP
+# See https://azure.github.io/aad-pod-identity/docs/configure/deploy_in_openshift/
+helm delete aad-pod-identity # If there was a previous instance of the helm chart
+helm install aad-pod-identity aad-pod-identity/aad-pod-identity \
+    --set adminsecret.cloud=AzurePublicCloud \
+    --set "adminsecret.subscriptionID=$subscription_id" \
+    --set "adminsecret.resourceGroup=$cluster_rg" \
+    --set adminsecret.vmType=vmss \
+    --set "adminsecret.tenantID=$tenant_id" \
+    --set "adminsecret.clientID=$sp_app_id" \
+    --set "adminsecret.clientSecret=$sp_app_secret" \
+    --set-string adminsecret.useMSI=false \
+    --set "adminsecret.userAssignedMSIClientID=$id_client_id"
+
+# Test
+# ====
+
+# Create sample identity
+sampleid_name=podidsample
+sampleid_id=$(az identity show -n $sampleid_name -g $rg --query id -o tsv 2>/dev/null)
+if [[ -z "$sampleid_id" ]]
+then
+    echo "Creating identity ${sampleid_name}..."
+    az identity create -n $sampleid_name -g $rg
+    sampleid_id=$(az identity show -n $sampleid_name -g $rg --query id -o tsv 2>/dev/null)
+fi
+sampleid_principal_id=$(az identity show -n $sampleid_name -g $rg --query principalId -o tsv)
+sampleid_client_id="$(az identity show -g $rg -n $sampleid_name --query clientId -o tsv)"
+az keyvault set-policy -n "$keyvault_name" --object-id "$sampleid_principal_id" --secret-permissions get list
+# Create AzureIdentity resource
+cat <<EOF | kubectl apply -f -
+apiVersion: "aadpodidentity.k8s.io/v1"
+kind: AzureIdentity
+metadata:
+  name: ${sampleid_name}
+spec:
+  type: 0
+  resourceID: ${sampleid_id}
+  clientID: ${sampleid_client_id}
+EOF
+# Create AzureIdentityBinding resource
+cat <<EOF | kubectl apply -f -
+apiVersion: "aadpodidentity.k8s.io/v1"
+kind: AzureIdentityBinding
+metadata:
+  name: ${sampleid_name}-binding
+spec:
+  azureIdentity: ${sampleid_name}
+  selector: ${sampleid_name}
+EOF
+# Deploy pod
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo
+  labels:
+    aadpodidbinding: $sampleid_name
+spec:
+  containers:
+  - name: demo
+    image: mcr.microsoft.com/oss/azure/aad-pod-identity/demo:v1.8.0
+    args:
+      - --subscription-id=${subscription_id}
+      - --resource-group=${rg}
+      - --identity-client-id=${sampleid_client_id}
+  nodeSelector:
+    kubernetes.io/os: linux
+EOF
+# Alternatively, run another simple demo pod like this
+# kubectl run azure-cli -it --image=mcr.microsoft.com/azure-cli --labels=aadpodidbinding=$sampleid_name /bin/bash
+# within the azure-cli shell
+# az login --identity --allow-no-subscriptions --debug
+
+# Troubleshoot
+kubectl --namespace=default get pods -l "app.kubernetes.io/component=mic" -o wide
+kubectl --namespace=default get pods -l "app.kubernetes.io/component=nmi" -o wide
+kubectl --namespace=default get pods -l "aadpodidbinding=$sampleid_name" -o wide
+kubectl --namespace=default describe pods -l "aadpodidbinding=$sampleid_name"
+kubectl logs demo
 
 ##################################
 #      Deploy second router      #

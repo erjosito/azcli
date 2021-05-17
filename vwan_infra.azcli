@@ -208,6 +208,9 @@ az network vnet peering create -n 242to24 -g $rg --vnet-name spoke242-${location
 az network vnet peering create -n 24to241 -g $rg --vnet-name spoke24-${location2} --remote-vnet spoke241-${location2} --allow-vnet-access --allow-forwarded-traffic
 az network vnet peering create -n 24to242 -g $rg --vnet-name spoke24-${location2} --remote-vnet spoke242-${location2} --allow-vnet-access --allow-forwarded-traffic
 
+# SNAT config for iptables
+# sudo iptables -t nat -A POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE
+
 # Create CSR to simulate branch1
 az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} \
     --admin-password $password --authentication-type all --admin-username $username --nsg $nsg1_name --size $nva_size \
@@ -318,7 +321,7 @@ monitor_name=spoke141-$location1
 test_name=spoke141
 az network watcher connection-monitor create -n $monitor_name -g $rg -l $location1 \
     --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type AzureVM \
-    --endpoint-source-resource-id $spoke141_vm_id --endpoint-source-name spoke11 \
+    --endpoint-source-resource-id $spoke141_vm_id --endpoint-source-name spoke141 \
     --endpoint-dest-resource-id $branch2_vm_id --endpoint-dest-name branch2 \
     --test-config-name HttpConfig --protocol Http \
     --http-method GET --https-prefer false --http-path '/'
@@ -385,3 +388,22 @@ az network watcher connection-monitor endpoint add --connection-monitor $monitor
 az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location1 \
     --resource-id $spoke242_vm_id --name spoke242 --type AzureVM --dest-test-groups $test_name
 
+# Get info for VPN connections
+# hub1
+hub1_name
+# vpngw1_name=$(az network vhub list --query '[].[select(contains(location,$location1))]')
+vpngw1_config=$(az network vpn-gateway show -n $vpngw1_name -g $rg)
+vpngw1_gw0_pip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]')
+vpngw1_gw1_pip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]')
+vpngw1_gw0_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
+vpngw1_gw1_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
+vpngw1_bgp_asn=$(echo $vpngw1_config | jq -r '.bgpSettings.asn')  # This is today always 65515
+echo "Extracted info for hubvpn1: Gateway0 $vpngw1_gw0_pip, $vpngw1_gw0_bgp_ip. Gateway1 $vpngw1_gw1_pip, $vpngw1_gw1_bgp_ip. ASN $vpngw1_bgp_asn"
+# hub2
+vpngw2_config=$(az network vpn-gateway show -n $vpngw2_name -g $rg)
+vpngw2_gw0_pip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]')
+vpngw2_gw1_pip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]')
+vpngw2_gw0_bgp_ip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
+vpngw2_gw1_bgp_ip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
+vpngw2_bgp_asn=$(echo $vpngw2_config | jq -r '.bgpSettings.asn')  # This is today always 65515
+echo "Extracted info for hubvpn2: Gateway0 $vpngw2_gw0_pip, $vpngw2_gw0_bgp_ip. Gateway1 $vpngw2_gw1_pip, $vpngw2_gw1_bgp_ip. ASN $vpngw2_bgp_asn"
