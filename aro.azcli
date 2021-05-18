@@ -23,6 +23,8 @@ ilb_subnet_name=apps
 ilb_subnet_prefix=192.168.0.128/28
 anf_subnet_name=anf
 anf_subnet_prefix=192.168.0.192/27
+anf_name=anf$RANDOM
+anf_location=$location
 master_vm_size=Standard_D8s_v3
 worker_vm_size=Standard_D4s_v3
 worker_vm_count=3
@@ -257,6 +259,132 @@ logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg
 aro_id=$(az aro show -n $cluster_name -g $rg --query id -o tsv) && echo $aro_id
 curl -o /tmp/enable-monitoring.sh -L https://aka.ms/enable-monitoring-bash-script
 bash /tmp/enable-monitoring.sh --resource-id $aro_id --workspace-id $logws_id
+
+
+#####################
+#    Azure Files    #
+#####################
+
+# Variables
+sc_name=myazfiles
+pvc_name=myshare
+app_name=azfilespod
+
+# Create SC
+cat <<EOF | kubectl apply -f -
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: $sc_name
+provisioner: kubernetes.io/azure-file
+mountOptions:
+  - dir_mode=0777
+  - file_mode=0777
+  - uid=0
+  - gid=0
+  - mfsymlinks
+  - cache=strict
+  - actimeo=30
+parameters:
+  skuName: Standard_LRS
+  location: $location
+EOF
+
+# To prevent error: User "system:serviceaccount:kube-system:persistent-volume-binder" cannot create resource "secrets" in API group "" in the namespace "default"
+# See https://bugzilla.redhat.com/show_bug.cgi?id=1575933
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: system:controller:persistent-volume-binder
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: system:controller:persistent-volume-binder
+subjects:
+- kind: ServiceAccount
+  name: persistent-volume-binder
+EOF
+oc policy add-role-to-user admin system:serviceaccount:kube-system:persistent-volume-binder -n default
+
+# Create PVC
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: $pvc_name
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: $sc_name
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+
+# Create pod
+cat <<EOF | kubectl apply -f -
+kind: Pod
+apiVersion: v1
+metadata:
+  name: $app_name
+  labels:
+    app: $app_name
+spec:
+  containers:
+  - name: $app_name
+    image: erjosito/sqlapi:1.0
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+    ports:
+      - containerPort: 8080
+    volumeMounts:
+    - mountPath: "/mnt/azure"
+      name: volume
+  volumes:
+    - name: volume
+      persistentVolumeClaim:
+        claimName: $pvc_name
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: $app_name
+  name: $app_name
+spec:
+  ports:
+  - port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: $name
+  type: LoadBalancer
+EOF
+
+# Diagnostics
+secret_name=$(k get pv -o json | jq -r '.items[0].spec.azureFile.secretName') && echo $secret_name
+storage_account_name=$(echo $secret_name | cut -d- -f 4) && echo $storage_account_name
+share_name=$(k get pv -o json | jq -r '.items[0].spec.azureFile.shareName') && echo $share_name
+az storage account show -g $cluster_rg -n $storage_account_name -o table
+storage_account_key=$(az storage account keys list -n $storage_account_name -g $cluster_rg --query '[0].value' -o tsv)  # Doesnt work, no privilege
+storage_account_name=$(k get secret $secret_name -o json | jq -r '.data.azurestorageaccountname' | base64 -d) && echo $storage_account_name
+storage_account_key=$(k get secret $secret_name -o json | jq -r '.data.azurestorageaccountkey' | base64 -d)
+az storage share list --account-name $storage_account_name --account-key $storage_account_key -o table
+k get sc
+k get pvc
+k describe pvc/$pvc_name
+k get pv
+k describe pv
+k describe pod/$app_name
+k exec $app_name -- bash -c 'ls -ald /mnt/*'
+k exec -it $app_name -- bash
 
 ######################
 #    Pod identity    #
@@ -541,6 +669,188 @@ then
   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "ping myserver.onprem.contoso.com -c 1"
   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip_ip" "curl -s http://{$app_url}/api/dns?fqdn=myserver.onprem.contoso.com"
 fi
+
+
+#################
+#    Trident    #
+#################
+
+# Install tridentctl
+tridentctl_binary=$(which tridentctl)
+if [[ "$tridentctl_binary" == "tridentctl not found" ]]
+then
+    echo "Downloading and installing tridentctl executable..."
+    tridentctl_tmp=/tmp/tridentctl.tar.gz
+    wget https://github.com/NetApp/trident/releases/download/v21.04.0/trident-installer-21.04.0.tar.gz -O $tridentctl_tmp
+    tar xfvz $tridentctl_tmp -C /tmp/
+    sudo cp /tmp/trident-installer/tridentctl /usr/local/bin
+fi
+
+# Create ANF pool
+az netappfiles account create -g $rg -n $anf_name -l $anf_location
+az netappfiles pool create -g $rg -a $anf_name -n $anf_name -l $anf_location --size 4 --service-level Standard
+anf_account_id=$(az netappfiles account show -n $anf_name -g $rg --query id -o tsv)
+az role assignment create --scope $anf_account_id --assignee $sp_app_id --role 'Contributor'
+
+# Deploy Helm chart
+trident_ns=trident
+if [[ -e "/tmp/trident-installer/helm/trident-operator-21.04.0.tgz" ]]
+then
+    helm install trident /tmp/trident-installer/helm/trident-operator-21.04.0.tgz --namespace $trident_ns --create-namespace
+else
+    echo "Helm chart not found"
+fi
+sleep 30
+tridentctl -n $trident_ns version
+
+# Create backend
+trident_backend_file=/tmp/trident_backend.json
+subscription_id=$(az account show --query id -o tsv)
+tenant_id=$(az account show --query tenantId -o tsv)
+cat <<EOF > $trident_backend_file
+{
+  "version": 1,
+  "storageDriverName": "azure-netapp-files",
+  "subscriptionID": "$subscription_id",
+  "tenantID": "$tenant_id",
+  "clientID": "$sp_app_id",
+  "clientSecret": "$sp_app_secret",
+  "location": "$anf_location",
+  "serviceLevel": "Standard",
+  "virtualNetwork": "$vnet_name",
+  "subnet": "$anf_subnet_name",
+  "nfsMountOptions": "vers=3,proto=tcp,timeo=600",
+  "limitVolumeSize": "500Gi",
+  "defaults": {
+    "exportRule": "0.0.0.0/0",
+    "size": "200Gi"
+  }
+}
+EOF
+tridentctl -n $trident_ns create backend -f $trident_backend_file
+
+# Storage class
+# https://github.com/seanluce/ANF_Trident_AKS
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: azurenetappfiles
+provisioner: netapp.io/trident
+parameters:
+  backendType: "azure-netapp-files"
+EOF
+
+# PVC
+# https://github.com/seanluce/ANF_Trident_AKS
+cat <<EOF | kubectl apply -f -
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: azurenetappfiles
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: azurenetappfiles
+EOF
+
+# Deployment
+# https://github.com/seanluce/ANF_Trident_AKS
+name=api
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $name
+  labels:
+    app: $name
+    deploymethod: trident
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: $name
+  template:
+    metadata:
+      labels:
+        app: $name
+        deploymethod: trident
+    spec:
+      containers:
+      - name: $name
+        #image: nginx:1.14.2
+        image: erjosito/sqlapi:1.0
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: disk01
+          #mountPath: /usr/share/nginx/html
+          mountPath: /mnt/disk
+      volumes:
+      - name: disk01
+        persistentVolumeClaim:
+          claimName: azurenetappfiles
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: $name
+  name: $name
+spec:
+  ports:
+  - port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: $name
+  type: LoadBalancer
+EOF
+
+# Diagnostics
+az netappfiles volume list -g $rg -a $anf_name -p $anf_name -o table --query '[].{Name:name, ProvisioningState:provisioningState, ThroughputMibps:throughputMibps, ServiceLevel:serviceLevel, Location:location}'
+
+# Cleanup
+az netappfiles pool delete -g $rg -a $anf_name -n $anf_name
+az netappfiles account delete -g $rg -n $anf_name
+
+########################
+#  Pod in hostNetwork  #
+########################
+
+# Deploy pod
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apihn
+spec:
+  hostNetwork: true
+  containers:
+  - name: apihn
+    image: erjosito/sqlapi:1.0
+    ports:
+    - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: $name
+  name: $name
+spec:
+  ports:
+  - port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: $name
+  type: LoadBalancer
+EOF
+
 
 ###############################
 # Azure SQL with private link #
