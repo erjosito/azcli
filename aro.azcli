@@ -337,11 +337,11 @@ spec:
     image: erjosito/sqlapi:1.0
     resources:
       requests:
-        cpu: 100m
-        memory: 128Mi
+        cpu: 1000m
+        memory: 1024Mi
       limits:
-        cpu: 250m
-        memory: 256Mi
+        cpu: 1000m
+        memory: 1024Mi
     ports:
       - containerPort: 8080
     volumeMounts:
@@ -364,7 +364,7 @@ spec:
     protocol: TCP
     targetPort: 8080
   selector:
-    app: $name
+    app: $app_name
   type: LoadBalancer
 EOF
 
@@ -384,7 +384,11 @@ k get pv
 k describe pv
 k describe pod/$app_name
 k exec $app_name -- bash -c 'ls -ald /mnt/*'
+k exec $app_name -- bash -c 'apt install -y fio'
+k exec $app_name -- bash -c 'cd /mnt/azure/ && fio --name=128krandomreads --rw=randread --direct=1 --ioengine=libaio --bs=128k --numjobs=4 --iodepth=128 --size=128M --runtime=600 --group_reporting'
+k exec $app_name -- bash -c 'cd /mnt/azure/ && fio --name=256krandomreads --rw=randread --direct=1 --ioengine=libaio --bs=256k --numjobs=4 --iodepth=128 --size=128M --runtime=600 --group_reporting'
 k exec -it $app_name -- bash
+
 
 ######################
 #    Pod identity    #

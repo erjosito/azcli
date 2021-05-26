@@ -63,10 +63,10 @@ az network vhub route-table update -n defaultRouteTable --vhub-name hub2 -g $rg 
 
 # Retrieve IDs of RTs. We will need this when creating the connections
 hub1_vnet_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n hub1Vnet --query id -o tsv)
-hub2_vnet_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n hub2Vnet --query id -o tsv)
 hub1_default_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n defaultRouteTable --query id -o tsv)
-hub2_default_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n defaultRouteTable --query id -o tsv)
 hub1_none_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n noneRouteTable --query id -o tsv)
+hub2_default_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n defaultRouteTable --query id -o tsv)
+hub2_vnet_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n hub2Vnet --query id -o tsv)
 hub2_none_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n noneRouteTable --query id -o tsv)
 
 # Create VPN gateways
@@ -111,11 +111,11 @@ az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Outbound_All --
 
 # Configure NSG flow logs
 storage_account1_name=vwan$RANDOM$location1
-storage_account2_name=vwan$RANDOM$location2
 az storage account create -n $storage_account1_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location1
-az storage account create -n $storage_account2_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location2
 az network watcher flow-log create -l $location1 -n flowlog-$location1 -g $rg \
     --nsg $nsg1_name --storage-account $storage_account1_name --log-version 2 --retention 7
+storage_account2_name=vwan$RANDOM$location2
+az storage account create -n $storage_account2_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location2
 az network watcher flow-log create -l $location2 -n flowlog-$location2 -g $rg \
     --nsg $nsg2_name --storage-account $storage_account2_name --log-version 2 --retention 7
 
@@ -324,16 +324,16 @@ az network firewall create -n azfw2 -g $rg --vhub hub2 --policy $azfw_policy_nam
 
 # Configure static routes to firewall in the VWAN hub route tables
 azfw1_id=$(az network firewall show -n azfw1 -g $rg --query id -o tsv)
-azfw2_id=$(az network firewall show -n azfw2 -g $rg --query id -o tsv)
 az network vhub route-table route add -n defaultRouteTable --vhub-name hub1 -g $rg \
     --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
     --next-hop-type ResourceId --next-hop $azfw1_id
-az network vhub route-table route add -n defaultRouteTable --vhub-name hub2 -g $rg \
-    --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
-    --next-hop-type ResourceId --next-hop $azfw2_id
 az network vhub route-table route add -n hub1Vnet --vhub-name hub1 -g $rg \
     --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
     --next-hop-type ResourceId --next-hop $azfw1_id
+azfw2_id=$(az network firewall show -n azfw2 -g $rg --query id -o tsv)
+az network vhub route-table route add -n defaultRouteTable --vhub-name hub2 -g $rg \
+    --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
+    --next-hop-type ResourceId --next-hop $azfw2_id
 az network vhub route-table route add -n hub2Vnet --vhub-name hub2 -g $rg \
     --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
     --next-hop-type ResourceId --next-hop $azfw2_id

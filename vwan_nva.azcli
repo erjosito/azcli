@@ -1,7 +1,14 @@
-# Check subscription (only whitelisted subs will work)
-az account set -s bb0a98e0-34e3-40d1-856f-899c5203df01
+# Variables (Thomas SIG)
+# subscription_id=bb0a98e0-34e3-40d1-856f-899c5203df01
+# vendor="Contoso_generic_test_nva"
+# version=latest
 
-# Variables
+# Variables (jomore AIRS)
+subscription_id=e7da9914-9b05-4891-893c-546cb7b0422e
+vendor="Jose_generic_test_nva"
+version=latest
+
+# Variables (common)
 nva_rg=josenva
 location=westcentralus
 vwan_name=josevwan
@@ -13,6 +20,9 @@ nva_asn=65100
 gnva_cloudinit="/tmp/nva-cloudinit.txt"
 username=$(whoami)
 public_ssh_key=$(more ~/.ssh/id_rsa.pub)
+
+# Select subscription (only whitelisted subs will work)
+az account set -s $subscription_id
 
 # Create RG, VWAN and Vhub
 az group create -n $nva_rg -l $location
@@ -40,27 +50,58 @@ runcmd:
 EOF
 cloudinit_string=$(cat $gnva_cloudinit | python3 -c 'import json, sys; print( json.dumps( sys.stdin.read() ) )')
 
+########################
+#   Helper functions   #
+########################
+
+# Wait for resource to be created
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
 #######################
 # Deploy NVA with CLI #
 #######################
 
-az network virtual-appliance create -n $nva_name -g $nva_rg \
-     --scale-unit 2 \
-     --vendor Contoso_generic_test_nva \
-     --version latest \
-     --vhub $hub_id \
-     --asn $nva_asn \
-     --init-config $cloudinit_string \
-     --tags tagExample="xyz"
+# Not working!!!!
+# az network virtual-appliance create -n $nva_name -g $nva_rg \
+#      --scale-unit 2 \
+#      --vendor $vendor \
+#      --version $version \
+#      --vhub $hub_id \
+#      --asn $nva_asn \
+#      --init-config $cloudinit_string \
+#      --tags tagExample="xyz"
 
 # Diagnostics
-az network virtual-appliance list --query '[].{Name:name,ResourceGroup:resourceGroup,ProvisioningState:provisioningState,AddressPrefix:addressPrefix}' -o table
-pip1=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
-pip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
-az network virtual-appliance show -n $nva_name -g $nva_rg --query cloudInitConfiguration -o tsv
-nva_id=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query id -o tsv)
+# az network virtual-appliance list --query '[].{Name:name,ResourceGroup:resourceGroup,ProvisioningState:provisioningState,AddressPrefix:addressPrefix}' -o table
+# pip1=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
+# pip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
+# az network virtual-appliance show -n $nva_name -g $nva_rg --query cloudInitConfiguration -o tsv
+# nva_id=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query id -o tsv)
+
 # SSH
-ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "ip a"
+# ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "ip a"
+
 # Cleanup
 # az network virtual-appliance delete -n $nva_name -g $nva_rg -y
 
@@ -68,16 +109,16 @@ ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "ip a"
 # Powershell command #
 ######################
 
-$nva_rg = "josenva"
-$nva_name = "josenva-pwsh"
-$nva_location = "westcentralus"
-$vhub_name = "josehub"
-$vhub_id = $(get-azvirtualhub -resourcegroupname $nva_rg -name $vhub_name).id
-$cloudinit_string = "#!/bin/bash\nuseradd -m jose\necho \"jose:Microsoft123!\" | chpasswd \n"
-New-AzNetworkVirtualAppliance -Name $nva_name -ResourceGroupName $nva_rg `
-  -CloudInitConfiguration $cloudinit_string `
-  -Location $nva_location
-  -Sku <Microsoft.Azure.Commands.Network.Models.PSVirtualApplianceSkuProperties> -VirtualHubId $vhub_id
+# $nva_rg = "josenva"
+# $nva_name = "josenva-pwsh"
+# $nva_location = "westcentralus"
+# $vhub_name = "josehub"
+# $vhub_id = $(get-azvirtualhub -resourcegroupname $nva_rg -name $vhub_name).id
+# $cloudinit_string = "#!/bin/bash\nuseradd -m jose\necho \"jose:Microsoft123!\" | chpasswd \n"
+# New-AzNetworkVirtualAppliance -Name $nva_name -ResourceGroupName $nva_rg `
+#   -CloudInitConfiguration $cloudinit_string `
+#   -Location $nva_location
+#   -Sku <Microsoft.Azure.Commands.Network.Models.PSVirtualApplianceSkuProperties> -VirtualHubId $vhub_id
 
 ##############################
 # Creating NVA over REST API #
@@ -87,9 +128,9 @@ New-AzNetworkVirtualAppliance -Name $nva_name -ResourceGroupName $nva_rg `
 json_payload='{
   "properties": {
     "nvaSku": {
-      "vendor": "Contoso_generic_test_nva",
+      "vendor": "'$vendor'",
       "bundledScaleUnit": "2",
-      "marketPlaceVersion": "latest"
+      "marketPlaceVersion": "'$version'"
     },
     "virtualHub": {
       "id": "'$hub_id'"
@@ -102,36 +143,47 @@ json_payload='{
     "tagexample1": "tagvalue1"
   }
 }'
-uri="/subscriptions/bb0a98e0-34e3-40d1-856f-899c5203df01/resourceGroups/${nva_rg}/providers/Microsoft.Network/NetworkVirtualAppliances/${nva_name}?api-version=2021-02-01"
+uri="/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/NetworkVirtualAppliances/${nva_name}?api-version=2021-02-01"
 az rest --method PUT --uri $uri --body $json_payload
 
 # Wait until provisioning state is Successful
-az network virtual-appliance show -n $nva_name -g $nva_rg --query provisioningState -o tsv
+# az network virtual-appliance show -n $nva_name -g $nva_rg --query provisioningState -o tsv
+
+# Wait for NVA to be created
+nva_id=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query id -o tsv)
+wait_until_finished $nva_id
 
 # Diagnostics
 az network virtual-appliance list --query '[].{Name:name,ResourceGroup:resourceGroup,ProvisioningState:provisioningState,AddressPrefix:addressPrefix}' -o table
+az network virtual-appliance show -n $nva_name -g $nva_rg --query cloudInitConfiguration -o tsv
+
+# Get PIPs
 pip1=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
 pip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
-az network virtual-appliance show -n $nva_name -g $nva_rg --query cloudInitConfiguration -o tsv
-nva_id=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query id -o tsv)
-# SSH
+
+# Verify SSH
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip1" "ip a"
 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "ip a"
+
 # Cleanup
-az network virtual-appliance delete -n $nva_name -g $nva_rg -y
+# az network virtual-appliance delete -n $nva_name -g $nva_rg -y
 
 # Some other REST calls
-subscription_id=$(az account show --query id -o tsv)
-api_version=2021-02-01
-hub_rg=$(az network vhub list --query '[0].resourceGroup' -o tsv) && echo $hub_rg
+# subscription_id=$(az account show --query id -o tsv)
+# api_version=2021-02-01
+# hub_rg=$(az network vhub list --query '[0].resourceGroup' -o tsv) && echo $hub_rg
+
 # List NVA SKUs (not working: NOT FOUND)
-url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs?api-version=${api_version}" 
-az rest --method GET --url $url
+# url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs?api-version=${api_version}" 
+# az rest --method GET --url $url
+
 # Show NVA SKU (not working: NOT FOUND)
-url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs/Contoso_generic_test_nva?api-version=${api_version}" 
-az rest --method GET --url $url
+# url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs/Contoso_generic_test_nva?api-version=${api_version}" 
+# az rest --method GET --url $url
+
 # Show NVA
-url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualAppliances/${nva_name}?api-version=${api_version}" 
-az rest --method GET --url $url
+# url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualAppliances/${nva_name}?api-version=${api_version}" 
+# az rest --method GET --url $url
 
 ###################
 #  Provision BGP  #
@@ -190,6 +242,11 @@ protocol static {
       import all;
       # route $vhub_space via $linuxnva_default_gw;
 }
+filter DROP_LONG {
+      # Drop long prefixes
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      else accept;
+}
 protocol bgp RS1 {
       description "RS1";
       multihop;
@@ -197,7 +254,8 @@ protocol bgp RS1 {
       local as $nva_asn;
       neighbor $rs_ip1 as $rs_asn;
           import filter {accept;};
-          export filter {accept;};
+          # export filter {accept;};
+          export filter DROP_LONG;
 }
 protocol bgp RS2 {
       description "RS1";
@@ -206,7 +264,8 @@ protocol bgp RS2 {
       local as $nva_asn;
       neighbor $rs_ip2 as $rs_asn;
           import filter {accept;};
-          export filter {accept;};
+          # export filter {accept;};
+          export filter DROP_LONG;
 }
 EOF
 
@@ -233,15 +292,16 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show proto
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show protocol all RS1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show route"
 
-###################
-#   Create VNet   #
-###################
+#########################
+#   Create spoke VNet   #
+#########################
 
 # Variables
-vnet_name=spoke
-vnet_prefix=172.16.0.0/16
-vm_subnet_name=vm
-vm_subnet_prefix=172.16.1.0/24
+vnet_name=spoke1
+vnet_prefix=10.1.0.0/16
+vm_subnet_name=vm1
+vm_subnet_prefix=10.1.1.0/24
+vm_size=Standard_B1s
 
 # Create Vnet
 az network vnet create -g $nva_rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix
@@ -263,10 +323,12 @@ hub_default_rt_id=$(az network vhub route-table show --vhub-name $vhub_name -g $
 az network vhub connection create -n $vnet_name -g $nva_rg --vhub-name $vhub_name --remote-vnet $vnet_name \
     --internet-security true --associated-route-table $hub_default_rt_id --propagated-route-tables $hub_default_rt_id --labels default
 
+# Diagnostics
+az network vhub connection list -g $nva_rg --vhub-name $vhub_name -o table
+
 # New route should be visible in the NVA
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show route"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show route"
-
 
 ########################
 # Create onprem branch #
@@ -284,7 +346,6 @@ onprem_linuxnva_asn=65002
 onprem_linuxnva_name=onpremnva
 onprem_linuxnva_pip=${onprem_linuxnva_name}-pip
 onprem_linuxnva_ip=172.16.1.10
-onprem_linuxnva_autodeploy=no
 linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
 cat <<EOF > $linuxnva_cloudinit_file
 #cloud-config
@@ -505,13 +566,19 @@ protocol static {
       import all;
       route $vhub_space via $nva_default_gw;
 }
+filter DROP_LONG {
+      # Drop long prefixes
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      else accept;
+}
 protocol bgp RS1 {
       description "RS1";
       multihop;
       local as $nva_asn;
       neighbor $rs_ip1 as $rs_asn;
           import filter {accept;};
-          export filter {accept;};
+          # export filter {accept;};
+          export filter DROP_LONG;
 }
 protocol bgp RS2 {
       description "RS1";
@@ -519,7 +586,8 @@ protocol bgp RS2 {
       local as $nva_asn;
       neighbor $rs_ip2 as $rs_asn;
           import filter {accept;};
-          export filter {accept;};
+          # export filter {accept;};
+          export filter DROP_LONG;
 }
 protocol bgp onprem {
       description "BGP to Onprem";
@@ -527,7 +595,8 @@ protocol bgp onprem {
       local as $nva_asn;
       neighbor $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
           import filter {accept;};
-          export filter {accept;};
+          # export filter {accept;};
+          export filter DROP_LONG;
 }
 EOF
 # Configure BGP with Bird (onprem)
@@ -560,13 +629,19 @@ protocol static {
       route 1.1.1.1/32 via $onprem_linuxnva_default_gw;
       route $onprem_vnet_prefix via $onprem_linuxnva_default_gw;
 }
+filter DROP_LONG {
+      # Drop long prefixes
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      else accept;
+}
 protocol bgp NVA1 {
       description "BGP to NVA1";
       multihop;
       local $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
       neighbor $nva_ip21 as $nva_asn;
           import filter {accept;};
-          export filter {accept;};
+          #export filter {accept;};
+          export filter DROP_LONG;
 }
 protocol bgp NVA2 {
       description "BGP to NVA2";
@@ -574,7 +649,8 @@ protocol bgp NVA2 {
       local $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
       neighbor $nva_ip22 as $nva_asn;
           import filter {accept;};
-          export filter {accept;};
+          #export filter {accept;};
+          export filter DROP_LONG;
 }
 EOF
 
@@ -611,40 +687,49 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show route
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status bird"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show status"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols RS1"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocol all RS1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols NVA1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocol all NVA1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols NVA2"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocol all NVA2"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show route"
 
 # Connectivity from spoke VM to onprem
 az network nic show-effective-route-table --ids $azurevm_nic_id -o table
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azurevm_pip_ip "ping -c 5 $onprem_linuxnva_private_ip"
 
+###############
+#   Cleanup   #
+###############
+
+# Delete RG
+# az group delete -n $nva_rg -y --no-wait
+
 ###############################
 # Some sample cloudinit files #
 ###############################
 
 # public SSH key
-cat <<EOF > $gnva_cloudinit
-#cloud-config
-users:
-  - default
-  - name: $username
-    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
-    ssh-authorized-keys:
-     - $public_ssh_key
-packages:
-  - jq
-EOF
+# cat <<EOF > $gnva_cloudinit
+# #cloud-config
+# users:
+#   - default
+#   - name: $username
+#     sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+#     ssh-authorized-keys:
+#      - $public_ssh_key
+# packages:
+#   - jq
+# EOF
 
 # New user/password
-cat <<EOF > $gnva_cloudinit
-#!/bin/bash
-apt install -y jq
-useradd -m $username
-echo "$username:Microsoft123!" | chpasswd $username
-usermod -aG sudo $username
-host_name=\$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2020-09-01" | jq -r '.compute.name')
-if [[ "\${HOSTNAME: -1}" == "0" ]]; then echo "0123456789" > ~/license.txt; else echo "9876543210" > ~/license.txt; fi
-EOF
+# cat <<EOF > $gnva_cloudinit
+# #!/bin/bash
+# apt install -y jq
+# useradd -m $username
+# echo "$username:Microsoft123!" | chpasswd $username
+# usermod -aG sudo $username
+# host_name=\$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2020-09-01" | jq -r '.compute.name')
+# if [[ "\${HOSTNAME: -1}" == "0" ]]; then echo "0123456789" > ~/license.txt; else echo "9876543210" > ~/license.txt; fi
+# EOF
 
 
