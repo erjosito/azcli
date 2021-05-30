@@ -1,0 +1,474 @@
+##############################################################
+#
+# This script demonstrates how to configure dynamically BGP
+#   adjacencies on Azure Route Server to the instances of a
+#   VMSS when it scales in and out.
+#
+# A Logic App will trigger everytime that the VMSS is modified,
+#   and it will call out an Azure Automation pwsh script that
+#   will update the adjacency table of the Route Server, depending
+#   on how many instances are active in the NVA VMSS.
+#
+# This script uses these CLI extensions:
+# - logic
+# - automation
+#
+# Jose Moreno, May 2021
+##############################################################
+
+# Variables
+rg=nva
+location=westeurope
+vnet_name=hub
+vnet_prefix=10.1.0.0/16
+gw_subnet_name=GatewaySubnet
+gw_subnet_prefix=10.1.0.0/24
+vpngw_asn=65501
+rs_subnet_name=RouteServersubnet
+rs_subnet_prefix=10.1.1.0/24
+nva_subnet_name=nva
+nva_subnet_prefix=10.1.2.0/24
+vm_subnet_name=vm
+vm_subnet_prefix=10.1.10.0/24
+vm_size=Standard_B1s
+publisher=Canonical
+offer=UbuntuServer
+sku=18.04-LTS
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
+nva_asn=65001
+nva_name=nva
+nva_pip=${nva_name}-pip
+nva_cloudinit_file=/tmp/nva_cloudinit.txt
+auto_account_name="${nva_name}auto"
+logicapp_name=$nva_name
+logicapp_file=/tmp/nva_logicapp.json
+logicapp_id_name=nvalogicapp
+
+# Auxiliary function to get the first IP of a subnet (default gateway)
+function first_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
+
+# Auxiliary function to wait until a resource has finished creation (either Successful or Failed)
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
+# Create Vnets and subnets
+az group create -n $rg -l $location
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $gw_subnet_name --address-prefix $gw_subnet_prefix
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $rs_subnet_name --address-prefix $rs_subnet_prefix
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $nva_subnet_name --address-prefix $nva_subnet_prefix
+
+# Deploy RS (no --no-wait option)
+rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az network routeserver create -n rs -g $rg --hosted-subnet $rs_subnet_id -l $location
+rs_asn=$(az network routeserver show -n rs -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
+rs_ip1=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
+rs_ip2=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
+
+# Create VM for testing purposes
+azurevm_name=azurevm
+azurevm_pip_name="${azurevm_name}-pip"
+az network nsg create -n "${azurevm_name}-nsg" -g $rg
+az network nsg rule create -n SSH --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n ICMP --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
+az vm create -n $azurevm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${azurevm_name}-nsg" \
+    --public-ip-address $azurevm_pip_name --vnet-name $vnet_name --size $vm_size --subnet $vm_subnet_name
+azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddress -o tsv -g $rg) && echo $azurevm_pip_ip
+azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+azurevm_private_ip=$(az network nic show --ids $azurevm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $azurevm_private_ip
+
+# Create NSG for NVA
+az network nsg create -n "${nva_name}-nsg" -g $rg
+az network nsg rule create -n SSH --nsg-name "${nva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n IKE --nsg-name "${nva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp
+az network nsg rule create -n IPsec --nsg-name "${nva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp
+az network nsg rule create -n ICMP --nsg-name "${nva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
+az network nsg rule create -n Webin --nsg-name "${nva_name}-nsg" -g $rg --priority 1040 --source-address-prefixes 'VirtualNetwork' --destination-port-ranges 80 443 --access Allow --protocol Tcp
+
+# Create Azure NVA with Bird and StrongSwan (only Bird is required for this scenario)
+nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
+cat <<EOF > $nva_cloudinit_file
+#cloud-config
+packages:
+  - bird
+runcmd:
+  - sysctl -w net.ipv4.ip_forward=1
+  - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
+  - sysctl -w net.ipv4.conf.all.send_redirects = 0
+  - iptables -t nat -A POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE
+  - sysmtemctl restart bird
+write_files:
+- content: |
+    log syslog all;
+    protocol device {
+            scan time 10;
+    }
+    protocol direct {
+        disabled;
+    }
+    protocol kernel {
+        preference 254;
+        learn;
+        merge paths on;
+        import filter {
+            reject;
+        };
+        export filter {
+            reject;
+        };
+    }
+    protocol static {
+        import all;
+        # Test route
+        route 1.1.1.1/32 via $nva_default_gw;
+        # Vnet prefix
+        route $vnet_prefix via $nva_default_gw;
+    }
+    protocol bgp rs0 {
+        description "RouteServer instance 0";
+        multihop;
+        local as $nva_asn;
+        neighbor $rs_ip1 as $rs_asn;
+            import filter {accept;};
+            export filter {accept;};
+    }
+    protocol bgp rs1 {
+        description "Route Server instance 1";
+        multihop;
+        local as $nva_asn;
+        neighbor $rs_ip2 as $rs_asn;
+            import filter {accept;};
+            export filter {accept;};
+    }
+  path: /etc/bird/bird.conf
+EOF
+
+# Create a VMSS
+az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
+     --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1
+az vmss update -n $nva_name -g $rg --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].enableIPForwarding=true'
+az vmss update-instances -n $nva_name -g $rg --instance-ids '*'
+az vmss list-instance-connection-info -n $nva_name -g $rg -o table
+
+# Create Azure Automation Account
+# You need to create the Azure Automation Account in the portal, to have the default AzureRunAsConnection
+# See https://dev.to/omiossec/runas-account-in-azure-automation-arm-template-and-deployment-script-56n8
+# An additional manual task is importing the Az modules: Az.Account, Az.Resources, Az.Network, Az.Compute
+# az automation account create -n $auto_account_name -g $rg --sku Basic  # Dont do this!
+
+# Create Azure Automation Runbook
+az automation runbook create --automation-account-name $auto_account_name -n $nva_name -g $rg --type "PowerShell"
+
+# Update runbook
+tenant_id=$(az account show --query tenantId -o tsv)
+ps_script_path=/tmp/configure_ars.ps1
+cat <<EOF > $ps_script_path
+# Parameters
+param(
+  [Parameter(mandatory = \$false)]
+  [string]\$ConnectionAssetName = "AzureRunAsConnection",
+  
+  [Parameter(mandatory = \$false)]
+  [string]\$RouteServerName = "rs",
+
+  [Parameter(mandatory = \$false)]
+  [string]\$RouteServerRG = "$rg",
+
+  [Parameter(mandatory = \$false)]
+  [string]\$VmssName = "$nva_name",
+
+  [Parameter(mandatory = \$false)]
+  [string]\$VmssRG = "$rg",
+
+  [Parameter(mandatory = \$false)]
+  [string]\$BgpAsn = "$nva_asn",
+
+  [Parameter(mandatory = \$false)]
+  [string]\$TenantId = "$tenant_id"
+)
+
+# Debug info
+Write-Output "Running with parameters: ConnectionAssetName = \$ConnectionAssetName, RouteServerName = \$RouteServerName, VmssName = \$VmssName, VmssRG = \$VmssRG, TenantId = \$TenantId"
+
+# Authentification using Azure Automation connections
+\$Connection = Get-AutomationConnection -Name \$ConnectionAssetName
+if (\$Connection) {
+    Write-Output "Connection \$ConnectionAssetName found"
+} else {
+    Write-Output "Connection \$ConnectionAssetName not found, exiting"
+    exit
+}
+
+# The TenantID can be supplied over a parameter
+\$AzAuthentication = Connect-AzAccount -ServicePrincipal \`
+                                      -TenantId \$TenantId  \`
+                                      -ApplicationId \$Connection.ApplicationId \`
+                                      -CertificateThumbprint \$Connection.CertificateThumbprint
+
+# Verify authentication
+if (!\$AzAuthentication) {
+    Write-Output "Failed to authenticate Azure: \$(\$_.exception.message)"
+    exit
+} else {
+    \$SubscriptionId = \$(Get-AzContext).Subscription.Id
+    Write-Output = "Authentication as service principal for Azure successful on subscription \$SubscriptionId."
+}
+
+# Get VMSS in Resource Group
+\$VMSS = Get-AzVmss -Name \$VmssName -ResourceGroupName \$VmssRG
+Write-Output "VMSS found with ID \$VMSS.Id"
+
+# Get Instance IPs
+Write-Output "Getting VMSS instances..."
+\$VMs = Get-AzVmssVM -VMScaleSetName \$VmssName -ResourceGroupName \$VmssRG
+\$VmssIPs = @()
+\$VmssNames = @{}
+foreach (\$VM in \$VMs)
+{
+    Write-Output "Processing instance \$VM.Name..."
+    \$NicId = \$VM.NetworkProfile.NetworkInterfaces[0].Id
+    Write-Output "Instance has NIC ID \$NicId"
+    \$NIC = Get-AzResource -Id \$NicId -ExpandProperties
+    \$IP = \$NIC.Properties.ipConfigurations[0].properties.privateIPAddress
+    Write-Output "VMSS instance has IP address \$IP"
+    \$VmssIPs += \$IP
+    \$VmssNames[\$IP] = \$VM.Name
+}
+
+# Get Route Server adjacencies
+\$PeeringIPs = @()
+\$PeeringNames = @{}
+Write-Output "Looking for Route Server \$RouteServerName..."
+\$RSId = \$(Get-AzResource -Name \$RouteServerName -ResourceType Microsoft.Network/virtualHubs -ResourceGroupName \$RouteServerRG).Id
+Write-Output "Found RS with ID \$RSId"
+\$RSuri = "\${RSId}/bgpConnections?api-version=2021-02-01"
+\$Peerings = \$(Invoke-AzRest -Method GET -Path \$RSuri).content | ConvertFrom-Json
+foreach (\$Peering in \$Peerings.value)
+{
+    \$PeerIP = \$Peering.properties.peerIp
+    Write-Output "Found Route Server peering to \$PeerIP"
+    \$PeeringIPs += \$PeerIP
+    \$PeeringNames[\$PeerIP] = \$Peering.name
+}
+
+# See whether any peering is missing
+foreach (\$VmssIP in \$VmssIPs) {
+    if (\$VmssIP -in \$PeeringIPs) {
+        Write-Output "Peering to \$VmssIP already exists"
+    } else {
+        Write-Output "Peering to \$VmssIP needs to be created"
+        \$PeerName = \$VmssNames[\$VmssIP]
+        \$PeerJson = '{"name": "' + \$PeerName + '", "properties": {"peerIp": "' + \$VmssIP + '", "peerAsn": "' + \$BgpAsn + '"}}'
+        \$PeerUri = "\${RSId}/bgpConnections/\${PeerName}?api-version=2021-02-01"
+        Write-Output "Creating Route Server peering \$PeerName for IP \$VmssIP and ASN \$BgpAsn..."
+        Invoke-AzRest -Method PUT -Path \$PeerUri -Payload \$PeerJson
+    }
+}
+
+# See whether any peering should be deleted
+foreach (\$PeeringIP in \$PeeringIPs) {
+    if (\$PeeringIP -in \$VmssIPs) {
+        Write-Output "Instance \$PeeringIP still exists"
+    } else {
+        Write-Output "Instance \$PeeringIP does not exist any more, peering needs to be deleted"
+        \$PeerName = \$PeeringNames[\$PeeringIP]
+        \$PeerUri = "\${RSId}/bgpConnections/\${PeerName}?api-version=2021-02-01"
+        Write-Output "Deleting Route Server peering \$PeerName..."
+        Invoke-AzRest -Method DELETE -Path \$PeerUri
+    }
+}
+EOF
+
+# Update runbook code
+az automation runbook replace-content --automation-account-name $auto_account_name -n $nva_name -g $rg --content "@$ps_script_path"
+az automation runbook publish --automation-account-name $auto_account_name -n $nva_name -g $rg
+
+# Logic App and Eventgrid
+subscription_id=e7da9914-9b05-4891-893c-546cb7b0422e
+cat <<EOF > $logicapp_file
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "actions": {
+            "Condition": {
+                "actions": {
+                    "Create_job": {
+                        "inputs": {
+                            "body": {
+                                "properties": {
+                                    "parameters": {
+                                        "VmssName": "$nva_name",
+                                        "VmssRG": "$rg"
+                                    }
+                                }
+                            },
+                            "host": {
+                                "connection": {
+                                    "name": "@parameters('$connections')['azureautomation']['connectionId']"
+                                }
+                            },
+                            "method": "put",
+                            "path": "/subscriptions/@{encodeURIComponent('$subscription_id')}/resourceGroups/@{encodeURIComponent('$rg')}/providers/Microsoft.Automation/automationAccounts/@{encodeURIComponent('$auto_account_name')}/jobs",
+                            "queries": {
+                                "runbookName": "$nva_name",
+                                "wait": true,
+                                "x-ms-api-version": "2015-10-31"
+                            }
+                        },
+                        "runAfter": {},
+                        "type": "ApiConnection"
+                    }
+                },
+                "expression": {
+                    "and": [
+                        {
+                            "equals": [
+                                "@triggerBody()?['data']['operationName']",
+                                "Microsoft.Compute/virtualMachineScaleSets/write"
+                            ]
+                        }
+                    ]
+                },
+                "runAfter": {},
+                "type": "If"
+            }
+        },
+        "contentVersion": "1.0.0.0",
+        "outputs": {},
+        "parameters": {
+            "$connections": {
+                "defaultValue": {},
+                "type": "Object"
+            }
+        },
+        "triggers": {
+            "When_a_resource_event_occurs": {
+                "inputs": {
+                    "body": {
+                        "properties": {
+                            "destination": {
+                                "endpointType": "webhook",
+                                "properties": {
+                                    "endpointUrl": "@{listCallbackUrl()}"
+                                }
+                            },
+                            "filter": {
+                                "includedEventTypes": [
+                                    "Microsoft.Resources.ResourceWriteSuccess"
+                                ]
+                            },
+                            "topic": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/nva"
+                        }
+                    },
+                    "host": {
+                        "connection": {
+                            "name": "@parameters('$connections')['azureeventgrid_1']['connectionId']"
+                        }
+                    },
+                    "path": "/subscriptions/@{encodeURIComponent('e7da9914-9b05-4891-893c-546cb7b0422e')}/providers/@{encodeURIComponent('Microsoft.Resources.ResourceGroups')}/resource/eventSubscriptions",
+                    "queries": {
+                        "x-ms-api-version": "2017-09-15-preview"
+                    }
+                },
+                "splitOn": "@triggerBody()",
+                "type": "ApiConnectionWebhook"
+            }
+        }
+    },
+    "parameters": {
+        "$connections": {
+            "value": {
+                "azureautomation": {
+                    "connectionId": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/nva/providers/Microsoft.Web/connections/azureautomation",
+                    "connectionName": "azureautomation",
+                    "connectionProperties": {
+                        "authentication": {
+                            "identity": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourcegroups/nva/providers/microsoft.managedidentity/userassignedidentities/nvalogicapp",
+                            "type": "ManagedServiceIdentity"
+                        }
+                    },
+                    "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/providers/Microsoft.Web/locations/westeurope/managedApis/azureautomation"
+                },
+                "azureeventgrid_1": {
+                    "connectionId": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/nva/providers/Microsoft.Web/connections/azureeventgrid-1",
+                    "connectionName": "azureeventgrid-1",
+                    "connectionProperties": {
+                        "authentication": {
+                            "identity": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourcegroups/nva/providers/microsoft.managedidentity/userassignedidentities/nvalogicapp",
+                            "type": "ManagedServiceIdentity"
+                        }
+                    },
+                    "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/providers/Microsoft.Web/locations/westeurope/managedApis/azureeventgrid"
+                }
+            }
+        }
+    }
+}
+EOF
+# See https://docs.microsoft.com/en-us/azure/logic-apps/create-managed-service-identity#arm-template-for-managed-connections-and-managed-identities for automating creation with managed identity
+az identity create -n $logicapp_id_name -g $rg
+logicapp_id_principal_id=$(az identity show -n $logicapp_id_name -g $rg --query principalId -o tsv)
+vmss_id=$(az vmss show -n $nva_name -g $rg --query id -o tsv)
+rg_id=$(az group show -n $rg --query id -o tsv)
+# I think it actually only needs:
+# - Microsoft.EventGrid/eventSubscriptions/write
+# - Microsoft.Automation/automationAccounts/jobs/write
+# (disclaimer: assignments not tested extensively)
+az role assignment create --scope $rg_id --assignee $logicapp_id_principal_id --role 'EventGrid EventSubscription Contributor'
+
+# Create logic app
+az logic workflow create -n $logicapp_name -g $rg -l $location --definition $logicapp_file
+
+# Scale NVA VMSS in and out
+az vmss scale -n $nva_name -g $rg --new-capacity 2
+
+# See job runs
+az automation job list --automation-account-name $auto_account_name -g $rg -o table
+
+# See adjacencies in RS
+az network routeserver peering list --routeserver rs -g nva -o table
+
+# See adjacencies in NVA
+vm_list=$(az vmss list-instance-connection-info -n $nva_name -g $rg | grep ':')
+while IFS= read -r vm; do
+    vm=$(echo $vm | cut -d\" -f 4)
+    echo "Processing $vm..."
+    vm_ip=$(echo $vm | cut -d: -f 1)
+    vm_port=$(echo $vm | cut -d: -f 2)
+    echo "Connecting to IP $vm_ip port $vm_port..."
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_ip -p $vm_port "sudo birdc show protocols"
+done <<< "$vm_list"
+
+###############
+# Danger Zone #
+###############
+
+# az vmss delete -n $nva_name -g $rg
+# az group delete -y --no-wait -n $rg

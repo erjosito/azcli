@@ -16,8 +16,8 @@
 # Variables
 rg=vwan2xshub
 vwan=vwan
-location1=westeurope
-location2=westus2
+location1=westcentralus
+location2=westcentralus
 password=Microsoft123!
 vwan_hub1_prefix=192.168.1.0/24
 vwan_hub2_prefix=192.168.2.0/24
@@ -54,12 +54,12 @@ az network vhub create -n hub1 -g $rg --vwan $vwan -l $location1 --address-prefi
 az network vhub create -n hub2 -g $rg --vwan $vwan -l $location2 --address-prefix $vwan_hub2_prefix
 
 # Create RT for vnets
-az network vhub route-table create -n hub1Vnet --vhub-name hub1 -g $rg --labels vnet nohub2
-az network vhub route-table create -n hub2Vnet --vhub-name hub2 -g $rg --labels vnet nohub1
+az network vhub route-table create -n hub1Vnet --vhub-name hub1 -g $rg --labels vnet
+az network vhub route-table create -n hub2Vnet --vhub-name hub2 -g $rg --labels vnet
 
 # Add nohub1/nohub2 labels to default RTs
-az network vhub route-table update -n defaultRouteTable --vhub-name hub1 -g $rg --labels default nohub2
-az network vhub route-table update -n defaultRouteTable --vhub-name hub2 -g $rg --labels default nohub1
+# az network vhub route-table update -n defaultRouteTable --vhub-name hub1 -g $rg --labels default nohub2
+# az network vhub route-table update -n defaultRouteTable --vhub-name hub2 -g $rg --labels default nohub1
 
 # Retrieve IDs of RTs. We will need this when creating the connections
 hub1_vnet_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n hub1Vnet --query id -o tsv)
@@ -69,7 +69,7 @@ hub2_default_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n
 hub2_vnet_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n hub2Vnet --query id -o tsv)
 hub2_none_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n noneRouteTable --query id -o tsv)
 
-# Create VPN gateways
+# Create VPN gateways (not using --no-wait to avoid race conditions due to parallelism)
 az network vpn-gateway create -n hubvpn1 -g $rg -l $location1 --vhub hub1 --asn 65515
 az network vpn-gateway create -n hubvpn2 -g $rg -l $location2 --vhub hub2 --asn 65515
 
@@ -132,7 +132,7 @@ az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan \
     --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --ip-address $branch1_ip --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100
 az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
-    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels nohub1 --internet-security true
+    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default --internet-security true
 
 # Create CSR to simulate branch2
 az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} \
@@ -144,7 +144,7 @@ az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan \
     --asn $branch2_asn --bgp-peering-address $branch2_bgp_ip --ip-address $branch2_ip --address-prefixes ${branch2_ip}/32
 az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 \
     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
-    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id  --labels nohub2 --internet-security true
+    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id  --labels default --internet-security true
 
 # Configure branches (CSRs)
 
@@ -371,12 +371,13 @@ while IFS= read -r fw_id; do
 done <<< "$fw_id_list"
 
 # Optional: Configure NAT space for firewalls
-while IFS= read -r fw_id; do
-    echo "Configuring SNAT range for AzFW $fw_id..."
-    az network firewall update --ids $fw_id --private-ranges 192.168.0.0/16
-    # az network firewall update --ids $fw_id --private-ranges 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
-done <<< "$fw_id_list"
-az network firewall list -g $rg -o table
+# NOTE: this should be done now at the policy level!!!!
+# while IFS= read -r fw_id; do
+#     echo "Configuring SNAT range for AzFW $fw_id..."
+#     az network firewall update --ids $fw_id --private-ranges 192.168.0.0/16
+#     # az network firewall update --ids $fw_id --private-ranges 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
+# done <<< "$fw_id_list"
+# az network firewall list -g $rg -o table
 
 # Create cloudinit file:
 cloudinit_file=/tmp/cloudinit.txt
@@ -396,7 +397,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --adm
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --remote-vnet spoke${spoke_id}-$location1 \
-    --internet-security true --associated-route-table $hub1_vnet_rt_id --propagated-route-tables $hub2_vnet_rt_id --labels nohub1
+    --internet-security true --associated-route-table $hub1_vnet_rt_id --propagated-route-tables $hub2_vnet_rt_id --labels default
 
 # Spoke12 in location1
 spoke_id=12
@@ -407,7 +408,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --adm
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --remote-vnet spoke${spoke_id}-$location1 \
-    --internet-security true --associated-route-table $hub1_vnet_rt_id --propagated-route-tables $hub2_vnet_rt_id --labels nohub1
+    --internet-security true --associated-route-table $hub1_vnet_rt_id --propagated-route-tables $hub2_vnet_rt_id --labels default
 
 # Spoke21 in location2
 spoke_id=21
@@ -418,7 +419,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --adm
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
-    --internet-security true --associated-route-table $hub2_vnet_rt_id --propagated-route-tables $hub1_vnet_rt_id --labels nohub2
+    --internet-security true --associated-route-table $hub2_vnet_rt_id --propagated-route-tables $hub1_vnet_rt_id --labels default
 
 
 # Spoke22 in location2
@@ -430,32 +431,32 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --adm
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
-    --internet-security true --associated-route-table $hub2_vnet_rt_id --propagated-route-tables $hub1_vnet_rt_id --labels nohub2
+    --internet-security true --associated-route-table $hub2_vnet_rt_id --propagated-route-tables $hub1_vnet_rt_id --labels default
 
 # VM in branch1
 az vm create -n branch1-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
     --public-ip-address branch1-vm-pip --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
     --subnet vm --subnet-address-prefix $branch1_vm_subnet --custom-data $cloudinit_file
 az vm extension set --vm-name branch1-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
-az network route-table create -n branchvm-$location1 -g $rg -l $location1
+az network route-table create -n branch1vm-$location1 -g $rg -l $location1
 myip=$(curl -s4 ifconfig.co)
-az network route-table route create -n mypc -g $rg --route-table-name branchvm-$location1 \
+az network route-table route create -n mypc -g $rg --route-table-name branch1vm-$location1 \
     --address-prefix "${myip}/32" --next-hop-type Internet
-az network route-table route create -n default -g $rg --route-table-name branchvm-$location1 \
+az network route-table route create -n default -g $rg --route-table-name branch1vm-$location1 \
     --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch1_bgp_ip
-az network vnet subnet update -n vm --vnet-name branch1 -g $rg --route-table branchvm-$location1
+az network vnet subnet update -n vm --vnet-name branch1 -g $rg --route-table branch1vm-$location1
 
 # VM in branch2
 az vm create -n branch2-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
     --public-ip-address branch2-vm-pip --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
     --subnet vm --subnet-address-prefix $branch2_vm_subnet --custom-data $cloudinit_file
 az vm extension set --vm-name branch2-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
-az network route-table create -n branchvm-$location2 -g $rg -l $location2
-az network route-table route create -n mypc -g $rg --route-table-name branchvm-$location2 \
+az network route-table create -n branch2vm-$location2 -g $rg -l $location2
+az network route-table route create -n mypc -g $rg --route-table-name branch2vm-$location2 \
     --address-prefix "${myip}/32" --next-hop-type Internet
-az network route-table route create -n default -g $rg --route-table-name branchvm-$location2 \
+az network route-table route create -n default -g $rg --route-table-name branch2vm-$location2 \
     --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch2_bgp_ip
-az network vnet subnet update -n vm --vnet-name branch2 -g $rg --route-table branchvm-$location2
+az network vnet subnet update -n vm --vnet-name branch2 -g $rg --route-table branch2vm-$location2
 
 # Configure IP forwarding in the CSR NICs
 vm_names=("branch1-nva" "branch2-nva")
@@ -476,6 +477,12 @@ az network route-table route create -n mypc -g $rg --route-table-name spokes-$lo
 az network vnet subnet update -n vm --vnet-name spoke21-$location2 -g $rg --route-table spokes-$location2
 az network vnet subnet update -n vm --vnet-name spoke22-$location2 -g $rg --route-table spokes-$location2
 
+##########################################
+# Optional: add some VMs with public IPs #
+##########################################
+
+# This can be used to test AzFW default SNAT behavior
+
 # Add public subnet to branch1
 new_subnet=21.21.21.0/24
 new_subnet_long="21.21.21.0 255.255.255.0"
@@ -486,7 +493,7 @@ az vm create -n $vm_name -g $rg -l $location1 --image ubuntuLTS --admin-username
     --public-ip-address ${vm_name}-pip --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
     --subnet $new_subnet_name --subnet-address-prefix $new_subnet --custom-data $cloudinit_file
 az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
-az network vnet subnet update -n $new_subnet_name --vnet-name branch1 -g $rg --route-table branchvm-$location1
+az network vnet subnet update -n $new_subnet_name --vnet-name branch1 -g $rg --route-table branch1vm-$location1
 default_gateway=$branch1_gateway
 branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
@@ -495,7 +502,7 @@ config t
     ip route ${new_subnet_long} ${default_gateway}
 end
 wr mem
-EOF
+# EOF
 
 # Add public subnet to branch2
 new_subnet=22.22.22.0/24
@@ -507,7 +514,7 @@ az vm create -n $vm_name -g $rg -l $location2 --image ubuntuLTS --admin-username
     --public-ip-address ${vm_name}-pip --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
     --subnet $new_subnet_name --subnet-address-prefix $new_subnet --custom-data $cloudinit_file
 az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
-az network vnet subnet update -n $new_subnet_name --vnet-name branch2 -g $rg --route-table branchvm-$location2
+az network vnet subnet update -n $new_subnet_name --vnet-name branch2 -g $rg --route-table branch2vm-$location2
 default_gateway=$branch2_gateway
 branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip <<EOF
@@ -518,6 +525,37 @@ end
 wr mem
 EOF
 
+##############################
+# Connectivity test examples #
+##############################
+
+# Set variables
+spoke11_pip=$(az network public-ip show -n spoke11-pip -g $rg --query ipAddress -o tsv)
+spoke12_pip=$(az network public-ip show -n spoke12-pip -g $rg --query ipAddress -o tsv)
+spoke21_pip=$(az network public-ip show -n spoke21-pip -g $rg --query ipAddress -o tsv)
+spoke22_pip=$(az network public-ip show -n spoke22-pip -g $rg --query ipAddress -o tsv)
+branch1_pip=$(az network public-ip show -n branch1-vm-pip -g $rg --query ipAddress -o tsv)
+branch2_pip=$(az network public-ip show -n branch2-vm-pip -g $rg --query ipAddress -o tsv)
+csr1_pip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
+csr2_pip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)
+spoke11_nic_id=$(az vm show -n spoke11-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke12_nic_id=$(az vm show -n spoke12-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke21_nic_id=$(az vm show -n spoke21-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke22_nic_id=$(az vm show -n spoke22-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+branch1_nic_id=$(az vm show -n branch1-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+branch2_nic_id=$(az vm show -n branch2-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke11_ip=$(az network nic show --ids $spoke11_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+spoke12_ip=$(az network nic show --ids $spoke12_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+spoke21_ip=$(az network nic show --ids $spoke21_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+spoke22_ip=$(az network nic show --ids $spoke22_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+branch1_ip=$(az network nic show --ids $branch1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+branch2_ip=$(az network nic show --ids $branch2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+
+# Sample commands
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke11_pip "ping -c 5 $spoke12_ip"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke11_pip "nc -vz $spoke12_ip 22"
+ssh -o StrictHostKeyChecking=no -J $spoke11_pip $spoke12_ip
+az network nic show-effective-route-table --ids $branch1_nic_id -o table
 
 ######################
 # Connection Monitor #
