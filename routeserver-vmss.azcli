@@ -39,6 +39,8 @@ nva_asn=65001
 nva_name=nva
 nva_pip=${nva_name}-pip
 nva_cloudinit_file=/tmp/nva_cloudinit.txt
+azurevm_name=azurevm
+azurevm_pip_name="${azurevm_name}-pip"
 auto_account_name="${nva_name}auto"
 logicapp_name=$nva_name
 logicapp_file=/tmp/nva_logicapp.json
@@ -85,6 +87,18 @@ az network vnet subnet create --vnet-name $vnet_name -g $rg -n $gw_subnet_name -
 az network vnet subnet create --vnet-name $vnet_name -g $rg -n $rs_subnet_name --address-prefix $rs_subnet_prefix
 az network vnet subnet create --vnet-name $vnet_name -g $rg -n $nva_subnet_name --address-prefix $nva_subnet_prefix
 
+# Configure a RT in the NVA subnet so that it doesnt learn its own routes
+nva_rt_name=nva
+az network route-table create -n $nva_rt_name -g $rg -l $location --disable-bgp-route-propagation
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $nva_subnet_name --route-table $nva_rt_name
+
+# Configure a RT in the VM subnet to provide connectivity to the PC where these commands are running
+vm_rt_name=vm
+az network route-table create -n $vm_rt_name -g $rg -l $location
+myip=$(curl -s4 ifconfig.co) && echo $myip
+az network route-table route create --route-table-name $vm_rt_name -g $rg --address-prefix "${myip}/32" --name "TestPC"  --next-hop-type Internet
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table $vm_rt_name
+
 # Deploy RS (no --no-wait option)
 rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 az network routeserver create -n rs -g $rg --hosted-subnet $rs_subnet_id -l $location
@@ -93,8 +107,6 @@ rs_ip1=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[0]' 
 rs_ip2=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
 
 # Create VM for testing purposes
-azurevm_name=azurevm
-azurevm_pip_name="${azurevm_name}-pip"
 az network nsg create -n "${azurevm_name}-nsg" -g $rg
 az network nsg rule create -n SSH --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
 az network nsg rule create -n ICMP --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
@@ -109,8 +121,10 @@ az network nsg create -n "${nva_name}-nsg" -g $rg
 az network nsg rule create -n SSH --nsg-name "${nva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
 az network nsg rule create -n IKE --nsg-name "${nva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp
 az network nsg rule create -n IPsec --nsg-name "${nva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp
-az network nsg rule create -n ICMP --nsg-name "${nva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
+az network nsg rule create -n ICMP --nsg-name "${nva_name}-nsg" -g $rg --priority 1030 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp
 az network nsg rule create -n Webin --nsg-name "${nva_name}-nsg" -g $rg --priority 1040 --source-address-prefixes 'VirtualNetwork' --destination-port-ranges 80 443 --access Allow --protocol Tcp
+az network nsg rule create -n ICMPout --nsg-name "${nva_name}-nsg" -g $rg --priority 1130 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp  --direction Outbound
+az network nsg rule create -n Webout --nsg-name "${nva_name}-nsg" -g $rg --priority 1140 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges 80 443 --access Allow --protocol Tcp --direction Outbound
 
 # Create Azure NVA with Bird and StrongSwan (only Bird is required for this scenario)
 nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
@@ -120,8 +134,8 @@ packages:
   - bird
 runcmd:
   - sysctl -w net.ipv4.ip_forward=1
-  - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
-  - sysctl -w net.ipv4.conf.all.send_redirects = 0
+  - sysctl -w net.ipv4.conf.all.accept_redirects=0
+  - sysctl -w net.ipv4.conf.all.send_redirects=0
   - iptables -t nat -A POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE
   - sysmtemctl restart bird
 write_files:
@@ -146,9 +160,9 @@ write_files:
     }
     protocol static {
         import all;
-        # Test route
-        route 1.1.1.1/32 via $nva_default_gw;
-        # Vnet prefix
+        # Default route
+        route 0.0.0.0/0 via $nva_default_gw;
+        # Vnet prefix to cover the RS' IPs
         route $vnet_prefix via $nva_default_gw;
     }
     protocol bgp rs0 {
@@ -172,8 +186,9 @@ EOF
 
 # Create a VMSS
 az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
-     --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1
-az vmss update -n $nva_name -g $rg --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].enableIPForwarding=true'
+    --vnet-name $vnet_name --subnet $nva_subnet_name \
+    --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1
+az vmss update -n $nva_name -g $rg --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].enableIpForwarding=true'
 az vmss update-instances -n $nva_name -g $rg --instance-ids '*'
 az vmss list-instance-connection-info -n $nva_name -g $rg -o table
 
@@ -276,6 +291,12 @@ foreach (\$Peering in \$Peerings.value)
     Write-Output "Found Route Server peering to \$PeerIP"
     \$PeeringIPs += \$PeerIP
     \$PeeringNames[\$PeerIP] = \$Peering.name
+    \$PeerProvisioningState = \$Peering.properties.provisioningState
+    # Exit if there was a peering in Updating state
+    if (\$PeerProvisioningState -eq "Updating") {
+        Write-Output "Peering to \$PeerIP is in Updating state, exiting to avoid uncontrolled concurrent operations"
+        exit
+    }
 }
 
 # See whether any peering is missing
@@ -289,6 +310,16 @@ foreach (\$VmssIP in \$VmssIPs) {
         \$PeerUri = "\${RSId}/bgpConnections/\${PeerName}?api-version=2021-02-01"
         Write-Output "Creating Route Server peering \$PeerName for IP \$VmssIP and ASN \$BgpAsn..."
         Invoke-AzRest -Method PUT -Path \$PeerUri -Payload \$PeerJson
+        # Wait until the provisioning state of the new peering is Succeeded/Failed
+        Write-Output "Waiting for peering \$PeerName to finish creation..."
+        \$i = 0
+        Do {
+            \$PeeringState = \$(\$(Invoke-AzRest -Method GET -Path \$PeerUri).content | ConvertFrom-Json).properties.provisioningState
+            \$i += 1
+            Start-Sleep -s 15   # Wait 15 seconds between each check
+        } While (\$PeeringState -eq "Updating")
+        \$i = \$i * 15
+        Write-Output "Peering \$PeerName provisioning state is \$PeeringState, wait time \$i seconds"
     }
 }
 
@@ -302,6 +333,20 @@ foreach (\$PeeringIP in \$PeeringIPs) {
         \$PeerUri = "\${RSId}/bgpConnections/\${PeerName}?api-version=2021-02-01"
         Write-Output "Deleting Route Server peering \$PeerName..."
         Invoke-AzRest -Method DELETE -Path \$PeerUri
+        # Wait until the deleting of the peering is finished
+        Write-Output "Waiting for peering \$PeerName to finish deletion..."
+        \$i = 0
+        Do {
+            Try {
+                \$PeeringState = \$(\$(Invoke-AzRest -Method GET -Path \$PeerUri).content | ConvertFrom-Json).properties.provisioningState
+            } Catch {
+                \$PeeringState = ""
+            }
+            \$i += 1
+            Start-Sleep -s 15   # Wait 15 seconds between each check
+        } While (\$PeeringState -eq "Deleting")
+        \$i = \$i * 15
+        Write-Output "Peering \$PeerName is deleted (state is \$PeeringState), wait time \$i seconds"
     }
 }
 EOF
@@ -465,6 +510,15 @@ while IFS= read -r vm; do
     echo "Connecting to IP $vm_ip port $vm_port..."
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_ip -p $vm_port "sudo birdc show protocols"
 done <<< "$vm_list"
+
+# See effective routes in VM
+azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $azurevm_nic_id -o table
+
+# Ping from VM
+azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddress -o tsv -g $rg) && echo $azurevm_pip_ip
+az network public-ip list -o table -g $rg
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azurevm_pip_ip "curl -s4 ifconfig.co"  # The public IP should be the VMSS' public ALB
 
 ###############
 # Danger Zone #

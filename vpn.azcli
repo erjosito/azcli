@@ -22,11 +22,11 @@ function create_gw {
     if [[ $no_of_gws == "1" ]]
     then
         az network public-ip create -g $rg -n pip${id}
-        az network vnet-gateway create -g $rg -sku VpnGw1 --gateway-type Vpn --vpn-type Route-Based --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id} --no-wait
+        az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id} --no-wait
     else
         az network public-ip create -g $rg -n pip${id}a
         az network public-ip create -g $rg -n pip${id}b
-        az network vnet-gateway create -g $rg -sku VpnGw1 --gateway-type Vpn --vpn-type Route-Based --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id}a pip${id}b --no-wait
+        az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id}a pip${id}b --no-wait
     fi
 }
 
@@ -36,21 +36,192 @@ function connect_gws {
     az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n ${gw1_id}to${gw2_id} --vnet-gateway1 vng${gw1_id} --vnet-gateway2 vng${gw2_id}
 }
 
-############
-#  Script  #
-############
+################
+#  Create GWs  #
+################
 
 # Create RG
 az group create -n $rg -l $location
 
+# Create VPN GW in one vnet
+create_gw 1 1
+
+# Create test VM
+azurevm_name=testvm
+azurevm_pip_name="${azurevm_name}-pip"
+vm_size=Standard_B1s
+az network nsg create -n "${azurevm_name}-nsg" -g $rg
+az vm create -n $azurevm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address $azurevm_pip_name --vnet-name vnet1 --size $vm_size --subnet vm --subnet-address-prefix 10.1.1.0/24
+
 # Connection between Azure VNGs
-az network vpn-connection create -g $rg --shared-key $password --enable-bgp -n 0to11 --vnet-gateway1 vng0 --vnet-gateway2 vng11
+# az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n 0to11 --vnet-gateway1 vng0 --vnet-gateway2 vng11
 
 # Connection between VNG and LocalGW
 # Local GW without BGP
-az network local-gateway create -g $rg -n vng0 --gateway-ip-address 1.2.3.4 --local-address-prefixes 192.168.0.0/24
+# az network local-gateway create -g $rg -n vng0 --gateway-ip-address 1.2.3.4 --local-address-prefixes 192.168.0.0/24
 # Local GW with BGP
-az network local-gateway create -g $rg -n lgw0 --gateway-ip-address 1.2.3.4 --local-address-prefixes 192.168.0.0/24 --asn 65101 --bgp-peering-address 192.168.0.1 --peer-weight 0
+# az network local-gateway create -g $rg -n lgw0 --gateway-ip-address 1.2.3.4 --local-address-prefixes 192.168.0.0/24 --asn 65101 --bgp-peering-address 192.168.0.1 --peer-weight 0
+
+#####################
+#  Simulate onprem  #
+#####################
+
+# Variables
+publisher=cisco
+offer=cisco-csr-1000v
+sku=16_12-byol
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+branch_prefix=172.16.200.0/24
+branch_subnet=172.16.200.0/26
+branch_gateway=172.16.200.1
+branch1_bgp_ip=172.16.200.11
+branch2_bgp_ip=172.16.200.12
+branch_asn=65500
+username=$(whoami)
+
+# Create CSR to simulate a branch
+az vm create -n branch-nva1 -g $rg -l $location --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys --public-ip-address branch1-pip --public-ip-address-allocation static \
+    --vnet-name branch --vnet-address-prefix $branch_prefix --subnet nva --subnet-address-prefix $branch_subnet --private-ip-address $branch1_bgp_ip
+branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
+
+# With BGP
+# az network local-gateway create -g $rg -n branch1 --gateway-ip-address $branch1_ip --local-address-prefixes "${branch1_bgp_ip}/32" --asn $branch_asn --bgp-peering-address $branch1_bgp_ip --peer-weight 0
+# az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n branch1 --vnet-gateway1 vng1 --local-gateway2 branch1
+# Without BGP
+az network local-gateway create -g $rg -n branch1 --gateway-ip-address $branch1_ip --local-address-prefixes $branch_prefix 
+az network vpn-connection create -g $rg --shared-key $psk -n branch1 --vnet-gateway1 vng1 --local-gateway2 branch1
+
+# Get VPNGW config data
+gw_name=vng1
+vpngw_pip_0=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_pip_0
+vpngw_private_ip_0=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_0
+vpngw_pip_1=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_pip_1
+vpngw_private_ip_1=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_1
+
+# Configure CSR
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
+config t
+    crypto ikev2 proposal azure-proposal
+        encryption aes-cbc-256 aes-cbc-128 3des
+        integrity sha1
+        group 2
+        exit
+    !
+    crypto ikev2 policy azure-policy
+        proposal azure-proposal
+        exit
+    !
+    crypto ikev2 keyring azure-keyring
+    peer $vpngw_pip_0
+        address $vpngw_pip_0
+        pre-shared-key $psk
+        exit
+    exit
+    !
+    crypto ikev2 profile azure-profile
+        match address local interface GigabitEthernet1
+        match identity remote address $vpngw_pip_0 255.255.255.255
+        authentication remote pre-share
+        authentication local pre-share
+        keyring local azure-keyring
+    exit
+    !
+    crypto ipsec transform-set azure-ipsec-proposal-set esp-aes 256 esp-sha-hmac
+        mode tunnel
+    exit
+
+    crypto ipsec profile azure-vti
+        set transform-set azure-ipsec-proposal-set
+        set ikev2-profile azure-profile
+        set security-association lifetime kilobytes 102400000
+        set security-association lifetime seconds 3600 
+    exit
+    !
+    interface Tunnel0
+        ip unnumbered GigabitEthernet1 
+        ip tcp adjust-mss 1350
+        tunnel source GigabitEthernet1
+        tunnel mode ipsec ipv4
+        tunnel destination $vpngw_pip_0
+        tunnel protection ipsec profile azure-vti
+    exit
+    !
+    ip route 10.1.0.0 255.255.0.0 Tunnel0
+    !
+end
+!
+wr mem
+EOF
+
+###############################
+# Optional, create second CSR #
+###############################
+
+# Create CSR to simulate a branch
+az vm create -n branch-nva2 -g $rg -l $location --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys \
+     --public-ip-address branch2-pip --public-ip-address-allocation static \
+    --vnet-name branch --subnet nva --private-ip-address $branch2_bgp_ip
+branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)
+
+# Local GW
+az network local-gateway create -g $rg -n branch2 --gateway-ip-address $branch2_ip --local-address-prefixes $branch_prefix 
+az network vpn-connection create -g $rg --shared-key $psk -n branch2 --vnet-gateway1 vng1 --local-gateway2 branch2
+
+# Configure IPsec
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip <<EOF
+config t
+    crypto ikev2 proposal azure-proposal
+        encryption aes-cbc-256 aes-cbc-128 3des
+        integrity sha1
+        group 2
+        exit
+    !
+    crypto ikev2 policy azure-policy
+        proposal azure-proposal
+        exit
+    !
+    crypto ikev2 keyring azure-keyring
+    peer $vpngw_pip_0
+        address $vpngw_pip_0
+        pre-shared-key $psk
+        exit
+    exit
+    !
+    crypto ikev2 profile azure-profile
+        match address local interface GigabitEthernet1
+        match identity remote address $vpngw_pip_0 255.255.255.255
+        authentication remote pre-share
+        authentication local pre-share
+        keyring local azure-keyring
+    exit
+    !
+    crypto ipsec transform-set azure-ipsec-proposal-set esp-aes 256 esp-sha-hmac
+        mode tunnel
+    exit
+
+    crypto ipsec profile azure-vti
+        set transform-set azure-ipsec-proposal-set
+        set ikev2-profile azure-profile
+        set security-association lifetime kilobytes 102400000
+        set security-association lifetime seconds 3600 
+    exit
+    !
+    interface Tunnel0
+        ip unnumbered GigabitEthernet1 
+        ip tcp adjust-mss 1350
+        tunnel source GigabitEthernet1
+        tunnel mode ipsec ipv4
+        tunnel destination $vpngw_pip_0
+        tunnel protection ipsec profile azure-vti
+    exit
+    !
+    ip route 10.1.0.0 255.255.0.0 Tunnel0
+    !
+end
+!
+wr mem
+EOF
 
 
 ####################
@@ -79,12 +250,21 @@ az network vpn-connection ipsec-policy add -g $rg --connection-name mycx \
 # Diagnostics #
 ###############
 
+# Azure VPN GW resources
 az network vnet-gateway list -g $rg -o table
 az network local-gateway list -g $rg -o table
-az network vpn-connection list -g $rg -o table
+az network vpn-connection list -g $rg -o table --query '[].{Name:name, EnableBgp:enableBgp, ProvisioningState:provisioningState}'
 az network vpn-connection ipsec-policy list -g $rg --connection-name mycx -o table
+
+# Effective routes
+testvm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $testvm_nic_id -o table
+
+# CSR
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip int b"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "sh ip int b"
 
 ###########
 # Cleanup #
 ###########
-az group delete -n $rg -y --no-wait
+# az group delete -n $rg -y --no-wait

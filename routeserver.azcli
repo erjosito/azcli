@@ -32,7 +32,7 @@ az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefi
 # Create Route Server
 subnet_id=$(az network vnet subnet show -n $subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 az network routeserver create -n $rs_name -g $rg --hosted-subnet $subnet_id -l $location
-az network routeserver update -g $rs_name -n <your-rs> --allow-b2b-traffic true
+az network routeserver update -n $rs_name -g $rg --allow-b2b-traffic true
 
 # Get info (once created)
 rs_ip1=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1

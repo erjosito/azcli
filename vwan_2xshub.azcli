@@ -17,7 +17,7 @@
 rg=vwan2xshub
 vwan=vwan
 location1=westcentralus
-location2=westcentralus
+location2=westeurope
 password=Microsoft123!
 vwan_hub1_prefix=192.168.1.0/24
 vwan_hub2_prefix=192.168.2.0/24
@@ -397,7 +397,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --adm
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --remote-vnet spoke${spoke_id}-$location1 \
-    --internet-security true --associated-route-table $hub1_vnet_rt_id --propagated-route-tables $hub2_vnet_rt_id --labels default
+    --internet-security true --associated-route-table $hub1_vnet_rt_id --propagated-route-tables $hub1_vnet_rt_id --labels default
 
 # Spoke12 in location1
 spoke_id=12
@@ -408,7 +408,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location1 --image ubuntuLTS --adm
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub1 --remote-vnet spoke${spoke_id}-$location1 \
-    --internet-security true --associated-route-table $hub1_vnet_rt_id --propagated-route-tables $hub2_vnet_rt_id --labels default
+    --internet-security true --associated-route-table $hub1_vnet_rt_id --propagated-route-tables $hub1_vnet_rt_id --labels default
 
 # Spoke21 in location2
 spoke_id=21
@@ -419,7 +419,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --adm
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
-    --internet-security true --associated-route-table $hub2_vnet_rt_id --propagated-route-tables $hub1_vnet_rt_id --labels default
+    --internet-security true --associated-route-table $hub2_vnet_rt_id --propagated-route-tables $hub2_vnet_rt_id --labels default
 
 
 # Spoke22 in location2
@@ -431,7 +431,7 @@ az vm create -n spoke${spoke_id}-vm -g $rg -l $location2 --image ubuntuLTS --adm
     --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file
 az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
 az network vhub connection create -n spoke${spoke_id} -g $rg --vhub-name hub2 --remote-vnet spoke${spoke_id}-$location2 \
-    --internet-security true --associated-route-table $hub2_vnet_rt_id --propagated-route-tables $hub1_vnet_rt_id --labels default
+    --internet-security true --associated-route-table $hub2_vnet_rt_id --propagated-route-tables $hub2_vnet_rt_id --labels default
 
 # VM in branch1
 az vm create -n branch1-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
