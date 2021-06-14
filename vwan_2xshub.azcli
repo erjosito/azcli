@@ -687,7 +687,7 @@ fw_net_logs_query='AzureDiagnostics
 //| where Action == "Deny" 
 //| project TimeGenerated, msg_s, Protocol, SourceIP,SourcePort,TargetIP,TargetPort,Action, NatDestination  // with msg_s
 | project TimeGenerated, Protocol, SourceIP,SourcePort,TargetIP,TargetPort,Action, NatDestination, Resource  // without msg_s
-//| take 20 '
+| take 20 '
 az monitor log-analytics query -w $logws_customerid --analytics-query $fw_net_logs_query -o tsv
 # Firewall App Rules
 fw_app_logs_query='AzureDiagnostics 

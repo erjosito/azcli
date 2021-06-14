@@ -391,11 +391,75 @@ az network application-gateway rewrite-rule create --gateway-name $appgw_name -g
     --response-headers 'Location=/api/{http_resp_Location_2}'
 az network application-gateway rewrite-rule condition create --gateway-name $appgw_name -g $rg --rule-name $rule_name --rule-set-name $ruleset_name  \
     --ignore-case true --negate false --pattern '(https?):\/\/vm\.cloudtrooper\.net\/api\/(.*)$' --variable "http_resp_Location"
-# Update SSL LB rule
-az network application-gateway rule update -g "$rg" --gateway-name "$appgw_name" -n sslrule --rewrite-rule-set $ruleset_name
+# Update HTTP LB rule
+default_rule_name=$(az network application-gateway rule list -g $rg --gateway-name $appgw_name --query '[0].name' -o tsv) && echo $default_rule_name  # should be something like "rule1"
+az network application-gateway rule update -g "$rg" --gateway-name "$appgw_name" -n $default_rule_name --rewrite-rule-set $ruleset_name
+# Update SSL LB rule - This only works for non-path-based rules!!!
+# az network application-gateway rule update -g "$rg" --gateway-name "$appgw_name" -n sslrule --rewrite-rule-set $ruleset_name
+# If using PathBased rules, the urlPathMap needs to be updated too
+# Either the default one for the whole path map:
+az network application-gateway url-path-map update --gateway-name $appgw_name -g $rg -n sslpathmap --default-rewrite-rule-set $ruleset_name
+# Or the individual rule:
+az network application-gateway url-path-map rule create --gateway-name $appgw_name -g $rg --path-map-name sslpathmap \
+  --name rule01 --paths '/api/*' --address-pool $default_address_pool_name --http-settings sslsettings --rewrite-rule-set $ruleset_name
 
 # Test
 curl -i "https://${appgw_fqdn}/healthcheck"
+
+##############
+#     WAF    #
+##############
+
+# Arguments
+#     --match-variables [Required] : Space-separated list of variables to use when matching. Variable
+#                                    values: RemoteAddr, RequestMethod, QueryString, PostArgs,
+#                                    RequestUri, RequestHeaders, RequestBody, RequestCookies.
+#     --operator        [Required] : Operator for matching.  Allowed values: BeginsWith, Contains,
+#                                    EndsWith, Equal, GeoMatch, GreaterThan, GreaterThanOrEqual,
+#                                    IPMatch, LessThan, LessThanOrEqual, Regex.
+#     --values          [Required] : Space-separated list of values to match.
+#     --negate                     : Match the negative of the condition.  Allowed values: false,
+#                                    true.
+#     --transforms                 : Space-separated list of transforms to apply when matching.
+#                                    Allowed values: HtmlEntityDecode, Lowercase, RemoveNulls, Trim,
+#                                    UrlDecode, UrlEncode.
+
+# Create policy
+waf_policy_name=wafpolicy
+az network application-gateway waf-policy create -n $waf_policy_name -g $rg
+
+# Blocking an IP
+waf_rule_name=blockip
+myip=$(curl -s4 ifconfig.co)
+az network application-gateway waf-policy custom-rule create -n $waf_rule_name -g $rg --policy-name $waf_policy_name \
+    --action Block --priority 10 --rule-type MatchRule
+az network application-gateway waf-policy custom-rule match-condition add -n $waf_rule_name --policy-name $waf_policy_name -g $rg \
+    --negate false --match-variables RemoteAddr --values $myip --operator IPMatch 
+# az network application-gateway waf-policy custom-rule delete -n $waf_rule_name -g $rg --policy-name $waf_policy_name
+
+# Blocking a certain UserAgent (Header)
+# No support for "selector" (to specify which header) in CLI!!!!!
+waf_rule_name=blockuseragent
+az network application-gateway waf-policy custom-rule create -n $waf_rule_name -g $rg --policy-name $waf_policy_name \
+    --action Block --priority 20 --rule-type MatchRule
+az network application-gateway waf-policy custom-rule match-condition add -n $waf_rule_name --policy-name $waf_policy_name -g $rg \
+    --negate false --match-variables RequestHeaders --values "evil" --operator Equal --transforms Lowercase
+# az network application-gateway waf-policy custom-rule delete -n $waf_rule_name -g $rg --policy-name $waf_policy_name
+
+# Allowing certain countries (using negate true!)
+waf_rule_name=allowcountry
+az network application-gateway waf-policy custom-rule create -n $waf_rule_name -g $rg --policy-name $waf_policy_name \
+    --action Block --priority 30 --rule-type MatchRule
+az network application-gateway waf-policy custom-rule match-condition add -n $waf_rule_name --policy-name $waf_policy_name -g $rg \
+    --negate true --match-variables RemoteAddr --values "de" --operator GeoMatch --transforms Lowercase
+
+# Apply policy to url path map
+waf_policy_id=$(az network application-gateway waf-policy show -n $waf_policy_name -g $rg --query id -o tsv) && echo $waf_policy_id
+az network application-gateway url-path-map rule create --gateway-name $appgw_name -g $rg --path-map-name sslpathmap \
+  --name rule01 --paths '/api/*' --address-pool $default_address_pool_name --http-settings sslsettings --rewrite-rule-set $ruleset_name --waf-policy $waf_policy_id
+
+# Test
+curl -A "evil" "https://appgw.cloudtrooper.net/api/healthcheck"
 
 ###############
 # Redirection #
@@ -420,6 +484,8 @@ curl -vvl "http://${appgw_fqdn}:8080/api/healthcheck"
 # Upgrade / Downgrade
 az network application-gateway update -g $rg -n $appgw_name --sku WAF_v2
 az network application-gateway update -g $rg -n $appgw_name --sku Standard_v2  # Downgrade not supported??
+ruleset_version=$(az network application-gateway waf-config list-rule-sets --query '[0].ruleSetVersion' -o tsv) && echo $ruleset_version
+az network application-gateway waf-config set -g $rg --gateway-name $appgw_name --enabled true --firewall-mode Prevention --rule-set-version $ruleset_version
 
 ###############
 # Diagnostics #
@@ -434,17 +500,25 @@ az network application-gateway address-pool list -g $rg --gateway-name $appgw_na
 az network application-gateway rule list -g $rg --gateway-name $appgw_name -o table
 az network application-gateway rule show -g $rg --gateway-name $appgw_name -n rule1
 az network application-gateway rule list -g $rg --gateway-name $appgw_name -o table
-rule=$(az network application-gateway rule list -g $rg --gateway-name $appgw_name --query '[0].name' -o tsv)
-az network application-gateway rule show -g $rg --gateway-name $appgw_name -n $rule
+default_rule_name=$(az network application-gateway rule list -g $rg --gateway-name $appgw_name --query '[0].name' -o tsv) && echo $default_rule_name
+az network application-gateway rule show -g $rg --gateway-name $appgw_name -n $default_rule_name
 az network application-gateway rule show -g $rg --gateway-name $appgw_name -n sslrule
 az network application-gateway url-path-map list -g $rg --gateway-name $appgw_name -o table
 az network application-gateway http-settings list -g $rg --gateway-name $appgw_name -o table
 az network application-gateway show-backend-health -g $rg --gateway-name $appgw_name -o table
+# Rewrite
 az network application-gateway rewrite-rule list-request-headers -o table
 az network application-gateway rewrite-rule list-response-headers -o table
 az network application-gateway rewrite-rule set list -g $rg --gateway-name $appgw_name -o table
 az network application-gateway rewrite-rule list -g $rg --gateway-name $appgw_name --rule-set-name $ruleset_name -o table
 az network application-gateway rewrite-rule condition list -g $rg --gateway-name $appgw_name --rule-set-name $ruleset_name --rule-name $rule_name -o table
+# WAF
+az network application-gateway waf-policy custom-rule list --policy-name $waf_policy_name -g $rg -o table
+az network application-gateway waf-policy custom-rule match-condition list --policy-name $waf_policy_name -g $rg -o table -n blockip
+az network application-gateway waf-policy custom-rule match-condition list --policy-name $waf_policy_name -g $rg -o table -n blockuseragent
+az network application-gateway waf-policy custom-rule match-condition list --policy-name $waf_policy_name -g $rg -o table -n allowcountry
+
+
 
 # curl cheatsheet
 url="https://${appgw_fqdn}/api/healthcheck"

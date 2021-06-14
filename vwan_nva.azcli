@@ -722,14 +722,14 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azurevm_pip_ip "ping -c 5 $
 # EOF
 
 # New user/password
-# cat <<EOF > $gnva_cloudinit
-# #!/bin/bash
-# apt install -y jq
-# useradd -m $username
-# echo "$username:Microsoft123!" | chpasswd $username
-# usermod -aG sudo $username
-# host_name=\$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2020-09-01" | jq -r '.compute.name')
-# if [[ "\${HOSTNAME: -1}" == "0" ]]; then echo "0123456789" > ~/license.txt; else echo "9876543210" > ~/license.txt; fi
-# EOF
+cat <<EOF > $gnva_cloudinit
+#!/bin/bash
+apt install -y jq
+useradd -m $username
+echo "$username:Microsoft123!" | chpasswd $username
+usermod -aG sudo $username
+host_name=\$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2020-09-01" | jq -r '.compute.name')
+if [[ "\${HOSTNAME: -1}" == "0" ]]; then echo "0123456789" > ~/license.txt; else echo "9876543210" > ~/license.txt; fi
+EOF
 
 

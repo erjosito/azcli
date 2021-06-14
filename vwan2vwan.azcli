@@ -31,10 +31,10 @@ password=Microsoft123!
 az group create -n $rg -l $location1
 
 # vwans and hubs
-az network vwan create -n $vwan1 -g $rg -l $location1 --branch-to-branch-traffic true --vnet-to-vnet-traffic true
-az network vhub create -n hub1 -g $rg --vwan $vwan1 -l $location1 --address-prefix $vwan1_hub_prefix --sku Standard
-az network vwan create -n $vwan2 -g $rg -l $location2 --branch-to-branch-traffic true --vnet-to-vnet-traffic true
-az network vhub create -n hub2 -g $rg --vwan $vwan2 -l $location2 --address-prefix $vwan2_hub_prefix --sku Standard
+az network vwan create -n $vwan1 -g $rg -l $location1 --branch-to-branch-traffic true --type Standard
+az network vhub create -n hub1 -g $rg --vwan $vwan1 -l $location1 --address-prefix $vwan1_hub_prefix
+az network vwan create -n $vwan2 -g $rg -l $location2 --branch-to-branch-traffic true --type Standard
+az network vhub create -n hub2 -g $rg --vwan $vwan2 -l $location2 --address-prefix $vwan2_hub_prefix
 
 # VPN Gateways
 az network vpn-gateway create -n hubvpn1 -g $rg -l $location1 --vhub hub1 --asn $vwan_hub1_asn --no-wait
