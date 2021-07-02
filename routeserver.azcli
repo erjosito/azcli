@@ -111,6 +111,7 @@ az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefi
 rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 az network routeserver create -n $rs_name -g $rg --hosted-subnet $rs_subnet_id -l $location
 az network routeserver update -n $rs_name -g $rg --allow-b2b-traffic true   # Optional
+# az network routeserver delete -n $rs_name -g $rg -y  # Danger Zone!
 
 # Get info (once created)
 rs_ip1=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
@@ -311,7 +312,7 @@ config t
     interface GigabitEthernet1
         ip nat outside
     interface GigabitEthernet2
-        ip nat outside
+        ip nat inside
     access-list 100 remark SOURCES TO BE NATTED
     access-list 100 deny ip $hub_csrext_subnet_prefix_long_reversemask any
     access-list 100 permit ip 10.0.0.0 0.255.255.255 any
@@ -348,7 +349,7 @@ EOF
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr2_ip "ping $rs_ip1"
 # Create peering
 az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $hub_csr2_bgp_ip --peer-asn $hub_csr_asn -n $hub_csr2_name
-# az network routeserver peering delete --routeserver $rs_name -g $rg -n $hub_csr2_name -y -o none
+# az network routeserver peering delete --routeserver $rs_name -g $rg -n $hub_csr2_name -y -o none  # In case you need to recreate the BGP peering
 
 # Verify that the RS is learning the routes from both CSRs
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr1_ip "sh ip bgp summ"
@@ -366,7 +367,7 @@ config t
 EOF
 start_time=$(date +%s)
 echo "Internal interface shutdown in CSR1, now waiting for the effective route to switch to CSR2 ($hub_csr2_bgp_ip)..."
-nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)  && echo $nexthop
+nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]')  && echo $nexthop
 until [[ "$nexthop" == "$hub_csr2_bgp_ip" ]]
 do
   nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
