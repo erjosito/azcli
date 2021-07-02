@@ -100,6 +100,7 @@ enableAksFeature "EnablePodIdentityPreview"
 enableAksFeature "MigrateToMSIClusterPreview"
 enableAksFeature "PodSubnetPreview"
 
+# Update extension
 az extension update -n aks-preview
 
 ########
@@ -180,6 +181,7 @@ az aks create -g $rg -n $aks_name -l $location \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
     --pod-subnet-id $pod_subnet_id \
     --node-osdisk-type ephemeral --node-osdisk-size 30 \
+    --outbound-type userDefinedRouting \
     --no-wait
 
 # Other options you can use in the previous command
@@ -189,7 +191,7 @@ az aks create -g $rg -n $aks_name -l $location \
     # --cluster-autoscaler-profile scan-interval=30s \
     # --dns-name-prefix cloudtrooper \
     # --node-osdisk-type ephemeral --node-osdisk-size 30 \
-
+    # --outbound-type userDefinedRouting \
 ########
 # Wait #
 ########

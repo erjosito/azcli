@@ -1,0 +1,328 @@
+############################################################################
+# Created by Jose Moreno
+# June 2021
+#
+# The script creates APIM in an AKS cluster, plus a pod with a test API
+#
+############################################################################
+
+
+# Variables
+rg=apim
+location=westeurope
+arc_name=myaksengine
+apim_sku=Developer  # The Premium SKU offers multi-region on top
+apim_vnet_type=Internal
+apim_publisher_email=admin@contoso.com
+apim_publisher_name=Contoso
+
+######################
+# Kubernetes cluster #
+######################
+
+# Create RG for AKS engine cluster
+az group create -n $rg -l $location
+
+# Install AKS engine
+# Go here: https://github.com/Azure/aks-engine/releases/latest
+# Example with v0.61.0:
+aksengine_exec=$(which aks-engine 2>/dev/null)
+if [[ "$aksengine_exec" == "aks-engine not found" ]]
+then
+    echo "Downloading and installing aks-engine executable..."
+    aksengine_tmp=/tmp/aksengine.tar.gz
+    wget https://github.com/Azure/aks-engine/releases/download/v0.61.0/aks-engine-v0.61.0-linux-amd64.tar.gz -O $aksengine_tmp
+    tar xfvz $aksengine_tmp -C /tmp/
+    sudo cp /tmp/aks-engine-v0.61.0-linux-amd64/aks-engine /usr/local/bin
+else
+    echo "aks-engine executable found in ${aksengine_exec}"
+fi
+
+# Retrieve Service Principal form your AKV, required for AKS engine or CAPI
+purpose=aksengine
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+keyvault_name=erjositoKeyvault
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv 2>/dev/null)
+sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv 2>/dev/null)
+
+# If they could not be retrieved, generate new ones
+if [[ -z "$sp_app_id" ]] || [[ -z "$sp_app_secret" ]]
+then
+    echo "No SP for AKS-engine could be found in AKV $keyvault_name, generating new ones..."
+    sp_name=$purpose
+    sp_output=$(az ad sp create-for-rbac --name $sp_name --skip-assignment 2>/dev/null)
+    sp_app_id=$(echo $sp_output | jq -r '.appId')
+    sp_app_secret=$(echo $sp_output | jq -r '.password')
+    # Store the created app ID and secret in an AKV
+    az keyvault secret set --vault-name $keyvault_name -n $keyvault_appid_secret_name --value $sp_app_id
+    az keyvault secret set --vault-name $keyvault_name -n $keyvault_password_secret_name --value $sp_app_secret
+else
+    echo "Service Principal $sp_app_id and secret successfully retrieved from AKV $keyvault_name"
+fi
+
+# Grant access to the SP to the new RG
+scope=$(az group show -n $rg --query id -o tsv)
+assignee=$(az ad sp show --id $sp_app_id --query objectId -o tsv)
+az role assignment create --scope $scope --role Contributor --assignee $assignee
+
+# File containing the description of the AKS engine cluster to create
+aksengine_cluster_file="/tmp/aksengine_cluster.json" 
+
+# Option1: Retrieve example JSON file describing a basic cluster
+# url=https://raw.githubusercontent.com/Azure/aks-engine/master/examples/kubernetes.json
+# wget $url -O $aksengine_cluster_file
+# You can modify the kubernetes.json file, for example with smaller VM sizes such as Standard_B2ms
+
+# Option 2: Create a cluster file from scratch:
+aksengine_vm_size=Standard_B2ms
+cat <<EOF > $aksengine_cluster_file
+{
+  "apiVersion": "vlabs",
+  "properties": {
+    "orchestratorProfile": {
+      "orchestratorType": "Kubernetes"
+    },
+    "masterProfile": {
+      "count": 1,
+      "dnsPrefix": "",
+      "vmSize": "$aksengine_vm_size"
+    },
+    "agentPoolProfiles": [
+      {
+        "name": "agentpool1",
+        "count": 2,
+        "vmSize": "$aksengine_vm_size"
+      }
+    ],
+    "linuxProfile": {
+      "adminUsername": "azureuser",
+      "ssh": {
+        "publicKeys": [
+          {
+            "keyData": ""
+          }
+        ]
+      }
+    },
+    "servicePrincipalProfile": {
+      "clientId": "",
+      "secret": ""
+    }
+  }
+}
+EOF
+
+# Wait 30 seconds (the role assignment might need some time to propagate)
+sleep 30
+
+# Create AKS-engine cluster
+# You might need to install aks-engine from https://github.com/Azure/aks-engine/blob/master/docs/tutorials/quickstart.md
+subscription=$(az account show --query id -o tsv)
+domain=abc$RANDOM
+output_dir=/tmp/aksengine
+rm -rf $output_dir   # The output directory cannot exist
+aks-engine deploy --subscription-id $subscription \
+    --dns-prefix $domain \
+    --resource-group $rg \
+    --location $location \
+    --api-model $aksengine_cluster_file \
+    --client-id $sp_app_id \
+    --client-secret $sp_app_secret \
+    --set servicePrincipalProfile.clientId=$sp_app_id \
+    --set servicePrincipalProfile.secret="$sp_app_secret" \
+    --output-directory $output_dir
+
+# There are different ways to access the cluster
+# Exporting the KUBECONFIG variable is required by the command "az k8s-configuration create"
+export KUBECONFIG="$output_dir/kubeconfig/kubeconfig.$location.json" 
+kubectl get node
+# The alias is a little dirty trick for lazy persons like me
+# alias ke="kubectl --kubeconfig ./_output/$domain/kubeconfig/kubeconfig.$location.json" 
+
+# Az CLI extension connectedk8s
+extension_name=connectedk8s
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+if [[ -z "$extension_version" ]]
+then
+    echo "Azure CLI extension $extension_name not found, installing now..."
+    az extension add -n $extension_name
+else
+    echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
+    az extension update -n $extension_name
+fi
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+echo "Azure CLI extension $extension_name installed with version $extension_version"
+
+# Registering providers
+for provider in "Kubernetes" "KubernetesConfiguration" "ExtendedLocation"
+do
+    registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
+    if [[ "$registration_state" == "Registered" ]]
+    then
+        echo "Resource Provider Microsoft.${provider} is successfully registered with status ${registration_state}"
+    else
+        echo "It seems that provider Microsoft.${provider} is not registered, registering now..."
+        az provider register --namespace "Microsoft.${provider}"
+        wait_time=30
+        registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
+        while [[ "$registration_state" != "Registered" ]]
+        do
+            echo "Registration state for RP Microsoft.${provider} is still $registration_state..."
+            sleep $wait_time
+            registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
+        done
+        echo "Registration state for RP Microsoft.${provider} is ${registration_state}"
+    fi
+done
+echo "All resource providers successfully registered"
+
+# Create the ARC resource
+az connectedk8s connect --name $arc_name -g $rg
+
+# Diagnostics
+az connectedk8s list -g $rg -o table
+kubectl -n azure-arc get deployments,pods
+
+########
+# APIM #
+########
+
+# Find existing APIM or create one
+apim_name=$(az apim list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$apim_name" ]]
+then
+    apim_name=apim$RANDOM
+    echo "Creating APIM ${apim_name}..."
+    az apim create -n $apim_name -g $rg --publisher-email $apim_publisher_email --publisher-name $apim_publisher_name --sku-name $apim_sku --virtual-network $apim_vnet_type
+else
+    echo "APIM $apim_name found in resource group"
+fi
+
+# az network vnet subnet create -g $rg -n $apim_subnet_name --vnet-name $vnet_name --address-prefix $apim_subnet_prefix
+# apim_subnet_id=$(az network vnet subnet show -n $apim_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+# And this another 23m
+# az apim update -n $apim_name -g $rg \
+#   --set virtualNetworkType=$apim_vnet_type \
+#   --set virtualNetworkConfiguration.subnetResourceId=$apim_subnet_id
+
+# Create product and API
+az apim product create -g $rg --service-name $apim_name \
+        --product-id MyApis --product-name MyAPIs --description "My API" --legal-terms MyTerms \
+        --subscription-required false --approval-required false --subscriptions-limit 8 --state "published"
+az apim api create -g $rg --service-name $apim_name --api-id SqlApi --path '/api' --display-name 'SQL API'
+az apim product api add -n $apim_name -g $rg --product-id MyApis --api-id SqlApi
+az apim api operation create -g $rg --service-name $apim_name --api-id SqlApi --display-name 'SQL API' --operation-id ip --url-template /ip --method GET
+az apim api operation create -g $rg --service-name $apim_name --api-id SqlApi --display-name 'Healthcheck' --operation-id healthcheck --url-template /healthcheck --method GET
+
+# Add a Gateway (portal) and get its key and config URL
+gw_key=<copy from portal>
+gw_config_url=<copy from portal>
+
+# Deploy Gateway to k8s
+az k8s-extension create --cluster-type connectedClusters --cluster-name $arc_name -g $rg \
+  --name apimgw --extension-type Microsoft.ApiManagement.Gateway \
+  --scope namespace --target-namespace apim \
+  --configuration-settings gateway.endpoint="$gw_config_url" \
+  --configuration-protected-settings gateway.authKey="$gw_key" \
+  --configuration-settings service.type='LoadBalancer' --release-train preview
+
+# Verify extension state
+az k8s-extension show --cluster-type connectedClusters --cluster-name $arc_name --resource-group $rg --name apimgw -o table
+az k8s-extension list --cluster-type connectedClusters --cluster-name $arc_name --resource-group $rg -o table
+
+# Delete extension
+# az k8s-extension delete --cluster-type connectedClusters --cluster-name $arc_name --resource-group $rg --name apimgw -y
+
+# Create test DB for the API
+sql_server_name=sqlserver$RANDOM
+sql_db_name=mydb
+sql_username=azure
+sql_password=Microsoft123!
+az group create -n $rg -l $location
+az sql server create -n $sql_server_name -g $rg -l $location --admin-user "$sql_username" --admin-password "$sql_password"
+az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait
+sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName) && echo $sql_server_fqdn
+
+# Create backend using the SQL API image
+yaml_file=/tmp/sqlapi.yml
+cat <<EOF > $yaml_file
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sqlpassword
+type: Opaque
+stringData:
+  password: $sql_password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    run: api
+  name: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      run: api
+  template:
+    metadata:
+      labels:
+        run: api
+    spec:
+      containers:
+      - image: fasthacks/sqlapi:1.0
+        name: api
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        - name: SQL_SERVER_USERNAME
+          value: "$sql_username"
+        - name: SQL_SERVER_FQDN
+          value: "$sql_server_fqdn"
+        - name: SQL_SERVER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: sqlpassword
+              key: password
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    run: api
+EOF
+kubectl apply -f $yaml_file
+
+# Get public IP and test /api/healthcheck endpoint
+api_pip=$(kubectl get svc/api -n default -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null) && echo $api_pip
+curl -s4 "http://${api_pip}:8080/api/healthcheck"
+curl -s4 "http://${api_pip}:8080/api/sqlversion"   # SQL Server firewall would have to be updated
+
+# Create backend in portal, FQDN should be api.default.svc.cluster.local
+
+# Test APIM
+
+
+###############
+# Diagnostics #
+###############
+
+az apim list -g $rg -o table
+
+###############
+# DANGER ZONE #
+###############
+
+# az group delete -n $rg -y --no-wait

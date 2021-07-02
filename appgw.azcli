@@ -294,6 +294,15 @@ appgw_fqdn=$(create_dns "appgw" "$appgw_pip") && echo $appgw_fqdn
 appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
 wait_until_finished $appgw_id
 
+# Add diagnostic setting
+appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "ApplicationGatewayAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+        {"category": "ApplicationGatewayPerformanceLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+        {"category": "ApplicationGatewayFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+
+
 # Add healthcheck probe with custom path to existing settings
 az network application-gateway probe create -g "$rg" --gateway-name "$appgw_name" \
 --name testvmprobe8080 --protocol Http --host-name-from-http-settings --match-status-codes 200-399 --port 8080 --path /api/healthcheck
@@ -458,6 +467,12 @@ waf_policy_id=$(az network application-gateway waf-policy show -n $waf_policy_na
 az network application-gateway url-path-map rule create --gateway-name $appgw_name -g $rg --path-map-name sslpathmap \
   --name rule01 --paths '/api/*' --address-pool $default_address_pool_name --http-settings sslsettings --rewrite-rule-set $ruleset_name --waf-policy $waf_policy_id
 
+# Apply policy to the listener
+az network application-gateway http-listener update -n ssllistener -g $rg --gateway-name $appgw_name --waf-policy $waf_policy_id
+
+# Apply policy to full AppGW (NOT WORKING!)
+az network application-gateway waf-policy update -n $waf_policy_name -g $rg --add applicationGateways id=$appgw_id
+
 # Test
 curl -A "evil" "https://appgw.cloudtrooper.net/api/healthcheck"
 
@@ -487,6 +502,36 @@ az network application-gateway update -g $rg -n $appgw_name --sku Standard_v2  #
 ruleset_version=$(az network application-gateway waf-config list-rule-sets --query '[0].ruleSetVersion' -o tsv) && echo $ruleset_version
 az network application-gateway waf-config set -g $rg --gateway-name $appgw_name --enabled true --firewall-mode Prevention --rule-set-version $ruleset_version
 
+
+########################
+# Query AzMonitor logs #
+########################
+
+# AppGW Log Categories
+query='AzureDiagnostics 
+| where ResourceType == "APPLICATIONGATEWAYS" 
+| distinct Category '
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+# AppGW Access Logs
+myip=$(curl -s4 ifconfig.co)
+query_acc='AzureDiagnostics 
+| where TimeGenerated >= ago(5m) 
+| where ResourceType == "APPLICATIONGATEWAYS" 
+| where Category == "ApplicationGatewayAccessLog"
+| project timeStamp_t, clientIP_s, clientPort_d, host_s, originalHost_s, originalRequestUriWithArgs_s, serverRouted_s, httpMethod_s, httpStatus_d, ruleName_s, transactionId_g
+| where clientIP_s == "'$myip'"
+| take 20'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_acc -o tsv
+# AppGW WAF Logs
+query_waf='AzureDiagnostics 
+| where TimeGenerated >= ago(5m) 
+| where ResourceType == "APPLICATIONGATEWAYS" 
+| where Category == "ApplicationGatewayFirewallLog"
+| project timeStamp_t, ruleId_s, ruleSetType_s, clientIp_s, hostname_s, transactionId_g, Message
+| take 20'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_waf -o tsv
+
+
 ###############
 # Diagnostics #
 ###############
@@ -513,15 +558,41 @@ az network application-gateway rewrite-rule set list -g $rg --gateway-name $appg
 az network application-gateway rewrite-rule list -g $rg --gateway-name $appgw_name --rule-set-name $ruleset_name -o table
 az network application-gateway rewrite-rule condition list -g $rg --gateway-name $appgw_name --rule-set-name $ruleset_name --rule-name $rule_name -o table
 # WAF
+az network application-gateway waf-config list-rule-sets -o table
+az network application-gateway waf-config show --gateway-name $appgw_name -g $rg
+az network application-gateway waf-policy policy-setting list --policy-name $waf_policy_name -g $rg
 az network application-gateway waf-policy custom-rule list --policy-name $waf_policy_name -g $rg -o table
-az network application-gateway waf-policy custom-rule match-condition list --policy-name $waf_policy_name -g $rg -o table -n blockip
-az network application-gateway waf-policy custom-rule match-condition list --policy-name $waf_policy_name -g $rg -o table -n blockuseragent
-az network application-gateway waf-policy custom-rule match-condition list --policy-name $waf_policy_name -g $rg -o table -n allowcountry
+az network application-gateway waf-policy custom-rule match-condition list --policy-name $waf_policy_name -g $rg -n blockip
+az network application-gateway waf-policy custom-rule match-condition list --policy-name $waf_policy_name -g $rg -n blockuseragent
+az network application-gateway waf-policy custom-rule match-condition list --policy-name $waf_policy_name -g $rg -n allowcountry
 
+################
+#  Stop/Start  #
+################
+
+# Stop
+az network application-gateway stop -g $rg -n $appgw_name
+az vm deallocate -g $rg -n $vm_name
+
+# Start
+az network application-gateway start -g $rg -n $appgw_name
+az vm start -g $rg -n $vm_name
+# Update DNS?
+vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
+vm_fqdn=$(create_dns "vm" "$vm_pip_address") && echo $vm_fqdn
+appgw_pip=$(az network public-ip show -g $rg -n $appgw_pipname --query ipAddress -o tsv) && echo $appgw_pip
+appgw_fqdn=$(create_dns "appgw" "$appgw_pip") && echo $appgw_fqdn
 
 
 # curl cheatsheet
-url="https://${appgw_fqdn}/api/healthcheck"
-curl -i $url    # Show response headers
-curl -vvl $url  # Show certificate data
-curl -L $url    # Follow redirections
+# url="https://${appgw_fqdn}/api/healthcheck"
+# curl -i $url    # Show response headers
+# curl -vvl $url  # Show certificate data
+# curl -L $url    # Follow redirections
+# curl --resolve appgw.cloudtrooper.net:443:1.2.3.4    # Follow redirections
+
+#############
+#  Cleanup  #
+#############
+
+# az group delete -n $rg -y --no-wait
