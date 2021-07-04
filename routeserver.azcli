@@ -104,7 +104,7 @@ az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subn
 # Create additional subnets (no subnet can be created while the route server is being provisioned, same as VNGs)
 az network vnet subnet create -n $hub_csrext_subnet_name --address-prefix $hub_csrext_subnet_prefix --vnet-name $vnet_name -g $rg
 az network vnet subnet create -n $hub_csrint_subnet_name --address-prefix $hub_csrint_subnet_prefix --vnet-name $vnet_name -g $rg
-az network vnet subnet create -n $vm_subnet_name --address-prefix $vm_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n $hub_vm_subnet_name --address-prefix $hub_vm_subnet_prefix --vnet-name $vnet_name -g $rg
 az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefix --vnet-name $vnet_name -g $rg
 
 # Create Route Server
