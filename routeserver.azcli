@@ -104,7 +104,7 @@ az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subn
 # Create additional subnets (no subnet can be created while the route server is being provisioned, same as VNGs)
 az network vnet subnet create -n $hub_csrext_subnet_name --address-prefix $hub_csrext_subnet_prefix --vnet-name $vnet_name -g $rg
 az network vnet subnet create -n $hub_csrint_subnet_name --address-prefix $hub_csrint_subnet_prefix --vnet-name $vnet_name -g $rg
-az network vnet subnet create -n $vm_subnet_name --address-prefix $vm_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n $hub_vm_subnet_name --address-prefix $hub_vm_subnet_prefix --vnet-name $vnet_name -g $rg
 az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefix --vnet-name $vnet_name -g $rg
 
 # Create Route Server
@@ -364,44 +364,51 @@ az network routeserver peering list-learned-routes -n $hub_csr2_name --routeserv
 az network nic show-effective-route-table --ids $hub_vm_nic_id -o table
 
 # Simulate outage of CSR1 and measure time for CSR2 to take over (looking at the effective routes)
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
-config t
-  int GigabitEthernet2
-  shutdown
+function bring_down_csr1() {
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
+  config t
+    int GigabitEthernet2
+    shutdown
 EOF
-start_time=$(date +%s)
-echo "Internal interface shutdown in CSR1, now waiting for the effective route to switch to CSR2 ($hub_csr2_bgp_ip)..."
-nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]')  && echo $nexthop
-until [[ "$nexthop" == "$hub_csr2_bgp_ip" ]]
-do
-  nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
-  echo "Next hop for 0.0.0.0/0 is $nexthop"
-done
-finish_time=$(date +%s)
-run_time=$(($finish_time - $start_time))
-((minutes=run_time/60))
-((seconds=run_time%60))
-echo "Effective route pointing now to $nexthop after $minutes minutes and $seconds seconds"
+  start_time=$(date +%s)
+  echo "Internal interface shutdown in CSR1, now waiting for the effective route to switch to CSR2 ($hub_csr2_bgp_ip)..."
+  nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]')  && echo $nexthop
+  until [[ "$nexthop" == "$hub_csr2_bgp_ip" ]]
+  do
+    nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
+    echo "Next hop for 0.0.0.0/0 is $nexthop"
+  done
+  finish_time=$(date +%s)
+  run_time=$(($finish_time - $start_time))
+  ((minutes=run_time/60))
+  ((seconds=run_time%60))
+  echo "Effective route pointing now to $nexthop after $minutes minutes and $seconds seconds"
+}
 
 # Restore CSR1 connectivity
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
-config t
-  int GigabitEthernet2
-  no shutdown
+function bring_up_csr1() {
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
+  config t
+    int GigabitEthernet2
+    no shutdown
 EOF
-start_time=$(date +%s)
-echo "Internal interface restored in CSR1, now waiting for the effective route to switch back to CSR1 ($hub_csr1_bgp_ip)..."
-nexthop=$(❯ az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
-until [[ "$nexthop" == "$hub_csr1_bgp_ip" ]]
-do
-  nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
-  echo "Next hop for 0.0.0.0/0 is $nexthop"
-done
-finish_time=$(date +%s)
-run_time=$(($finish_time - $start_time))
-((minutes=run_time/60))
-((seconds=run_time%60))
-echo "Effective route pointing now to $nexthop after $minutes minutes and $seconds seconds"
+  start_time=$(date +%s)
+  echo "Internal interface restored in CSR1, now waiting for the effective route to switch back to CSR1 ($hub_csr1_bgp_ip)..."
+  nexthop=$(❯ az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
+  until [[ "$nexthop" == "$hub_csr1_bgp_ip" ]]
+  do
+    nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
+    echo "Next hop for 0.0.0.0/0 is $nexthop"
+  done
+  finish_time=$(date +%s)
+  run_time=$(($finish_time - $start_time))
+  ((minutes=run_time/60))
+  ((seconds=run_time%60))
+  echo "Effective route pointing now to $nexthop after $minutes minutes and $seconds seconds"
+}
+
+bring_down_csr1
+bring_up_csr1
 
 ################
 #    Spokes    #
