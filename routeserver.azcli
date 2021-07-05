@@ -122,7 +122,7 @@ rs_asn=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAs
 az vm create -n hubvm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
     --public-ip-address hubvm-pip --vnet-name $vnet_name --size Standard_B1s --subnet $hub_vm_subnet_name
 hub_vm_ip=$(az network public-ip show -n hubvm-pip --query ipAddress -o tsv -g $rg) && echo $hub_vm_ip
-hub_vm_nic_id=$(az vm show -n hubvm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+hub_vm_nic_id=$(az vm show -n hubvm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv) && echo $hub_vm_nic_id
 hub_vm_private_ip=$(az network nic show --ids $hub_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub_vm_private_ip
 
 ####################
@@ -174,7 +174,7 @@ az network route-table create -n csrext -g $rg -l $location --disable-bgp-route-
 az network vnet subnet update --name $hub_csrext_subnet_name --route-table csrext --vnet-name $vnet_name --resource-group $rg
 
 # Test access over SSH
-hub_csr1_ip=$(az network public-ip show -n "${hub_csr1_name}-pip" --query ipAddress -o tsv -g $rg)
+hub_csr1_ip=$(az network public-ip show -n "${hub_csr1_name}-pip" --query ipAddress -o tsv -g $rg) && echo $hub_csr1_ip
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" "sh ip int b"
 
 # Configure hub CSR1 with BGP
@@ -188,9 +188,11 @@ config t
         neighbor $rs_ip1 remote-as $rs_asn
         neighbor $rs_ip1 ebgp-multihop 2
         neighbor $rs_ip1 update-source GigabitEthernet2
+        neighbor $rs_ip1 timers 5 15
         neighbor $rs_ip2 remote-as $rs_asn
         neighbor $rs_ip2 ebgp-multihop 2
         neighbor $rs_ip2 update-source GigabitEthernet2
+        neighbor $rs_ip2 timers 5 15
     ip route 10.0.0.0 255.0.0.0 $hub_csrint_default_gw
     ip route $vnet_prefix_long $hub_csrint_default_gw
     ip route 172.16.0.0 255.240.0.0 $hub_csrint_default_gw
@@ -302,7 +304,7 @@ az vm create -n $hub_csr2_name -g $rg -l $location \
     --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
     --nics "${hub_csr2_name}-nic0" "${hub_csr2_name}-nic1"
 # Configure hub CSR2 with BGP
-hub_csr2_ip=$(az network public-ip show -n "${hub_csr2_name}-pip" --query ipAddress -o tsv -g $rg)
+hub_csr2_ip=$(az network public-ip show -n "${hub_csr2_name}-pip" --query ipAddress -o tsv -g $rg) && echo $hub_csr2_ip
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr2_ip" "sh ip int b"
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr2_ip" <<EOF
 config t
@@ -327,10 +329,12 @@ config t
         neighbor $rs_ip1 ebgp-multihop 2
         neighbor $rs_ip1 update-source GigabitEthernet2
         neighbor $rs_ip1 route-map ToRS out
+        neighbor $rs_ip1 timers 5 15
         neighbor $rs_ip2 remote-as $rs_asn
         neighbor $rs_ip2 ebgp-multihop 2
         neighbor $rs_ip2 update-source GigabitEthernet2
         neighbor $rs_ip2 route-map ToRS out
+        neighbor $rs_ip2 timers 5 15
     route-map ToRS
         set as-path prepend ${hub_csr_asn} ${hub_csr_asn}
     ip route 0.0.0.0 0.0.0.0  $hub_csrext_default_gw
