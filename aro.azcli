@@ -242,9 +242,101 @@ oc expose dc kuard-amd64 --port 8080 --type=LoadBalancer --name=kuard --dry-run 
 # Exposing ClusterIP Svc over a route
 oc expose svc kuardilb
 
+############################
+#   Machine Sets and CA    #
+############################
+
+# Get initial configuration
+oc get node
+oc get machine -n openshift-machine-api
+oc get machinesets -n openshift-machine-api
+oc get clusterautoscaler -n openshift-machine-api
+
+# Deploy CA
+# https://docs.openshift.com/container-platform/4.7/machine_management/applying-autoscaling.html
+cat <<EOF | kubectl apply -f -
+apiVersion: "autoscaling.openshift.io/v1"
+kind: "ClusterAutoscaler"
+metadata:
+    name: "default"
+    namespace: "openshift-machine-api"
+spec:
+    podPriorityThreshold: -10
+    resourceLimits:
+        maxNodesTotal: 12
+    scaleDown:
+        enabled: true
+        delayAfterAdd: 10s
+        delayAfterDelete: 10s
+        delayAfterFailure: 10s
+EOF
+oc get clusterautoscaler -n openshift-machine-api
+
+# Deploy machine autoscalers for each machineset
+machineset_list=$(oc get machinesets -n openshift-machine-api -o json | jq -r '.items[].metadata.name')
+echo "$machineset_list" | while read machineset_name
+do
+  cat <<EOF | kubectl apply -f -
+  apiVersion: autoscaling.openshift.io/v1beta1
+  kind: MachineAutoscaler
+  metadata:
+      name: autoscale-$machineset_name
+      namespace: openshift-machine-api
+  spec:
+      minReplicas: 1
+      maxReplicas: 3
+      scaleTargetRef:
+          apiVersion: machine.openshift.io/v1beta1
+          kind: MachineSet
+          name: $machineset_name
+EOF
+done
+oc get machineautoscaler -n openshift-machine-api
+
+# Create sample deployment with 1CPU resource requests, and scale it up/down
+project_name=autoscalerdemo
+oc new-project $project_name
+cat <<EOF | kubectl apply -n $project_name -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoscaler-demo
+  labels:
+    app: autoscaler-demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: autoscaler-demo
+  template:
+    metadata:
+      labels:
+        app: autoscaler-demo
+    spec:
+      containers:
+      - name: kuard
+        image: gcr.io/kuar-demo/kuard-amd64:1
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "1000m"
+          limits:
+            memory: "128Mi"
+            cpu: "2000m"
+        ports:
+        - containerPort: 8080
+EOF
+oc get deploy -n $project_name
+kubectl get pod -n $project_name
+kubectl scale --replicas=21 -n $project_name deploy/autoscaler-demo
+oc get machinesets -n openshift-machine-api
+
 ###########################
 #   Container Insights    #
 ###########################
+
+# NOTE: this will probably be migrated to Arc
+
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
 if [[ -z "$logws_name" ]]
 then
