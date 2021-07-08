@@ -53,7 +53,7 @@ $location="westeurope"
 az group create -n $rg -l $location
 $rg_id=$(az group show -n $rg --query id -o tsv)
 #az role assignment create --assignee $aib_app_id --role  $role_name --scope $rg_id
-New-AzRoleAssignment -ObjectId ef511139-6170-438e-a6e1-763dc31bdf74 -Scope "/subscriptions/$subscriptionID/resourceGroups/aibmdiwin06" -RoleDefinitionName $role_name
+New-AzRoleAssignment -ObjectId ef511139-6170-438e-a6e1-763dc31bdf74 -Scope "/subscriptions/$subscription_id/resourceGroups/$rg" -RoleDefinitionName $role_name
 
 # Download hello world example
 template_url=https://raw.githubusercontent.com/danielsollondon/azvmimagebuilder/master/quickquickstarts/0_Creating_a_Custom_Windows_Managed_Image/helloImageTemplateWin.json
