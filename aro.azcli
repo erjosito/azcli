@@ -25,6 +25,8 @@ anf_subnet_name=anf
 anf_subnet_prefix=192.168.0.192/27
 anf_name=anf$RANDOM
 anf_location=$location
+pls_subnet_name=PrivateLinkService
+pls_subnet_prefix=192.168.0.64/28
 master_vm_size=Standard_D8s_v3
 worker_vm_size=Standard_D4s_v3
 worker_vm_count=3
@@ -328,8 +330,29 @@ spec:
 EOF
 oc get deploy -n $project_name
 kubectl get pod -n $project_name
-kubectl scale --replicas=21 -n $project_name deploy/autoscaler-demo
+kubectl scale --replicas=3 -n $project_name deploy/autoscaler-demo
 oc get machinesets -n openshift-machine-api
+oc get machines -n openshift-machine-api
+
+#########################
+# Private Link Services #
+#########################
+
+node_rg_id=$(az aro show -n $cluster_name -g $rg --query 'clusterProfile.resourceGroupId' -o tsv)
+node_rg_name=$(echo $node_rg_id | cut -d/ -f 5) && echo $node_rg_name
+if [[ "$ingress_visibility" == "Public" ]]
+then
+    alb_name=$(az network lb list -g $node_rg_name -o tsv --query "[?contains(name,'internal')].name")
+    frontend_id=$(az network lb frontend-ip list --lb-name $internal_alb_name -g $node_rg_name -o tsv --query '[0].id') && echo $internal_frontend_id
+else
+fi
+
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $pls_subnet_name --address-prefix $pls_subnet_prefix
+az network vnet subnet update --vnet-name $vnet_name -g $rg -n $pls_subnet_name --disable-private-link-service-network-policies
+
+# tenant_id=$(az account show --query tenantId -o tsv) && echo $tenant_id
+# az login --service-principal -u $sp_app_id -p $sp_app_secret --tenant $tenant_id   # Otherwise no access to the ALB in the node RG
+az network private-link-service create -g $rg -n AROTestPLS --vnet-name $vnet_name --subnet $pls_subnet_name --lb-frontend-ip-configs $frontend_id -l $location
 
 ###########################
 #   Container Insights    #
