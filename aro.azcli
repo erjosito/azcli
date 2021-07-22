@@ -273,6 +273,7 @@ spec:
         delayAfterFailure: 10s
 EOF
 oc get clusterautoscaler -n openshift-machine-api
+oc describe clusterautoscaler -n openshift-machine-api
 
 # Deploy machine autoscalers for each machineset
 machineset_list=$(oc get machinesets -n openshift-machine-api -o json | jq -r '.items[].metadata.name')

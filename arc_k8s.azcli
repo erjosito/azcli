@@ -15,21 +15,6 @@ arc_name=myaksengine
 # Create RG for AKS engine cluster
 az group create -n $k8s_rg -l $location
 
-# Install AKS engine
-# Go here: https://github.com/Azure/aks-engine/releases/latest
-# Example with v0.61.0:
-aksengine_exec=$(which aks-engine 2>/dev/null)
-if [[ "$aksengine_exec" == "aks-engine not found" ]]
-then
-    echo "Downloading and installing aks-engine executable..."
-    aksengine_tmp=/tmp/aksengine.tar.gz
-    wget https://github.com/Azure/aks-engine/releases/download/v0.61.0/aks-engine-v0.61.0-linux-amd64.tar.gz -O $aksengine_tmp
-    tar xfvz $aksengine_tmp -C /tmp/
-    sudo cp /tmp/aks-engine-v0.61.0-linux-amd64/aks-engine /usr/local/bin
-else
-    echo "aks-engine executable found in ${aksengine_exec}"
-fi
-
 # Retrieve Service Principal form your AKV, required for AKS engine or CAPI
 purpose=aksengine
 keyvault_appid_secret_name=$purpose-sp-appid

@@ -17,10 +17,10 @@
 rg=vwan2xshub
 vwan=vwan
 location1=westcentralus
-location2=westeurope
+location2=eastus2
 password=Microsoft123!
-vwan_hub1_prefix=192.168.1.0/24
-vwan_hub2_prefix=192.168.2.0/24
+vwan_hub1_prefix=192.168.0.0/23
+vwan_hub2_prefix=192.168.2.0/23
 username=$(whoami)
 vm_size=Standard_B1s
 nva_size=Standard_B2ms

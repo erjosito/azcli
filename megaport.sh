@@ -105,17 +105,24 @@ function create_mcr () {
     then
         mcr_name="${mcr_name}-${name_suffix}"
     fi
-    log_msg "INFO: Creating MCR $mcr_name in Megaport location $location_id and ASN $mcr_asn..."
-    # Sending call to create MCR
-    buy_url="${base_url}/v2/networkdesign/buy" 
-    buy_payload_template='[{locationId: $locationId, productName: $productName, productType: "MCR2", portSpeed: 5000, config: { mcrAsn: $mcrAsn } } ]'
-    buy_payload=$(jq -n \
-        --arg locationId "$location_id" \
-        --arg productName "$mcr_name" \
-        --arg mcrAsn "$mcr_asn" \
-        "$buy_payload_template")
-    buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
-    echo "$buy_response" | jq
+    # Try to find an existing MCR (LIVE or otherwise):
+    mcr_id=$(list_products | jq -r '.[].productUid')
+    if [[ -z "$mcr_id" ]]
+    then
+        log_msg "INFO: Creating MCR $mcr_name in Megaport location $location_id and ASN $mcr_asn..."
+        # Sending call to create MCR
+        buy_url="${base_url}/v2/networkdesign/buy" 
+        buy_payload_template='[{locationId: $locationId, productName: $productName, productType: "MCR2", portSpeed: 5000, config: { mcrAsn: $mcrAsn } } ]'
+        buy_payload=$(jq -n \
+            --arg locationId "$location_id" \
+            --arg productName "$mcr_name" \
+            --arg mcrAsn "$mcr_asn" \
+            "$buy_payload_template")
+        buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
+        echo "$buy_response" | jq
+    else
+        log_msg "INFO: MCR $mcr_id already found, skipping creation"
+    fi
 }
 
 function validate_key () {
