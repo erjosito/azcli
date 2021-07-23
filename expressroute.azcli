@@ -59,7 +59,7 @@ az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute 
 circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id
 az network vpn-connection create -n "${ergw_name}-${er_pop}" -g $rg -l $location --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
 
-# Optional: create spoke associated to the previous VNet
+# Optional: create spoke associated to the previous VNet and configure the Hub VM as NVA
 spoke_vnet_name="ervnet-${er_pop}-spoke"
 spoke_vnet_prefix=192.168.11.0/24
 spoke_vm_subnet_name=vm
@@ -75,6 +75,19 @@ spoke_vm_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.ne
 az network nic show-effective-route-table --ids $spoke_vm_nic_id -o table
 spoke_vm_pip=$(az network public-ip show -n $spoke_vm_pip_name --query ipAddress -o tsv -g $rg) && echo $spoke_vm_pip
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke_vm_pip "ip a"
+# Route tables
+hub_vm_pip=$(az network public-ip show -n $vm_pip_name --query ipAddress -o tsv -g $rg) && echo $hub_vm_pip
+hub_vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+hub_vm_ip=$(az network nic show --ids $hub_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub_vm_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm_pip "sudo sysctl -w net.ipv4.ip_forward=1"
+az network nic update --ids $hub_vm_nic_id --ip-forwarding
+az network route-table create -n spoke-${er_pop} -g $rg -l $location --disable-bgp-route-propagation
+az network route-table route create --route-table-name spoke-${er_pop} -g $rg --address-prefix "0.0.0.0/0" --name default --next-hop-type VirtualAppliance --next-hop-ip-address "$hub_vm_ip"
+myip=$(curl -s4 ifconfig.co) && echo $myip
+az network route-table route create --route-table-name spoke-${er_pop} -g $rg --address-prefix "${myip}/32" --name mypc --next-hop-type Internet
+az network vnet subnet update -g $rg --vnet-name $spoke_vnet_name -n $spoke_vm_subnet_name --route-table spoke-${er_pop}
+az network route-table create -n hub-${er_pop} -g $rg -l $location
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table hub-${er_pop}
 
 ###################################################
 # Optional: create second Vnet to simulate onprem #

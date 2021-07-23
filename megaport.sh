@@ -74,6 +74,26 @@ function log_msg () {
     fi
 }
 
+function get_mcr_name () {
+    # Optional parameter with provisioningStatus
+    product_id=$1
+    # Sending call to get product by UID
+    products_url="${base_url}/v2/products"
+    products_json=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
+    output=$(echo "$products_json" | jq -r "[ .data[] | select( .productUid | contains(\"${product_id}\")) | { productName } ] | .[].productName")
+    echo $output
+}
+
+function get_mcr_status () {
+    # Optional parameter with provisioningStatus
+    product_id=$1
+    # Sending call to get product by UID
+    products_url="${base_url}/v2/products"
+    products_json=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
+    output=$(echo "$products_json" | jq -r "[ .data[] | select( .productUid | contains(\"${product_id}\")) | { provisioningStatus } ] | .[].provisioningStatus")
+    echo $output
+}
+
 function list_products () {
     # Optional parameter with provisioningStatus
     status=$1
@@ -253,7 +273,19 @@ case $action in
         list_products
         ;;
     list_live)
-        list_products "LIVE"
+        mcr_ids=$(list_products "LIVE" | jq -r '.[].productUid')
+        mcr_ids=($mcr_ids)
+        if [[ -z "$mcr_ids" ]]
+        then
+            log_msg "INFO: No MCR found matching that string"
+        else
+            for mcr_id in "${mcr_ids[@]}"
+            do
+                mcr_name=$(get_mcr_name $mcr_id)
+                mcr_status=$(get_mcr_status $mcr_id)
+                log_msg "INFO: Found MCR $mcr_name, ID $mcr_id, status $mcr_status"
+            done
+        fi
         ;;
     delete)
         cancel_product "$product_id"
@@ -274,9 +306,14 @@ case $action in
         create_mcr
         ;;
     delete_mcr)
-        mcr_id=$(list_products "LIVE" | jq -r '.[].productUid')
-        log_msg "INFO: Deleting MCR $mcr_id..."
-        cancel_product "$mcr_id"
+        mcr_ids=$(list_products "LIVE" | jq -r '.[].productUid')
+        mcr_ids=($mcr_ids)
+        for mcr_id in "${mcr_ids[@]}"
+        do
+            mcr_name=$(get_mcr_name $mcr_id)
+            log_msg "INFO: Deleting MCR $mcr_name, ID $mcr_id..."
+            cancel_product "$mcr_id"
+        done
         ;;
     validate)
         validate_key "$service_key"
