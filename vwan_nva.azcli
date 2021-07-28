@@ -144,7 +144,7 @@ json_payload='{
   }
 }'
 uri="/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/NetworkVirtualAppliances/${nva_name}?api-version=2021-02-01"
-az rest --method PUT --uri $uri --body $json_payload
+az rest --method PUT --uri $uri --body "$json_payload"
 
 # Wait until provisioning state is Successful
 # az network virtual-appliance show -n $nva_name -g $nva_rg --query provisioningState -o tsv
@@ -169,8 +169,8 @@ ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "ip a"
 # az network virtual-appliance delete -n $nva_name -g $nva_rg -y
 
 # Some other REST calls
-# subscription_id=$(az account show --query id -o tsv)
-# api_version=2021-02-01
+subscription_id=$(az account show --query id -o tsv)
+api_version=2021-02-01
 # hub_rg=$(az network vhub list --query '[0].resourceGroup' -o tsv) && echo $hub_rg
 
 # List NVA SKUs (not working: NOT FOUND)
