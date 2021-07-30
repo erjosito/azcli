@@ -61,7 +61,7 @@ spoke2_subnet_name=vm
 spoke2_subnet_prefix=10.12.0.0/24
 # Azure VPN GW
 vpngw_name=vpngw
-vpngw_asn=65500
+vpngw_asn=65515
 vpngw_pip="${vpngw_name}-pip"
 # Azure ExpressRoute GW
 ergw_name=ergw

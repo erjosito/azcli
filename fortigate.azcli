@@ -1,0 +1,162 @@
+# Variables
+rg=fortigate
+location=westeurope
+vnet_name=hub
+vnet_prefix=10.1.0.0/16
+vnet_prefix_long='10.1.0.0 255.255.0.0'
+rs_subnet_name=RouteServerSubnet  # Fixed name
+rs_subnet_prefix=10.1.0.0/24
+rs_subnet_prefix_long='10.1.0.0 255.255.255.0'
+rs_name=hubrs
+hub_vm_subnet_name=vm
+hub_vm_subnet_prefix=10.1.10.0/24
+# GatewaySubnet
+gw_subnet_prefix=10.1.254.0/24
+# Fortigate NVA
+publisher=fortinet
+offer=fortinet_fortigate-vm_v5
+sku=fortinet_fg-vm
+# fg_vm_size=Standard_F2s  # F2s is the size recommended in the marketplace UI, but seems to only support 2 NICs?
+# fg_vm_size=Standard_F2s_v2  # F2s_v2 supports 2 NICs only as well
+fg_vm_size=Standard_B2ms  # B2ms is not supported from a performance perspective, it supports 2 VMs though
+fg_username=$(whoami)
+fg_password=Microsoft123!
+hub_fgext_subnet_name=fgext  # External
+hub_fgext_subnet_prefix=10.1.1.0/24
+hub_fgext_nsg_name=hubfgext-nsg
+hub_fgint_subnet_name=fgint  # Internal
+hub_fgint_subnet_prefix=10.1.2.0/24
+hub_fgint_nsg_name=hubfgint-nsg
+hub_fgpro_subnet_name=fgpro  # Protected
+hub_fgpro_subnet_prefix=10.1.3.0/24
+hub_fgpro_nsg_name=hubfgpro-nsg
+hub_fg_asn=65001
+hub_fg1_name=fg1
+hub_fg1_bgp_ip=10.1.2.11
+hub_fg1_pro_ip=10.1.3.11
+hub_fg2_name=fg2
+hub_fg2_bgp_ip=10.1.2.12
+hub_fg2_pro_ip=10.1.3.12
+
+####################
+# Helper functions #
+####################
+
+# Auxiliary function to get the first IP of a subnet (default gateway)
+function first_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
+
+#################################
+# Hub VNet, optionally with ARS #
+#################################
+
+# Create Vnet
+az group create -n $rg -l $location
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $rs_subnet_name --subnet-prefix $rs_subnet_prefix
+
+# Create additional subnets (no subnet can be created while the route server is being provisioned, same as VNGs)
+az network vnet subnet create -n $hub_fgext_subnet_name --address-prefix $hub_fgext_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n $hub_fgint_subnet_name --address-prefix $hub_fgint_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n $hub_fgpro_subnet_name --address-prefix $hub_fgpro_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n $hub_vm_subnet_name --address-prefix $hub_vm_subnet_prefix --vnet-name $vnet_name -g $rg
+az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefix --vnet-name $vnet_name -g $rg
+
+# Create Route Server
+# rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+# az network routeserver create -n $rs_name -g $rg --hosted-subnet $rs_subnet_id -l $location
+# az network routeserver update -n $rs_name -g $rg --allow-b2b-traffic true   # Optional
+# # If you need to delete it to recreate it again
+# # az network routeserver delete -n $rs_name -g $rg -y  # Danger Zone!
+# # Get info (once created)
+# rs_ip1=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
+# rs_ip2=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
+# rs_asn=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
+
+# Create test VM in hub
+az vm create -n hubvm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address hubvm-pip --vnet-name $vnet_name --size Standard_B1s --subnet $hub_vm_subnet_name
+hub_vm_ip=$(az network public-ip show -n hubvm-pip --query ipAddress -o tsv -g $rg) && echo $hub_vm_ip
+hub_vm_nic_id=$(az vm show -n hubvm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv) && echo $hub_vm_nic_id
+hub_vm_private_ip=$(az network nic show --ids $hub_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub_vm_private_ip
+
+####################
+# Create Fortigate #
+####################
+
+# Default gateways
+hub_fgext_default_gw=$(first_ip $hub_fgext_subnet_prefix) && echo $hub_fgext_default_gw # External
+hub_fgint_default_gw=$(first_ip $hub_fgint_subnet_prefix) && echo $hub_fgint_default_gw # Internal
+hub_fgpro_default_gw=$(first_ip $hub_fgpro_subnet_prefix) && echo $hub_fgpro_default_gw # Protected
+
+# Create hub Fortigate with 3 NICs
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[-1].version' -o tsv) && echo $version
+az vm image terms accept --urn ${publisher}:${offer}:${sku}:${version}
+
+# NSGs (104.21.25.86 and 172.67.133.228 are the addresses of ifconfig.co)
+az network nsg create -n $hub_fgext_nsg_name -g $rg -l $location
+myip=$(curl -s4 ifconfig.co) && echo $myip
+az network nsg rule create -n Internet2VnetInbound --nsg-name $hub_fgext_nsg_name -g $rg \
+  --protocol '*' --access Allow --priority 1010 --direction Inbound \
+  --source-address-prefixes 8.8.8.8/32 104.21.25.86/32 172.67.133.228/32 --source-port-ranges '*' \
+  --destination-address-prefixes VirtualNetwork --destination-port-ranges '*'
+az network nsg rule create -n SSHInbound --nsg-name $hub_fgext_nsg_name -g $rg \
+  --protocol 'TCP' --access Allow --priority 1020 --direction Inbound \
+  --source-address-prefixes "${myip}/32" --source-port-ranges '*' \
+  --destination-address-prefixes VirtualNetwork --destination-port-ranges '22'
+az network nsg create -n $hub_fgint_nsg_name -g $rg -l $location
+az network nsg rule create -n Vnet2InternetInbound --nsg-name $hub_fgint_nsg_name -g $rg \
+  --protocol '*' --access Allow --priority 1010 --direction Inbound \
+  --source-address-prefixes VirtualNetwork --source-port-ranges '*' \
+  --destination-address-prefixes Internet --destination-port-ranges '*'
+az network nsg rule create -n Internet2VnetOutbound --nsg-name $hub_fgint_nsg_name -g $rg \
+  --protocol '*' --access Allow --priority 1010 --direction Outbound \
+  --source-address-prefixes 8.8.8.8/32 104.21.25.86/32 172.67.133.228/32 --source-port-ranges '*' \
+  --destination-address-prefixes VirtualNetwork --destination-port-ranges '*'
+# PIP
+az network public-ip create -g $rg -n "${hub_fg1_name}-pip" --sku basic --allocation-method Static
+# NICs
+az network nic create -n "${hub_fg1_name}-nic0" -g $rg --vnet-name $vnet_name --subnet $hub_fgext_subnet_name --network-security-group "$hub_fgext_nsg_name" --public-ip-address "${hub_fg1_name}-pip" --ip-forwarding
+az network nic create -n "${hub_fg1_name}-nic1" -g $rg --vnet-name $vnet_name --subnet $hub_fgint_subnet_name --network-security-group "$hub_fgint_nsg_name" --private-ip-address $hub_fg1_bgp_ip --ip-forwarding
+az network nic create -n "${hub_fg1_name}-nic2" -g $rg --vnet-name $vnet_name --subnet $hub_fgpro_subnet_name --network-security-group "$hub_fgint_nsg_name" --private-ip-address $hub_fg1_pro_ip --ip-forwarding
+# Fortigate VM
+az vm create -n $hub_fg1_name -g $rg -l $location --size $fg_vm_size \
+    --image ${publisher}:${offer}:${sku}:${version} \
+    --admin-username "$fg_username" --admin-password $fg_password --authentication-type all --generate-ssh-keys \
+    --nics "${hub_fg1_name}-nic0" "${hub_fg1_name}-nic1" "${hub_fg1_name}-nic2"
+# Test access over SSH
+hub_fg1_ip=$(az network public-ip show -n "${hub_fg1_name}-pip" --query ipAddress -o tsv -g $rg) && echo $hub_fg1_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_fg1_ip" "get system interface physical"
+# Config BGP
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_fg1_ip" <<EOF
+config router bgp
+    set as $hub_fg_asn
+    set router-id $hub_fg1_bgp_ip
+    set ebgp-multipath enable
+    set graceful-restart enable
+    config neighbor-group
+        edit "RouteServer"
+            set soft-reconfiguration enable
+            set remote-as 65515
+            set ebgp-multihop enable
+            set ebgp-multihop-ttl 2
+        next
+    end
+    config neighbor-range
+        edit 1
+            set prefix "$rs_subnet_prefix_long"
+            set neighbor-group "RouteServer"
+        next
+    end
+    config network
+        edit 1
+            set prefix "$vnet_prefix_long"
+        next
+    end
+end
+EOF
