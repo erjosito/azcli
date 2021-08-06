@@ -95,6 +95,59 @@ az network watcher connection-monitor endpoint add --connection-monitor $monitor
 az network watcher connection-monitor list -l $location1 -o table # -g flag not supported
 az network watcher connection-monitor list -l $location2 -o table # -g flag not supported
 
+# Looks for connection monitors in the region(s) and represents results
+# Get list of log analytics workspace IDs
+locations=($location1 $location2)
+for location in "${locations[@]}"
+do
+    logws_id_list=$(az network watcher connection-monitor list -l $location2 -o tsv --query '[].outputs[].workspaceSettings.workspaceResourceId')
+    logws_id_list=$(echo $logws_id_list | sort -u)  # Unique values
+done
+# Get list of log analytics customerIds
+logws_customer_id_list=$(for logws_id in "${logws_id_list[@]}"; do logws_rg=$(echo $logws_id | cut -d/ -f 5); logws_name=$(echo $logws_id | cut -d/ -f 9) && az monitor log-analytics workspace show -n $logws_name -g $logws_rg --query customerId -o tsv; done)
+# Get list of tests, sources and destinations
+src_query="NWConnectionMonitorTestResult | where TimeGenerated > ago(1h) | distinct SourceName"
+src_list=$(for logws_customer_id in "${logws_customer_id_list[@]}"; do az monitor log-analytics query -w $logws_customer_id --analytics-query $src_query --query '[].SourceName' -o tsv; done)
+dst_query="NWConnectionMonitorTestResult | where TimeGenerated > ago(1h) | distinct DestinationName"
+dst_list=$(for logws_customer_id in "${logws_customer_id_list[@]}"; do az monitor log-analytics query -w $logws_customer_id --analytics-query $dst_query --query '[].DestinationName' -o tsv; done)
+cfg_query="NWConnectionMonitorTestResult | where TimeGenerated > ago(1h) | distinct TestConfigurationName"
+cfg_list=$(for logws_customer_id in "${logws_customer_id_list[@]}"; do az monitor log-analytics query -w $logws_customer_id --analytics-query $cfg_query --query '[].TestConfigurationName' -o tsv; done)
+src_list=$(echo $src_list | sort -u)
+dst_list=$(echo $dst_list | sort -u)
+# For each source, print the latest results to the destination. Do a separate table per configuration test
+interval=5m
+while IFS= read -r cfg
+do
+    echo " **** Test configuration $cfg ****"
+    printf "%10s" "Source"
+    while IFS= read -r dst
+    do
+        printf "%10s" $dst
+    done <<< "$dst_list"
+    printf "\n"
+    while IFS= read -r src
+    do
+        printf "%10s" "$src"
+        while IFS= read -r dst
+        do
+            pass_query="NWConnectionMonitorTestResult | where TimeGenerated > ago($interval) | where SourceName==\"$src\" and DestinationName == \"$dst\" and TestConfigurationName == \"$cfg\" | project TestResult | summarize Pass=countif(TestResult == \"Pass\"), NoPass=countif(TestResult != \"Pass\") | project PassPercent=Pass/(Pass+NoPass)"
+            # Browse over the workspaces until something other than "None" arrives
+            pass_percent="None"
+            for logws_customer_id in "${logws_customer_id_list[@]}"
+            do
+                if [[ "$pass_percent" == "None" ]]
+                then
+                    pass_percent=$(az monitor log-analytics query -w $logws_customer_id --analytics-query $pass_query --query '[].PassPercent' -o tsv)
+                fi
+                printf "%10s" "$pass_percent"
+            done
+        done <<< "$dst_list"
+        printf "\n"
+    done <<< "$src_list"
+done <<< "$cfg_list"
+
+
+
 # Cleanup
 # az group delete -n $rg -y --no-wait
 # az network watcher connection-monitor delete -n poller-$location1 -l $location1

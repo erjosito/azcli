@@ -1,0 +1,17 @@
+# How to measure the remaining operations before throttling in the ARM API
+
+# Variables
+subscription_id=$(az account show --query id -o tsv)
+testrg=blahblah123
+
+# Writes
+remaining_writes=$(az rest --method PUT --uri "/subscriptions/${subscription_id}/resourcegroups/${testrg}?api-version=2021-04-01" --body '{"location": "westeurope"}' --debug 2>&1 | grep remaining | cut -d"'" -f 4)
+# Reads
+remaining_reads=$(az rest --method GET --uri "/subscriptions/${subscription_id}/resourcegroups/${testrg}?api-version=2021-04-01" --debug 2>&1 | grep remaining | cut -d"'" -f 4)
+# Deletes
+remaining_deletes=$(az rest --method DELETE --uri "/subscriptions/${subscription_id}/resourcegroups/${testrg}?api-version=2021-04-01" --debug 2>&1 | grep remaining | cut -d"'" -f 4)
+# Summary
+echo "Remaining operations this hour:"
+echo " * Writes: $remaining_writes"
+echo " * Reads: $remaining_reads"
+echo " * Deletes: $remaining_deletes"

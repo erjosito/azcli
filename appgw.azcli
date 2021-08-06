@@ -208,6 +208,9 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
 curl ${vm_pip_address}:8080/api/healthcheck
 curl ${vm_pip_address}:8080/api/ip
 
+# If required (for example because you restarted the VM), restart the python app
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo python3 /root/myip.py &"
+
 # Create DNS record
 vm_fqdn=$(create_dns "vm" "$vm_pip_address") && echo $vm_fqdn
 curl "http://${vm_fqdn}:8080/api/healthcheck"

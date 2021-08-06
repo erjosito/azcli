@@ -229,8 +229,8 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip ro
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ifconfig eth0 mtu 1600"
 
 # RS adjacencies
-az network routeserver peering create --vrouter-name $hub1_rs_name -g $rg --peer-ip $hub1_nva_private_ip --peer-asn $hub1_nva_asn -n $hub1_nva_name
-az network routeserver peering create --vrouter-name $hub2_rs_name -g $rg --peer-ip $hub2_nva_private_ip --peer-asn $hub2_nva_asn -n $hub2_nva_name
+az network routeserver peering create --routeserver $hub1_rs_name -g $rg --peer-ip $hub1_nva_private_ip --peer-asn $hub1_nva_asn -n $hub1_nva_name
+az network routeserver peering create --routeserver $hub2_rs_name -g $rg --peer-ip $hub2_nva_private_ip --peer-asn $hub2_nva_asn -n $hub2_nva_name
 
 # Hub1 NVA bird config file
 bird_config_file=/tmp/bird.conf
@@ -352,34 +352,51 @@ az network vnet peering list --vnet-name $spoke22_vnet_name -g $rg -o table
 
 # VXLAN interfaces
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ip route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping -c 3 192.168.0.2"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping -c 3 192.168.0.6"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ip route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ping -c 3 192.168.0.1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "ip route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "ping -c 3 192.168.0.5"
 
 # BGP adjacencies
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show protocols"
-az network routeserver peering list --vrouter-name $hub1_rs_name -g $rg -o table
-az network routeserver peering list --vrouter-name $hub2_rs_name -g $rg -o table
+az network routeserver peering list --routeserver $hub1_rs_name -g $rg -o table
+az network routeserver peering list --routeserver $hub2_rs_name -g $rg -o table
 
 # BGP route tables in NVA
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show route"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show route all 10.2.0.0/16"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols all rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show route protocol rs0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show route all $spoke21_vnet_prefix"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ip a"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "netstat -rnv"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo systemctl restart bird"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show route"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show protocols"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show protocols all rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show route protocol rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show route protocol hub1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show route export rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show route export rs0 all"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo birdc show route all $spoke21_vnet_prefix"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ip a"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "netstat -rnv"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo systemctl restart bird"
 
 # BGP route tables in RS
-az network routeserver peering list-learned-routes -n hub1nva --vrouter-name $hub1_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-az network routeserver peering list-advertised-routes -n hub1nva --vrouter-name $hub1_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-az network routeserver peering list-learned-routes -n hub2nva --vrouter-name $hub2_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-az network routeserver peering list-advertised-routes -n hub2nva --vrouter-name $hub2_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list --routeserver $hub1_rs_name -g $rg -o table
+az network routeserver peering list-learned-routes -n hub1nva --routeserver $hub1_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list-advertised-routes -n hub1nva --routeserver $hub1_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list --routeserver $hub2_rs_name -g $rg -o table
+az network routeserver peering list-learned-routes -n hub2nva --routeserver $hub2_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list-advertised-routes -n hub2nva --routeserver $hub2_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
 
 # Effective routes in nva NICs
 az network nic show-effective-route-table --ids $hub1_nva_nic_id -o table
@@ -432,7 +449,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo ip r
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo ifconfig eth0 mtu 1600"
 
 # RS adjacencies
-az network routeserver peering create --vrouter-name $hub2_rs_name -g $rg --peer-ip $hub2_nva2_private_ip --peer-asn $hub2_nva_asn -n $hub2_nva2_name
+az network routeserver peering create --routeserver $hub2_rs_name -g $rg --peer-ip $hub2_nva2_private_ip --peer-asn $hub2_nva_asn -n $hub2_nva2_name
 
 # Hub1 NVA bird config file
 bird_config_file=/tmp/bird.conf
@@ -509,15 +526,19 @@ protocol kernel {
       export where source != RTS_STATIC;
 }
 protocol static {
+      route 1.1.1.1/32 via $hub2_nva_default_gw;
       route $hub2_rs_ip1/32 via $hub2_nva_default_gw;
       route $hub2_rs_ip2/32 via $hub2_nva_default_gw;
       route $hub1_nva_overlay_ip/32 via "vxlan0";
       route $hub2_spoke_summary via $hub2_nva_default_gw;
 }
 filter TO_RS {
-      # Drop long prefixes
-      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
-      else accept;
+      # Drop long prefixes, remove 65515 to propagate routes coming from Hub1
+      # if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      # else {
+        bgp_path.delete(65515);
+        accept;
+      # }
 }
 template bgp PEERS {
     local as $hub2_nva_asn;
@@ -562,6 +583,7 @@ protocol kernel {
       export where source != RTS_STATIC;
 }
 protocol static {
+      route 1.1.1.1/32 via $hub2_nva_default_gw;
       route $hub2_rs_ip1/32 via $hub2_nva_default_gw;
       route $hub2_rs_ip2/32 via $hub2_nva_default_gw;
       route $hub1_nva2_overlay_ip/32 via "vxlan1";
@@ -569,11 +591,12 @@ protocol static {
 }
 filter TO_RS {
       # Drop long prefixes
-      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
-      else {
-          bgp_path.prepend($hub2_nva_asn);
+      # if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      # else {
+          # bgp_path.prepend($hub2_nva_asn);  # To configure the 2nd NVA as passive
+          bgp_path.delete(65515);
           accept;
-      }
+      # }
 }
 template bgp PEERS {
     local as $hub2_nva_asn;
@@ -606,12 +629,126 @@ scp $bird_config_file "${hub2_nva2_pip_ip}:/home/${hub2_nva2_user}/bird.conf"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo mv /home/${hub2_nva_user}/bird.conf /etc/bird/bird.conf"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "sudo systemctl restart bird"
 
+#######################################
+# Optional - Stress test route number #
+#######################################
+
+# Variables
+location=$hub1_location
+
+# Create VNets
+octet2list=({90..99})
+for octet3 in {46..55}
+do
+    prefixes=""
+    for octet2 in "${octet2list[@]}"
+    do
+        if [[ -z "$prefixes" ]]
+        then
+            prefixes="10.${octet2}.${octet3}.0/24"
+        else
+            prefixes="${prefixes} 10.${octet2}.${octet3}.0/24"
+        fi
+    done
+    echo "Creating VNet spoke-test-${octet3} with prefixes $prefixes..."
+    az network vnet create -g $rg -n "spoke-test-${octet3}" --address-prefixes ${(z)prefixes} -l $location -o none
+    az network vnet peering create -n "hub1-to-spoke-test-${octet3}" -g $rg --vnet-name $hub1_vnet_name --remote-vnet "spoke-test-${octet3}" --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
+    az network vnet peering create -n "spoke-test-${octet3}-to-hub1" -g $rg --remote-vnet $hub1_vnet_name --vnet-name "spoke-test-${octet3}" --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
+done
+
+# Delete VNets
+for octet3 in {41..55}
+do
+    echo "Deleting VNet spoke-${octet2}-${octet3}..."
+    az network vnet peering delete -n "hub1-to-spoke-test-${octet3}" -g $rg --vnet-name $hub1_vnet_name -o none
+    az network vnet peering delete -n "spoke-test-${octet3}-to-hub1" -g $rg --vnet-name "spoke-test-${octet3}" -o none
+    az network vnet delete -g $rg -n "spoke-test-${octet3}" -o none
+done
+
+# Inject routes from CSR-based NVA
+nva_ips=(13.82.216.121 13.82.216.121)
+nva_asn=12345
+octet1=11
+
+# Configure static route redistribution into BGP (the routes will be created as static routes pointing to Null)
+for nva_ip in "${octet2list[@]}"
+do
+      echo "Configuring route distribution in NVA $nva_ip"
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no $nva_ip <<EOF
+      config t
+            router bgp $asn
+                  redistribute static
+      end
+EOF
+done
+
+# Create routes
+for route_id in {0..9}
+do
+      octet2=(($route_id / 256))
+      octet3=(($route_id % 256))
+      for nva_ip in "${octet2list[@]}"
+      do
+            # jose@hub2nva:~$ sudo ip route add blackhole 11.0.0.0/24
+            # jose@hub2nva:~$ sudo ip route add blackhole to 11.0.0.0/24
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=no $nva_ip <<EOF
+            config t
+                  ip route ${octet1}.${octet2}.${octet3}.0 255.255.255.0 Null
+            end
+EOF
+      done
+done
+
+# Delete routes
+for route_id in {0..9}
+do
+      octet2=(($route_id / 256))
+      octet3=(($route_id % 256))
+      for nva_ip in "${octet2list[@]}"
+      do
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=no $nva_ip <<EOF
+            config t
+                  no ip route ${octet1}.${octet2}.${octet3}.0 255.255.255.0 Null
+            end
+EOF
+      done
+done
+
+# Inject routes to Linux-based NVAs
+nva_ips=(13.82.216.121 20.185.88.190)
+octet1=11
+default_gw=$hub2_nva_default_gw
+
+# Create routes
+for route_id in {539..639}
+do
+      octet2=$(($route_id / 256))
+      octet3=$(($route_id % 256))
+      for nva_ip in "${nva_ips[@]}"
+      do
+            echo "Creating route for ${octet1}.${octet2}.${octet3}.0/24 in NVA $nva_ip..."
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_ip "sudo ip route add ${octet1}.${octet2}.${octet3}.0/24 via $default_gw"
+      done
+done
+
+# Delete routes
+for route_id in {0..639}
+do
+      octet2=$(($route_id / 256))
+      octet3=$(($route_id % 256))
+      for nva_ip in "${nva_ips[@]}"
+      do
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_ip "sudo ip route delete ${octet1}.${octet2}.${octet3}.0/24 via $default_gw"
+      done
+done
+
+
 ###########
 # Cleanup #
 ###########
 
-# az network routeserver peering delete --vrouter-name $hub1_rs_name -g $rg -n $hub1_nva_name -y
-# az network routeserver peering delete --vrouter-name $hub2_rs_name -g $rg -n $hub2_nva_name -y
+# az network routeserver peering delete --routeserver $hub1_rs_name -g $rg -n $hub1_nva_name -y
+# az network routeserver peering delete --routeserver $hub2_rs_name -g $rg -n $hub2_nva_name -y
 # az network routeserver delete -n  $hub1_rs_name -g $rg -y
 # az network routeserver delete -n  $hub2_rs_name -g $rg -y
 # az group delete -y --no-wait -n $rg

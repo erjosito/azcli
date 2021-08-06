@@ -287,8 +287,6 @@ echo ""
 
 az connectedk8s connect --name $CAPI_WORKLOAD_CLUSTER_NAME --resource-group $CAPI_WORKLOAD_CLUSTER_NAME --location $AZURE_LOCATION --kube-config $CAPI_WORKLOAD_CLUSTER_NAME.kubeconfig
 
-
-
 ############################
 # Enabling cluster for Arc #
 ############################

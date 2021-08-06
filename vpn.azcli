@@ -71,6 +71,7 @@ az vm create -n $azurevm_name -g $rg -l $location --image ubuntuLTS --generate-s
 publisher=cisco
 offer=cisco-csr-1000v
 sku=16_12-byol
+nva_size=Standard_B2ms
 version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
 branch_prefix=172.16.200.0/24
 branch_subnet=172.16.200.0/26
@@ -82,15 +83,15 @@ username=$(whoami)
 
 # Create CSR to simulate a branch
 az vm create -n branch-nva1 -g $rg -l $location --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys --public-ip-address branch1-pip --public-ip-address-allocation static \
-    --vnet-name branch --vnet-address-prefix $branch_prefix --subnet nva --subnet-address-prefix $branch_subnet --private-ip-address $branch1_bgp_ip
-branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
+    --vnet-name branch --vnet-address-prefix $branch_prefix --subnet nva --subnet-address-prefix $branch_subnet --private-ip-address $branch1_bgp_ip --size $nva_size
+branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv) && echo $branch1_ip
 
 # With BGP
-# az network local-gateway create -g $rg -n branch1 --gateway-ip-address $branch1_ip --local-address-prefixes "${branch1_bgp_ip}/32" --asn $branch_asn --bgp-peering-address $branch1_bgp_ip --peer-weight 0
-# az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n branch1 --vnet-gateway1 vng1 --local-gateway2 branch1
+az network local-gateway create -g $rg -n branch1 --gateway-ip-address $branch1_ip --local-address-prefixes "${branch1_bgp_ip}/32" --asn $branch_asn --bgp-peering-address $branch1_bgp_ip --peer-weight 0 -l $location
+az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n branch1 --vnet-gateway1 vng1 --local-gateway2 branch1 -l $location
 # Without BGP
-az network local-gateway create -g $rg -n branch1 --gateway-ip-address $branch1_ip --local-address-prefixes $branch_prefix 
-az network vpn-connection create -g $rg --shared-key $psk -n branch1 --vnet-gateway1 vng1 --local-gateway2 branch1
+# az network local-gateway create -g $rg -n branch1 --gateway-ip-address $branch1_ip --local-address-prefixes $branch_prefix 
+# az network vpn-connection create -g $rg --shared-key $psk -n branch1 --vnet-gateway1 vng1 --local-gateway2 branch1
 
 # Get VPNGW config data
 gw_name=vng1
@@ -98,6 +99,7 @@ vpngw_pip_0=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettin
 vpngw_private_ip_0=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_0
 vpngw_pip_1=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_pip_1
 vpngw_private_ip_1=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_1
+vpngw_asn=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.asn' -o tsv) && echo $vpngw_asn
 
 # Configure CSR
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
@@ -117,11 +119,16 @@ config t
         address $vpngw_pip_0
         pre-shared-key $psk
         exit
+    peer $vpngw_pip_1
+        address $vpngw_pip_1
+        pre-shared-key $psk
+        exit
     exit
     !
     crypto ikev2 profile azure-profile
         match address local interface GigabitEthernet1
         match identity remote address $vpngw_pip_0 255.255.255.255
+        match identity remote address $vpngw_pip_1 255.255.255.255
         authentication remote pre-share
         authentication local pre-share
         keyring local azure-keyring
@@ -145,14 +152,38 @@ config t
         tunnel mode ipsec ipv4
         tunnel destination $vpngw_pip_0
         tunnel protection ipsec profile azure-vti
+    interface Tunnel1
+        ip unnumbered GigabitEthernet1 
+        ip tcp adjust-mss 1350
+        tunnel source GigabitEthernet1
+        tunnel mode ipsec ipv4
+        tunnel destination $vpngw_pip_1
+        tunnel protection ipsec profile azure-vti
     exit
     !
-    ip route 10.1.0.0 255.255.0.0 Tunnel0
+    router bgp $branch_asn
+        bgp router-id interface GigabitEthernet1
+        bgp log-neighbor-changes
+        neighbor $vpngw_private_ip_0 remote-as $vpngw_asn
+        neighbor $vpngw_private_ip_0 ebgp-multihop 5
+        neighbor $vpngw_private_ip_0 update-source GigabitEthernet1
+        neighbor $vpngw_private_ip_1 remote-as $vpngw_asn
+        neighbor $vpngw_private_ip_1 ebgp-multihop 5
+        neighbor $vpngw_private_ip_1 update-source GigabitEthernet1
     !
+    ip route vpngw_private_ip_0 255.255.255.255 Tunnel0
+    ip route vpngw_private_ip_1 255.255.255.255 Tunnel1
+!
 end
 !
 wr mem
 EOF
+
+# Diagnostics
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip int b"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip bgp summ"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip route bgp"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip bgp"
 
 ###############################
 # Optional, create second CSR #
@@ -186,11 +217,16 @@ config t
         address $vpngw_pip_0
         pre-shared-key $psk
         exit
+    peer $vpngw_pip_1
+        address $vpngw_pip_1
+        pre-shared-key $psk
+        exit
     exit
     !
     crypto ikev2 profile azure-profile
         match address local interface GigabitEthernet1
         match identity remote address $vpngw_pip_0 255.255.255.255
+        match identity remote address $vpngw_pip_1 255.255.255.255
         authentication remote pre-share
         authentication local pre-share
         keyring local azure-keyring

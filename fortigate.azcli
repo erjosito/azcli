@@ -132,6 +132,23 @@ az vm create -n $hub_fg1_name -g $rg -l $location --size $fg_vm_size \
 # Test access over SSH
 hub_fg1_ip=$(az network public-ip show -n "${hub_fg1_name}-pip" --query ipAddress -o tsv -g $rg) && echo $hub_fg1_ip
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_fg1_ip" "get system interface physical"
+
+# Get license keys (previously stored in an AKV)
+keyvault_name=erjositoKeyvault
+license1_secret_name=fortigatelicense1
+license2_secret_name=fortigatelicense2
+license1=$(az keyvault secret show --vault-name $keyvault_name -n $license1_secret_name --query 'value' -o tsv)
+license2=$(az keyvault secret show --vault-name $keyvault_name -n $license2_secret_name --query 'value' -o tsv)
+if [[ -n "$license1" ]] && [[ -n "$license2" ]]
+then
+    echo "Fortigate licenses successfully retrieved from Azure Key Vault $keyvault_name"
+else
+    echo "Fortigate licenses could NOT be retrieved from Azure Key Vault $keyvault_name"
+fi
+
+# Install license in Fortigate NVA
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_fg1_ip" "exec forticarrier-license $license1"
+
 # Config BGP
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_fg1_ip" <<EOF
 config router bgp

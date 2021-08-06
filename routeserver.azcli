@@ -771,15 +771,15 @@ offer=cisco-csr-1000v
 sku=16_12-byol
 version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
 az vm create -n onprem-csr -g "$rg" -l "$location" --image "${publisher}:${offer}:${sku}:${version}" --size "$nva_size" \
-    --generate-ssh-keys --public-ip-address "onprem-csr-pip" --public-ip-address-allocation static \
+    --generate-ssh-keys --public-ip-address "onprem-csr-pip" --public-ip-address-allocation static --public-ip-sku Standard \
     --vnet-name "$onprem_vnet_name" --subnet "$onprem_nva_subnet_name" \
     --private-ip-address "$onprem_csr_ip"
 
 # Configure onprem CSR for VPN
 onprem_default_gw=192.168.0.1
-vpngw_pip_ip=$(az network public-ip show -n $vpngw_pip -g $rg --query ipAddress -o tsv)
-vpngw_bgp_ip=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.)
-vpngw_bgp_asn=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.asn)
+vpngw_pip_ip=$(az network public-ip show -n $vpngw_pip -g $rg --query ipAddress -o tsv) && echo $vpngw_pip_ip
+vpngw_bgp_ip=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]) && echo $vpngw_bgp_ip
+vpngw_bgp_asn=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.asn) && echo $vpngw_bgp_asn
 onprem_asn=65200
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$onprem_csr_ip"
     config t
@@ -834,8 +834,10 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellma
     end
     wr mem
 EOF
-
-# Create onprem Linux NVA
+# Create LNG, connection
+az network local-gateway create -g $rg -n onprem --gateway-ip-address $onprem_csr_ip --local-address-prefixes "$onprem_csr_ip\32" \
+  --bgp-peering-address $onprem_csr_ip --asn ${onprem_asn}
+az network vpn-connection create -g $rg --shared-key $psk -n onprem --vnet-gateway1 $vpngw_name --local-gateway2 onprem 
 
 ################
 # ExpressRoute #
@@ -868,6 +870,7 @@ az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --a
 az network public-ip create -g $rg -n $vpngw_pip --allocation-method Dynamic --sku Basic
 az network vnet-gateway create -g "$rg" --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased \
             --vnet "$vnet_name" -n $vpngw_name --asn "$vpngw_asn" --public-ip-address $vpngw_pip --no-wait
+az network vnet-gateway list -g $rg -o table
 
 ###############
 # Diagnostics #
