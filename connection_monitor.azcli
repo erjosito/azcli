@@ -100,7 +100,7 @@ az network watcher connection-monitor list -l $location2 -o table # -g flag not 
 locations=($location1 $location2)
 for location in "${locations[@]}"
 do
-    logws_id_list=$(az network watcher connection-monitor list -l $location2 -o tsv --query '[].outputs[].workspaceSettings.workspaceResourceId')
+    logws_id_list=$(az network watcher connection-monitor list -l $location -o tsv --query '[].outputs[].workspaceSettings.workspaceResourceId')
     logws_id_list=$(echo $logws_id_list | sort -u)  # Unique values
 done
 # Get list of log analytics customerIds
