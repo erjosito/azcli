@@ -9,7 +9,7 @@
 # Variables
 # rg=vwantest         # RG to be defined in the main function
 # vwan_name=vwantest  # vwan_name to be defined in the main function
-location1=westeurope
+location1=westcentralus
 location2=westcentralus
 location3=uksouth
 password=Microsoft123!  # Used as IPsec PSK too
@@ -27,7 +27,8 @@ azfw_policy_name=vwan
 #####################
 
 # REST Variables
-vwan_api_version=2020-05-01
+# vwan_api_version=2020-05-01
+vwan_api_version=2021-03-01
 subscription_id=$(az account show --query id -o tsv)
 # JSON
 vwan_json='{location: $location, properties: {disableVpnEncryption: false, type: $sku}}'
@@ -1168,7 +1169,7 @@ function create_vpngw {
     wait_until_finished $vhub_id
     vpngw_json_string=$(jq -n \
             --arg location "$location" \
-            --arg vhub_id $vhub_id \
+            --arg vhub_id "$vhub_id" \
             --arg asn "65515" \
             "$vpngw_json")
     az rest --method put --uri $vpngw_uri --body $vpngw_json_string >/dev/null  # PUT
