@@ -1,8 +1,3 @@
-# Variables (Thomas SIG)
-# subscription_id=bb0a98e0-34e3-40d1-856f-899c5203df01
-# vendor="Contoso_generic_test_nva"
-# version=latest
-
 # Variables (jomore AIRS)
 subscription_id=e7da9914-9b05-4891-893c-546cb7b0422e
 vendor="Jose_generic_test_nva"
@@ -119,6 +114,80 @@ function wait_until_finished {
 #   -CloudInitConfiguration $cloudinit_string `
 #   -Location $nva_location
 #   -Sku <Microsoft.Azure.Commands.Network.Models.PSVirtualApplianceSkuProperties> -VirtualHubId $vhub_id
+
+#######################
+# Deploy NVA with ARM #
+#######################
+
+# Create ARM template and parameters
+arm_template_file=/tmp/nva_template.json
+cat <<'EOF' > $arm_template_file
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "name": {
+            "defaultValue": "mynva",
+            "type": "String"
+        },
+        "vhub_id": {
+            "type": "String"
+        },
+        "vendor": {
+            "defaultValue": "Jose_generic_test_nva",
+            "type": "String"
+        },
+        "version": {
+            "defaultValue": "latest",
+            "type": "String"
+        },
+        "cloudinit": {
+            "defaultValue": "echo helloworld",
+            "type": "String"
+        },
+        "asn": {
+            "defaultValue": 65001,
+            "type": "Int"
+        }
+    },
+    "variables": {},
+    "resources": [
+        {
+            "type": "Microsoft.Network/NetworkVirtualAppliances",
+            "apiVersion": "2020-11-01",
+            "name": "[parameters('name')]",
+            "location": "[resourceGroup().location]",
+            "tags": {
+                "tagexample1": "tagvalue1"
+            },
+            "properties": {
+                "nvaSku": {
+                    "vendor": "[parameters('vendor')]",
+                    "bundledScaleUnit": "2",
+                    "marketPlaceVersion": "[parameters('version')]"
+                },
+                "virtualHub": {
+                    "id": "[parameters('vhub_id')]"
+                },
+                "virtualApplianceAsn": "[parameters('asn')]",
+                "cloudInitConfiguration": "[parameters('cloudinit')]"
+            }
+        }
+    ]
+}
+EOF
+
+# Send ARM deployment
+nva_name=armnva
+az deployment group create -n vwannva-$RANDOM --template-file $arm_template_file -g $nva_rg \
+      --parameters "name=$nva_name" \
+      --parameters "vhub_id=$hub_id" \
+      --parameters "cloudinit=$cloudinit_string" \
+      --parameters "asn=$nva_asn" \
+      --parameters "version=$version"
+
+# Check provisioning state
+az network virtual-appliance show -n $nva_name -g $nva_rg --query provisioningState -o tsv
 
 ##############################
 # Creating NVA over REST API #

@@ -118,6 +118,9 @@ az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_SSH --p
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_HTTP --priority 1010 --direction Inbound \
     --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' \
     --destination-address-prefixes '*' --destination-port-ranges 9 80 443
+# az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_HTTP_Return --priority 1015 --direction Inbound \
+#     --access Allow --protocol Tcp --source-address-prefixes '*' \
+#     --destination-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --destination-port-ranges 80 443
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
     --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
     --destination-address-prefixes '*' --destination-port-ranges 500 4500
@@ -607,8 +610,14 @@ then
         --address-prefix "${myip}/32" --next-hop-type Internet
     az network vnet subnet update -n vm --vnet-name spoke241-${location2} -g $rg --route-table indirectspokes24-$location2
     az network vnet subnet update -n vm --vnet-name spoke242-${location2} -g $rg --route-table indirectspokes24-$location2
-    # RT with backdoor for spokes14/24
-    az network vnet subnet update -n vm --vnet-name spoke14-$location1 -g $rg --route-table spokes-$location1
+    # RT with backdoor for spokes14/24 and default to Internet
+    az network route-table create -n nva14-$location1 -g $rg -l $location1
+    az network route-table route create -n default -g $rg --route-table-name nva14-$location1 \
+        --address-prefix "0.0.0.0/0" --next-hop-type Internet
+    az network vnet subnet update -n vm --vnet-name spoke14-$location1 -g $rg --route-table nva14-$location1
+    az network route-table create -n nva24-$location2 -g $rg -l $location2
+    az network route-table route create -n default -g $rg --route-table-name nva24-$location2 \
+        --address-prefix "0.0.0.0/0" --next-hop-type Internet
     az network vnet subnet update -n vm --vnet-name spoke24-$location2 -g $rg --route-table spokes-$location2
 fi
 
@@ -682,9 +691,14 @@ protocol kernel {
     export none;
 }
 protocol static {
-    route 10.1.41.0/24 via $spoke14_default_gw;
-    route 10.1.42.0/24 via $spoke14_default_gw;
-    route 0.0.0.0/0 via $spoke14_default_gw;
+    route 1.1.1.1/32 via $spoke14_default_gw;   # Test route
+    # route 10.1.1.0/24 via $spoke14_default_gw;  # To attract traffic to spoke11
+    # route 10.1.2.0/24 via $spoke14_default_gw;  # To attract traffic to spoke12
+    # route 10.1.3.0/24 via $spoke14_default_gw;  # To attract traffic to spoke13
+    # route 10.1.41.0/24 via $spoke14_default_gw;
+    # route 10.1.42.0/24 via $spoke14_default_gw;
+    # route 0.0.0.0/0 via $spoke14_default_gw;    # To attract traffic to Internet
+    route 10.1.40.0/22 via $spoke14_default_gw; # Summary to spokes141 and 142
 }
 protocol bgp rs0 {
     description "VWAN Route Service instance 0";
@@ -722,9 +736,14 @@ protocol kernel {
     export none;
 }
 protocol static {
-    route 10.2.41.0/24 via $spoke24_default_gw;
-    route 10.2.42.0/24 via $spoke24_default_gw;
-    route 0.0.0.0/0 via $spoke24_default_gw;
+    route 2.2.2.2/32 via $spoke24_default_gw;   # Test route
+    # route 10.2.1.0/24 via $spoke24_default_gw;  # To attract traffic to spoke21
+    # route 10.2.2.0/24 via $spoke24_default_gw;  # To attract traffic to spoke22
+    # route 10.2.3.0/24 via $spoke24_default_gw;  # To attract traffic to spoke23
+    # route 10.2.41.0/24 via $spoke24_default_gw;
+    # route 10.2.42.0/24 via $spoke24_default_gw;
+    # route 0.0.0.0/0 via $spoke24_default_gw;    # To attract traffic to Internet
+    route 10.2.40.0/22 via $spoke24_default_gw; # Summary to spokes241 and 242
 }
 protocol bgp rs0 {
     description "VWAN Route Service instance 0";
@@ -750,10 +769,12 @@ EOF
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo birdc show protocols"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo birdc show route protocol rs0"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo birdc show route export rs0"
+    az network nic show-effective-route-table --ids $spoke14_nic_id -o table
     # Diagnostics for spoke24
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo birdc show protocols"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo birdc show route protocol rs0"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo birdc show route export rs0"
+    az network nic show-effective-route-table --ids $spoke24_nic_id -o table
     # Now configure the VWAN side (at this point only over the portal)
 fi
 
@@ -776,8 +797,12 @@ spoke14_pip=$(az network public-ip show -n spoke14-pip -g $rg --query ipAddress 
 spoke24_pip=$(az network public-ip show -n spoke24-pip -g $rg --query ipAddress -o tsv)
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -A INPUT -p ICMP --icmp-type 8 -j DROP"
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -A INPUT -p ICMP --icmp-type 8 -j DROP"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -A FORWARD -p ICMP --icmp-type 8 -j DROP"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -A FORWARD -p ICMP --icmp-type 8 -j DROP"
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -D INPUT -p ICMP --icmp-type 8 -j DROP"
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -D INPUT -p ICMP --icmp-type 8 -j DROP"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -D FORWARD -p ICMP --icmp-type 8 -j DROP"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -D FORWARD -p ICMP --icmp-type 8 -j DROP"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -L"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -L"
 
@@ -917,7 +942,6 @@ update_myip
 ######################
 
 # Get all VMs containing the string "vm" (that excludes the NVAs)
-# vm_list=$(az vm list -g $rg --query "[?contains(name,'vm')].name" -o tsv | sort -u | grep -v branch)
 vm_list=$(az vm list -g $rg --query "[?contains(name,'vm')].name" -o tsv | sort -u)
 # Build an associative array with all VM IDs
 declare -A vm_id_list
@@ -956,7 +980,6 @@ do
         fi
     done <<< "$vm_list"
 done <<< "$vm_list"
-
 
 # Represents results in table form (configurable interval, default 5m)
 function monitor_results() {
@@ -1015,45 +1038,58 @@ function monitor_results() {
     query="${line1} ${line2}"
     monitor_json=$(az monitor log-analytics query -w $logws_customer_id --analytics-query $query -o json)
     # For each source, print the latest results to the destination. Do a separate table per configuration test
+    cfgs=''
     while IFS= read -r cfg
     do
-        echo " **** Test configuration $cfg ****"
-        printf "%${table_width}s" "Source"
+        if [[ -n "$cfgs" ]]; then
+            cfgs+='/'
+        fi
+        cfgs+="$cfg"
+    done <<< "$cfg_list"
+    echo " **** Test configurations: $cfgs ****"
+    printf "%${table_width}s" "Source"
+    while IFS= read -r dst
+    do
+        printf "%${table_width}s" $dst
+    done <<< "$dst_list"
+    printf "\n"
+    while IFS= read -r src
+    do
+        printf "%${table_width}s" "$src"
         while IFS= read -r dst
         do
-            printf "%${table_width}s" $dst
-        done <<< "$dst_list"
-        printf "\n"
-        while IFS= read -r src
-        do
-            printf "%${table_width}s" "$src"
-            while IFS= read -r dst
-            do
-                if [[ "$src" != "$dst" ]]
-                then
-                    # pass_query="NWConnectionMonitorTestResult | where TimeGenerated > ago($interval) | where SourceName==\"$src\" and DestinationName == \"$dst\" and TestConfigurationName == \"$cfg\" | project TestResult | summarize Pass=countif(TestResult == \"Pass\"), NoPass=countif(TestResult != \"Pass\") | project PassPercent=Pass/(Pass+NoPass)"
-                    # # Browse over the workspaces until something other than "None" arrives
-                    # pass_percent="None"
-                    # for logws_customer_id in "${logws_customer_id_list[@]}"
-                    # do
-                    #     if [[ "$pass_percent" == "None" ]]
-                    #     then
-                    #         # echo "**DEBUG*** Sending query $pass_query to workspace $logws_customer_id..."
-                    #         pass_percent=$(az monitor log-analytics query -w $logws_customer_id --analytics-query $pass_query --query '[].PassPercent' -o tsv)
-                    #     fi
-                    # done
+            if [[ "$src" != "$dst" ]]
+            then
+                # pass_query="NWConnectionMonitorTestResult | where TimeGenerated > ago($interval) | where SourceName==\"$src\" and DestinationName == \"$dst\" and TestConfigurationName == \"$cfg\" | project TestResult | summarize Pass=countif(TestResult == \"Pass\"), NoPass=countif(TestResult != \"Pass\") | project PassPercent=Pass/(Pass+NoPass)"
+                # # Browse over the workspaces until something other than "None" arrives
+                # pass_percent="None"
+                # for logws_customer_id in "${logws_customer_id_list[@]}"
+                # do
+                #     if [[ "$pass_percent" == "None" ]]
+                #     then
+                #         # echo "**DEBUG*** Sending query $pass_query to workspace $logws_customer_id..."
+                #         pass_percent=$(az monitor log-analytics query -w $logws_customer_id --analytics-query $pass_query --query '[].PassPercent' -o tsv)
+                #     fi
+                # done
+                results=''
+                while IFS= read -r cfg
+                do
+                    if [[ -n "$results" ]]; then
+                        results+='/'
+                    fi
                     pass_percent=$(echo $monitor_json | jq -r '.[] | select(.SourceName == "'$src'") | select(.DestinationName == "'$dst'") | select(.TestConfigurationName == "'$cfg'") | .PassPercent')
                     if [[ -z "$pass_percent" ]]; then
                         pass_percent='No Data'
                     fi
-                    printf "%${table_width}s" "$pass_percent"
-                else
-                    printf "%${table_width}s" "N/A"
-                fi
-            done <<< "$dst_list"
-            printf "\n"
-        done <<< "$src_list"
-    done <<< "$cfg_list"
+                    results+="$pass_percent"
+                done <<< "$cfg_list"
+                printf "%${table_width}s" "$results"
+            else
+                printf "%${table_width}s" "N/A"
+            fi
+        done <<< "$dst_list"
+        printf "\n"
+    done <<< "$src_list"
 }
 monitor_results
 
