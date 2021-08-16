@@ -8,6 +8,8 @@ hub1_rs_subnet_prefix=10.1.0.0/24
 hub1_rs_name=hub1rs
 hub1_nva_subnet_name=nva
 hub1_nva_subnet_prefix=10.1.1.0/24
+hub1_nva_subnet2_name=nva2
+hub1_nva_subnet2_prefix=10.1.11.0/24
 hub1_nva_overlay_ip=192.168.0.1
 hub1_vm_subnet_name=vm
 hub1_vm_subnet_prefix=10.1.2.0/24
@@ -29,6 +31,8 @@ hub2_rs_subnet_prefix=10.2.0.0/24
 hub2_rs_name=hub2rs
 hub2_nva_subnet_name=nva
 hub2_nva_subnet_prefix=10.2.1.0/24
+hub2_nva_subnet2_name=nva2
+hub2_nva_subnet2_prefix=10.2.11.0/24
 hub2_vm_subnet_name=vm
 hub2_vm_subnet_prefix=10.2.2.0/24
 hub2_gw_subnet_prefix=10.2.3.0/24
@@ -47,12 +51,14 @@ spoke22_vm_subnet_prefix=10.2.17.0/26
 az group create -n $rg -l $hub1_location
 az network vnet create -g $rg -n $hub1_vnet_name --address-prefix $hub1_vnet_prefix --subnet-name $hub1_vm_subnet_name --subnet-prefixes $hub1_vm_subnet_prefix -l $hub1_location
 az network vnet subnet create -n $hub1_nva_subnet_name --address-prefix $hub1_nva_subnet_prefix --vnet-name $hub1_vnet_name -g $rg
+az network vnet subnet create -n $hub1_nva_subnet2_name --address-prefix $hub1_nva_subnet2_prefix --vnet-name $hub1_vnet_name -g $rg
 az network vnet subnet create -n GatewaySubnet --address-prefix $hub1_gw_subnet_prefix --vnet-name $hub1_vnet_name -g $rg
 az network vnet subnet create -n RouteServerSubnet --address-prefix $hub1_rs_subnet_prefix --vnet-name $hub1_vnet_name -g $rg
 az network vnet create -g $rg -n $spoke11_vnet_name --address-prefix $spoke11_vnet_prefix --subnet-name $spoke11_vm_subnet_name --subnet-prefixes $spoke11_vm_subnet_prefix -l $hub1_location
 az network vnet create -g $rg -n $spoke12_vnet_name --address-prefix $spoke12_vnet_prefix --subnet-name $spoke12_vm_subnet_name --subnet-prefixes $spoke12_vm_subnet_prefix -l $hub1_location
 az network vnet create -g $rg -n $hub2_vnet_name --address-prefix $hub2_vnet_prefix --subnet-name $hub2_vm_subnet_name --subnet-prefixes $hub2_vm_subnet_prefix -l $hub2_location
 az network vnet subnet create -n $hub2_nva_subnet_name --address-prefix $hub2_nva_subnet_prefix --vnet-name $hub2_vnet_name -g $rg
+az network vnet subnet create -n $hub2_nva2_subnet_name --address-prefix $hub2_nva_subnet2_prefix --vnet-name $hub2_vnet_name -g $rg
 az network vnet subnet create -n GatewaySubnet --address-prefix $hub2_gw_subnet_prefix --vnet-name $hub2_vnet_name -g $rg
 az network vnet subnet create -n RouteServerSubnet --address-prefix $hub2_rs_subnet_prefix --vnet-name $hub2_vnet_name -g $rg
 az network vnet create -g $rg -n $spoke21_vnet_name --address-prefix $spoke21_vnet_prefix --subnet-name $spoke21_vm_subnet_name --subnet-prefixes $spoke21_vm_subnet_prefix -l $hub2_location
@@ -176,15 +182,22 @@ runcmd:
   - sysctl -w net.ipv4.conf.all.send_redirects = 0
 EOF
 
-# Hub1 NVA creation
+# Hub1 NVA creation (2 NICs)
 hub1_nva_asn=65001
 hub1_nva_name=hub1nva
 hub1_nva_pip=${hub1_nva_name}-pip
+# Option 1: 1-NIC NVA
+# az vm create -n $hub1_nva_name -g $rg -l $hub1_location --image ubuntuLTS --generate-ssh-keys \
+#     --public-ip-address $hub1_nva_pip --vnet-name $hub1_vnet_name --size $nva_size --subnet $hub1_nva_subnet_name \
+#     --custom-data $nva_cloudinit_file --nsg $hub1_nsg_name
+# hub1_nva_nic_id=$(az vm show -n $hub1_nva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+# az network nic update --ids $hub1_nva_nic_id --ip-forwarding
+# Option 2: 2-NIC NVA
+az network public-ip create -g $rg -n "$hub1_nva_pip" --allocation-method Dynamic --sku Basic
+az network nic create -n "${hub1_nva_name}-nic0" -g $rg --vnet-name $vnet_name --subnet $hub1_nva_subnet_name --network-security-group "$hub1_nsg_name" --public-ip-address $hub1_nva_pip --ip-forwarding
+az network nic create -n "${hub1_nva_name}-nic1" -g $rg --vnet-name $vnet_name --subnet $hub1_nva_subnet2_name --network-security-group "$hub1_nsg_name" --ip-forwarding
 az vm create -n $hub1_nva_name -g $rg -l $hub1_location --image ubuntuLTS --generate-ssh-keys \
-    --public-ip-address $hub1_nva_pip --vnet-name $hub1_vnet_name --size $nva_size --subnet $hub1_nva_subnet_name \
-    --custom-data $nva_cloudinit_file --nsg $hub1_nsg_name
-hub1_nva_nic_id=$(az vm show -n $hub1_nva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-az network nic update --ids $hub1_nva_nic_id --ip-forwarding
+     --size ${nva_size} --custom-data "$nva_cloudinit_file" --nics "${hub1_nva_name}-nic0" "${hub1_nva_name}-nic1"
 hub1_nva_pip_ip=$(az network public-ip show -n $hub1_nva_pip -g $rg --query ipAddress -o tsv) && echo $hub1_nva_pip_ip
 hub1_nva_private_ip=$(az network nic show --ids $hub1_nva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub1_nva_private_ip
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ip a"

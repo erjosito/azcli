@@ -23,7 +23,6 @@ ilb_subnet_name=apps
 ilb_subnet_prefix=192.168.0.128/28
 anf_subnet_name=anf
 anf_subnet_prefix=192.168.0.192/27
-anf_name=anf$RANDOM
 anf_location=$location
 pls_subnet_name=PrivateLinkService
 pls_subnet_prefix=192.168.0.64/28
@@ -801,27 +800,52 @@ if [[ "$tridentctl_binary" == "tridentctl not found" ]]
 then
     echo "Downloading and installing tridentctl executable..."
     tridentctl_tmp=/tmp/tridentctl.tar.gz
-    wget https://github.com/NetApp/trident/releases/download/v21.04.0/trident-installer-21.04.0.tar.gz -O $tridentctl_tmp
+    # wget https://github.com/NetApp/trident/releases/download/v21.04.0/trident-installer-21.04.0.tar.gz -O $tridentctl_tmp
+    wget https://github.com/NetApp/trident/releases/download/v21.07.1/trident-installer-21.07.1.tar.gz -O $tridentctl_tmp
     tar xfvz $tridentctl_tmp -C /tmp/
     sudo cp /tmp/trident-installer/tridentctl /usr/local/bin
 fi
 
-# Create ANF pool
-az netappfiles account create -g $rg -n $anf_name -l $anf_location
-az netappfiles pool create -g $rg -a $anf_name -n $anf_name -l $anf_location --size 4 --service-level Standard
-anf_account_id=$(az netappfiles account show -n $anf_name -g $rg --query id -o tsv)
-az role assignment create --scope $anf_account_id --assignee $sp_app_id --role 'Contributor'
+# Create ANF account
+anf_name=$(az netappfiles account list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$anf_name" ]]
+then
+  echo "No Azure Netapp Files found in RG $rg, creating a new one..."
+  anf_name=anf$RANDOM
+  az netappfiles account create -g $rg -n $anf_name -l $anf_location
+else
+  echo "Azure Netapp Files account $anf_name found in RG $rg"
+fi
+anf_account_id=$(az netappfiles account show -n $anf_name -g $rg --query id -o tsv) && echo $anf_account_id
+az netappfiles account list -g $rg -o table
+
+# Create ANF pool(s)
+anf_pool_skus=(Standard Premium Ultra)  # To create a capacity pool for each performance tier
+# anf_pool_skus=(Standard)                # To create a single capacity pool in the Standard tier
+for anf_sku in "${anf_pool_skus[@]}"
+do
+  anf_pool_name="${anf_name}-${anf_sku}"
+  echo "Creating pool $anf_pool_name..."
+  az netappfiles pool create -g $rg -a $anf_name -n $anf_pool_name -l $anf_location --size 4 --service-level $anf_sku
+  az role assignment create --scope $anf_account_id --assignee $sp_app_id --role 'Contributor'
+done
+az netappfiles pool list -g $rg -a $anf_name -o table
 
 # Deploy Helm chart
-trident_ns=trident
-if [[ -e "/tmp/trident-installer/helm/trident-operator-21.04.0.tgz" ]]
+trident_ns=tridentns
+if [[ -e "/tmp/trident-installer/helm/trident-operator-21.07.1.tgz" ]]
 then
-    helm install trident /tmp/trident-installer/helm/trident-operator-21.04.0.tgz --namespace $trident_ns --create-namespace
+    # helm install trident /tmp/trident-installer/helm/trident-operator-21.04.0.tgz --namespace $trident_ns --create-namespace
+    helm install trident /tmp/trident-installer/helm/trident-operator-21.07.1.tgz --namespace $trident_ns --create-namespace
 else
     echo "Helm chart not found"
 fi
-sleep 30
+sleep 60 # Waiting for helm chart to finish deployment... (a more elegant loop is probably possible, I feel lazy today though)
 tridentctl -n $trident_ns version
+
+# Uninstall trident (DANGER ZONE!)
+# tridentctl uninstall -n $trident_ns
+# k delete ns/$trident_ns
 
 # Create backend
 trident_backend_file=/tmp/trident_backend.json
@@ -829,6 +853,7 @@ subscription_id=$(az account show --query id -o tsv)
 tenant_id=$(az account show --query tenantId -o tsv)
 cat <<EOF > $trident_backend_file
 {
+  "backendName": "$anf_name",
   "version": 1,
   "storageDriverName": "azure-netapp-files",
   "subscriptionID": "$subscription_id",
@@ -836,50 +861,88 @@ cat <<EOF > $trident_backend_file
   "clientID": "$sp_app_id",
   "clientSecret": "$sp_app_secret",
   "location": "$anf_location",
-  "serviceLevel": "Standard",
+  "serviceLevel": "$anf_sku",
   "virtualNetwork": "$vnet_name",
   "subnet": "$anf_subnet_name",
   "nfsMountOptions": "vers=3,proto=tcp,timeo=600",
-  "limitVolumeSize": "500Gi",
+  "limitVolumeSize": "4Ti",
+  "capacityPools": [ "${anf_name}-Standard,${anf_name}-Premium,${anf_name}-Ultra" ],
   "defaults": {
     "exportRule": "0.0.0.0/0",
     "size": "200Gi"
-  }
+  },
+ "storage": [{
+      "labels": {
+        "performance": "gold"
+      },
+      "serviceLevel": "Ultra"
+    },
+    {
+      "labels": {
+        "performance": "silver"
+      },
+      "serviceLevel": "Premium"
+    },
+    {
+      "labels": {
+        "performance": "bronze"
+      },
+      "serviceLevel": "Standard"
+    }
+  ]
 }
 EOF
 tridentctl -n $trident_ns create backend -f $trident_backend_file
+# tridentctl -n $trident_ns update backend $anf_name -f $trident_backend_file
+tridentctl -n $trident_ns get backend -o yaml
+# tridentctl -n $trident_ns delete backend ${anf_name}
 
-# Storage class
+# Storage classes
 # https://github.com/seanluce/ANF_Trident_AKS
-cat <<EOF | kubectl apply -f -
+perf_tiers=(bronze silver gold)           # To create a SC per tier
+for perf_tier in "${perf_tiers[@]}"
+do
+  cat <<EOF | kubectl apply -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: azurenetappfiles
-provisioner: netapp.io/trident
+  name: anf-$perf_tier
+#provisioner: netapp.io/trident
+provisioner: csi.trident.netapp.io  # CSI all the things!!!!
 parameters:
   backendType: "azure-netapp-files"
+  fsType: "nfs"
+  selector: "performance=$perf_tier"  # Matching labels in the backends...
+allowVolumeExpansion: true            # To allow volume resizing. This parameter is optional
+mountOptions:
+  - nconnect=16
 EOF
+done
 
-# PVC
+# PVCs
 # https://github.com/seanluce/ANF_Trident_AKS
-cat <<EOF | kubectl apply -f -
+# perf_tiers=(bronze silver gold)           # To create a SC per tier
+perf_tiers=(gold)           # To create a SC per tier
+for perf_tier in "${perf_tiers[@]}"
+do
+  cat <<EOF | kubectl apply -f -
 kind: PersistentVolumeClaim
 apiVersion: v1
 metadata:
-  name: azurenetappfiles
+  name: anf-$perf_tier
 spec:
   accessModes:
     - ReadWriteMany
   resources:
     requests:
-      storage: 100Gi
-  storageClassName: azurenetappfiles
+      storage: 4000Gi
+  storageClassName: anf-$perf_tier
 EOF
+done
 
-# Deployment
-# https://github.com/seanluce/ANF_Trident_AKS
-name=api
+# Deployment & Service
+perf_tier=gold
+name=api-$perf_tier
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -889,7 +952,7 @@ metadata:
     app: $name
     deploymethod: trident
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: $name
@@ -901,18 +964,16 @@ spec:
     spec:
       containers:
       - name: $name
-        #image: nginx:1.14.2
         image: erjosito/sqlapi:1.0
         ports:
         - containerPort: 8080
         volumeMounts:
         - name: disk01
-          #mountPath: /usr/share/nginx/html
           mountPath: /mnt/disk
       volumes:
       - name: disk01
         persistentVolumeClaim:
-          claimName: azurenetappfiles
+          claimName: anf-$perf_tier
 ---
 apiVersion: v1
 kind: Service
@@ -930,8 +991,29 @@ spec:
   type: LoadBalancer
 EOF
 
-# Diagnostics
-az netappfiles volume list -g $rg -a $anf_name -p $anf_name -o table --query '[].{Name:name, ProvisioningState:provisioningState, ThroughputMibps:throughputMibps, ServiceLevel:serviceLevel, Location:location}'
+# Query pod, potentially send commands like IO perf testing
+svc_ip=$(kubectl get svc/api-${perf_tier} -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null) && echo $svc_ip
+curl "http://${svc_ip}:8080/api/healthcheck"
+curl "http://${svc_ip}:8080/api/ioperf?file=%2Fmnt%2Fdisk%2Fiotest"
+
+# Further performance tests:
+# https://docs.microsoft.com/en-us/azure/azure-netapp-files/azure-netapp-files-performance-metrics-volumes#fio-examples-for-iops
+# For example:
+# fio --name=8krandomreads --rw=read --direct=1 --ioengine=libaio --bs=64k --numjobs=4 --iodepth=1 --size=1G --runtime=60 --group_reporting --fallocate=none
+# apt update && apt install -y fio --fix-missing
+# apt install -y ioping && cd /mnt/disk && ioping -c 5 .
+# Write bash code to test
+# For example on a 4TB volume in Ultra:
+#  READ: bw=211MiB/s (221MB/s), 211MiB/s-211MiB/s (221MB/s-221MB/s), io=4096MiB (4295MB), run=19457-19457msec
+
+# Show created volumes
+az netappfiles volume list -g $rg -a $anf_name -p $anf_name-Standard -o table --query '[].{Name:name, ProvisioningState:provisioningState, ThroughputMibps:throughputMibps, ServiceLevel:serviceLevel, Location:location}'
+az netappfiles volume list -g $rg -a $anf_name -p $anf_name-Premium -o table --query '[].{Name:name, ProvisioningState:provisioningState, ThroughputMibps:throughputMibps, ServiceLevel:serviceLevel, Location:location}'
+az netappfiles volume list -g $rg -a $anf_name -p $anf_name-Ultra -o table --query '[].{Name:name, ProvisioningState:provisioningState, ThroughputMibps:throughputMibps, ServiceLevel:serviceLevel, Location:location}'
+
+# Volume resizing
+# https://netapp-trident.readthedocs.io/en/stable-v18.10/kubernetes/operations/tasks/volumes.html
+# kube-apiserver --feature-gates=ExpandPersistentVolumes=true --disable-admission-plugins=PersistentVolumeClaimResize
 
 # Cleanup
 az netappfiles pool delete -g $rg -a $anf_name -n $anf_name

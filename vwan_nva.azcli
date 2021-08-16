@@ -2,6 +2,7 @@
 subscription_id=e7da9914-9b05-4891-893c-546cb7b0422e
 vendor="Jose_generic_test_nva"
 version=latest
+deploy_mode=rest        # arm and rest supported at this time
 
 # Variables (common)
 nva_rg=josenva
@@ -119,101 +120,135 @@ function wait_until_finished {
 # Deploy NVA with ARM #
 #######################
 
-# Create ARM template and parameters
-arm_template_file=/tmp/nva_template.json
-cat <<'EOF' > $arm_template_file
+if [[ "$deploy_mode" == "arm" ]]; then
+      # Create ARM template and parameters
+      arm_template_file=/tmp/nva_template.json
+      cat <<'EOF' > $arm_template_file
 {
-    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-    "contentVersion": "1.0.0.0",
-    "parameters": {
-        "name": {
+"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+"contentVersion": "1.0.0.0",
+"parameters": {
+      "name": {
             "defaultValue": "mynva",
             "type": "String"
-        },
-        "vhub_id": {
+      },
+      "vhub_id": {
             "type": "String"
-        },
-        "vendor": {
+      },
+      "vendor": {
             "defaultValue": "Jose_generic_test_nva",
             "type": "String"
-        },
-        "version": {
+      },
+      "version": {
             "defaultValue": "latest",
             "type": "String"
-        },
-        "cloudinit": {
+      },
+      "cloudinit": {
             "defaultValue": "echo helloworld",
             "type": "String"
-        },
-        "asn": {
+      },
+      "asn": {
             "defaultValue": 65001,
             "type": "Int"
-        }
-    },
-    "variables": {},
-    "resources": [
-        {
+      }
+},
+"variables": {},
+"resources": [
+      {
             "type": "Microsoft.Network/NetworkVirtualAppliances",
             "apiVersion": "2020-11-01",
             "name": "[parameters('name')]",
             "location": "[resourceGroup().location]",
             "tags": {
-                "tagexample1": "tagvalue1"
+            "tagexample1": "tagvalue1"
             },
             "properties": {
-                "nvaSku": {
-                    "vendor": "[parameters('vendor')]",
-                    "bundledScaleUnit": "2",
-                    "marketPlaceVersion": "[parameters('version')]"
-                },
-                "virtualHub": {
-                    "id": "[parameters('vhub_id')]"
-                },
-                "virtualApplianceAsn": "[parameters('asn')]",
-                "cloudInitConfiguration": "[parameters('cloudinit')]"
+            "nvaSku": {
+                  "vendor": "[parameters('vendor')]",
+                  "bundledScaleUnit": "2",
+                  "marketPlaceVersion": "[parameters('version')]"
+            },
+            "virtualHub": {
+                  "id": "[parameters('vhub_id')]"
+            },
+            "virtualApplianceAsn": "[parameters('asn')]",
+            "cloudInitConfiguration": "[parameters('cloudinit')]"
             }
-        }
-    ]
+      }
+]
+}
+EOF
+      arm_params_file=/tmp/nva_params.json
+      cat <<EOF > $arm_params_file
+{
+"\$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentParameters.json#",
+"contentVersion": "1.0.0.0",
+"parameters": {
+      "name": {
+            "value": "$nva_name"
+      },
+      "vhub_id": {
+            "value": "$hub_id"
+      },
+      "cloudinit": {
+            "value": $cloudinit_string
+      },
+      "asn": {
+            "value": $nva_asn
+      },
+      "vendor": {
+            "value": "$vendor"
+      },
+      "version": {
+            "value": "$version"
+      },
+}
 }
 EOF
 
-# Send ARM deployment
-nva_name=armnva
-az deployment group create -n vwannva-$RANDOM --template-file $arm_template_file -g $nva_rg \
-      --parameters "name=$nva_name" \
-      --parameters "vhub_id=$hub_id" \
-      --parameters "cloudinit=$cloudinit_string" \
-      --parameters "asn=$nva_asn" \
-      --parameters "version=$version"
-
-# Check provisioning state
-az network virtual-appliance show -n $nva_name -g $nva_rg --query provisioningState -o tsv
+      # Send ARM deployment
+      # Option 1: Parameters inline (there seems to be some problem with the cloudinit string, probably with quoting)
+      # az deployment group create -n vwannva-$RANDOM --template-file $arm_template_file -g $nva_rg \
+      #       --parameters "name=$nva_name" \
+      #       --parameters "vhub_id=$hub_id" \
+      #       --parameters "cloudinit=$cloudinit_string" \
+      #       --parameters "asn=$nva_asn" \
+      #       --parameters "version=$version"
+      # Option 2: Parameters in file (working fine)
+      az deployment group create -n vwannva-$RANDOM --template-file $arm_template_file --parameters @$arm_params_file -g $nva_rg
+fi
 
 ##############################
 # Creating NVA over REST API #
 ##############################
 
-# REST API
-json_payload='{
-  "properties": {
-    "nvaSku": {
-      "vendor": "'$vendor'",
-      "bundledScaleUnit": "2",
-      "marketPlaceVersion": "'$version'"
-    },
-    "virtualHub": {
-      "id": "'$hub_id'"
-    },
-    "virtualApplianceAsn": '$nva_asn',
-    "cloudInitConfiguration": '$cloudinit_string'
-  },
-  "location": "'$location'",
-  "tags": {
-    "tagexample1": "tagvalue1"
-  }
-}'
-uri="/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/NetworkVirtualAppliances/${nva_name}?api-version=2021-02-01"
-az rest --method PUT --uri $uri --body "$json_payload"
+if [[ "$deploy_mode" == "rest" ]]; then
+      # REST payload
+      json_payload='{
+            "properties": {
+            "nvaSku": {
+                  "vendor": "'$vendor'",
+                  "bundledScaleUnit": "2",
+                  "marketPlaceVersion": "'$version'"
+            },
+            "virtualHub": {
+                  "id": "'$hub_id'"
+            },
+            "virtualApplianceAsn": '$nva_asn',
+            "cloudInitConfiguration": '$cloudinit_string'
+            },
+            "location": "'$location'",
+            "tags": {
+            "tagexample1": "tagvalue1"
+            }
+      }'
+      uri="/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/NetworkVirtualAppliances/${nva_name}?api-version=2021-02-01"
+      az rest --method PUT --uri $uri --body "$json_payload"
+fi
+
+############################
+# NVA creation diagnostics #
+############################
 
 # Wait until provisioning state is Successful
 # az network virtual-appliance show -n $nva_name -g $nva_rg --query provisioningState -o tsv
