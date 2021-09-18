@@ -48,6 +48,29 @@ function allow_ssh () {
     done <<< "$vm_list"
 }
 
+# Function to inject an allow rule for SSH for only the current IP address
+function allow_1ip_ssh () {
+    echo "Getting current IP..."
+    myip=$(curl -s4 ifconfig.co)
+    echo "Current IP is $myip"
+    while IFS= read -r vm; do
+        ssh_vm_name=$(echo $vm | cut -f1 -d$'\t')
+        ssh_rg=$(echo $vm | cut -f2 -d$'\t')
+        echo "Getting NSG for VM $ssh_vm_name in RG $ssh_rg..."
+        ssh_nic_id=$(az vm show -n $ssh_vm_name -g $ssh_rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        ssh_nsg_id=$(az network nic show --ids $ssh_nic_id --query 'networkSecurityGroup.id' -o tsv)
+        if [[ -z "$ssh_nsg_id" ]]
+        then
+            echo "No NSG could be found for NIC $ssh_nic_id"
+        else
+            ssh_nsg_name=$(basename $ssh_nsg_id)
+            echo "Adding allow rule for SSH and RDP to NSG $ssh_nsg_name for VM $ssh_vm_name in RG $ssh_rg (for IP address $myip)..."
+            az network nsg rule create -n "${rule_prefix}Mgmt" --nsg-name $ssh_nsg_name -g $ssh_rg --priority $rule_prio \
+                --source-address-prefixes "${myip}/32" --destination-port-ranges 22 3389 --access Allow --protocol Tcp -o none
+        fi
+    done <<< "$vm_list"
+}
+
 # Function to inject an allow rule for SSH
 function delete_ssh_rule () {
     while IFS= read -r vm; do
@@ -119,5 +142,8 @@ case $action in
         ;;
     delete|remove)
         delete_ssh_rule
+        ;;
+    allow1|permit1|allow1ip|permit1ip)
+        allow_1ip_ssh
         ;;
 esac

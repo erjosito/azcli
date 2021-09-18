@@ -42,6 +42,31 @@ function convert_string_to_array () {
     echo "${myarray[@]}"
 }
 
+# Configure flow logs for all NSGs in a given location
+function configure_flowlogs () {
+    if [[ -z $1 ]]; then
+        nsg_location=$(az group show -n $rg --query location -o tsv)
+        echo "No argument specified, taking the RG's location $nsg_location"
+    else
+        echo "Using $1 as location"
+        nsg_location=$1
+    fi
+    storage_account_name=$(az storage account list -g $rg -o tsv --query "[?location=='$nsg_location'].name" | head -1)
+    if [[ -z "$storage_account_name" ]]; then
+        storage_account_name=$(echo "logs$RANDOM${nsg_location}" | cut -c1-24)  # max 24 characters
+        echo "No storage account found in $nsg_location, creating one..."
+        az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $nsg_location -o none
+    else
+        echo "Storage account $storage_account_name created in $nsg_location, using it for NSG flow flogs"
+    fi
+    echo "Looking for NSGs in resource group $rg in location $nsg_location..."
+    nsg_list=$(az network nsg list -g $rg -o tsv --query "[?location=='$nsg_location'].name")
+    echo "$(echo $nsg_list | wc -l) NSGs found"
+    while IFS= read -r nsg_name; do
+        echo "Configuring Flow Logs for NSG $nsg_name into storage account $storage_account_name..."
+        az network watcher flow-log create -l $nsg_location -n "${nsg_name}-${nsg_location}" -g $rg --nsg $nsg_name --storage-account $storage_account_name --log-version 2 --retention 1 -o none
+    done <<< "$nsg_list"
+}
 
 # Create RG, Vnet, NSG
 az group create -n $rg -l $location

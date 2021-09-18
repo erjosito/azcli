@@ -57,8 +57,8 @@ spoke1_csr_subnet_prefix=10.11.1.0/24
 # Spoke 2
 spoke2_name=spoke2
 spoke2_prefix=10.12.0.0/16
-spoke2_subnet_name=vm
-spoke2_subnet_prefix=10.12.0.0/24
+spoke2_vm_subnet_name=vm
+spoke2_vm_subnet_prefix=10.12.0.0/24
 # Azure VPN GW
 vpngw_name=vpngw
 vpngw_asn=65515
@@ -123,7 +123,9 @@ az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefi
 
 # Create Route Server
 rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-az network routeserver create -n $rs_name -g $rg --hosted-subnet $rs_subnet_id -l $location
+rs_pip_name="${rs_name}-pip"
+az network public-ip create -g $rg -n $rs_pip_name --allocation-method Static --sku Standard
+az network routeserver create -n $rs_name -g $rg --hosted-subnet $rs_subnet_id -l $location --public-ip-address $rs_pip_name
 az network routeserver update -n $rs_name -g $rg --allow-b2b-traffic true   # Optional
 # az network routeserver delete -n $rs_name -g $rg -y  # Danger Zone!
 
@@ -449,7 +451,7 @@ spoke1_private_ip=$(az network nic show --ids $spoke1_nic_id --query 'ipConfigur
 
 # Spoke 2 with Ubuntu VM
 az network vnet create -g $rg -n $spoke2_name --address-prefix $spoke2_prefix --subnet-name $spoke2_vm_subnet_name --subnet-prefix $spoke2_subnet_prefix -l $location
-az network vnet subnet update -g $rg --vnet-name $spoke1_name -n $spoke1_vm_subnet_name --route-table spokevmrt
+az network vnet subnet update -g $rg --vnet-name $spoke2_name -n $spoke2_vm_subnet_name --route-table spokevmrt
 az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $vnet_name --remote-vnet $spoke2_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
 az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke2_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
 az vm create -n spoke2-vm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
@@ -527,7 +529,9 @@ protocol kernel {
 # Static IPv4 routes.
 protocol static {
       route 5.5.5.5/32 via $hub_linuxnva_default_gw;
-      route $vnet_prefix via $hub_linuxnva_default_gw;
+      route 0.0.0.0/1 via $hub_linuxnva_default_gw;
+      route 128.0.0.0/1 via $hub_linuxnva_default_gw;
+      # route $vnet_prefix via $hub_linuxnva_default_gw;
 }
 # BGP peers
 protocol bgp rs0 {
@@ -554,12 +558,15 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo s
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show status"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip 'sudo birdc sh prot "uplink*"'
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols all"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols uplink0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs1"
 
 # Effective routes in a spoke (5.5.5.5/32 should be there)
 az network nic show-effective-route-table --ids $spoke1_nic_id -o table
+
+# Routes advertised to ARS
+az network routeserver peering list-learned-routes -n $hub_linuxnva_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
 
 
 #################################
@@ -867,10 +874,14 @@ az network vnet-gateway list-bgp-peer-status -n $ergw_name -g $rg -o table
 
 # Create VPN Gateway
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix
-az network public-ip create -g $rg -n $vpngw_pip --allocation-method Dynamic --sku Basic
+az network public-ip create -g $rg -n "${vpngw_pip}-a" --allocation-method Dynamic --sku Basic
+az network public-ip create -g $rg -n "${vpngw_pip}-b" --allocation-method Dynamic --sku Basic
 az network vnet-gateway create -g "$rg" --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased \
-            --vnet "$vnet_name" -n $vpngw_name --asn "$vpngw_asn" --public-ip-address $vpngw_pip --no-wait
+            --vnet "$vnet_name" -n $vpngw_name --asn "$vpngw_asn" --public-ip-addresses "${vpngw_pip}-a" "${vpngw_pip}-b"
 az network vnet-gateway list -g $rg -o table
+
+# Inspect learnt routes
+az network vnet-gateway list-learned-routes -n $vpngw_name -g $rg --query 'value[].{LocalAddress:localAddress, Peer:sourcePeer, Network:network, NextHop:nextHop, ASPath: asPath, Origin:origin, Weight:weight}' -o tsv
 
 ###############
 # Diagnostics #

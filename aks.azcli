@@ -512,6 +512,45 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
 node_ip=$(kubectl get node -o json | jq -r '.items[0].status.addresses[] | select(.type=="InternalIP") | .address') && echo $node_ip
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -m hmac-sha2-512 -J $vm_pip_address $node_ip "ip a"
 
+##########################
+#  Azure Firewall (WIP)  #
+##########################
+
+# Variables
+azfw_policy_name=aksfwpolicy
+azfw_name=aksazfw
+azfw_pip_name=${azfw_name}-pip
+# Create policy and FW
+az network vnet subnet create -g $rg -n AzureFirewallSubnet --vnet-name $vnet_name --address-prefix $azfw_subnet_prefix
+az network firewall policy create -n $azfw_policy_name -g $rg
+az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location
+azfw_ip=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv) && echo $azfw_ip
+az network firewall create -n $azfw_name -g $rg -l $location
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name
+az network firewall update -n $azfw_name -g $rg
+azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo $azfw_private_ip
+# Enable logging
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    logws_name=log$RANDOM
+    echo "INFO: Creating log analytics workspace ${logws_name}..."
+    az monitor log-analytics workspace create -n $logws_name -g $rg
+else
+    echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+      --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+      --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+              {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
+# Add some rules to the policy (TBD)
+
+# Cleanup
+az network firewall delete -n $azfw_name -g $rg -y
+
 ###########################
 # Logs from Azure Monitor #
 ###########################

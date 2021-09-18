@@ -42,7 +42,6 @@ then
     ./megaport.sh -s=jomore-${er_pop} -a=create_mcr -k=$service_key
     sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
     ./megaport.sh -s=jomore-${er_pop} -a=create_vxc -k=$service_key
-    sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
 else
     echo "Sorry, I cannot seem to find the script megaport.sh to interact with the Megaport API"
 fi

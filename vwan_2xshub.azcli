@@ -20,7 +20,7 @@
 # Control
 secure_hub=no        # Whether firewalls are provisioned in the hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
-indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
+indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
 nva_bgp=yes          # If using an NVA in spoke14/24, whether configuring BGP on it towards VWAN
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'

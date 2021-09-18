@@ -95,60 +95,186 @@ az network watcher connection-monitor endpoint add --connection-monitor $monitor
 az network watcher connection-monitor list -l $location1 -o table # -g flag not supported
 az network watcher connection-monitor list -l $location2 -o table # -g flag not supported
 
-# Looks for connection monitors in the region(s) and represents results
-# Get list of log analytics workspace IDs
-locations=($location1 $location2)
-for location in "${locations[@]}"
+#########################
+# Some useful functions #
+#########################
+
+# Get all VMs containing the string "vm" (that excludes the NVAs)
+vm_list=$(az vm list -g $rg --query "[?contains(name,'vm')].name" -o tsv | sort -u)
+# Build an associative array with all VM IDs
+declare -A vm_id_list
+echo "Getting VM IDs..."
+while IFS= read -r vm_name
 do
-    logws_id_list=$(az network watcher connection-monitor list -l $location -o tsv --query '[].outputs[].workspaceSettings.workspaceResourceId')
-    logws_id_list=$(echo $logws_id_list | sort -u)  # Unique values
-done
-# Get list of log analytics customerIds
-logws_customer_id_list=$(for logws_id in "${logws_id_list[@]}"; do logws_rg=$(echo $logws_id | cut -d/ -f 5); logws_name=$(echo $logws_id | cut -d/ -f 9) && az monitor log-analytics workspace show -n $logws_name -g $logws_rg --query customerId -o tsv; done)
-# Get list of tests, sources and destinations
-src_query="NWConnectionMonitorTestResult | where TimeGenerated > ago(1h) | distinct SourceName"
-src_list=$(for logws_customer_id in "${logws_customer_id_list[@]}"; do az monitor log-analytics query -w $logws_customer_id --analytics-query $src_query --query '[].SourceName' -o tsv; done)
-dst_query="NWConnectionMonitorTestResult | where TimeGenerated > ago(1h) | distinct DestinationName"
-dst_list=$(for logws_customer_id in "${logws_customer_id_list[@]}"; do az monitor log-analytics query -w $logws_customer_id --analytics-query $dst_query --query '[].DestinationName' -o tsv; done)
-cfg_query="NWConnectionMonitorTestResult | where TimeGenerated > ago(1h) | distinct TestConfigurationName"
-cfg_list=$(for logws_customer_id in "${logws_customer_id_list[@]}"; do az monitor log-analytics query -w $logws_customer_id --analytics-query $cfg_query --query '[].TestConfigurationName' -o tsv; done)
-src_list=$(echo $src_list | sort -u)
-dst_list=$(echo $dst_list | sort -u)
-# For each source, print the latest results to the destination. Do a separate table per configuration test
-interval=5m
-while IFS= read -r cfg
+    vm_id=$(az vm show -g $rg --query id -o tsv -n $vm_name)
+    vm_id_list+=([$vm_name]="$vm_id")
+done <<< "$vm_list"
+
+# Install the network watcher extension in every VM (Linux assumed)
+while IFS= read -r vm
 do
-    echo " **** Test configuration $cfg ****"
-    printf "%10s" "Source"
+    echo "Installing Network Watcher extension in VM $vm..."
+    az vm extension set --vm-name $vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4 -o none
+done <<< "$vm_list"
+
+# Install Apache web server in every VM (Ubuntu assumed)
+while IFS= read -r vm
+do
+    echo "Installing Apache in VM $vm..."
+    nic_id=$(az vm show -n $vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    pip_id=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+    pip_ip=$(az network public-ip show --ids $pip_id --query ipAddress -o tsv)
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip_ip "sudo apt install -y apache2"
+done <<< "$vm_list"
+
+# Create connection monitors
+while IFS= read -r src_vm
+do
+    test_name="${src_vm}"
+    location=$(az vm show -n $src_vm -g $rg --query location -o tsv)
+    monitor_name="${src_vm}-${location}"
+    echo "Creating connection monitor for source $src_vm in $location..."
+    # The monitor is created with an HTTP config to ubuntu.com
+    az network watcher connection-monitor create -n $monitor_name -g $rg -l $location \
+        --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type ExternalAddress \
+        --endpoint-source-resource-id "$vm_id_list[$src_vm]" --endpoint-source-name $src_vm \
+        --endpoint-dest-address "ubuntu.com" --endpoint-dest-name ubuntucom \
+        --test-config-name Http --protocol Http --http-method GET --https-prefer false -o none
+    # An ICMP config is added
+    echo "Adding ICMP config to connection monitor $monitor_name..."
+    az network watcher connection-monitor test-configuration add --connection-monitor $monitor_name -l $location \
+        -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name -o none
+    # Plus the rest of the VMs are added as targets
+    while IFS= read -r dst_vm
+    do
+        if [[ "$src_vm" != "$dst_vm" ]]
+        then
+            echo "Adding destination $dst_vm to connection monitor $monitor_name..."
+            az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location \
+                --resource-id "$vm_id_list[$dst_vm]" --name $dst_vm --type AzureVM --dest-test-groups $test_name -o none
+        fi
+    done <<< "$vm_list"
+done <<< "$vm_list"
+
+# Represents results in table form (configurable interval, default 5m)
+function monitor_results() {
+    interval=5m
+    table_width=12
+    # Get location list
+    echo "Getting a list of locations..."
+    location_list=$(az vm list -g $rg --query "[?contains(name,'vm')].location" -o tsv | sort -u)
+    echo "$(echo $location_list | wc -l) locations with VMs found in resource group $rg"
+    # Get list of log analytics workspace IDs
+    declare -a logws_id_list
+    logws_id_list=()
+    while IFS= read -r location
+    do
+        logws_id_list_location=$(az network watcher connection-monitor list -l $location -o tsv --query '[].outputs[].workspaceSettings.workspaceResourceId')
+        logws_id_list_location=$(echo $logws_id_list_location | sort -u)  # Unique values
+        logws_id_list+=$logws_id_list_location
+    done <<< "$location_list"
+    # Remove duplicates
+    # logws_id_list=$(echo $(for i in ${logws_id_list[@]}; do echo "$i"; done) | sort -u)
+    echo "${#logws_id_list[@]} workspaces found"
+    # Get list of log analytics customerIds
+    logws_customer_id_list_string=$(for logws_id in "${logws_id_list[@]}"; do logws_rg=$(echo $logws_id | cut -d/ -f 5); logws_name=$(echo $logws_id | cut -d/ -f 9); az monitor log-analytics workspace show -n $logws_name -g $logws_rg --query customerId -o tsv; done)
+    declare -a logws_customer_id_list
+    logws_customer_id_list=()
+    while IFS= read -r customer_id; do
+        logws_customer_id_list+=$customer_id
+    done <<< "$logws_customer_id_list_string"
+    echo "${#logws_customer_id_list[@]} workspace customer IDs found"
+    # Get list of tests, sources and destinations
+    echo "Getting sources..."
+    src_query="NWConnectionMonitorTestResult | where TimeGenerated > ago(1h) | distinct SourceName"
+    src_list=$(for logws_customer_id in "${logws_customer_id_list[@]}"; do az monitor log-analytics query -w $logws_customer_id --analytics-query $src_query --query '[].SourceName' -o tsv; done)
+    src_list=$(echo $src_list | sort -u)
+    echo "$(echo $src_list | wc -l) sources found"
+    echo "Getting destinations..."
+    dst_query="NWConnectionMonitorTestResult | where TimeGenerated > ago(1h) | distinct DestinationName"
+    dst_list=$(for logws_customer_id in "${logws_customer_id_list[@]}"; do az monitor log-analytics query -w $logws_customer_id --analytics-query $dst_query --query '[].DestinationName' -o tsv; done)
+    dst_list=$(echo $dst_list | sort -u)
+    echo "$(echo $dst_list | wc -l) destinations found"
+    echo "Getting test configurations..."
+    cfg_query="NWConnectionMonitorTestResult | where TimeGenerated > ago(1h) | distinct TestConfigurationName"
+    cfg_list=$(for logws_customer_id in "${logws_customer_id_list[@]}"; do az monitor log-analytics query -w $logws_customer_id --analytics-query $cfg_query --query '[].TestConfigurationName' -o tsv; done)
+    cfg_list=$(echo $cfg_list | sort -u)
+    echo "$(echo $cfg_list | wc -l) test configurations found"
+    # Get connectivity data with a union query to all workspaces
+    if (( ${#logws_customer_id_list[@]} == 1 )); then
+        line1='NWConnectionMonitorTestResult'
+    else
+        line1='union '
+        for logws_customer_id in "${logws_customer_id_list[@]}"; do
+            if [[ "$line1" != "union " ]]; then
+                line1+=', '
+            fi
+            line1+='workspace("'$logws_customer_id'").NWConnectionMonitorTestResult'
+        done
+    fi
+    line2="| where TimeGenerated > ago($interval) | project SourceName, DestinationName, TestResult, TestConfigurationName | summarize Pass=countif(TestResult == \"Pass\"), NoPass=countif(TestResult != \"Pass\") by SourceName, DestinationName, TestConfigurationName | project PassPercent=Pass/(Pass+NoPass), SourceName, DestinationName, TestConfigurationName"
+    query="${line1} ${line2}"
+    monitor_json=$(az monitor log-analytics query -w $logws_customer_id --analytics-query $query -o json)
+    # For each source, print the latest results to the destination. Do a separate table per configuration test
+    cfgs=''
+    while IFS= read -r cfg
+    do
+        if [[ -n "$cfgs" ]]; then
+            cfgs+='/'
+        fi
+        cfgs+="$cfg"
+    done <<< "$cfg_list"
+    echo " **** Test configurations: $cfgs ****"
+    printf "%${table_width}s" "Source"
     while IFS= read -r dst
     do
-        printf "%10s" $dst
+        printf "%${table_width}s" $dst
     done <<< "$dst_list"
     printf "\n"
     while IFS= read -r src
     do
-        printf "%10s" "$src"
+        printf "%${table_width}s" "$src"
         while IFS= read -r dst
         do
-            pass_query="NWConnectionMonitorTestResult | where TimeGenerated > ago($interval) | where SourceName==\"$src\" and DestinationName == \"$dst\" and TestConfigurationName == \"$cfg\" | project TestResult | summarize Pass=countif(TestResult == \"Pass\"), NoPass=countif(TestResult != \"Pass\") | project PassPercent=Pass/(Pass+NoPass)"
-            # Browse over the workspaces until something other than "None" arrives
-            pass_percent="None"
-            for logws_customer_id in "${logws_customer_id_list[@]}"
-            do
-                if [[ "$pass_percent" == "None" ]]
-                then
-                    pass_percent=$(az monitor log-analytics query -w $logws_customer_id --analytics-query $pass_query --query '[].PassPercent' -o tsv)
-                fi
-                printf "%10s" "$pass_percent"
-            done
+            if [[ "$src" != "$dst" ]]
+            then
+                # pass_query="NWConnectionMonitorTestResult | where TimeGenerated > ago($interval) | where SourceName==\"$src\" and DestinationName == \"$dst\" and TestConfigurationName == \"$cfg\" | project TestResult | summarize Pass=countif(TestResult == \"Pass\"), NoPass=countif(TestResult != \"Pass\") | project PassPercent=Pass/(Pass+NoPass)"
+                # # Browse over the workspaces until something other than "None" arrives
+                # pass_percent="None"
+                # for logws_customer_id in "${logws_customer_id_list[@]}"
+                # do
+                #     if [[ "$pass_percent" == "None" ]]
+                #     then
+                #         # echo "**DEBUG*** Sending query $pass_query to workspace $logws_customer_id..."
+                #         pass_percent=$(az monitor log-analytics query -w $logws_customer_id --analytics-query $pass_query --query '[].PassPercent' -o tsv)
+                #     fi
+                # done
+                results=''
+                while IFS= read -r cfg
+                do
+                    if [[ -n "$results" ]]; then
+                        results+='/'
+                    fi
+                    pass_percent=$(echo $monitor_json | jq -r '.[] | select(.SourceName == "'$src'") | select(.DestinationName == "'$dst'") | select(.TestConfigurationName == "'$cfg'") | .PassPercent')
+                    if [[ -z "$pass_percent" ]]; then
+                        pass_percent='ND'
+                    fi
+                    results+="$pass_percent"
+                done <<< "$cfg_list"
+                printf "%${table_width}s" "$results"
+            else
+                printf "%${table_width}s" "N/A"
+            fi
         done <<< "$dst_list"
         printf "\n"
     done <<< "$src_list"
-done <<< "$cfg_list"
+}
+monitor_results
 
+###########
+# Cleanup #
+###########
 
-
-# Cleanup
 # az group delete -n $rg -y --no-wait
 # az network watcher connection-monitor delete -n poller-$location1 -l $location1
 # az network watcher connection-monitor delete -n poller-$location2 -l $location2

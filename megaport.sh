@@ -97,18 +97,15 @@ function get_mcr_status () {
 function list_products () {
     # Optional parameter with provisioningStatus
     status=$1
-
     # Sending call to get services, and associated VXCs
     products_url="${base_url}/v2/products"
     products_json=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
     output=$(echo "$products_json" | jq -r "[ .data[] | select( .productName | contains(\"${product_string}\")) | { productName, productType, provisioningStatus, productUid, vxcs: [ .associatedVxcs[]? | { productName, productType, provisioningStatus, productUid }] } ]")
-
     # Only show products with a certain state
     if [[ -n "$status" ]]
     then
         output=$(echo $output | jq -r "[ .[] | select(.provisioningStatus==\"${status}\") ]")
     fi
-
     # Validate we have an output
     if [[ -n $output ]]
     then
@@ -126,7 +123,10 @@ function create_mcr () {
         mcr_name="${mcr_name}-${name_suffix}"
     fi
     # Try to find an existing MCR (LIVE or otherwise):
-    mcr_id=$(list_products | jq -r '.[].productUid')
+    echo "INFO: Checking if a live MCR with the string $product_string already exists..."
+    product_json=$(list_products LIVE)
+    mcr_id=$(echo "$product_json" | jq -r '.[].productUid')
+    mcr_status=$(echo "$product_json" | jq -r '.[].provisioningStatus')
     if [[ -z "$mcr_id" ]]
     then
         log_msg "INFO: Creating MCR $mcr_name in Megaport location $location_id and ASN $mcr_asn..."
@@ -141,7 +141,7 @@ function create_mcr () {
         buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
         echo "$buy_response" | jq
     else
-        log_msg "INFO: MCR $mcr_id already found, skipping creation"
+        log_msg "INFO: MCR $mcr_id already found (status $mcr_status), skipping creation"
     fi
 }
 
@@ -301,6 +301,7 @@ case $action in
                 log_msg "INFO: Getting Location ID from existing ER..."
                 er_json=$(validate_key "$service_key")
                 location_id=$(echo "$er_json" | jq -r '.ports[] | select (.name | contains("Primary")) | .locationId')
+                echo "INFO: Location ID derived from the supplied service key: $location_id"
             fi
         fi
         create_mcr

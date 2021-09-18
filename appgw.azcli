@@ -348,22 +348,41 @@ az network application-gateway rule create -g $rg --gateway-name $appgw_name \
 # Keyvault
 # keyvault_name=joseakv-airs
 keyvault_name=erjositoKeyvault
+
+# Option 1: cert already uploaded to AKV
 cert_name=cloudtroopernet
+
+# Option 2: upload a cert to AKV
+cert_name=selfsigned01
+az keyvault certificate create --vault-name $keyvault_name -n $cert_name -p "$(az keyvault certificate get-default-policy)"
 
 # Create Identity to access the AKV
 id_name=appgwid
 az identity create -n $id_name -g $rg
 id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
-az keyvault set-policy -n "$keyvault_name" --object-id "$id_principal_id" \
-  --secret-permissions get list \
-  --certificate-permissions get list
+
+# Grant permissions, depending on whether Azure RBAC is enabled or not
+akv_azure_rbac=$(az keyvault show -n $keyvault_name --query properties.enableRbacAuthorization -o tsv)
+if [[ "$akv_azure_rbac" == "true" ]]
+then
+    keyvault_id=$(az keyvault show -n $keyvault_name --query id -o tsv)
+    az role assignment create --scope $keyvault_id --role "Key Vault Secrets User" --assignee $id_principal_id
+else
+    az keyvault set-policy -n "$keyvault_name" --object-id "$id_principal_id" \
+      --secret-permissions get list \
+      --certificate-permissions get list
+fi
 id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
 az network application-gateway identity assign --gateway-name $appgw_name -g $rg --identity $id_id
 
-# Create from AKV
+# Import cert from AKV
 cert_sid=$(az keyvault certificate show --vault-name $keyvault_name -n $cert_name --query sid -o tsv) && echo $cert_sid
+# az network application-gateway ssl-cert delete -n $cert_name -g $rg --gateway-name $appgw_name  # In case the certificate already existed
 az network application-gateway ssl-cert create -n $cert_name -g $rg --gateway-name $appgw_name \
     --key-vault-secret-id $cert_sid
+
+# Check certs in appgw
+az network application-gateway ssl-cert list -g $rg --gateway-name $appgw_name -o table
 
 # Create from file
 # az network application-gateway ssl-cert create -g $rg --gateway-name $appgw_name -n starcloudtrooper \

@@ -2,6 +2,13 @@
 # az provider register -n Microsoft.RedHatOpenShift --wait
 # az extension add -n aro --index https://az.aroapp.io/preview
 
+# Control
+ingress_visibility=Public
+api_visibility=Public
+custom_domain=no
+domain=cloudtrooper.net  # If using custom_domain=yes. Assumes you own this domain and have it managed by Azure DNS
+nat_gateway=no           # Just for testing, this is not supported
+
 # Variables
 rg=aro
 cluster_name=aro
@@ -31,11 +38,6 @@ worker_vm_size=Standard_D4s_v3
 worker_vm_count=3
 pod_cidr=10.128.0.0/14
 service_cidr=172.30.0.0/16
-ingress_visibility=Public
-api_visibility=Public
-domain=cloudtrooper.net  # Assumes you own this domain and have it managed by Azure DNS
-custom_domain=no
-nat_gateway=no           # Just for testing, this is not supported
 
 # Create RG if it did not exist
 rg_location=$(az group show -n $rg --query location -o tsv)
@@ -353,6 +355,61 @@ az network vnet subnet update --vnet-name $vnet_name -g $rg -n $pls_subnet_name 
 # tenant_id=$(az account show --query tenantId -o tsv) && echo $tenant_id
 # az login --service-principal -u $sp_app_id -p $sp_app_secret --tenant $tenant_id   # Otherwise no access to the ALB in the node RG
 az network private-link-service create -g $rg -n AROTestPLS --vnet-name $vnet_name --subnet $pls_subnet_name --lb-frontend-ip-configs $frontend_id -l $location
+
+################
+#  Stop/Start  #
+################
+
+# Start/stop ARO VMs
+# Usage:
+# - aro_vm start
+# - aro_vm stop
+function aro_vm() {
+    # Get node RG before logging in as SP
+    if [[ -z "$node_rg_name" ]]
+    then
+      echo "Getting node RG name..."
+      node_rg_id=$(az aro show -n $cluster_name -g $rg --query 'clusterProfile.resourceGroupId' -o tsv)
+      node_rg_name=$(echo $node_rg_id | cut -d/ -f 5)
+    else
+      echo "Using node RG name $node_rg_name..."
+    fi
+    if [[ -n "$node_rg_name" ]]
+    then
+      echo "Node RG $node_rg_name"
+      # Log in with the ARP SP to have privilege to the resources in the node RG
+      echo "Getting logged user type..."
+      user_type=$(az account show --query 'user.type' -o tsv)
+      if [[ "$user_type" == "user" ]]
+      then
+          echo "Existing user logged not as Service Principal. Logging in as Service Principal $sp_app_id..."
+          tenant_id=$(az account show --query tenantId -o tsv) && echo "Tenant ID is $tenant_id"
+          az login --service-principal -u $sp_app_id -p $sp_app_secret --tenant $tenant_id -o none
+      fi
+      # Get list of VMs in the node RG
+      echo "Getting VM names in resource group $node_rg_name..."
+      vm_list=$(az vm list -g $node_rg_name --query '[].name' -o tsv | sort -u)
+      echo "$(echo $vm_list | wc -l) VMs found"
+      while IFS= read -r vm
+      do
+          if [[ "$1" == "stop" ]]
+          then
+            echo "Deallocating virtual machine $vm..."
+            az vm deallocate -n $vm -g $node_rg_name -o none
+          else
+            echo "Starting virtual machine $vm..."
+            az vm start -n $vm -g $node_rg_name -o none
+          fi
+      done <<< "$vm_list"
+      # Log in as standard user again
+      az login
+    else
+      echo "ERROR: Node RG name could not be found"
+    fi
+}
+
+# aro_vm stop
+# aro_vm start
 
 ###########################
 #   Container Insights    #
