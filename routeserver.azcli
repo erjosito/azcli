@@ -54,6 +54,8 @@ spoke1_vm_subnet_name=vm
 spoke1_vm_subnet_prefix=10.11.0.0/24
 spoke1_csr_subnet_name=csr
 spoke1_csr_subnet_prefix=10.11.1.0/24
+spoke1_csr_name=spoke1csr
+spoke1_csr_asn=65001
 # Spoke 2
 spoke2_name=spoke2
 spoke2_prefix=10.12.0.0/16
@@ -450,7 +452,7 @@ spoke1_nic_id=$(az vm show -n spoke1-vm -g "$rg" --query 'networkProfile.network
 spoke1_private_ip=$(az network nic show --ids $spoke1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke1_private_ip
 
 # Spoke 2 with Ubuntu VM
-az network vnet create -g $rg -n $spoke2_name --address-prefix $spoke2_prefix --subnet-name $spoke2_vm_subnet_name --subnet-prefix $spoke2_subnet_prefix -l $location
+az network vnet create -g $rg -n $spoke2_name --address-prefix $spoke2_prefix --subnet-name $spoke2_vm_subnet_name --subnet-prefix $spoke2_vm_subnet_prefix -l $location
 az network vnet subnet update -g $rg --vnet-name $spoke2_name -n $spoke2_vm_subnet_name --route-table spokevmrt
 az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $vnet_name --remote-vnet $spoke2_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
 az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke2_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
@@ -477,6 +479,47 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_ip "ping $spoke2_pri
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_ip "ping $spoke1_private_ip -c 5"
 # SSH from spoke to spoke (using one of them as jump host)
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $spoke1_ip $spoke2_private_ip "ip a"
+
+# CSR in spoke1 (using the hub NSG, I am lazy...)
+az network route-table create -n spoke1csr -g $rg -l $location --disable-bgp-route-propagation
+az network vnet subnet update -g $rg --vnet-name $spoke1_name -n $spoke1_csr_subnet_name --route-table spoke1csr  # To prevent ARS routes to be injected here
+az network public-ip create -g $rg -n "${spoke1_csr_name}-pip" --sku basic --allocation-method Static
+az network nic create -n "${spoke1_csr_name}-nic0" -g $rg --vnet-name $spoke1_name --subnet $spoke1_csr_subnet_name --public-ip-address "${spoke1_csr_name}-pip" --network-security-group "$hub_csrext_nsg_name" --ip-forwarding
+az vm create -n $spoke1_csr_name -g $rg -l $location \
+    --image ${publisher}:${offer}:${sku}:${version} \
+    --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
+    --nics "${spoke1_csr_name}-nic0"
+# Configure spoke1 CSR with BGP
+spoke1_csr_ip=$(az network public-ip show -n "${spoke1_csr_name}-pip" --query ipAddress -o tsv -g $rg) && echo $spoke1_csr_ip
+spoke1_csr_default_gw=$(first_ip $spoke1_csr_subnet_prefix) && echo $spoke1_csr_default_gw
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_csr_ip" "sh ip int b"
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_csr_ip" <<EOF
+config t
+    no ip domain lookup
+    interface Loopback0
+        ip address 22.22.22.22 255.255.255.255
+    router bgp ${spoke1_csr_asn}
+        network 22.22.22.22 mask 255.255.255.255
+        neighbor $rs_ip1 remote-as $rs_asn
+        neighbor $rs_ip1 ebgp-multihop 2
+        neighbor $rs_ip1 update-source GigabitEthernet1
+        neighbor $rs_ip1 timers 5 15
+        neighbor $rs_ip2 remote-as $rs_asn
+        neighbor $rs_ip2 ebgp-multihop 2
+        neighbor $rs_ip2 update-source GigabitEthernet1
+        neighbor $rs_ip2 timers 5 15
+    ip route $rs_ip1 255.255.255.255 $hub_csrint_default_gw
+    ip route $rs_ip2 255.255.255.255 $hub_csrint_default_gw
+end
+wr mem
+EOF
+# Add BGP peering to ARS
+spoke1_csr_private_ip=$(az network nic show -n "${spoke1_csr_name}-nic0" -g $rg  --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke1_csr_private_ip
+az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $spoke1_csr_private_ip --peer-asn $spoke1_csr_asn -n $spoke1_csr_name
+
+# Since the NVA is in spoke1, you want to vnet-peer spoke1 and spoke2, otherwise the effective route in spoke2 would show up as none
+az network vnet peering create -n spoke2tospoke1 -g $rg --vnet-name $spoke2_name --remote-vnet $spoke1_name --allow-vnet-access --allow-forwarded-traffic
+az network vnet peering create -n spoke1tospoke1 -g $rg --vnet-name $spoke1_name --remote-vnet $spoke2_name --allow-vnet-access --allow-forwarded-traffic
 
 
 #############

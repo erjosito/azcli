@@ -184,21 +184,24 @@ az aks create -g $rg -n $aks_name -l $location \
     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
     ${(z)identity_options} \
     --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
-    --network-policy '' --load-balancer-sku Standard \
+    --network-policy 'azure' --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
-    --pod-subnet-id $pod_subnet_id \
     --node-osdisk-type ephemeral --node-osdisk-size 30 \
+    --uptime-sla \
     --no-wait
 
 # Other options you can use in the previous command
     # --enable-private-cluster \
+    # --pod-subnet-id $pod_subnet_id \
     # --enable-pod-security-policy \
-    # --enable-cluster-autoscaler --min-count 1 --max-count 4 \
+    # --enable-cluster-autoscaler --min-count 1 --max-count 3 \
     # --cluster-autoscaler-profile scan-interval=30s \
     # --dns-name-prefix cloudtrooper \
     # --node-osdisk-type ephemeral --node-osdisk-size 30 \
     # --outbound-type userDefinedRouting \
     # --aks-custom-headers EnableAzureDiskFileCSIDriver=true \
+    # --os-sku Mariner \
+    # --uptime-sla
 
 ########
 # Wait #
@@ -218,6 +221,9 @@ kubectl get nodes
 
 # Enable monitoring addon
 az aks enable-addons -g $rg -n $aks_name --addons monitoring --workspace-resource-id "$logws_id"
+
+# Enable AKV addon (Work In Progress)
+az aks enable-addons -g $rg -n $aks_name --addons azure-keyvault-secrets-provider
 
 # Add cluster autoscaler (requires the monitoring addon)
 az aks update -g $rg -n $aks_name --enable-cluster-autoscaler --min-count 1 --max-count 4
@@ -264,6 +270,23 @@ az aks nodepool list --cluster-name $aks_name -g $rg -o table
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=1
 kubectl create deployment sqlapi --image=erjosito/sqlapi:1.0 --port=8080 --replicas=1
+
+# Service
+yaml_file=/tmp/svc.yaml
+cat <<EOF > $yaml_file
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+  name: kuard
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8080
+  selector:
+    app: kuard
+EOF
+kubectl apply -f $yaml_file
 
 # Service with Static PIP
 svc_pip_name=k8ssvcpip

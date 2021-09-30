@@ -8,7 +8,7 @@ keyvault_loc=westeurope # Only required if new AKV is to be created
 purpose=test
 
 # Day zero: create Azure Key Vault if required
-keyvault_rg_found=$(az keyvault list -o tsv --query '[?name=="'$keyvault_name'"].resourceGroup')
+keyvault_rg_found=$(az keyvault list -o tsv --query "[?name=='$keyvault_name'].resourceGroup")
 if [[ -n ${keyvault_rg_found} ]]
 then
     echo "AKV ${keyvault_name} found in resource group $keyvault_rg_found"
@@ -33,6 +33,20 @@ keyvault_password_secret_name=$purpose-sp-secret
 sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
 sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
 
+# Verify whether SP has expired, and if so, renew it
+sp_end_date=$(az ad app show --id $sp_app_id --query 'passwordCredentials[0].endDate' -o tsv)
+sp_end_date=$(date --date="$sp_end_date" +%s)
+now=$(date +%s)
+if [[ $sp_end_date < $now ]]
+then
+    echo "SP expired, extending one year"
+    new_password=$(az ad app credential reset --id $sp_app_id --years 1 --query password -o tsv)
+    az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $new_password
+    sp_app_secret=$new_password
+else
+    echo "SP not expired"
+fi
+
 # If either is blank, create new SP with the required name
 if [[ -z "$sp_app_id" ]] || [[ -z "$sp_app_secret" ]]
 then
@@ -49,7 +63,6 @@ then
     # az role assignment create --scope $rg_id --assignee $sp_app_id --role Contributor
     # az keyvault set-policy -n $keyvault_name --object-id $sp_app_id --certificate-permissions get --secret-permissions get
 fi
-
 
 
 

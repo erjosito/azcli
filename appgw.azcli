@@ -378,8 +378,7 @@ az network application-gateway identity assign --gateway-name $appgw_name -g $rg
 # Import cert from AKV
 cert_sid=$(az keyvault certificate show --vault-name $keyvault_name -n $cert_name --query sid -o tsv) && echo $cert_sid
 # az network application-gateway ssl-cert delete -n $cert_name -g $rg --gateway-name $appgw_name  # In case the certificate already existed
-az network application-gateway ssl-cert create -n $cert_name -g $rg --gateway-name $appgw_name \
-    --key-vault-secret-id $cert_sid
+az network application-gateway ssl-cert create -n $cert_name -g $rg --gateway-name $appgw_name --key-vault-secret-id $cert_sid
 
 # Check certs in appgw
 az network application-gateway ssl-cert list -g $rg --gateway-name $appgw_name -o table

@@ -220,7 +220,7 @@ oc login $aro_api_url -u $aro_usr -p $aro_pwd
 
 # Console
 aro_console_url=$(az aro show -n $cluster_name -g $rg --query 'consoleProfile.url' -o tsv)
-echo "Connect to $aro_console_url, password is $aro_pwd"
+echo "Connect to $aro_console_url (username kubeadmin, password $aro_pwd)"
 
 # URLs:
 # echo "API: $aro_api_url"
@@ -851,14 +851,37 @@ fi
 #    Trident    #
 #################
 
-# Install tridentctl
+# Get last version of trident
+trident_lastversion_json=$(curl --silent "https://api.github.com/repos/NetApp/trident/releases/latest" | jq 'with_entries(select([.key] | inside(["html_url", "assets", "name"])))')
+trident_lastversion=$(echo "$trident_lastversion_json" | jq -r '.name')
+trident_lastversion_url=$(echo "$trident_lastversion_json" | jq -r '.html_url')
+trident_lastversion_file=$(echo "$trident_lastversion_json" | jq -r '.assets[0].name')
+trident_lastversion_file_url=$(echo "$trident_lastversion_json" | jq -r '.assets[0].browser_download_url')
+
+# See whether we need to install/upgrade tridentctl
+install_trident=no
 tridentctl_binary=$(which tridentctl)
 if [[ "$tridentctl_binary" == "tridentctl not found" ]]
 then
-    echo "Downloading and installing tridentctl executable..."
+    echo "tridentctl not found"
+    install_trident=yes
+else
+    trident_version="v$(tridentctl version --client -o json | jq -r '.client.version')"
+    if [[ "$trident_version" == "$trident_lastversion" ]]
+    then
+        echo "tridentctl version is already the latest available version ($trident_version)"
+    else
+        echo "tridentctl needs to be upgraded from version $trident_version to $trident_lastversion"
+        install_trident=yes
+    fi
+fi
+# Install
+if [[ "$install_trident" == "yes" ]]
+then
+    echo "Downloading and installing tridentctl executable from $trident_lastversion_file_url..."
     tridentctl_tmp=/tmp/tridentctl.tar.gz
     # wget https://github.com/NetApp/trident/releases/download/v21.04.0/trident-installer-21.04.0.tar.gz -O $tridentctl_tmp
-    wget https://github.com/NetApp/trident/releases/download/v21.07.1/trident-installer-21.07.1.tar.gz -O $tridentctl_tmp
+    wget $trident_lastversion_file_url -O $tridentctl_tmp
     tar xfvz $tridentctl_tmp -C /tmp/
     sudo cp /tmp/trident-installer/tridentctl /usr/local/bin
 fi
@@ -878,7 +901,6 @@ az netappfiles account list -g $rg -o table
 
 # Create ANF pool(s)
 anf_pool_skus=(Standard Premium Ultra)  # To create a capacity pool for each performance tier
-# anf_pool_skus=(Standard)                # To create a single capacity pool in the Standard tier
 for anf_sku in "${anf_pool_skus[@]}"
 do
   anf_pool_name="${anf_name}-${anf_sku}"
@@ -888,17 +910,21 @@ do
 done
 az netappfiles pool list -g $rg -a $anf_name -o table
 
-# Deploy Helm chart
+# Install Trident in cluster
 trident_ns=tridentns
-if [[ -e "/tmp/trident-installer/helm/trident-operator-21.07.1.tgz" ]]
-then
-    # helm install trident /tmp/trident-installer/helm/trident-operator-21.04.0.tgz --namespace $trident_ns --create-namespace
-    helm install trident /tmp/trident-installer/helm/trident-operator-21.07.1.tgz --namespace $trident_ns --create-namespace
-else
-    echo "Helm chart not found"
-fi
-sleep 60 # Waiting for helm chart to finish deployment... (a more elegant loop is probably possible, I feel lazy today though)
-tridentctl -n $trident_ns version
+tridentctl install -n $trident_ns
+# if [[ -e "/tmp/trident-installer/helm/trident-operator-21.07.1.tgz" ]]
+# then
+#     # helm install trident /tmp/trident-installer/helm/trident-operator-21.04.0.tgz --namespace $trident_ns --create-namespace
+#     helm install trident /tmp/trident-installer/helm/trident-operator-21.07.1.tgz --namespace $trident_ns --create-namespace
+# else
+#     echo "Helm chart not found"
+# fi
+# sleep 60 # Waiting for helm chart to finish deployment... (a more elegant loop is probably possible, I feel lazy today though)
+# tridentctl -n $trident_ns version
+
+# Check version
+tridentctl version -n $trident_ns
 
 # Uninstall trident (DANGER ZONE!)
 # tridentctl uninstall -n $trident_ns
@@ -923,7 +949,7 @@ cat <<EOF > $trident_backend_file
   "subnet": "$anf_subnet_name",
   "nfsMountOptions": "vers=3,proto=tcp,timeo=600",
   "limitVolumeSize": "4Ti",
-  "capacityPools": [ "${anf_name}-Standard,${anf_name}-Premium,${anf_name}-Ultra" ],
+  "capacityPools": [ "${anf_name}-Standard", "${anf_name}-Premium" ,"${anf_name}-Ultra" ],
   "defaults": {
     "exportRule": "0.0.0.0/0",
     "size": "200Gi"
@@ -979,7 +1005,7 @@ done
 # PVCs
 # https://github.com/seanluce/ANF_Trident_AKS
 # perf_tiers=(bronze silver gold)           # To create a SC per tier
-perf_tiers=(gold)           # To create a SC per tier
+perf_tiers=(gold silver bronze)           # To create a SC per tier
 for perf_tier in "${perf_tiers[@]}"
 do
   cat <<EOF | kubectl apply -f -
@@ -1053,6 +1079,12 @@ svc_ip=$(kubectl get svc/api-${perf_tier} -o json | jq -rc '.status.loadBalancer
 curl "http://${svc_ip}:8080/api/healthcheck"
 curl "http://${svc_ip}:8080/api/ioperf?file=%2Fmnt%2Fdisk%2Fiotest"
 
+# Get pod name and do some performance tests
+pod_name=$(kubectl get pod -o json -l app=api-${perf_tier} | jq -r '.items[0].metadata.name')
+kubectl exec $pod_name -- /bin/bash -c "apt update && apt install -y fio ioping --fix-missing"
+kubectl exec $pod_name -- /bin/bash -c "cd /mnt/disk && fio --name=8kseqreads --rw=read --direct=1 --ioengine=libaio --bs=64k --numjobs=16 --iodepth=1 --size=1G --runtime=60 --group_reporting --fallocate=none"
+kubectl exec $pod_name -- /bin/bash -c "cd /mnt/disk && ioping -c 10 ."
+
 # Further performance tests:
 # https://docs.microsoft.com/en-us/azure/azure-netapp-files/azure-netapp-files-performance-metrics-volumes#fio-examples-for-iops
 # For example:
@@ -1062,6 +1094,8 @@ curl "http://${svc_ip}:8080/api/ioperf?file=%2Fmnt%2Fdisk%2Fiotest"
 # Write bash code to test
 # For example on a 4TB volume in Ultra:
 #  READ: bw=211MiB/s (221MB/s), 211MiB/s-211MiB/s (221MB/s-221MB/s), io=4096MiB (4295MB), run=19457-19457msec
+# ioping example: ioping -c 100
+# Validate with performance calculator: https://anftechteam.github.io/calc/advanced/
 
 # Show created volumes
 az netappfiles volume list -g $rg -a $anf_name -p $anf_name-Standard -o table --query '[].{Name:name, ProvisioningState:provisioningState, ThroughputMibps:throughputMibps, ServiceLevel:serviceLevel, Location:location}'

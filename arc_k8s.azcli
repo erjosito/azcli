@@ -589,6 +589,61 @@ az connectedk8s proxy -n $arc_name -g $arc_rg --token $k8s_token
 kubectl get pods
 
 
+################
+# App Services #
+################
+
+# CLI extension
+az extension remove --name appservice-kube
+az extension add --yes --source "https://aka.ms/appsvc/appservice_kube-latest-py2.py3-none-any.whl"
+
+# Create LA workspace
+logws_name="log$RANDOM" # Name of the Log Analytics workspace
+az monitor log-analytics workspace create -g $k8s_rg --workspace-name $logws_name
+logws_customer_id=$(az monitor log-analytics workspace show -g $k8s_rg -n $logws_name --query customerId -o tsv)
+logws_customer_id_enc=$(printf %s $logws_customer_id | base64 -w0) # Needed for the next step
+logws_key=$(az monitor log-analytics workspace get-shared-keys -g $k8s_rg -n $logws_name --query primarySharedKey -o tsv)
+logws_key_enc=$(printf %s $logws_key | base64 -w0) # Needed for the next step
+
+# Create public IP
+appsvc_pip_name=appsvc-pip
+az network public-ip create -g $k8s_rg -n $appsvc_pip_name --sku Standard
+appsvc_pip=$(az network public-ip show -g $k8s_rg --name $appsvc_pip_name --output tsv --query ipAddress) && echo $appsvc_pip
+
+# Deploy arc extension
+extension_name="appsvc" # Name of the App Service extension
+namespace="appsvc" # Namespace in your cluster to install the extension and provision resources
+kube_env_name="appsvc" # Name of the App Service Kubernetes environment resource
+az k8s-extension create \
+    --resource-group $arc_rg \
+    --name $extension_name \
+    --cluster-type connectedClusters \
+    --cluster-name $arc_name \
+    --extension-type 'Microsoft.Web.Appservice' \
+    --release-train stable \
+    --auto-upgrade-minor-version true \
+    --scope cluster \
+    --release-namespace $namespace \
+    --configuration-settings "Microsoft.CustomLocation.ServiceAccount=default" \
+    --configuration-settings "appsNamespace=${namespace}" \
+    --configuration-settings "clusterName=${kube_env_name}" \
+    --configuration-settings "loadBalancerIp=${appsvc_pip}" \
+    --configuration-settings "keda.enabled=true" \
+    --configuration-settings "buildService.storageClassName=default" \
+    --configuration-settings "buildService.storageAccessMode=ReadWriteOnce" \
+    --configuration-settings "customConfigMap=${namespace}/kube-environment-config" \
+    --configuration-settings "envoy.annotations.service.beta.kubernetes.io/azure-load-balancer-resource-group=${aksClusterGroupName}" \
+    --configuration-settings "logProcessor.appLogs.destination=log-analytics" \
+    --configuration-protected-settings "logProcessor.appLogs.logAnalyticsConfig.customerId=${logws_customer_id_enc}" \
+    --configuration-protected-settings "logProcessor.appLogs.logAnalyticsConfig.sharedKey=${logws_key_enc}"
+
+
+# Logic Apps
+
+# Install extension
+az extension add --yes --source "https://aka.ms/logicapp-latest-py2.py3-none-any.whl"
+
+
 #########
 #  AAD  #
 #########
