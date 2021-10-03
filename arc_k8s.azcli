@@ -64,7 +64,11 @@ cat <<EOF > $aksengine_cluster_file
   "apiVersion": "vlabs",
   "properties": {
     "orchestratorProfile": {
-      "orchestratorType": "Kubernetes"
+      "orchestratorType": "Kubernetes",
+      "kubernetesConfig": {
+        "networkPlugin": "antrea",
+        "networkPolicy": "antrea"
+      }
     },
     "masterProfile": {
       "count": 1,
@@ -308,7 +312,7 @@ extension_version=$(az extension show -n $extension_name --query version -o tsv 
 echo "Azure CLI extension $extension_name installed with version $extension_version"
 
 # Registering providers
-for provider in "Kubernetes" "KubernetesConfiguration" "ExtendedLocation"
+for provider in "Kubernetes" "KubernetesConfiguration" "ExtendedLocation" "Web"
 do
     registration_state=$(az provider show -n "Microsoft.${provider}" --query registrationState -o tsv)
     if [[ "$registration_state" == "Registered" ]]
@@ -332,7 +336,7 @@ echo "All resource providers successfully registered"
 
 # Create the ARC resource
 az group create -n $arc_rg -l $location
-az connectedk8s connect --name $arc_name -g $arc_rg
+az connectedk8s connect --name $arc_name -g $arc_rg -l $location
 
 # Diagnostics
 az connectedk8s list -g $arc_rg -o table
@@ -611,19 +615,19 @@ az network public-ip create -g $k8s_rg -n $appsvc_pip_name --sku Standard
 appsvc_pip=$(az network public-ip show -g $k8s_rg --name $appsvc_pip_name --output tsv --query ipAddress) && echo $appsvc_pip
 
 # Deploy arc extension
-extension_name="appsvc" # Name of the App Service extension
-namespace="appsvc" # Namespace in your cluster to install the extension and provision resources
-kube_env_name="appsvc" # Name of the App Service Kubernetes environment resource
+appsvc_extension_name="appsvc" # Name of the App Service extension
+appsvc_ns="appsvc"             # Namespace in your cluster to install the extension and provision resources
+kube_env_name="appsvc$RANDOM"  # Name of the App Service Kubernetes environment resource (must be unique!)
 az k8s-extension create \
     --resource-group $arc_rg \
-    --name $extension_name \
+    --name $appsvc_extension_name \
     --cluster-type connectedClusters \
     --cluster-name $arc_name \
     --extension-type 'Microsoft.Web.Appservice' \
     --release-train stable \
     --auto-upgrade-minor-version true \
     --scope cluster \
-    --release-namespace $namespace \
+    --release-namespace $appsvc_ns \
     --configuration-settings "Microsoft.CustomLocation.ServiceAccount=default" \
     --configuration-settings "appsNamespace=${namespace}" \
     --configuration-settings "clusterName=${kube_env_name}" \
@@ -632,17 +636,87 @@ az k8s-extension create \
     --configuration-settings "buildService.storageClassName=default" \
     --configuration-settings "buildService.storageAccessMode=ReadWriteOnce" \
     --configuration-settings "customConfigMap=${namespace}/kube-environment-config" \
-    --configuration-settings "envoy.annotations.service.beta.kubernetes.io/azure-load-balancer-resource-group=${aksClusterGroupName}" \
+    --configuration-settings "envoy.annotations.service.beta.kubernetes.io/azure-load-balancer-resource-group=${arc_rg}" \
     --configuration-settings "logProcessor.appLogs.destination=log-analytics" \
     --configuration-protected-settings "logProcessor.appLogs.logAnalyticsConfig.customerId=${logws_customer_id_enc}" \
     --configuration-protected-settings "logProcessor.appLogs.logAnalyticsConfig.sharedKey=${logws_key_enc}"
 
+# If you need to update it, you can delete and recreate it
+# az k8s-extension delete -n $appsvc_extension_name -g $arc_rg --cluster-name $arc_name --cluster-type connectedClusters
 
-# Logic Apps
+# Wait for extension to be provisioned
+appsvc_extension_id=$(az k8s-extension show -n $appsvc_extension_name --cluster-type connectedClusters --cluster-name $arc_name -g $arc_rg --query id -o tsv) && echo $appsvc_extension_id
+az resource wait --ids $appsvc_extension_id --custom "properties.installState!='Pending'" --api-version "2020-07-01-preview"
 
-# Install extension
+# Az CLI extension customlocation
+extension_name=customlocation
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+if [[ -z "$extension_version" ]]
+then
+    echo "Azure CLI extension $extension_name not found, installing now..."
+    az extension add -n $extension_name
+else
+    echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
+    az extension update -n $extension_name
+fi
+extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+echo "Azure CLI extension $extension_name installed with version $extension_version"
+
+# Custom location (custom location is not an extension, but a resource on its own)
+# It refers to the namespace where the appsvc is installed
+customloc_name=mycluster
+arc_cluster_id=$(az connectedk8s show -g $arc_rg -n $arc_name --query id --output tsv) && echo $arc_cluster_id
+az customlocation create -g $arc_rg -n $customloc_name --host-resource-id $arc_cluster_id --namespace $appsvc_ns --cluster-extension-ids $appsvc_extension_id
+az customlocation show -g $arc_rg -n $customloc_name
+customloc_id=$(az customlocation show -g $arc_rg -n $customloc_name --query id -o tsv) && echo $customloc_id
+
+# App Svc environment
+az appservice kube create -n $kube_env_name -g $arc_rg  -l $location --custom-location $customloc_id    # Static IP not required for Arc clusters
+#az appservice kube create -n $kube_env_name -g $arc_rg --custom-location $customloc_id --static-ip $appsvc_pip
+az appservice kube show -n $kube_env_name -g $arc_rg
+# If no IP is specified, it will look for a svc in the namespace specified in the customlocation. If no svc is found, it will give this error:
+# "Service with specified selector k8se.microsoft.com/component=envoy not found in namespace customlocation"
+
+# App Svc Plan
+appsvc_plan_name=mysvcplan
+az appservice plan create -g $arc_rg -n $appsvc_plan_name --custom-location $customloc_id --per-site-scaling --is-linux --sku K1
+
+# Web App
+webapp_name=mywebapp$RANDOM
+az webapp create --plan $appsvc_plan_name -g $arc_rg -n $webapp_name --custom-location $customloc_id --runtime 'NODE|12-lts'
+current_dir=$(pwd)
+cd /tmp
+git clone https://github.com/Azure-Samples/nodejs-docs-hello-world
+cd nodejs-docs-hello-world
+zip -r package.zip .
+az webapp deployment source config-zip -g $arc_rg --name $webapp_name --src package.zip
+cd $current_dir
+
+# Logic App: Install extension and create logic app
+logicapp_name=arclogicapp$RANDOM
+storage_account_name=logicapp$RANDOM
+subscription_id=$(az account show --query id -o tsv)
+az extension remove --name logicapp
 az extension add --yes --source "https://aka.ms/logicapp-latest-py2.py3-none-any.whl"
+az storage account create -n $storage_account_name -g $arc_rg --sku Standard_LRS -l $location --kind StorageV2
+az logicapp create -n $logicapp_name -g $arc_rg --subscription $subscription_id --storage-account $storage_account_name \
+  --custom-location $customloc_id --plan $appsvc_plan_name
+# ERROR: "Unable to find Kube Environment associated to the Custom Location"
 
+
+# Troubleshooting
+az connectedk8s list -g $arc_rg -o table  # There should be an ARC cluster
+kubectl -n azure-arc get deployments,pods # The Arc pods should be up and running
+az k8s-extension list --cluster-type connectedClusters --cluster-name $arc_name -g $arc_rg -o table  # The appsvc extension should be successful
+kubectl -n $appsvc_ns get deploy,pod      # The AppSvc pods should be up and running
+az customlocation list -g $arc_rg -o table
+az appservice kube list -g $arc_rg -o table
+k get sc  # There should be a storage class for app svc build called something like "appsvc-k8se-build-service"
+k describe sc appsvc-k8se-build-service
+k get svc -A -l k8se.microsoft.com/component=envoy  # Service that hte appsvc kube environment will look for, to get the public IP
+az appservice plan list -g $arc_rg -o table
+az storage account list -g $arc_rg -o table
+az logicapp show -n $logicapp_name -g $arc_rg -o table
 
 #########
 #  AAD  #
@@ -674,19 +748,23 @@ echo "Azure CLI extension $extension_name installed with version $extension_vers
 # Custom location
 az connectedk8s enable-features -n $arc_name -g $arc_rg --features cluster-connect custom-locations
 extension_name=customLocation
-az k8s-extension create --name $extension_name --extension-type microsoft.arcdataservices \
-    --cluster-type connectedClusters -c $arc_name -g $arc_rg --scope cluster --release-namespace arc \
-    --config Microsoft.CustomLocation.ServiceAccount=sa-bootstrapper
-extension_id=$(az k8s-extension show --name $extension_name --cluster-type connectedClusters -c $arc_name -g $arc_rg  --query id -o tsv) && echo $extension_id
-az customlocation create -n micasa -g $arc_rg --namespace arc --host-resource-id $arc_id --cluster-extension-ids $extension_id
+location_name=mycluster
+location_ns=customlocation
+# az k8s-extension create --name $extension_name --extension-type microsoft.arcdataservices \
+#     --cluster-type connectedClusters -c $arc_name -g $arc_rg --scope cluster --release-namespace arc \
+#     --config Microsoft.CustomLocation.ServiceAccount=sa-bootstrapper
+# extension_id=$(az k8s-extension show --name $extension_name --cluster-type connectedClusters -c $arc_name -g $arc_rg  --query id -o tsv) && echo $extension_id
+# az customlocation create -n $extension_name -g $arc_rg --namespace $location_ns --host-resource-id $arc_id --cluster-extension-ids $extension_id
+arc_cluster_id=$(az connectedk8s show -g $arc_rg -n $arc_name --query id --output tsv) && echo $arc_cluster_id
+az customlocation create -n $location_name  -g $arc_rg --namespace $location_ns --host-resource-id $arc_cluster_id --cluster-extension-ids $appsvc_extension_id
 
 # Diagnostics
 az customlocation list -o table
-az customlocation list-enabled-resource-types -n micasa -g $arc_rg -o table
+az customlocation list-enabled-resource-types -n mycluster -g $arc_rg -o table
 
 ###########
 # Cleanup #
 ###########
 
-# az group delete -y --no-wait -n $k8s_rg
-# az group delete -y --no-wait -n $arc_rg
+az group delete -y --no-wait -n $k8s_rg
+az group delete -y --no-wait -n $arc_rg

@@ -3,6 +3,7 @@ subscription_id=e7da9914-9b05-4891-893c-546cb7b0422e
 vendor="Jose_generic_test_nva"
 version=latest
 deploy_mode=rest        # arm and rest supported at this time
+vpn_endpoint=public    # if "private", deploys ER to connect to onprem too
 
 # Variables (common)
 nva_rg=josenva
@@ -289,9 +290,9 @@ api_version=2021-02-01
 # url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualAppliances/${nva_name}?api-version=${api_version}" 
 # az rest --method GET --url $url
 
-###################
-#  Provision BGP  #
-###################
+#############################
+#  Provision BGP to the RS  #
+#############################
 
 # Helper function to calculate the default gateway for a subnet
 # Example: default_gw 172.16.1.31 255.255.255.248
@@ -321,7 +322,7 @@ nva_ip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'vir
 # Find out the gateway for the private ip
 nva_default_gw=$(default_gw $nva_ip1 "255.255.255.128") && echo $nva_default_gw
 
-# Static route for the whole hub???
+# Static route for the whole hub pointing to the private IPs
 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip1" "sudo ip route add $vhub_space via $nva_default_gw"
 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "sudo ip route add $vhub_space via $nva_default_gw"
 
@@ -340,6 +341,7 @@ protocol kernel {
       preference 254;
       learn;
       merge paths on;
+      export all;
       #disabled;
 }
 protocol static {
@@ -382,16 +384,17 @@ scp $bird_config_file "${pip2}:/home/${username}/bird.conf"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo systemctl restart bird"
 
-# BGP Diagnostics
+# BGP Diagnostics NVA_0
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "systemctl status bird"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show status"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show protocols"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show protocols RS1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show protocols RS2"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show route"
+# BGP Diagnostics NVA_1
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "systemctl status bird"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show protocols"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show protocols"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show protocols RS1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show protocol all RS1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show route"
@@ -419,8 +422,11 @@ az network nsg rule create -n ICMP --nsg-name "${azurevm_name}-nsg" -g $nva_rg -
 az vm create -n $azurevm_name -g $nva_rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${azurevm_name}-nsg" \
     --public-ip-address $azurevm_pip_name --vnet-name $vnet_name --size $vm_size --subnet $vm_subnet_name
 azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddress -o tsv -g $nva_rg) && echo $azurevm_pip_ip
-azurevm_nic_id=$(az vm show -n $azurevm_name -g "$nva_rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+azurevm_nic_id=$(az vm show -n $azurevm_name -g "$nva_rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv) && echo $azurevm_nic_id
 azurevm_private_ip=$(az network nic show --ids $azurevm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $azurevm_private_ip
+
+# Create VMSS
+# az vmss create -n vmsstest -g $nva_rg -l $location --image UbuntuLTS --generate-ssh-keys --public-ip-per-vm --lb "" --vnet-name $vnet_name --subnet $vm_subnet_name --nsg "${azurevm_name}-nsg" --vm-sku $vm_size
 
 # Connect to Virtual Hub
 hub_default_rt_id=$(az network vhub route-table show --vhub-name $vhub_name -g $nva_rg -n defaultRouteTable --query id -o tsv)
@@ -434,16 +440,68 @@ az network vhub connection list -g $nva_rg --vhub-name $vhub_name -o table
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show route"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show route"
 
+# Effective routes of the VM
+az network nic show-effective-route-table --ids $azurevm_nic_id -o table
+
 ########################
 # Create onprem branch #
 ########################
 
 # Simulation of onprem with a different Azure VNet and NVA
+
+# Variables
 onprem_vnet_name=onprem
 onprem_vnet_prefix=172.16.0.0/16
 onprem_nva_subnet_name=onprem
 onprem_nva_subnet_prefix=172.16.1.0/24
+onprem_vng_subnet_name=GatewaySubnet
+onprem_vng_subnet_prefix=172.16.0.0/24
+onprem_ergw_name=onprem-ergw
+onprem_ergw_pip=onprem-ergw-pip
+vwan_ergw_name=ergw
+er_pop=Dallas
+er_provider=Megaport
+er_circuit_sku=Standard
+er_circuit_name="er-$er_pop"
+
+# Create onprem VNet
 az network vnet create -n $onprem_vnet_name -g $nva_rg --address-prefixes $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefixes $onprem_nva_subnet_prefix
+
+# If using the vpn private endpoint, we need an ER
+if [[ $vpn_endpoint == "private" ]]
+then
+      az network vnet subnet create -g $nva_rg -n $onprem_vng_subnet_name --vnet-name $onprem_vnet_name --address-prefix $onprem_vng_subnet_prefix
+      az network public-ip create -g $nva_rg -n $onprem_ergw_pip --allocation-method Dynamic --sku Basic
+      az network vnet-gateway create -g $nva_rg -n $onprem_ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $onprem_vnet_name --public-ip-addresses $onprem_ergw_pip --no-wait
+      az network express-route gateway create -g $nva_rg -n $vwan_ergw_name --virtual-hub $hub_id
+      az network express-route create -n $er_circuit_name --peering-location $er_pop -g $nva_rg \
+            --bandwidth 50 Mbps --provider $er_provider -l $location --sku-family MeteredData --sku-tier $er_circuit_sku
+      service_key=$(az network express-route show -n $er_circuit_name -g $nva_rg --query serviceKey -o tsv) && echo "Service Key is $service_key"
+      # Provision Megaport MCR in location
+      script_location="/home/jose/repos/azcli/megaport.sh"
+      if [[ -e "$script_location" ]]
+      then
+            $script_location -s=jomore-${er_pop} -a=create_mcr -k=$service_key
+            sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+            $script_location -s=jomore-${er_pop} -a=create_vxc -k=$service_key
+      else
+            echo "Sorry, I cannot seem to find the script $script_location to interact with the Megaport API"
+      fi
+      # Connect circuit to ER gateways (onprem/)
+      circuit_id=$(az network express-route show -n $er_circuit_name -g $nva_rg -o tsv --query id) && echo "Circuit ID is $circuit_id"
+      circuit_state=$(az network express-route show -n $er_circuit_name -g $nva_rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit_state"
+      # Wait until circuit is provisioned
+      until [[ "$circuit_state" == "Provisioned" ]]
+      do
+            sleep 15
+            circuit_state=$(az network express-route show -n $er_circuit_name -g $nva_rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit_state"
+      done
+      peering_id=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name $er_circuit_name -g $nva_rg -o tsv --query id) && echo "Private peering ID is $peering_id" # For this to work, a Refresh might have to be done...
+      hub_default_rt_id=$(az network vhub route-table show --vhub-name $vhub_name -g $nva_rg -n defaultRouteTable --query id -o tsv) && echo $hub_default_rt_id
+      az network vpn-connection create -n "${onprem_ergw_name}-${er_pop}" -g $nva_rg -l $location --vnet-gateway1 $onprem_ergw_name --express-route-circuit2 $circuit_id
+      az network express-route gateway connection create --gateway-name $vwan_ergw_name -n "${vwan_ergw_name}-${er_pop}" -g $nva_rg --peering $peering_id \
+            --associated-route-table $hub_default_rt_id --propagated-route-tables $hub_default_rt_id --labels default
+fi
 
 # Create onprem Linux NVA
 onprem_linuxnva_asn=65002
@@ -477,33 +535,76 @@ onprem_linuxnva_default_gw=$(default_gw "$onprem_linuxnva_ip" "255.255.255.0") &
 nva_ip21=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[1].privateIpAddress' -o tsv) && echo $nva_ip21
 nva_ip22=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[3].privateIpAddress' -o tsv) && echo $nva_ip22
 
-# Configure StrongSwan VPN
+# Private IPs VWAN NVAs
+nva_private_ip1=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[0].privateIpAddress' -o tsv) && echo $nva_private_ip1
+nva_private_ip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[2].privateIpAddress' -o tsv) && echo $nva_private_ip2
+
+# If running on ER, connectivity to Azure VM and hub NVAs over ER can be verified
+if [[ $vpn_endpoint == "private" ]]
+then
+      az network nic show-effective-route-table --ids $azurevm_nic_id -o table
+      az network nic show-effective-route-table --ids $onprem_linuxnva_nic_id -o table
+      ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping -c 5 $azurevm_private_ip"
+      ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping -c 5 $nva_ip21"
+      ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping -c 5 $nva_ip22"
+      ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping -c 5 $nva_private_ip1"
+      ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping -c 5 $nva_private_ip2"
+      ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $onprem_linuxnva_pip_ip $nva_private_ip1
+      ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $onprem_linuxnva_pip_ip $nva_private_ip2
+fi
+
+# Configure StrongSwan VPN, depending on whether using the public or the private IPs
 # See https://blog.sys4.de/routing-based-vpn-with-strongswan-de.html
 # See https://wiki.strongswan.org/projects/strongswan/wiki/RouteBasedVPN
-echo "Configuring VPN between A:${pip1}/${nva_ip21} and C:${onprem_linuxnva_pip_ip}/${onprem_linuxnva_private_ip}"
-echo "Configuring VPN between B:${pip2}/${nva_ip22} and C:${onprem_linuxnva_pip_ip}/${onprem_linuxnva_private_ip}"
+# Note: routing breaks when endpoint_public = endpoint_private (the private endpoint is redirected to the VTI, which is still down)
+if [[ "$vpn_endpoint" == "public" ]]
+then
+      endpoint_a_public=$pip1
+      endpoint_a_private=$nva_ip21
+      endpoint_b_public=$pip2
+      endpoint_b_private=$nva_ip22
+      endpoint_c_public=$onprem_linuxnva_pip_ip
+      endpoint_c_private=$onprem_linuxnva_private_ip
+else
+      endpoint_a_public=$nva_private_ip1
+      endpoint_a_private=$nva_private_ip1
+      endpoint_b_public=$nva_private_ip2
+      endpoint_b_private=$nva_private_ip2
+      endpoint_c_public=$onprem_linuxnva_private_ip
+      endpoint_c_private=$onprem_linuxnva_private_ip
+fi
+
+echo "Configuring VPN between A:${endpoint_a_public}/${endpoint_a_private} and C:${endpoint_c_public}/${endpoint_c_private}"
+echo "Configuring VPN between B:${endpoint_b_public}/${endpoint_b_private} and C:${endpoint_c_public}/${endpoint_c_private}"
+
 # NVA 1
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip tunnel add vti0 local $nva_ip21 remote $onprem_linuxnva_pip_ip mode vti key 11"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip tunnel add vti0 local $endpoint_a_private remote $endpoint_c_public mode vti key 11"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip link set up dev vti0"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip route add ${onprem_linuxnva_private_ip}/32 dev vti0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip route add ${endpoint_c_private}/32 dev vti0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
 # NVA 2
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip tunnel add vti0 local $nva_ip22 remote $onprem_linuxnva_pip_ip mode vti key 11"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip tunnel add vti0 local $endpoint_b_private remote $endpoint_c_public mode vti key 11"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip link set up dev vti0"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip route add ${onprem_linuxnva_private_ip}/32 dev vti0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip route add ${endpoint_c_private}/32 dev vti0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
 # Onprem
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti0 local $onprem_linuxnva_private_ip remote $pip1 mode vti key 11"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti0 local $endpoint_c_private remote $endpoint_a_public mode vti key 11"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip link set up dev vti0"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route add ${nva_ip21}/32 dev vti0"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti1 local $onprem_linuxnva_private_ip remote $pip2 mode vti key 12"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti1 local $endpoint_c_private remote $endpoint_b_public mode vti key 12"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti1.disable_policy=1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip link set up dev vti1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route add ${nva_ip22}/32 dev vti1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
+
+# Troubleshooting: remove static routes
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip route delete ${endpoint_c_private}/32 dev vti0"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip route delete ${endpoint_c_private}/32 dev vti0"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route delete ${nva_ip21}/32 dev vti0"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route delete ${nva_ip22}/32 dev vti1"
 
 # IPsec Config files
 vpn_psk=$(openssl rand -base64 64)
@@ -512,14 +613,14 @@ psk_file_a=/tmp/ipsec.secrets.a
 psk_file_b=/tmp/ipsec.secrets.b
 psk_file_c=/tmp/ipsec.secrets.c
 cat <<EOF > $psk_file_a
-$pip1 $onprem_linuxnva_pip_ip : PSK "$vpn_psk"
+$endpoint_a_public $endpoint_c_public : PSK "$vpn_psk"
 EOF
 cat <<EOF > $psk_file_b
-$pip2 $onprem_linuxnva_pip_ip : PSK "$vpn_psk"
+$endpoint_b_public $endpoint_c_public : PSK "$vpn_psk"
 EOF
 cat <<EOF > $psk_file_c
-$onprem_linuxnva_pip_ip $pip1 : PSK "$vpn_psk"
-$onprem_linuxnva_pip_ip $pip2 : PSK "$vpn_psk"
+$endpoint_c_public $endpoint_a_public : PSK "$vpn_psk"
+$endpoint_c_public $endpoint_b_public : PSK "$vpn_psk"
 EOF
 ipsec_file_a=/tmp/ipsec.conf.a
 ipsec_file_b=/tmp/ipsec.conf.b
@@ -531,9 +632,9 @@ config setup
         strictcrlpolicy=no
 conn to-onprem
   authby=secret
-  leftid=$pip1
+  leftid=$endpoint_a_public
   leftsubnet=0.0.0.0/0
-  right=$onprem_linuxnva_pip_ip
+  right=$endpoint_c_public
   rightsubnet=0.0.0.0/0
   ike=aes256-sha2_256-modp1024!
   esp=aes256-sha2_256!
@@ -553,9 +654,9 @@ config setup
         strictcrlpolicy=no
 conn to-onprem
   authby=secret
-  leftid=$pip2
+  leftid=$endpoint_b_public
   leftsubnet=0.0.0.0/0
-  right=$onprem_linuxnva_pip_ip
+  right=$endpoint_c_public
   rightsubnet=0.0.0.0/0
   ike=aes256-sha2_256-modp1024!
   esp=aes256-sha2_256!
@@ -575,9 +676,9 @@ config setup
         strictcrlpolicy=no
 conn to-azure1
   authby=secret
-  leftid=$onprem_linuxnva_pip_ip
+  leftid=$endpoint_c_public
   leftsubnet=0.0.0.0/0
-  right=$pip1
+  right=$endpoint_a_public
   rightsubnet=0.0.0.0/0
   ike=aes256-sha2_256-modp1024!
   esp=aes256-sha2_256!
@@ -591,9 +692,9 @@ conn to-azure1
   mark=11
 conn to-azure2
   authby=secret
-  leftid=$onprem_linuxnva_pip_ip
+  leftid=$endpoint_c_public
   leftsubnet=0.0.0.0/0
-  right=$pip2
+  right=$endpoint_b_public
   rightsubnet=0.0.0.0/0
   ike=aes256-sha2_256-modp1024!
   esp=aes256-sha2_256!
@@ -638,8 +739,8 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ip 
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "netstat -rnv"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status ipsec"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ipsec status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping $nva_ip21 -c 5"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping $nva_ip22 -c 5"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping $endpoint_a_private -c 5"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping $endpoint_b_private -c 5"
 
 # Configure BGP with Bird
 bird_config_file_a=/tmp/bird.conf.a  # NVA 1/2
@@ -658,11 +759,11 @@ protocol kernel {
       learn;
       merge paths on;
       import filter {
-          if net ~ ${onprem_linuxnva_private_ip}/32 then accept;
+          if net ~ ${endpoint_c_private}/32 then accept;
           else reject;
       };
       export filter {
-          if net ~ ${onprem_linuxnva_private_ip}/32 then reject;
+          if net ~ ${endpoint_c_private}/32 then reject;
           else accept;
       };
 }
@@ -697,7 +798,7 @@ protocol bgp onprem {
       description "BGP to Onprem";
       multihop;
       local as $nva_asn;
-      neighbor $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
+      neighbor $endpoint_c_private as $onprem_linuxnva_asn;
           import filter {accept;};
           # export filter {accept;};
           export filter DROP_LONG;
@@ -706,7 +807,7 @@ EOF
 # Configure BGP with Bird (onprem)
 cat <<EOF > $bird_config_file_c
 log syslog all;
-router id $onprem_linuxnva_private_ip;
+router id $endpoint_c_private;
 protocol device {
         scan time 10;
 }
@@ -741,8 +842,8 @@ filter DROP_LONG {
 protocol bgp NVA1 {
       description "BGP to NVA1";
       multihop;
-      local $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
-      neighbor $nva_ip21 as $nva_asn;
+      local $endpoint_c_private as $onprem_linuxnva_asn;
+      neighbor $endpoint_a_private as $nva_asn;
           import filter {accept;};
           #export filter {accept;};
           export filter DROP_LONG;
@@ -750,8 +851,8 @@ protocol bgp NVA1 {
 protocol bgp NVA2 {
       description "BGP to NVA2";
       multihop;
-      local $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
-      neighbor $nva_ip22 as $nva_asn;
+      local $endpoint_c_private as $onprem_linuxnva_asn;
+      neighbor $endpoint_b_private as $nva_asn;
           import filter {accept;};
           #export filter {accept;};
           export filter DROP_LONG;
@@ -836,4 +937,11 @@ host_name=\$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance?
 if [[ "\${HOSTNAME: -1}" == "0" ]]; then echo "0123456789" > ~/license.txt; else echo "9876543210" > ~/license.txt; fi
 EOF
 
-
+# How to identify whether a VM is running on a VMSS
+vmss_name=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2020-09-01" | jq -r '.compute.vmScaleSetName') && echo $vmss_name
+if [[ -n "$vmss_name" ]]
+then
+      echo "It seems I am an instance of a VMSS"
+else
+      echo "It seems I am a standalone VM"
+fi
