@@ -336,6 +336,70 @@ kubectl scale --replicas=3 -n $project_name deploy/autoscaler-demo
 oc get machinesets -n openshift-machine-api
 oc get machines -n openshift-machine-api
 
+# Deploy additional machineset
+cat <<EOF | kubectl apply -n openshift-machine-api -f -
+apiVersion: machine.openshift.io/v1beta1
+kind: MachineSet
+metadata:
+  annotations:
+    machine.openshift.io/GPU: '0'
+    machine.openshift.io/memoryMb: '16384'
+    machine.openshift.io/vCPU: '4'
+  resourceVersion: '33181'
+  name: aro-jose-worker-northeurope1
+  generation: 1
+  namespace: openshift-machine-api
+  labels:
+    machine.openshift.io/cluster-api-cluster: aro-lfhz9
+    machine.openshift.io/cluster-api-machine-role: worker
+    machine.openshift.io/cluster-api-machine-type: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      machine.openshift.io/cluster-api-cluster: aro-lfhz9
+      machine.openshift.io/cluster-api-machineset: aro-jose-worker-northeurope1
+  template:
+    metadata:
+      labels:
+        machine.openshift.io/cluster-api-cluster: aro-lfhz9
+        machine.openshift.io/cluster-api-machine-role: worker
+        machine.openshift.io/cluster-api-machine-type: worker
+        machine.openshift.io/cluster-api-machineset: aro-jose-worker-northeurope1
+    spec:
+      metadata: {}
+      providerSpec:
+        value:
+          osDisk:
+            diskSizeGB: 128
+            managedDisk:
+              storageAccountType: Premium_LRS
+            osType: Linux
+          networkResourceGroup: aro
+          publicLoadBalancer: aro-lfhz9
+          userDataSecret:
+            name: worker-user-data
+          vnet: arovnet
+          credentialsSecret:
+            name: azure-cloud-credentials
+            namespace: openshift-machine-api
+          zone: '1'
+          metadata:
+            creationTimestamp: null
+          publicIP: false
+          resourceGroup: aro-15847
+          kind: AzureMachineProviderSpec
+          location: northeurope
+          vmSize: Standard_D4s_v3
+          image:
+            offer: aro4
+            publisher: azureopenshift
+            sku: aro_48
+            version: 48.84.20210630
+          subnet: workers
+          apiVersion: azureproviderconfig.openshift.io/v1beta1
+EOF
+
 #########################
 # Private Link Services #
 #########################
