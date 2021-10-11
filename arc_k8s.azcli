@@ -715,6 +715,8 @@ az logicapp create -n $logicapp_name -g $arc_rg --subscription $subscription_id 
 # ERROR: "Unable to find Kube Environment associated to the Custom Location" (!!!)
 # Created issue https://github.com/Azure/logicapps/issues/396
 
+# Delete the logicapp, if you need to recreate it
+# az logicapp delete -n $logicapp_name -g $arc_rg
 
 # Troubleshooting
 az connectedk8s list -g $arc_rg -o table  # There should be an ARC cluster

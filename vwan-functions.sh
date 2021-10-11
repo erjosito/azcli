@@ -37,7 +37,7 @@ vpnsitelink_json='{name: $link_name, properties: {ipAddress: $remote_pip, bgpPro
 vpnsite_json='{location: $location, properties: {virtualWan: {id: $vwan_id}, addressSpace: { addressPrefixes: [ $site_prefix ] }, isSecuritySite: $security, vpnSiteLinks: [ '${vpnsitelink_json}']}}'
 cx_json='{name: $cx_name, properties: {connectionBandwidth: 200, vpnConnectionProtocolType: "IKEv2", enableBgp: true, sharedKey: $psk, vpnSiteLink: {id: $site_link_id}}}'
 vpncx_json='{properties: {enableInternetSecurity: true, remoteVpnSite: {id: $site_id}, vpnLinkConnections: ['$cx_json']}}'
-vpngw_json='{location: $location, properties: {virtualHub: {id: $vhub_id}, connections: [], bgpSettings: {asn: $asn, peerWeight: 0}}}'
+vpngw_json='{location: $location, properties: {virtualHub: {id: $vhub_id}, connections: [], isRoutingPreferenceInternet: true, bgpSettings: {asn: $asn, peerWeight: 0}}}'
 vnet_cx_json='{properties: {remoteVirtualNetwork: {id: $vnet_id}, enableInternetSecurity: true}}'
 rt_json='{properties: {routes: [], labels: []}}'
 route_json='{name: $name, destinationType: "CIDR", destinations: [ $prefixes ], nextHopType: $type, nextHop: $nexthop }'
@@ -1163,10 +1163,10 @@ function create_vpngw {
     hub_id=$1
     hub_name=hub${hub_id}
     vpngw_name=hubvpn${hub_id}
-    location=$(get_location $hub_id)
+    location=$(get_location "$hub_id")
     vpngw_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/vpnGateways/$vpngw_name?api-version=$vwan_api_version"
     vhub_id=$(az network vhub show -n $hub_name -g $rg --query id -o tsv)
-    wait_until_finished $vhub_id
+    wait_until_finished "$vhub_id"
     vpngw_json_string=$(jq -n \
             --arg location "$location" \
             --arg vhub_id "$vhub_id" \

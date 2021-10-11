@@ -3,10 +3,10 @@ subscription_id=e7da9914-9b05-4891-893c-546cb7b0422e
 vendor="Jose_generic_test_nva"
 version=latest
 deploy_mode=rest        # arm and rest supported at this time
-vpn_endpoint=public    # if "private", deploys ER to connect to onprem too
+vpn_endpoint=public     # if "private", deploys ER to connect to onprem too. Use "public" if you dont have access to ER
 
 # Variables (common)
-nva_rg=josenva
+rg=josenva
 location=westcentralus
 vwan_name=josevwan
 vhub_name=josehub
@@ -22,10 +22,30 @@ public_ssh_key=$(more ~/.ssh/id_rsa.pub)
 az account set -s $subscription_id
 
 # Create RG, VWAN and Vhub
-az group create -n $nva_rg -l $location
-az network vwan create -n $vwan_name -l $location -g $nva_rg
-az network vhub create --vwan $vwan_name -n $vhub_name --address-prefix $vhub_space -l $location -g $nva_rg
-hub_id=$(az network vhub show -n $vhub_name -g $nva_rg --query id -o tsv)
+rg_location=$(az group show -n $rg --query id -o tsv)
+if [[ -n "$rg_location" ]]
+then
+      echo "Resource group $rg found in $rg_location"
+else
+      echo "Creating new resource group $rg in $location..."
+      az group create -n $rg -l $location
+fi
+vwan_id=$(az network vwan show -n $vwan_name -g $rg --query name -o tsv)
+if [[ -n "$vwan_id" ]]
+then
+      echo "Virtual WAN $vwan_name found in resource group $rg"
+else
+      echo "Creating new Virtual WAN in resource group $rg..."
+      az network vwan create -n $vwan_name -l $location -g $rg
+fi
+hub_id=$(az network vhub show -n $vhub_name -g $rg --query id -o tsv)
+if [[ -n "hub_id" ]]
+then
+      echo "Virtual Hub $vhub_name found in Virtual WAN $vwan_name"
+else
+      echo "Creating new Virtual Hub in VWAN $vwan in $location..."
+      az network vhub create --vwan $vwan_name -n $vhub_name --address-prefix $vhub_space -l $location -g $rg
+fi
 
 # Create cloudinit file
 cat <<EOF > $gnva_cloudinit
@@ -80,7 +100,7 @@ function wait_until_finished {
 #######################
 
 # Not working!!!!
-# az network virtual-appliance create -n $nva_name -g $nva_rg \
+# az network virtual-appliance create -n $nva_name -g $rg \
 #      --scale-unit 2 \
 #      --vendor $vendor \
 #      --version $version \
@@ -91,28 +111,28 @@ function wait_until_finished {
 
 # Diagnostics
 # az network virtual-appliance list --query '[].{Name:name,ResourceGroup:resourceGroup,ProvisioningState:provisioningState,AddressPrefix:addressPrefix}' -o table
-# pip1=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
-# pip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
-# az network virtual-appliance show -n $nva_name -g $nva_rg --query cloudInitConfiguration -o tsv
-# nva_id=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query id -o tsv)
+# pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
+# pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
+# az network virtual-appliance show -n $nva_name -g $rg --query cloudInitConfiguration -o tsv
+# nva_id=$(az network virtual-appliance show -n $nva_name -g $rg --query id -o tsv)
 
 # SSH
 # ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "ip a"
 
 # Cleanup
-# az network virtual-appliance delete -n $nva_name -g $nva_rg -y
+# az network virtual-appliance delete -n $nva_name -g $rg -y
 
 ######################
 # Powershell command #
 ######################
 
-# $nva_rg = "josenva"
+# $rg = "josenva"
 # $nva_name = "josenva-pwsh"
 # $nva_location = "westcentralus"
 # $vhub_name = "josehub"
-# $vhub_id = $(get-azvirtualhub -resourcegroupname $nva_rg -name $vhub_name).id
+# $vhub_id = $(get-azvirtualhub -resourcegroupname $rg -name $vhub_name).id
 # $cloudinit_string = "#!/bin/bash\nuseradd -m jose\necho \"jose:Microsoft123!\" | chpasswd \n"
-# New-AzNetworkVirtualAppliance -Name $nva_name -ResourceGroupName $nva_rg `
+# New-AzNetworkVirtualAppliance -Name $nva_name -ResourceGroupName $rg `
 #   -CloudInitConfiguration $cloudinit_string `
 #   -Location $nva_location
 #   -Sku <Microsoft.Azure.Commands.Network.Models.PSVirtualApplianceSkuProperties> -VirtualHubId $vhub_id
@@ -209,14 +229,14 @@ EOF
 
       # Send ARM deployment
       # Option 1: Parameters inline (there seems to be some problem with the cloudinit string, probably with quoting)
-      # az deployment group create -n vwannva-$RANDOM --template-file $arm_template_file -g $nva_rg \
+      # az deployment group create -n vwannva-$RANDOM --template-file $arm_template_file -g $rg \
       #       --parameters "name=$nva_name" \
       #       --parameters "vhub_id=$hub_id" \
       #       --parameters "cloudinit=$cloudinit_string" \
       #       --parameters "asn=$nva_asn" \
       #       --parameters "version=$version"
       # Option 2: Parameters in file (working fine)
-      az deployment group create -n vwannva-$RANDOM --template-file $arm_template_file --parameters @$arm_params_file -g $nva_rg
+      az deployment group create -n vwannva-$RANDOM --template-file $arm_template_file --parameters @$arm_params_file -g $rg
 fi
 
 ##############################
@@ -243,7 +263,7 @@ if [[ "$deploy_mode" == "rest" ]]; then
             "tagexample1": "tagvalue1"
             }
       }'
-      uri="/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/NetworkVirtualAppliances/${nva_name}?api-version=2021-02-01"
+      uri="/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/NetworkVirtualAppliances/${nva_name}?api-version=2021-02-01"
       az rest --method PUT --uri $uri --body "$json_payload"
 fi
 
@@ -252,26 +272,26 @@ fi
 ############################
 
 # Wait until provisioning state is Successful
-# az network virtual-appliance show -n $nva_name -g $nva_rg --query provisioningState -o tsv
+# az network virtual-appliance show -n $nva_name -g $rg --query provisioningState -o tsv
 
 # Wait for NVA to be created
-nva_id=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query id -o tsv)
+nva_id=$(az network virtual-appliance show -n $nva_name -g $rg --query id -o tsv)
 wait_until_finished $nva_id
 
 # Diagnostics
 az network virtual-appliance list --query '[].{Name:name,ResourceGroup:resourceGroup,ProvisioningState:provisioningState,AddressPrefix:addressPrefix}' -o table
-az network virtual-appliance show -n $nva_name -g $nva_rg --query cloudInitConfiguration -o tsv
+az network virtual-appliance show -n $nva_name -g $rg --query cloudInitConfiguration -o tsv
 
 # Get PIPs
-pip1=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
-pip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
+pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
+pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
 
 # Verify SSH
 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip1" "ip a"
 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "ip a"
 
 # Cleanup
-# az network virtual-appliance delete -n $nva_name -g $nva_rg -y
+# az network virtual-appliance delete -n $nva_name -g $rg -y
 
 # Some other REST calls
 subscription_id=$(az account show --query id -o tsv)
@@ -279,15 +299,15 @@ api_version=2021-02-01
 # hub_rg=$(az network vhub list --query '[0].resourceGroup' -o tsv) && echo $hub_rg
 
 # List NVA SKUs (not working: NOT FOUND)
-# url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs?api-version=${api_version}" 
+# url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs?api-version=${api_version}" 
 # az rest --method GET --url $url
 
 # Show NVA SKU (not working: NOT FOUND)
-# url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs/Contoso_generic_test_nva?api-version=${api_version}" 
+# url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/networkVirtualApplianceSKUs/Contoso_generic_test_nva?api-version=${api_version}" 
 # az rest --method GET --url $url
 
 # Show NVA
-# url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${nva_rg}/providers/Microsoft.Network/networkVirtualAppliances/${nva_name}?api-version=${api_version}" 
+# url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/networkVirtualAppliances/${nva_name}?api-version=${api_version}" 
 # az rest --method GET --url $url
 
 #############################
@@ -311,13 +331,13 @@ function default_gw(){
 }
 
 # Get RS IPs
-rs_ip1=$(az network vhub show -n $vhub_name -g $nva_rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
-rs_ip2=$(az network vhub show -n $vhub_name -g $nva_rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
-rs_asn=$(az network vhub show -n $vhub_name -g $nva_rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
+rs_ip1=$(az network vhub show -n $vhub_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
+rs_ip2=$(az network vhub show -n $vhub_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
+rs_asn=$(az network vhub show -n $vhub_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
 
 # Get NVA private IPs
-nva_ip1=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[0].privateIpAddress' -o tsv) && echo $nva_ip1
-nva_ip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[2].privateIpAddress' -o tsv) && echo $nva_ip2
+nva_ip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[0].privateIpAddress' -o tsv) && echo $nva_ip1
+nva_ip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[2].privateIpAddress' -o tsv) && echo $nva_ip2
 
 # Find out the gateway for the private ip
 nva_default_gw=$(default_gw $nva_ip1 "255.255.255.128") && echo $nva_default_gw
@@ -411,30 +431,30 @@ vm_subnet_prefix=10.1.1.0/24
 vm_size=Standard_B1s
 
 # Create Vnet
-az network vnet create -g $nva_rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix
 
 # Create VM
 azurevm_name=azurevm
 azurevm_pip_name="${azurevm_name}-pip"
-az network nsg create -n "${azurevm_name}-nsg" -g $nva_rg
-az network nsg rule create -n SSH --nsg-name "${azurevm_name}-nsg" -g $nva_rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
-az network nsg rule create -n ICMP --nsg-name "${azurevm_name}-nsg" -g $nva_rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
-az vm create -n $azurevm_name -g $nva_rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${azurevm_name}-nsg" \
+az network nsg create -n "${azurevm_name}-nsg" -g $rg
+az network nsg rule create -n SSH --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n ICMP --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
+az vm create -n $azurevm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${azurevm_name}-nsg" \
     --public-ip-address $azurevm_pip_name --vnet-name $vnet_name --size $vm_size --subnet $vm_subnet_name
-azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddress -o tsv -g $nva_rg) && echo $azurevm_pip_ip
-azurevm_nic_id=$(az vm show -n $azurevm_name -g "$nva_rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv) && echo $azurevm_nic_id
+azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddress -o tsv -g $rg) && echo $azurevm_pip_ip
+azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv) && echo $azurevm_nic_id
 azurevm_private_ip=$(az network nic show --ids $azurevm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $azurevm_private_ip
 
 # Create VMSS
-# az vmss create -n vmsstest -g $nva_rg -l $location --image UbuntuLTS --generate-ssh-keys --public-ip-per-vm --lb "" --vnet-name $vnet_name --subnet $vm_subnet_name --nsg "${azurevm_name}-nsg" --vm-sku $vm_size
+# az vmss create -n vmsstest -g $rg -l $location --image UbuntuLTS --generate-ssh-keys --public-ip-per-vm --lb "" --vnet-name $vnet_name --subnet $vm_subnet_name --nsg "${azurevm_name}-nsg" --vm-sku $vm_size
 
 # Connect to Virtual Hub
-hub_default_rt_id=$(az network vhub route-table show --vhub-name $vhub_name -g $nva_rg -n defaultRouteTable --query id -o tsv)
-az network vhub connection create -n $vnet_name -g $nva_rg --vhub-name $vhub_name --remote-vnet $vnet_name \
+hub_default_rt_id=$(az network vhub route-table show --vhub-name $vhub_name -g $rg -n defaultRouteTable --query id -o tsv)
+az network vhub connection create -n $vnet_name -g $rg --vhub-name $vhub_name --remote-vnet $vnet_name \
     --internet-security true --associated-route-table $hub_default_rt_id --propagated-route-tables $hub_default_rt_id --labels default
 
 # Diagnostics
-az network vhub connection list -g $nva_rg --vhub-name $vhub_name -o table
+az network vhub connection list -g $rg --vhub-name $vhub_name -o table
 
 # New route should be visible in the NVA
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show route"
@@ -465,18 +485,18 @@ er_circuit_sku=Standard
 er_circuit_name="er-$er_pop"
 
 # Create onprem VNet
-az network vnet create -n $onprem_vnet_name -g $nva_rg --address-prefixes $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefixes $onprem_nva_subnet_prefix
+az network vnet create -n $onprem_vnet_name -g $rg --address-prefixes $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefixes $onprem_nva_subnet_prefix
 
 # If using the vpn private endpoint, we need an ER
 if [[ $vpn_endpoint == "private" ]]
 then
-      az network vnet subnet create -g $nva_rg -n $onprem_vng_subnet_name --vnet-name $onprem_vnet_name --address-prefix $onprem_vng_subnet_prefix
-      az network public-ip create -g $nva_rg -n $onprem_ergw_pip --allocation-method Dynamic --sku Basic
-      az network vnet-gateway create -g $nva_rg -n $onprem_ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $onprem_vnet_name --public-ip-addresses $onprem_ergw_pip --no-wait
-      az network express-route gateway create -g $nva_rg -n $vwan_ergw_name --virtual-hub $hub_id
-      az network express-route create -n $er_circuit_name --peering-location $er_pop -g $nva_rg \
+      az network vnet subnet create -g $rg -n $onprem_vng_subnet_name --vnet-name $onprem_vnet_name --address-prefix $onprem_vng_subnet_prefix
+      az network public-ip create -g $rg -n $onprem_ergw_pip --allocation-method Dynamic --sku Basic
+      az network vnet-gateway create -g $rg -n $onprem_ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $onprem_vnet_name --public-ip-addresses $onprem_ergw_pip --no-wait
+      az network express-route gateway create -g $rg -n $vwan_ergw_name --virtual-hub $hub_id
+      az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg \
             --bandwidth 50 Mbps --provider $er_provider -l $location --sku-family MeteredData --sku-tier $er_circuit_sku
-      service_key=$(az network express-route show -n $er_circuit_name -g $nva_rg --query serviceKey -o tsv) && echo "Service Key is $service_key"
+      service_key=$(az network express-route show -n $er_circuit_name -g $rg --query serviceKey -o tsv) && echo "Service Key is $service_key"
       # Provision Megaport MCR in location
       script_location="/home/jose/repos/azcli/megaport.sh"
       if [[ -e "$script_location" ]]
@@ -488,18 +508,18 @@ then
             echo "Sorry, I cannot seem to find the script $script_location to interact with the Megaport API"
       fi
       # Connect circuit to ER gateways (onprem/)
-      circuit_id=$(az network express-route show -n $er_circuit_name -g $nva_rg -o tsv --query id) && echo "Circuit ID is $circuit_id"
-      circuit_state=$(az network express-route show -n $er_circuit_name -g $nva_rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit_state"
+      circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo "Circuit ID is $circuit_id"
+      circuit_state=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit_state"
       # Wait until circuit is provisioned
       until [[ "$circuit_state" == "Provisioned" ]]
       do
             sleep 15
-            circuit_state=$(az network express-route show -n $er_circuit_name -g $nva_rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit_state"
+            circuit_state=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit_state"
       done
-      peering_id=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name $er_circuit_name -g $nva_rg -o tsv --query id) && echo "Private peering ID is $peering_id" # For this to work, a Refresh might have to be done...
-      hub_default_rt_id=$(az network vhub route-table show --vhub-name $vhub_name -g $nva_rg -n defaultRouteTable --query id -o tsv) && echo $hub_default_rt_id
-      az network vpn-connection create -n "${onprem_ergw_name}-${er_pop}" -g $nva_rg -l $location --vnet-gateway1 $onprem_ergw_name --express-route-circuit2 $circuit_id
-      az network express-route gateway connection create --gateway-name $vwan_ergw_name -n "${vwan_ergw_name}-${er_pop}" -g $nva_rg --peering $peering_id \
+      peering_id=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name $er_circuit_name -g $rg -o tsv --query id) && echo "Private peering ID is $peering_id" # For this to work, a Refresh might have to be done...
+      hub_default_rt_id=$(az network vhub route-table show --vhub-name $vhub_name -g $rg -n defaultRouteTable --query id -o tsv) && echo $hub_default_rt_id
+      az network vpn-connection create -n "${onprem_ergw_name}-${er_pop}" -g $rg -l $location --vnet-gateway1 $onprem_ergw_name --express-route-circuit2 $circuit_id
+      az network express-route gateway connection create --gateway-name $vwan_ergw_name -n "${vwan_ergw_name}-${er_pop}" -g $rg --peering $peering_id \
             --associated-route-table $hub_default_rt_id --propagated-route-tables $hub_default_rt_id --labels default
 fi
 
@@ -517,27 +537,27 @@ runcmd:
   - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
   - sysctl -w net.ipv4.conf.all.send_redirects = 0
 EOF
-az network nsg create -n "${onprem_linuxnva_name}-nsg" -g $nva_rg
-az network nsg rule create -n SSH --nsg-name "${onprem_linuxnva_name}-nsg" -g $nva_rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
-az network nsg rule create -n IKE --nsg-name "${onprem_linuxnva_name}-nsg" -g $nva_rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp
-az network nsg rule create -n IPsec --nsg-name "${onprem_linuxnva_name}-nsg" -g $nva_rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp
-az network nsg rule create -n ICMP --nsg-name "${onprem_linuxnva_name}-nsg" -g $nva_rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
-az vm create -n $onprem_linuxnva_name -g $nva_rg -l $location --image ubuntuLTS --generate-ssh-keys \
+az network nsg create -n "${onprem_linuxnva_name}-nsg" -g $rg
+az network nsg rule create -n SSH --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n IKE --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp
+az network nsg rule create -n IPsec --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp
+az network nsg rule create -n ICMP --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp
+az vm create -n $onprem_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
     --public-ip-address $onprem_linuxnva_pip --vnet-name $onprem_vnet_name --size $vm_size --subnet $onprem_nva_subnet_name \
     --custom-data $linuxnva_cloudinit_file --private-ip-address "$onprem_linuxnva_ip" --nsg "${onprem_linuxnva_name}-nsg"
-onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$nva_rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding
-onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $nva_rg --query ipAddress -o tsv) && echo $onprem_linuxnva_pip_ip
+onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $onprem_linuxnva_pip_ip
 onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $onprem_linuxnva_private_ip
 onprem_linuxnva_default_gw=$(default_gw "$onprem_linuxnva_ip" "255.255.255.0") && echo $onprem_linuxnva_default_gw
 
 # Private IPs of the external interfaces of the VWAN NVA
-nva_ip21=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[1].privateIpAddress' -o tsv) && echo $nva_ip21
-nva_ip22=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[3].privateIpAddress' -o tsv) && echo $nva_ip22
+nva_ip21=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].privateIpAddress' -o tsv) && echo $nva_ip21
+nva_ip22=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].privateIpAddress' -o tsv) && echo $nva_ip22
 
 # Private IPs VWAN NVAs
-nva_private_ip1=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[0].privateIpAddress' -o tsv) && echo $nva_private_ip1
-nva_private_ip2=$(az network virtual-appliance show -n $nva_name -g $nva_rg --query 'virtualApplianceNics[2].privateIpAddress' -o tsv) && echo $nva_private_ip2
+nva_private_ip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[0].privateIpAddress' -o tsv) && echo $nva_private_ip1
+nva_private_ip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[2].privateIpAddress' -o tsv) && echo $nva_private_ip2
 
 # If running on ER, connectivity to Azure VM and hub NVAs over ER can be verified
 if [[ $vpn_endpoint == "private" ]]
@@ -907,7 +927,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azurevm_pip_ip "ping -c 5 $
 ###############
 
 # Delete RG
-# az group delete -n $nva_rg -y --no-wait
+# az group delete -n $rg -y --no-wait
 
 ###############################
 # Some sample cloudinit files #
