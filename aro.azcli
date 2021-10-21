@@ -38,6 +38,8 @@ worker_vm_size=Standard_D4s_v3
 worker_vm_count=3
 pod_cidr=10.128.0.0/14
 service_cidr=172.30.0.0/16
+arc_name=arcaro
+azmonitor_usearc=yes
 
 # Create RG if it did not exist
 rg_location=$(az group show -n $rg --query location -o tsv)
@@ -59,12 +61,12 @@ vnet_location=$(az network vnet show -n $vnet_name -g $rg --query location -o ts
 if [[ -z "${vnet_location}" ]]
 then
   echo "Creating Virtual Network..."
-  az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $workers_subnet_name --subnet-prefixes $workers_subnet_prefix
-  az network vnet subnet create -n $masters_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $masters_subnet_prefix
-  az network vnet subnet update -n $masters_subnet_name -g $rg --vnet-name $vnet_name --disable-private-link-service-network-policies true
-  masters_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $masters_subnet_name --query id -o tsv)
-  az network vnet subnet update -n $masters_subnet_name -g $rg --vnet-name $vnet_name --service-endpoints Microsoft.ContainerRegistry
-  az network vnet subnet update -n $workers_subnet_name -g $rg --vnet-name $vnet_name --service-endpoints Microsoft.ContainerRegistry
+  az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $workers_subnet_name --subnet-prefixes $workers_subnet_prefix -o none
+  az network vnet subnet create -n $masters_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $masters_subnet_prefix -o none
+  az network vnet subnet update -n $masters_subnet_name -g $rg --vnet-name $vnet_name --disable-private-link-service-network-policies true -o none
+  masters_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $masters_subnet_name --query id -o tsv) -o none
+  az network vnet subnet update -n $masters_subnet_name -g $rg --vnet-name $vnet_name --service-endpoints Microsoft.ContainerRegistry -o none
+  az network vnet subnet update -n $workers_subnet_name -g $rg --vnet-name $vnet_name --service-endpoints Microsoft.ContainerRegistry -o none
 else
   echo "Vnet $vnet_name already exists"
 fi
@@ -72,10 +74,10 @@ fi
 if [[ "$nat_gateway" == "yes" ]]
 then
   echo "Creating NAT Gateway..."
-  az network public-ip create -n nat-pip -g $rg --sku Standard
+  az network public-ip create -n nat-pip -g $rg --sku Standard -o none
   az network nat gateway create -n aronatgw -g $rg \
-    --public-ip-addresses nat-pip --idle-timeout 10
-  az network vnet subnet update -n $workers_subnet_name --vnet-name $vnet_name -g $rg --nat-gateway aronatgw
+    --public-ip-addresses nat-pip --idle-timeout 10 -o none
+  az network vnet subnet update -n $workers_subnet_name --vnet-name $vnet_name -g $rg --nat-gateway aronatgw -o none
   # az network vnet subnet update -n $masters_subnet_name --vnet-name $vnet_name -g $rg --nat-gateway aronatgw
 fi
 
@@ -99,14 +101,15 @@ then
   sp_output=$(az ad sp create-for-rbac --name $sp_name --skip-assignment)
   sp_app_id=$(echo $sp_output | jq -r '.appId')
   sp_app_secret=$(echo $sp_output | jq -r '.password')
-  az keyvault secret set --vault-name $keyvault_name --name $keyvault_appid_secret_name --value $sp_app_id
-  az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $sp_app_secret
+  az keyvault secret set --vault-name $keyvault_name --name $keyvault_appid_secret_name --value $sp_app_id -o none
+  az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $sp_app_secret -o none
 else
   echo "Service principal credentials successfully retrieved from AKV $keyvault_name"
 fi
 # Assign permissions to the vnet for the SP
 vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
-az role assignment create --scope $vnet_id --assignee $sp_app_id --role 'Network Contributor'
+echo "Assigning Network Contributor role to SP $sp_app_id..."
+az role assignment create --scope $vnet_id --assignee $sp_app_id --role 'Network Contributor' -o none
 
 # Show credentials expiration date
 sp_credentials_enddate=$(az ad sp credential list --id $sp_app_id --query '[].endDate' -o tsv)
@@ -143,7 +146,7 @@ az aro create -n $cluster_name -g $rg --worker-subnet workers --master-subnet ma
   --ingress-visibility $ingress_visibility --apiserver-visibility $api_visibility \
   --tags sampletag1=value1 sampletag2=value2 \
   --cluster-resource-group $cluster_rg \
-  --pod-cidr $pod_cidr --service-cidr $service_cidr ${(z)domain_flag} ${(z)pullsecret_flag}
+  --pod-cidr $pod_cidr --service-cidr $service_cidr ${(z)domain_flag} ${(z)pullsecret_flag} -o none
 
 #############
 #  Cleanup  #
@@ -479,22 +482,57 @@ function aro_vm() {
 #   Container Insights    #
 ###########################
 
-# NOTE: this will probably be migrated to Arc
-
+# Create LA workspace
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
 if [[ -z "$logws_name" ]]
 then
     logws_name=log$RANDOM
     echo "INFO: Creating log analytics workspace ${logws_name}..."
-    az monitor log-analytics workspace create -n $logws_name -g $rg
+    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
 else
     echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
 fi
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
-aro_id=$(az aro show -n $cluster_name -g $rg --query id -o tsv) && echo $aro_id
-curl -o /tmp/enable-monitoring.sh -L https://aka.ms/enable-monitoring-bash-script
-bash /tmp/enable-monitoring.sh --resource-id $aro_id --workspace-id $logws_id
+
+
+if [[ "$azmonitor_usearc" = "yes" ]]
+then
+    # Enable Arc
+    echo "INFO: Enabling Arc in ARO cluster..."
+    az connectedk8s connect --name $arc_name -g $rg -l $location -o none
+    az connectedk8s list -g $rg -o table
+    kubectl -n azure-arc get deployments,pods
+    # Enable AzMonitor extension
+    echo "INFO: Enabling Arc extension for Container Insights in ARO cluster..."
+    az k8s-extension create --name azuremonitor-containers --cluster-name $arc_name --resource-group $rg --cluster-type connectedClusters \
+        --extension-type Microsoft.AzureMonitor.Containers --configuration-settings "logAnalyticsWorkspaceResourceID=${logws_id}" -o none
+    # Other possible config settings for the extension (see https://docs.microsoft.com/azure/azure-monitor/containers/container-insights-enable-arc-enabled-clusters):
+    # omsagent.resources.daemonset.limits.cpu=150m
+    # omsagent.resources.daemonset.limits.memory=600Mi
+    # omsagent.resources.deployment.limits.cpu=1
+    # omsagent.resources.deployment.limits.memory=750Mi
+    # Deploy defender extension to the same WS
+    # Looking into the nodes, it looks like kube-apiserver/audit.log contains more info than openshift-apiserver/audit.log...
+    echo "INFO: Enabling Arc extension for Azure Defender in ARO cluster..."
+    az k8s-extension create --name microsoft.azuredefender.kubernetes --cluster-type connectedClusters \
+        --cluster-name $arc_name --resource-group $rg --extension-type microsoft.azuredefender.kubernetes \
+        --configuration-settings "logAnalyticsWorkspaceResourceID=${logws_id}" "auditLogPath=/var/log/kube-apiserver/audit.log" -o none
+    # Verify extensions
+    az k8s-extension list -c $arc_name -g $rg --cluster-type ConnectedClusters -o table
+    # Getting some logs
+    query='ContainerLog
+    | where TimeGenerated > ago(5m)
+    | project TimeGenerated, LogEntry, ContainerID
+    | take 20'
+    az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+else
+    # NOTE: this will probably be migrated to Arc
+    aro_id=$(az aro show -n $cluster_name -g $rg --query id -o tsv) && echo $aro_id
+    curl -o /tmp/enable-monitoring.sh -L https://aka.ms/enable-monitoring-bash-script
+    bash /tmp/enable-monitoring.sh --resource-id $aro_id --workspace-id $logws_id
+fi
+
 
 
 #####################

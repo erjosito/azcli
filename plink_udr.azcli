@@ -535,6 +535,195 @@ az network route-table route create --route-table $webapp_rt_name -n endpointsub
 # The source IP as seen by the SQL Server should be again the AzFW/NVA, instead of the webapp backend vnet
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_ip "curl -s http://${app_url_api}/api/sqlsrcip"
 
+#######################
+# Application Gateway #
+#######################
+
+# Variables
+rg=plinkappgw
+location=westeurope
+appgw_rg=appgw
+appgw_name=appgw
+appgw_vnet=appgw
+vm_size=Standard_B1ms
+testvm_name=testvm
+testvm_pip_name="${testvm_name}-pip"
+
+# Create VNet and test VM
+az group create -n $rg -l $location
+vnet_name=myvnet
+vnet_prefix=192.168.0.0/16
+subnet_ep_name=pe
+subnet_ep_prefix=192.168.2.0/24
+subnet_vm_name=vm
+subnet_vm_prefix=192.168.13.0/24
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_ep_name --address-prefix $subnet_ep_prefix
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_vm_name --address-prefix $subnet_vm_prefix
+az vm create -n $testvm_name -g $rg -l $location --image UbuntuLTS --size $vm_size --generate-ssh-keys --vnet-name $vnet_name --subnet $subnet_vm_name --public-ip-address $testvm_pip_name
+testvm_pip=$(az network public-ip show -n $testvm_pip_name -g $rg --query ipAddress -o tsv) && echo $testvm_pip
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$testvm_pip" "ip a"
+
+# Install web server on VM
+script_url=https://raw.githubusercontent.com/erjosito/whoami/master/api-vm/cse.sh
+script_command='./cse.sh'
+az vm extension set -n customScript --vm-name $testvm_name -g $rg --publisher Microsoft.Azure.Extensions \
+  --protected-settings "{\"fileUris\": [\"${script_url}\"],\"commandToExecute\": \"${script_command}\"}"
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$testvm_pip" "curl -s http://localhost:8080/api/healthcheck"
+
+# Azure CLI creation experience
+# https://docs.microsoft.com/en-us/cli/azure/network/application-gateway/private-link?view=azure-cli-latest
+appgw_pls_name=appgwpls
+frontend_ip_name=$(az network application-gateway frontend-ip list -g $appgw_rg --gateway-name $appgw_name -o tsv --query '[0].name') && echo $frontend_ip_name
+subnet_appgw_id=$(az network application-gateway show -n $appgw_name -g $appgw_rg --query 'gatewayIpConfigurations[0].subnet.id' -o tsv) && echo $subnet_appgw_id
+subnet_ep_id=$(az network vnet subnet show -n $subnet_ep_name --vnet-name $vnet_name -g $rg --query id -o tsv) && echo $subnet_ep_id
+subnet_appgwep_id=$(az network vnet subnet show -n ep --vnet-name $appgw_vnet -g $appgw_rg --query id -o tsv) && echo $subnet_appgwep_id
+az network vnet subnet update --ids $subnet_appgwep_id --disable-private-link-service-network-policies true
+az network vnet subnet update --ids $subnet_appgwep_id --disable-private-link-service-network-policies true
+# This command up to now only supports subnets in the same vnet as the appgw
+az network application-gateway private-link add -n $appgw_pls_name -g $appgw_rg --gateway-name $appgw_name --frontend-ip $frontend_ip_name --subnet $subnet_appgw_id
+# The previous command creates something like this (inside of the appgw config):
+  # "privateLinkConfigurations": [
+  #   {
+  #     "etag": "W/\"ce0d005d-2b6d-443c-923a-e94d521cf2bb\"",
+  #     "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/appgw/providers/Microsoft.Network/applicationGateways/appgw/privateLinkConfigurations/appgwpls",
+  #     "ipConfigurations": [
+  #       {
+  #         "etag": "W/\"ce0d005d-2b6d-443c-923a-e94d521cf2bb\"",
+  #         "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/appgw/providers/Microsoft.Network/applicationGateways/appgw/privateLinkConfigurations/appgwpls/ipConfigurations/PrivateLinkDefaultIPConfiguration",
+  #         "name": "PrivateLinkDefaultIPConfiguration",
+  #         "primary": null,
+  #         "privateIpAddress": null,
+  #         "privateIpAllocationMethod": "Dynamic",
+  #         "provisioningState": "Succeeded",
+  #         "resourceGroup": "appgw",
+  #         "subnet": {
+  #           "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/appgw/providers/Microsoft.Network/virtualNetworks/appgw/subnets/ep",
+  #           "resourceGroup": "appgw"
+  #         },
+  #         "type": "Microsoft.Network/applicationGateways/privateLinkConfigurations/ipConfigurations"
+  #       }
+  #     ],
+  #     "name": "appgwpls",
+  #     "provisioningState": "Succeeded",
+  #     "resourceGroup": "appgw",
+  #     "type": "Microsoft.Network/applicationGateways/privateLinkConfigurations"
+  #   }
+  # ],
+appgw_pls_ipconfig=plsipconfig
+az network application-gateway private-link ip-config add --name $appgw_pls_ipconfig --private-link $appgw_pls_name --gateway-name $appgw_name -g $appgw_rg
+# The previous command creates something like this (inside of the appgw config):
+  # "privateLinkConfigurations": [
+  #   {
+  #     "etag": "W/\"7882bd7c-6ecf-4d1a-991c-1cacd9177f94\"",
+  #     "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/appgw/providers/Microsoft.Network/applicationGateways/appgw/privateLinkConfigurations/appgwpls",
+  #     "ipConfigurations": [
+  #       {
+  #         "etag": "W/\"7882bd7c-6ecf-4d1a-991c-1cacd9177f94\"",
+  #         "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/appgw/providers/Microsoft.Network/applicationGateways/appgw/privateLinkConfigurations/appgwpls/ipConfigurations/PrivateLinkDefaultIPConfiguration",
+  #         "name": "PrivateLinkDefaultIPConfiguration",
+  #         "primary": null,
+  #         "privateIpAddress": null,
+  #         "privateIpAllocationMethod": "Dynamic",
+  #         "provisioningState": "Succeeded",
+  #         "resourceGroup": "appgw",
+  #         "subnet": {
+  #           "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/appgw/providers/Microsoft.Network/virtualNetworks/appgw/subnets/ep",
+  #           "resourceGroup": "appgw"
+  #           },
+  #           "type": "Microsoft.Network/applicationGateways/privateLinkConfigurations/ipConfigurations"
+  #       },
+  #       {
+  #         "etag": "W/\"7882bd7c-6ecf-4d1a-991c-1cacd9177f94\"",
+  #         "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/appgw/providers/Microsoft.Network/applicationGateways/appgw/privateLinkConfigurations/appgwpls/ipConfigurations/plsipconfig",
+  #         "name": "plsipconfig",
+  #         "primary": false,
+  #         "privateIpAddress": null,
+  #         "privateIpAllocationMethod": "Dynamic",
+  #         "provisioningState": "Succeeded",
+  #         "resourceGroup": "appgw",
+  #         "subnet": {
+  #           "id": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/appgw/providers/Microsoft.Network/virtualNetworks/appgw/subnets/ep",
+  #           "resourceGroup": "appgw"
+  #         },
+  #         "type": "Microsoft.Network/applicationGateways/privateLinkConfigurations/ipConfigurations"
+  #       }
+  #     ],
+  #     "name": "appgwpls",
+  #     "provisioningState": "Succeeded",
+  #     "resourceGroup": "appgw",
+  #     "type": "Microsoft.Network/applicationGateways/privateLinkConfigurations"
+  #   }
+  # ],
+
+
+plink_template_file="/tmp/plink_template.json"
+cat <<'EOF' > ${plink_template_file}
+{
+  "$schema": "http://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "privateEndpointName": {
+      "type": "string"
+    },
+    "subnetId": {
+      "type": "string"
+    },
+    "privateLinkServiceResourceId": {
+      "type": "string"
+    },
+    "privateLinkResourceGroupId": {
+      "type": "string",
+      "defaultValue": ""
+    }
+  },
+  "resources": [
+    {
+      "name": "[parameters('privateEndpointName')]",
+      "type": "Microsoft.Network/privateEndpoints",
+      "apiVersion": "2021-05-01",
+      "location": "[parameters('location')]",
+      "properties": {
+        "subnet": {
+          "id": "[parameters('subnetId')]"
+        },
+        "privateLinkServiceConnections": [
+          {
+            "name": "MyPrivateEndpointConnection",
+            "properties": {
+              "privateLinkServiceId": "[parameters('privateLinkServiceResourceId')]",
+              "groupIds": [
+                "[parameters('privateLinkResourceGroupId')]"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+EOF
+
+# Create endpoint
+appgw_ep_name=appgwep
+appgw_id=$(az network application-gateway show -n $appgw_name -g $appgw_rg -o tsv --query id) && echo $appgw_id
+az network vnet subnet update -n $subnet_ep_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
+#az network private-endpoint create -n $sql_endpoint_name -g $rg --vnet-name $vnet_name --subnet $subnet_sql_name --private-connection-resource-id $sql_server_id --group-id sqlServer --connection-name sqlConnection
+appgw_pls_id=$(az network application-gateway private-link show -n $appgw_pls_name --gateway-name $appgw_name -g $appgw_rg --query id -o tsv) && echo $appgw_pls_id
+az deployment group create -n $appgw_ep_name -g $rg --template-file ${plink_template_file} \
+  --parameters "privateEndpointName=${appgw_ep_name}" "subnetId=${subnet_ep_id}" "privateLinkServiceResourceId=${appgw_id}" "privateLinkResourceGroupId=appGatewayFrontendIP"
+appgw_ep_nic_id=$(az network private-endpoint show -n $appgw_ep_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
+appgw_ep_ip=$(az network nic show --ids $appgw_ep_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+echo "Private IP address for App Gateway ${appgw_name} in VNet ${vnet_name}: ${appgw_ep_ip}"
+
+# Test
+ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$testvm_pip" "curl http://$appgw_ep_ip"
+
+
 ###############
 # Danger zone #
 ###############

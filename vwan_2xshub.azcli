@@ -18,14 +18,18 @@
 ###############
 
 # Control
-secure_hub=yes       # Whether firewalls are provisioned in the hubs
+no_of_hubs=2         # 1 or 2 hubs
+no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
+secure_hub=no        # Whether firewalls are provisioned in the hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
 nva_bgp=yes          # If using an NVA in spoke14/24, whether configuring BGP on it towards VWAN
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
-nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
-nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub2=yes      # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
+deploy_vpngw=no      # Whether VPN GWs should be deployed
+deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
 # Generic variables
 rg=vwan
 vwan=vwan
@@ -57,6 +61,34 @@ branch2_gateway=10.202.0.1
 branch2_bgp_ip=10.202.0.10
 branch2_2ary_bgp_ip=10.202.0.20
 branch2_asn=65502
+branch3_prefix=10.213.0.0/24
+branch3_subnet=10.213.0.0/26
+branch3_vm_subnet=10.213.0.64/26
+branch3_gateway=10.213.0.1
+branch3_bgp_ip=10.213.0.75
+branch3_asn=65503
+branch3_test_route=3.3.3.0/24
+branch4_prefix=10.214.0.0/24
+branch4_vm_subnet=10.214.0.64/26
+branch4_subnet=10.214.0.0/26
+branch4_gateway=10.214.0.1
+branch4_bgp_ip=10.214.0.75
+branch4_asn=65504
+branch4_test_route=4.4.4.0/24
+# ER (optional)
+er_provider=Megaport
+er_circuit_sku=Standard
+megaport_script_location="/home/jose/repos/azcli/megaport.sh"
+hub1_er_pop=Dallas
+hub1_er_circuit_name="hub1er-$er_pop"
+hub2_er_pop=Dallas
+hub2_er_circuit_name="hub2er-$er_pop"
+branch5_prefix=10.225.0.0/24
+branch5_vm_subnet_name=vm
+branch5_vm_subnet_prefix=10.225.0.64/26
+branch5_gw_subnet_prefix=10.225.0.0/26
+branch5_gw_name=branch5ergw
+branch5_location=$location1
 
 #############
 # Functions #
@@ -91,6 +123,7 @@ function wait_until_finished {
 function default_gw(){
     IP=$1
     MASK=$2
+    DEBUG=$3    # Set to yes for message debugging
     IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
     MASK_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $MASK | sed -e 's/\./ /g'`)
     IP_DEC=$(echo "ibase=16; $IP_HEX" | bc)
@@ -98,8 +131,21 @@ function default_gw(){
     SUBNET_DEC=$(( IP_DEC&MASK_DEC ))
     GW_DEC=$(( $SUBNET_DEC + 1 ))
     GW_HEX=$(printf '%x\n' $GW_DEC)
+    if [[ "${#GW_HEX}" == "7" ]]; then
+        GW_HEX="0${GW_HEX}"
+    fi
     GW=$(printf '%d.%d.%d.%d\n' `echo $GW_HEX | sed -r 's/(..)/0x\1 /g'`)
-    echo "$GW"
+    if [[ "$DEBUG" == "yes" ]]
+    then
+        echo "Input: ${IP}/${MASK}"
+        echo "Decimal: ${IP_DEC}/${MASK_DEC}"
+        echo "Subnet decimal: ${SUBNET_DEC}"
+        echo "Gateway dec: ${GW_DEC}"
+        echo "Gateway hex: ${GW_HEX}"
+        echo "Gateway: ${GW}"
+    else
+        echo "$GW"
+    fi
 }
 
 # Create a VNet with a test VM and optionally attach it to a hub
@@ -152,6 +198,394 @@ function create_spoke() {
     fi
 }
 
+# Create a linux VM to simulate a branch to connect to an NVA deployed in the hub
+function create_hub_nva_branch() {
+    hub_id=$1
+    hub_name="hub${hub_id}"
+    nva_name="${hub_name}nva"
+    nva_asn="6510${hub_id}"
+    # Set variables depending on which hub we are connecting the branch to
+    if [[ "$hub_id" == "1" ]]
+    then
+        onprem_vnet_name=branch3
+        onprem_vnet_prefix=$branch3_prefix
+        onprem_nva_subnet_name=onpremnva
+        onprem_nva_subnet_prefix=$branch3_vm_subnet
+        onprem_linuxnva_asn=${branch3_asn}
+        onprem_linuxnva_name=branch3-nva
+        onprem_linuxnva_pip=${onprem_linuxnva_name}-pip
+        onprem_linuxnva_ip=$branch3_bgp_ip
+        onprem_test_route=$branch3_test_route
+        vhub_space="$vwan_hub1_prefix"
+        location=$location1
+        storage_account_name=$storage_account1_name
+    else
+        onprem_vnet_name=branch4
+        onprem_vnet_prefix=$branch4_prefix
+        onprem_nva_subnet_name=onpremnva
+        onprem_nva_subnet_prefix=$branch4_vm_subnet
+        onprem_linuxnva_asn=${branch4_asn}
+        onprem_linuxnva_name=branch4-nva
+        onprem_linuxnva_pip=${onprem_linuxnva_name}-pip
+        onprem_linuxnva_ip=$branch4_bgp_ip
+        onprem_test_route=$branch4_test_route
+        vhub_space="$vwan_hub2_prefix"
+        location=$location2
+        storage_account_name=$storage_account2_name
+    fi
+    # Get RS values from the virtual hub
+    echo "Getting IP addresses and ASN from ${hub_name}..."
+    rs_ip1=$(az network vhub show -n $hub_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
+    rs_ip2=$(az network vhub show -n $hub_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
+    rs_asn=$(az network vhub show -n $hub_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
+    # Create VNet
+    echo "Creating VNet $onprem_vnet_name with $onprem_vnet_prefix..."
+    az network vnet create -n $onprem_vnet_name -g $rg --address-prefixes $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefixes $onprem_nva_subnet_prefix -o none
+    # Cloudinit file for onprem NVA
+    linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
+    cat <<EOF > $linuxnva_cloudinit_file
+#cloud-config
+runcmd:
+  - apt update && apt install -y bird strongswan
+  - sysctl -w net.ipv4.ip_forward=1
+  - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
+  - sysctl -w net.ipv4.conf.all.send_redirects = 0
+EOF
+    # NSG for onprem NVA
+    echo "Creating NSG ${onprem_linuxnva_name}-nsg..."
+    az network nsg create -n "${onprem_linuxnva_name}-nsg" -g $rg -o none
+    az network nsg rule create -n SSH --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+    az network nsg rule create -n IKE --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp -o none
+    az network nsg rule create -n IPsec --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp -o none
+    az network nsg rule create -n ICMP --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp -o none
+    az network watcher flow-log create -l $location -n ${onprem_linuxnva_name}-nsg -g $rg \
+        --nsg ${onprem_linuxnva_name}-nsg --storage-account $storage_account_name --log-version 2 --retention 7 -o none
+    # VM for onprem NVA
+    echo "Creating VM $onprem_linuxnva_name..."
+    az vm create -n $onprem_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+        --public-ip-address $onprem_linuxnva_pip --vnet-name $onprem_vnet_name --size $vm_size --subnet $onprem_nva_subnet_name \
+        --custom-data $linuxnva_cloudinit_file --private-ip-address "$onprem_linuxnva_ip" --nsg "${onprem_linuxnva_name}-nsg" -o none
+    onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding -o none
+    echo "Getting information about the created VM..."
+    onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $onprem_linuxnva_pip_ip
+    onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $onprem_linuxnva_private_ip
+    onprem_linuxnva_default_gw=$(default_gw "$onprem_linuxnva_ip" "255.255.255.192") && echo $onprem_linuxnva_default_gw
+    # Public IPs of the external interfaces of the VWAN NVAs
+    echo "Getting public IPs of the NVA $nva_name deployed in the virtual hub..."
+    pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
+    pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
+    # Private IPs of the external interfaces of the VWAN NVAs
+    echo "Getting private IPs (external NICs) of the NVA $nva_name deployed in the virtual hub..."
+    nva_ip21=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].privateIpAddress' -o tsv) && echo $nva_ip21
+    nva_ip22=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].privateIpAddress' -o tsv) && echo $nva_ip22
+    # Private IPs VWAN NVAs
+    echo "Getting private IPs (internal NICs) of the NVA $nva_name deployed in the virtual hub..."
+    nva_private_ip11=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[0].privateIpAddress' -o tsv) && echo $nva_private_ip11
+    nva_private_ip12=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[2].privateIpAddress' -o tsv) && echo $nva_private_ip12
+    # Gateway for the VWAN NVA (internal NIC)
+    nva_internal_mask=$(ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip1" "ifconfig eth1 | grep netmask | sed -n 's/.* netmask \([^ ]*\).*/\1/p'") && echo "Network mask $nva_internal_mask"
+    if [[ "${nva_internal_mask:0:11}" != "255.255.255" ]]
+    then
+        echo "It looks like $nva_internal_mask is not a correct network mask, defaulting to 255.255.255.240..."
+        nva_internal_mask="255.255.255.240"
+    fi
+    nva_default_gw=$(default_gw "$nva_private_ip11" "$nva_internal_mask") && echo "Internal gateway $nva_default_gw"
+    # Private/public endpoints (A/B are the redundant hub NVAs, C is onprem)
+    endpoint_a_public=$pip1
+    endpoint_a_private=$nva_ip21
+    endpoint_b_public=$pip2
+    endpoint_b_private=$nva_ip22
+    endpoint_c_public=$onprem_linuxnva_pip_ip
+    endpoint_c_private=$onprem_linuxnva_private_ip
+    echo "Configuring VPN between A:${endpoint_a_public}/${endpoint_a_private} and C:${endpoint_c_public}/${endpoint_c_private}"
+    echo "Configuring VPN between B:${endpoint_b_public}/${endpoint_b_private} and C:${endpoint_c_public}/${endpoint_c_private}"
+    # Initial config: NVA 0
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip route add $vhub_space via $nva_default_gw"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip tunnel add vti0 local $endpoint_a_private remote $endpoint_c_public mode vti key 11"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip link set up dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ip route add ${endpoint_c_private}/32 dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
+    # Initial config: NVA 1
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip route add $vhub_space via $nva_default_gw"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip tunnel add vti0 local $endpoint_b_private remote $endpoint_c_public mode vti key 11"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip link set up dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ip route add ${endpoint_c_private}/32 dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
+    # Initial config: Onprem
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti0 local $endpoint_c_private remote $endpoint_a_public mode vti key 11"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip link set up dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route add ${nva_ip21}/32 dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti1 local $endpoint_c_private remote $endpoint_b_public mode vti key 12"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti1.disable_policy=1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip link set up dev vti1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route add ${nva_ip22}/32 dev vti1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
+    # IPsec Config files
+    vpn_psk=$(openssl rand -base64 64)
+    vpn_psk=${vpn_psk//$'\n'/}  # Remove line breaks
+    psk_file_a=/tmp/ipsec.secrets.a
+    psk_file_b=/tmp/ipsec.secrets.b
+    psk_file_c=/tmp/ipsec.secrets.c
+    # PSK VWAN NVA 0
+    cat <<EOF > $psk_file_a
+$endpoint_a_public $endpoint_c_public : PSK "$vpn_psk"
+EOF
+    # PSK VWAN NVA 1
+    cat <<EOF > $psk_file_b
+$endpoint_b_public $endpoint_c_public : PSK "$vpn_psk"
+EOF
+    # PSK onprem
+    cat <<EOF > $psk_file_c
+$endpoint_c_public $endpoint_a_public : PSK "$vpn_psk"
+$endpoint_c_public $endpoint_b_public : PSK "$vpn_psk"
+EOF
+    ipsec_file_a=/tmp/ipsec.conf.a
+    ipsec_file_b=/tmp/ipsec.conf.b
+    ipsec_file_c=/tmp/ipsec.conf.c
+    cat <<EOF > $ipsec_file_a
+config setup
+        charondebug="all"
+        uniqueids=yes
+        strictcrlpolicy=no
+conn to-onprem
+  authby=secret
+  leftid=$endpoint_a_public
+  leftsubnet=0.0.0.0/0
+  right=$endpoint_c_public
+  rightsubnet=0.0.0.0/0
+  ike=aes256-sha2_256-modp1024!
+  esp=aes256-sha2_256!
+  keyingtries=0
+  ikelifetime=1h
+  lifetime=8h
+  dpddelay=30
+  dpdtimeout=120
+  dpdaction=restart
+  auto=start
+  mark=11
+EOF
+    # IPsec VWAN NVA 1
+    cat <<EOF > $ipsec_file_b
+config setup
+        charondebug="all"
+        uniqueids=yes
+        strictcrlpolicy=no
+conn to-onprem
+  authby=secret
+  leftid=$endpoint_b_public
+  leftsubnet=0.0.0.0/0
+  right=$endpoint_c_public
+  rightsubnet=0.0.0.0/0
+  ike=aes256-sha2_256-modp1024!
+  esp=aes256-sha2_256!
+  keyingtries=0
+  ikelifetime=1h
+  lifetime=8h
+  dpddelay=30
+  dpdtimeout=120
+  dpdaction=restart
+  auto=start
+  mark=11
+EOF
+    # IPsec onprem
+    cat <<EOF > $ipsec_file_c
+config setup
+        charondebug="all"
+        uniqueids=yes
+        strictcrlpolicy=no
+conn to-azure1
+  authby=secret
+  leftid=$endpoint_c_public
+  leftsubnet=0.0.0.0/0
+  right=$endpoint_a_public
+  rightsubnet=0.0.0.0/0
+  ike=aes256-sha2_256-modp1024!
+  esp=aes256-sha2_256!
+  keyingtries=0
+  ikelifetime=1h
+  lifetime=8h
+  dpddelay=30
+  dpdtimeout=120
+  dpdaction=restart
+  auto=start
+  mark=11
+conn to-azure2
+  authby=secret
+  leftid=$endpoint_c_public
+  leftsubnet=0.0.0.0/0
+  right=$endpoint_b_public
+  rightsubnet=0.0.0.0/0
+  ike=aes256-sha2_256-modp1024!
+  esp=aes256-sha2_256!
+  keyingtries=0
+  ikelifetime=1h
+  lifetime=8h
+  dpddelay=30
+  dpdtimeout=120
+  dpdaction=restart
+  auto=start
+  mark=12
+EOF
+    username=$(whoami)
+    # Deploy files to NVA1
+    scp $psk_file_a $pip1:/home/$username/ipsec.secrets
+    scp $ipsec_file_a $pip1:/home/$username/ipsec.conf
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo mv ./ipsec.* /etc/"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo systemctl restart ipsec"
+    # Deploy files to NVA2
+    scp $psk_file_b $pip2:/home/$username/ipsec.secrets
+    scp $ipsec_file_b $pip2:/home/$username/ipsec.conf
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo mv ./ipsec.* /etc/"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo systemctl restart ipsec"
+    # Deploy files to onprem
+    scp $psk_file_c $onprem_linuxnva_pip_ip:/home/$username/ipsec.secrets
+    scp $ipsec_file_c $onprem_linuxnva_pip_ip:/home/$username/ipsec.conf
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo mv ./ipsec.* /etc/"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart ipsec"
+    # Configure BGP with Bird
+    # =======================
+    bird_config_file_a=/tmp/bird.conf.a  # NVA 1/2
+    bird_config_file_c=/tmp/bird.conf.c  # onprem
+    # BGP config VWAN NVA (both instances)
+    cat <<EOF > $bird_config_file_a
+log syslog all;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      preference 254;
+      learn;
+      merge paths on;
+      import filter {
+          if net ~ ${endpoint_c_private}/32 then accept;
+          else reject;
+      };
+      export filter {
+          if net ~ ${endpoint_c_private}/32 then reject;
+          if net ~ [ 0.0.0.0/0{0,1} ] then reject;
+          else accept;
+      };
+}
+protocol static {
+      import all;
+      route $vhub_space via $nva_default_gw;
+}
+filter DROP_LONG {
+      # Drop long prefixes
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      else accept;
+}
+protocol bgp RS1 {
+      description "RS1";
+      multihop;
+      local as $nva_asn;
+      neighbor $rs_ip1 as $rs_asn;
+          import filter {accept;};
+          # export filter {accept;};
+          export filter DROP_LONG;
+}
+protocol bgp RS2 {
+      description "RS1";
+      multihop;
+      local as $nva_asn;
+      neighbor $rs_ip2 as $rs_asn;
+          import filter {accept;};
+          # export filter {accept;};
+          export filter DROP_LONG;
+}
+protocol bgp onprem {
+      description "BGP to Onprem";
+      multihop;
+      local as $nva_asn;
+      neighbor $endpoint_c_private as $onprem_linuxnva_asn;
+          import filter {accept;};
+          # export filter {accept;};
+          export filter DROP_LONG;
+}
+EOF
+    # Configure BGP with Bird (onprem)
+    cat <<EOF > $bird_config_file_c
+log syslog all;
+router id $endpoint_c_private;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      preference 254;
+      learn;
+      merge paths on;
+      import filter {
+          if net ~ ${nva_ip21}/32 then accept;
+          if net ~ ${nva_ip22}/32 then accept;
+          else reject;
+      };
+      export filter {
+          if net ~ ${nva_ip21}/32 then reject;
+          if net ~ ${nva_ip22}/32 then reject;
+          if net ~ [ 0.0.0.0/0{0,1} ] then reject;
+          else accept;
+      };
+}
+protocol static {
+      import all;
+      route $onprem_test_route via $onprem_linuxnva_default_gw;
+      route $onprem_vnet_prefix via $onprem_linuxnva_default_gw;
+}
+filter DROP_LONG {
+      # Drop long prefixes
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      else accept;
+}
+protocol bgp NVA1 {
+      description "BGP to NVA1";
+      multihop;
+      local $endpoint_c_private as $onprem_linuxnva_asn;
+      neighbor $endpoint_a_private as $nva_asn;
+          import filter {accept;};
+          #export filter {accept;};
+          export filter DROP_LONG;
+}
+protocol bgp NVA2 {
+      description "BGP to NVA2";
+      multihop;
+      local $endpoint_c_private as $onprem_linuxnva_asn;
+      neighbor $endpoint_b_private as $nva_asn;
+          import filter {accept;};
+          #export filter {accept;};
+          export filter DROP_LONG;
+}
+EOF
+    # Deploy BGP config files
+    username=$(whoami)
+    # NVA instance 0
+    scp $bird_config_file_a "${pip1}:/home/${username}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo systemctl restart bird"
+    # NVA instance 1
+    scp $bird_config_file_a "${pip2}:/home/${username}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo systemctl restart bird"
+    # Onprem
+    scp $bird_config_file_c "${onprem_linuxnva_pip_ip}:/home/${username}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart bird"
+    # Some diagnostics
+    echo "IPSec status in onprem NVA:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ipsec status"
+    echo "BGP peerings in onprem NVA:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols"
+}
+
 # Create a Linux NVA in the hub
 # Most code from nva_vwan.azcli in this repo
 function create_hub_nva() {
@@ -175,7 +609,7 @@ function create_hub_nva() {
     fi
     # Get IDs
     vwan_id=$(az network vwan show -n $vwan -g $rg --query name -o tsv)
-    hub_id=$(az network vhub show -n $hub_name -g $rg --query id -o tsv)
+    hub_arm_id=$(az network vhub show -n $hub_name -g $rg --query id -o tsv)
     # Create cloudinit file
     cat <<EOF > $gnva_cloudinit
 #cloud-config
@@ -204,7 +638,7 @@ EOF
                 "marketPlaceVersion": "'$version'"
         },
         "virtualHub": {
-                "id": "'$hub_id'"
+                "id": "'$hub_arm_id'"
         },
         "virtualApplianceAsn": '$nva_asn',
         "cloudInitConfiguration": '$cloudinit_string'
@@ -219,6 +653,12 @@ EOF
     az rest --method PUT --uri $uri --body "$json_payload" -o none
     nva_id=$(az network virtual-appliance show -n $nva_name -g $rg --query id -o tsv)
     wait_until_finished $nva_id
+    # Diagnostics
+    echo "Interfaces in the NVA instances..."
+    nva_pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip1" "ip a"
+    nva_pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip2" "ip a"
 }
 
 # Configure BGP in a hub NVA
@@ -226,22 +666,39 @@ function configure_hub_nva_bgp() {
     hub_id=$1
     hub_name="hub${hub_id}"
     nva_name="${hub_name}nva"
+    echo "Getting public IP addresses of NVA $nva_name..."
     nva_pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
     nva_pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
     # Get RS IPs
+    echo "Finding information about Route Service in $hub_name..."
     rs_ip1=$(az network vhub show -n $hub_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
     rs_ip2=$(az network vhub show -n $hub_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
     rs_asn=$(az network vhub show -n $hub_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
     # Get NVA private IPs
+    echo "Finding internal private IPs of NVA $nva_name..."
     nva_ip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[0].privateIpAddress' -o tsv) && echo $nva_ip1
     nva_ip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[2].privateIpAddress' -o tsv) && echo $nva_ip2
     # Find out the gateway for the private ip
-    nva_default_gw=$(default_gw $nva_ip1 "255.255.255.128") && echo $nva_default_gw
-    # Static route for the whole hub pointing to the private IPs
-    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip1" "sudo ip route add $vhub_space via $nva_default_gw"
-    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip2" "sudo ip route add $vhub_space via $nva_default_gw"
+    nva_internal_mask=$(ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$nva_pip1" "ifconfig eth1 | grep netmask | sed -n 's/.* netmask \([^ ]*\).*/\1/p'") && echo "Network mask $nva_internal_mask"
+    if [[ "${nva_internal_mask:0:11}" != "255.255.255" ]]
+    then
+        echo "It looks like $nva_internal_mask is not a correct network mask, defaulting to 255.255.255.240..."
+        nva_internal_mask="255.255.255.240"
+    fi
+    nva_default_gw=$(default_gw "$nva_ip1" "$nva_internal_mask") && echo "Internal gateway is $nva_default_gw"
+    # Adding static IP routes
+    if [[ $hub_id == "1" ]]
+    then
+        vhub_space="$vwan_hub1_prefix"
+    else
+        vhub_space="$vwan_hub2_prefix"
+    fi
+    echo "Adding static routes to NVA instances for the hub prefix $vhub_space..."
+    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$nva_pip1" "sudo ip route add $vhub_space via $nva_default_gw"
+    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$nva_pip2" "sudo ip route add $vhub_space via $nva_default_gw"
     # Create BGP file
     bird_config_file=/tmp/bird.conf
+    echo "Generating BIRD config file in $bird_config_file..."
     cat <<EOF > $bird_config_file
 log syslog all;
 #router id $nva_ip1;
@@ -289,13 +746,18 @@ protocol bgp RS2 {
 }
 EOF
     # Deploy file
+    echo "Copying BIRD configuration files to both NVA instances..."
     username=$(whoami)
-    scp $bird_config_file "${pip1}:/home/${username}/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo systemctl restart bird"
-    scp $bird_config_file "${pip2}:/home/${username}/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo systemctl restart bird"
+    scp $bird_config_file "${nva_pip1}:/home/${username}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip1 "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip1 "sudo systemctl restart bird"
+    scp $bird_config_file "${nva_pip2}:/home/${username}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip2 "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip2 "sudo systemctl restart bird"
+    # Diagnostics
+    echo "Running some quick BGP diagnostics on both NVA instances..."
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip1 "sudo birdc show prot"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip2 "sudo birdc show prot"
 }
 
 #############
@@ -306,13 +768,21 @@ EOF
 az group create -n $rg -l $location1
 
 # vwan and hubs
-az network vwan create -n $vwan -g $rg -l $location1 --branch-to-branch-traffic true --type Standard
-az network vhub create -n hub1 -g $rg --vwan $vwan -l $location1 --address-prefix $vwan_hub1_prefix
-az network vhub create -n hub2 -g $rg --vwan $vwan -l $location2 --address-prefix $vwan_hub2_prefix
+echo "Creating Virtual WAN and Virtual Hubs..."
+az network vwan create -n $vwan -g $rg -l $location1 --branch-to-branch-traffic true --type Standard -o none
+az network vhub create -n hub1 -g $rg --vwan $vwan -l $location1 --address-prefix $vwan_hub1_prefix -o none
+if [[ "$no_of_hubs" == "2" ]]
+then
+    az network vhub create -n hub2 -g $rg --vwan $vwan -l $location2 --address-prefix $vwan_hub2_prefix -o none
+fi
 
 # Create RT for vnets
-az network vhub route-table create -n hub1Vnet --vhub-name hub1 -g $rg --labels vnet
-az network vhub route-table create -n hub2Vnet --vhub-name hub2 -g $rg --labels vnet
+echo "Creating custom RT for VNets..."
+az network vhub route-table create -n hub1Vnet --vhub-name hub1 -g $rg --labels vnet -o none
+if [[ "$no_of_hubs" == "2" ]]
+then
+    az network vhub route-table create -n hub2Vnet --vhub-name hub2 -g $rg --labels vnet -o none
+fi
 
 # Add nohub1/nohub2 labels to default RTs
 # az network vhub route-table update -n defaultRouteTable --vhub-name hub1 -g $rg --labels default nohub2
@@ -322,9 +792,12 @@ az network vhub route-table create -n hub2Vnet --vhub-name hub2 -g $rg --labels 
 hub1_vnet_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n hub1Vnet --query id -o tsv)
 hub1_default_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n defaultRouteTable --query id -o tsv)
 hub1_none_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n noneRouteTable --query id -o tsv)
-hub2_default_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n defaultRouteTable --query id -o tsv)
-hub2_vnet_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n hub2Vnet --query id -o tsv)
-hub2_none_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n noneRouteTable --query id -o tsv)
+if [[ "$no_of_hubs" == "2" ]]
+then
+    hub2_default_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n defaultRouteTable --query id -o tsv)
+    hub2_vnet_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n hub2Vnet --query id -o tsv)
+    hub2_none_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n noneRouteTable --query id -o tsv)
+fi
 
 # Define which association/propagations we will use
 if [[ "$vnet_ass" == "vnet" ]]
@@ -353,153 +826,184 @@ fi
 
 
 # Create VPN gateways (not using --no-wait to avoid race conditions due to parallelism)
-az network vpn-gateway create -n hubvpn1 -g $rg -l $location1 --vhub hub1 --asn 65515
-az network vpn-gateway create -n hubvpn2 -g $rg -l $location2 --vhub hub2 --asn 65515
+if [[ "$deploy_vpngw" == "yes" ]]
+then
+    echo "Creating VPN Gateways..."
+    az network vpn-gateway create -n hubvpn1 -g $rg -l $location1 --vhub hub1 --asn 65515 -o none
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        az network vpn-gateway create -n hubvpn2 -g $rg -l $location2 --vhub hub2 --asn 65515 -o none
+    fi
+fi
 
 # Create NSGs to be used by VMs
+echo "Creating NSGs for Virtual Machines..."
 nsg1_name=vm-nsg-$location1
-az network nsg create -n $nsg1_name -g $rg -l $location1
+az network nsg create -n $nsg1_name -g $rg -l $location1 -o none
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_SSH --priority 1000 \
     --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
-    --destination-address-prefixes '*' --destination-port-ranges 22
+    --destination-address-prefixes '*' --destination-port-ranges 22 -o none
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_HTTP --priority 1010 --direction Inbound \
     --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' \
-    --destination-address-prefixes '*' --destination-port-ranges 9 80 443
+    --destination-address-prefixes '*' --destination-port-ranges 9 80 443 -o none
 # az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_HTTP_Return --priority 1015 --direction Inbound \
 #     --access Allow --protocol Tcp --source-address-prefixes '*' \
 #     --destination-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --destination-port-ranges 80 443
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
     --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
-    --destination-address-prefixes '*' --destination-port-ranges 500 4500
+    --destination-address-prefixes '*' --destination-port-ranges 500 4500 -o none
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_NTP --priority 1030 \
     --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --direction Inbound \
-    --destination-address-prefixes '*' --destination-port-ranges 123
+    --destination-address-prefixes '*' --destination-port-ranges 123 -o none
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_Icmp --priority 1040 \
     --access Allow --protocol Icmp --source-address-prefixes '*' --direction Inbound \
-    --destination-address-prefixes '*' --destination-port-ranges '*'
+    --destination-address-prefixes '*' --destination-port-ranges '*' -o none
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Outbound_All --priority 1000 \
     --access Allow --protocol '*' --source-address-prefixes '*' --direction Outbound \
-    --destination-address-prefixes '*' --destination-port-ranges '*'
-
-nsg2_name=vm-nsg-$location2
-if [[ "$location1" != "$location2" ]]
-then
-    az network nsg create -n $nsg2_name -g $rg -l $location2
-    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_SSH --priority 1000 \
-        --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
-        --destination-address-prefixes '*' --destination-port-ranges 22
-    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_HTTP --priority 1010 \
-        --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' \
-        --destination-address-prefixes '*' --destination-port-ranges 9 80 443
-    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
-        --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
-        --destination-address-prefixes '*' --destination-port-ranges 500 4500
-    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_NTP --priority 1030 \
-        --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --direction Inbound \
-        --destination-address-prefixes '*' --destination-port-ranges 123
-    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_Icmp --priority 1040 \
-        --access Allow --protocol Icmp --source-address-prefixes '*' --direction Inbound \
-        --destination-address-prefixes '*' --destination-port-ranges '*'
-    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Outbound_All --priority 1000 \
-        --access Allow --protocol '*' --source-address-prefixes '*' --direction Outbound \
-        --destination-address-prefixes '*' --destination-port-ranges '*'
-fi
-
+    --destination-address-prefixes '*' --destination-port-ranges '*' -o none
 # Configure NSG flow logs
 storage_account1_name=vwan$RANDOM$location1
-az storage account create -n $storage_account1_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location1
+az storage account create -n $storage_account1_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location1 -o none
 az network watcher flow-log create -l $location1 -n flowlog-$location1 -g $rg \
-    --nsg $nsg1_name --storage-account $storage_account1_name --log-version 2 --retention 7
-storage_account2_name=vwan$RANDOM$location2
-az storage account create -n $storage_account2_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location2
-az network watcher flow-log create -l $location2 -n flowlog-$location2 -g $rg \
-    --nsg $nsg2_name --storage-account $storage_account2_name --log-version 2 --retention 7
+    --nsg $nsg1_name --storage-account $storage_account1_name --log-version 2 --retention 7 -o none
 
-# You might have to accept the CSR marketplace terms to deploy the image
-az vm image terms accept -p $publisher -f $offer --plan $sku
+# Hub2
+if [[ "$no_of_hubs" == "2" ]]
+then
+    nsg2_name=vm-nsg-$location2
+    if [[ "$location1" != "$location2" ]]
+    then
+        az network nsg create -n $nsg2_name -g $rg -l $location2 -o none
+        az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_SSH --priority 1000 \
+            --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
+            --destination-address-prefixes '*' --destination-port-ranges 22 -o none
+        az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_HTTP --priority 1010 \
+            --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' \
+            --destination-address-prefixes '*' --destination-port-ranges 9 80 443 -o none
+        az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
+            --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
+            --destination-address-prefixes '*' --destination-port-ranges 500 4500 -o none
+        az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_NTP --priority 1030 \
+            --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --direction Inbound \
+            --destination-address-prefixes '*' --destination-port-ranges 123 -o none
+        az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_Icmp --priority 1040 \
+            --access Allow --protocol Icmp --source-address-prefixes '*' --direction Inbound \
+            --destination-address-prefixes '*' --destination-port-ranges '*' -o none
+        az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Outbound_All --priority 1000 \
+            --access Allow --protocol '*' --source-address-prefixes '*' --direction Outbound \
+            --destination-address-prefixes '*' --destination-port-ranges '*' -o none
+    fi
+    if [[ "$location1" != "$location2" ]]
+    then
+        storage_account2_name=vwan$RANDOM$location2
+    else
+        storage_account2_name=$storage_account1_name
+    fi
+    az storage account create -n $storage_account2_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location2 -o none
+    az network watcher flow-log create -l $location2 -n flowlog-$location2 -g $rg \
+        --nsg $nsg2_name --storage-account $storage_account2_name --log-version 2 --retention 7 -o none
+fi
+
+
+# Create CSRs only if there are VPN Gateways
 
 # Create CSR to simulate branch1
-az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} \
-    --generate-ssh-keys --admin-username $username --nsg $nsg1_name --size $nva_size \
-    --public-ip-address branch1-pip --public-ip-address-allocation static --private-ip-address $branch1_bgp_ip \
-    --vnet-name branch1 --vnet-address-prefix $branch1_prefix --subnet nva --subnet-address-prefix $branch1_subnet
-branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
-az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan \
-    --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --ip-address $branch1_ip --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100
-az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
-    --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
-    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default --internet-security true
+if [[ "$deploy_vpngw" == "yes" ]]
+then
+    # You might have to accept the CSR marketplace terms to deploy the image
+    echo "Accepting the Cisco marketplace image for Cisco CSR..."
+    az vm image terms accept -p $publisher -f $offer --plan $sku -o none
+    echo "Creating NVAs..."
+    az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} \
+        --generate-ssh-keys --admin-username $username --nsg $nsg1_name --size $nva_size \
+        --public-ip-address branch1-pip --public-ip-address-allocation static --private-ip-address $branch1_bgp_ip \
+        --vnet-name branch1 --vnet-address-prefix $branch1_prefix --subnet nva --subnet-address-prefix $branch1_subnet -o none
+    branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
+    az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan \
+        --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --ip-address $branch1_ip --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100 -o none
+    az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
+        --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
+        --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default --internet-security true -o none
 
-# Create CSR to simulate branch2
-az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} \
-    --generate-ssh-keys --admin-username $username --nsg $nsg2_name --size $nva_size \
-    --public-ip-address branch2-pip --public-ip-address-allocation static --private-ip-address $branch2_bgp_ip \
-    --vnet-name branch2 --vnet-address-prefix $branch2_prefix --subnet nva --subnet-address-prefix $branch2_subnet
-branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)
-az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan \
-    --asn $branch2_asn --bgp-peering-address $branch2_bgp_ip --ip-address $branch2_ip --address-prefixes ${branch2_ip}/32
-az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 \
-    --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
-    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id  --labels default --internet-security true
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        # Create CSR to simulate branch2
+        az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} \
+            --generate-ssh-keys --admin-username $username --nsg $nsg2_name --size $nva_size \
+            --public-ip-address branch2-pip --public-ip-address-allocation static --private-ip-address $branch2_bgp_ip \
+            --vnet-name branch2 --vnet-address-prefix $branch2_prefix --subnet nva --subnet-address-prefix $branch2_subnet -o none
+        branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)
+        az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan \
+            --asn $branch2_asn --bgp-peering-address $branch2_bgp_ip --ip-address $branch2_ip --address-prefixes ${branch2_ip}/32 -o none
+        az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 \
+            --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
+            --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id  --labels default --internet-security true -o none
+    fi
+fi
 
 # Configure branches (CSRs)
 
 # Get parameters for VPN GW in hub1
-vpngw1_config=$(az network vpn-gateway show -n hubvpn1 -g $rg)
-site=branch1
-vpngw1_gw0_pip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]')
-vpngw1_gw1_pip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]')
-vpngw1_gw0_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
-vpngw1_gw1_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
-vpngw1_bgp_asn=$(echo $vpngw1_config | jq -r '.bgpSettings.asn')  # This is today always 65515
-echo "Extracted info for hubvpn1: Gateway0 $vpngw1_gw0_pip, $vpngw1_gw0_bgp_ip. Gateway1 $vpngw1_gw1_pip, $vpngw1_gw0_bgp_ip. ASN $vpngw1_bgp_asn"
+if [[ "$deploy_vpngw" == "yes" ]]
+then
+    vpngw1_config=$(az network vpn-gateway show -n hubvpn1 -g $rg)
+    site=branch1
+    vpngw1_gw0_pip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]')
+    vpngw1_gw1_pip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]')
+    vpngw1_gw0_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
+    vpngw1_gw1_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
+    vpngw1_bgp_asn=$(echo $vpngw1_config | jq -r '.bgpSettings.asn')  # This is today always 65515
+    echo "Extracted info for hubvpn1: Gateway0 $vpngw1_gw0_pip, $vpngw1_gw0_bgp_ip. Gateway1 $vpngw1_gw1_pip, $vpngw1_gw0_bgp_ip. ASN $vpngw1_bgp_asn"
 
-# Get parameters for VPN GW in hub2
-vpngw2_config=$(az network vpn-gateway show -n hubvpn2 -g $rg)
-site=branch2
-vpngw2_gw0_pip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]')
-vpngw2_gw1_pip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]')
-vpngw2_gw0_bgp_ip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
-vpngw2_gw1_bgp_ip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
-vpngw2_bgp_asn=$(echo $vpngw2_config | jq -r '.bgpSettings.asn')  # This is today always 65515
-echo "Extracted info for hubvpn2: Gateway0 $vpngw2_gw0_pip, $vpngw2_gw0_bgp_ip. Gateway1 $vpngw2_gw1_pip, $vpngw2_gw0_bgp_ip. ASN $vpngw2_bgp_asn"
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        # Get parameters for VPN GW in hub2
+        vpngw2_config=$(az network vpn-gateway show -n hubvpn2 -g $rg)
+        site=branch2
+        vpngw2_gw0_pip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]')
+        vpngw2_gw1_pip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]')
+        vpngw2_gw0_bgp_ip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
+        vpngw2_gw1_bgp_ip=$(echo $vpngw2_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
+        vpngw2_bgp_asn=$(echo $vpngw2_config | jq -r '.bgpSettings.asn')  # This is today always 65515
+        echo "Extracted info for hubvpn2: Gateway0 $vpngw2_gw0_pip, $vpngw2_gw0_bgp_ip. Gateway1 $vpngw2_gw1_pip, $vpngw2_gw0_bgp_ip. ASN $vpngw2_bgp_asn"
+    fi
 
-# Wait until CSR in branch1 takes SSH connections
-wait_interval_csr=30
-echo "Waiting until CSR in branch${branch_id} is reachable..."
-command="sho ver | i uptime"
-command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "$command")
-until [[ -n "$command_output" ]]
-do
-    sleep $wait_interval_csr
+    # Wait until CSR in branch1 takes SSH connections
+    wait_interval_csr=30
+    echo "Waiting until CSR in branch${branch_id} is reachable..."
+    command="sho ver | i uptime"
     command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "$command")
-done
-echo $command_output
+    until [[ -n "$command_output" ]]
+    do
+        sleep $wait_interval_csr
+        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "$command")
+    done
+    echo $command_output
 
-# Create CSR config for branch 1
-csr_config_url="https://raw.githubusercontent.com/erjosito/azure-wan-lab/master/csr_config_2tunnels_tokenized.txt"
-config_file_csr='branch1_csr.cfg'
-config_file_local='/tmp/branch1_csr.cfg'
-wget $csr_config_url -O $config_file_local
-sed -i "s|\*\*PSK\*\*|${password}|g" $config_file_local
-sed -i "s|\*\*GW0_Private_IP\*\*|${vpngw1_gw0_bgp_ip}|g" $config_file_local
-sed -i "s|\*\*GW1_Private_IP\*\*|${vpngw1_gw1_bgp_ip}|g" $config_file_local
-sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw1_gw0_pip}|g" $config_file_local
-sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw1_gw1_pip}|g" $config_file_local
-sed -i "s|\*\*BGP_ID\*\*|${branch1_asn}|g" $config_file_local
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
+    # Create CSR config for branch 1
+    csr_config_url="https://raw.githubusercontent.com/erjosito/azure-wan-lab/master/csr_config_2tunnels_tokenized.txt"
+    config_file_csr='branch1_csr.cfg'
+    config_file_local='/tmp/branch1_csr.cfg'
+    wget $csr_config_url -O $config_file_local
+    sed -i "s|\*\*PSK\*\*|${password}|g" $config_file_local
+    sed -i "s|\*\*GW0_Private_IP\*\*|${vpngw1_gw0_bgp_ip}|g" $config_file_local
+    sed -i "s|\*\*GW1_Private_IP\*\*|${vpngw1_gw1_bgp_ip}|g" $config_file_local
+    sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw1_gw0_pip}|g" $config_file_local
+    sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw1_gw1_pip}|g" $config_file_local
+    sed -i "s|\*\*BGP_ID\*\*|${branch1_asn}|g" $config_file_local
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
   config t
     file prompt quiet
 EOF
-scp $config_file_local ${branch1_ip}:/${config_file_csr}
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "copy bootflash:${config_file_csr} running-config"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "wr mem"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip int b"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip bgp summary"
-myip=$(curl -s4 ifconfig.co)
-loopback_ip=10.11.11.11
-default_gateway=$branch1_gateway
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
+    scp $config_file_local ${branch1_ip}:/${config_file_csr}
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "copy bootflash:${config_file_csr} running-config"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "wr mem"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip int b"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip bgp summary"
+    myip=$(curl -s4 ifconfig.co)
+    loopback_ip=10.11.11.11
+    default_gateway=$branch1_gateway
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
 config t
     username $username password 0 $password
     no ip domain lookup
@@ -521,42 +1025,44 @@ end
 write mem
 EOF
 
-# Wait until CSR in branch2 takes SSH connections
-wait_interval_csr=30
-echo "Waiting until CSR in branch${branch_id} is reachable..."
-command="sho ver | i uptime"
-command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "$command")
-until [[ -n "$command_output" ]]
-do
-    sleep $wait_interval_csr
-    command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "$command")
-done
-echo $command_output
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        # Wait until CSR in branch2 takes SSH connections
+        wait_interval_csr=30
+        echo "Waiting until CSR in branch${branch_id} is reachable..."
+        command="sho ver | i uptime"
+        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "$command")
+        until [[ -n "$command_output" ]]
+        do
+            sleep $wait_interval_csr
+            command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "$command")
+        done
+        echo $command_output
 
-# Create CSR config for branch 2
-csr_config_url="https://raw.githubusercontent.com/erjosito/azure-wan-lab/master/csr_config_2tunnels_tokenized.txt"
-config_file_csr='branch2_csr.cfg'
-config_file_local='/tmp/branch2_csr.cfg'
-wget $csr_config_url -O $config_file_local
-sed -i "s|\*\*PSK\*\*|${password}|g" $config_file_local
-sed -i "s|\*\*GW0_Private_IP\*\*|${vpngw2_gw0_bgp_ip}|g" $config_file_local
-sed -i "s|\*\*GW1_Private_IP\*\*|${vpngw2_gw1_bgp_ip}|g" $config_file_local
-sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw2_gw0_pip}|g" $config_file_local
-sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw2_gw1_pip}|g" $config_file_local
-sed -i "s|\*\*BGP_ID\*\*|${branch2_asn}|g" $config_file_local
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip <<EOF
+        # Create CSR config for branch 2
+        csr_config_url="https://raw.githubusercontent.com/erjosito/azure-wan-lab/master/csr_config_2tunnels_tokenized.txt"
+        config_file_csr='branch2_csr.cfg'
+        config_file_local='/tmp/branch2_csr.cfg'
+        wget $csr_config_url -O $config_file_local
+        sed -i "s|\*\*PSK\*\*|${password}|g" $config_file_local
+        sed -i "s|\*\*GW0_Private_IP\*\*|${vpngw2_gw0_bgp_ip}|g" $config_file_local
+        sed -i "s|\*\*GW1_Private_IP\*\*|${vpngw2_gw1_bgp_ip}|g" $config_file_local
+        sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw2_gw0_pip}|g" $config_file_local
+        sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw2_gw1_pip}|g" $config_file_local
+        sed -i "s|\*\*BGP_ID\*\*|${branch2_asn}|g" $config_file_local
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip <<EOF
   config t
     file prompt quiet
 EOF
-scp $config_file_local ${branch2_ip}:/${config_file_csr}
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "copy bootflash:${config_file_csr} running-config"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "wr mem"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "sh ip int b"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "sh ip bgp summary"
-myip=$(curl -s4 ifconfig.co)
-loopback_ip=10.22.22.22
-default_gateway=$branch2_gateway
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip <<EOF
+        scp $config_file_local ${branch2_ip}:/${config_file_csr}
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "copy bootflash:${config_file_csr} running-config"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "wr mem"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "sh ip int b"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "sh ip bgp summary"
+        myip=$(curl -s4 ifconfig.co)
+        loopback_ip=10.22.22.22
+        default_gateway=$branch2_gateway
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip <<EOF
 config t
     username $username password 0 $password
     no ip domain lookup
@@ -577,6 +1083,8 @@ config t
 end
 wr mem
 EOF
+    fi   # If $no_of_hubs == 2
+fi  # if $deploy_vpngw == yes
 
 # Configure VPN gateways to log to Azure Monitor
 # Create LA workspace if it doesnt exist
@@ -585,21 +1093,24 @@ if [[ -z "$logws_name" ]]
 then
     logws_name=vwanlogs$RANDOM
     echo "Creating log analytics workspace $logws_name..."
-    az monitor log-analytics workspace create -n $logws_name -g $rg -l $location1
+    az monitor log-analytics workspace create -n $logws_name -g $rg -l $location1 -o none
 fi
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
-# VPN gateways
-echo "Configuring VPN gateways..."
-gw_id_list=$(az network vpn-gateway list -g $rg --query '[].id' -o tsv)
-while IFS= read -r gw_id; do
-    az monitor diagnostic-settings create -n mydiag --resource $gw_id --workspace $logws_id \
-        --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
-        --logs '[{"category": "GatewayDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
-                {"category": "TunnelDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
-                {"category": "RouteDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
-                {"category": "IKEDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
-done <<< "$gw_id_list"
+if [[ "$deploy_vpngw" == "yes" ]]
+then
+    # VPN gateways
+    echo "Configuring VPN gateways..."
+    gw_id_list=$(az network vpn-gateway list -g $rg --query '[].id' -o tsv)
+    while IFS= read -r gw_id; do
+        az monitor diagnostic-settings create -n mydiag --resource $gw_id --workspace $logws_id \
+            --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+            --logs '[{"category": "GatewayDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+                    {"category": "TunnelDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "RouteDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "IKEDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+    done <<< "$gw_id_list"
+fi
 
 if [[ "$secure_hub" == "yes" ]]
 then
@@ -611,7 +1122,7 @@ then
     echo "Creating rule to allow SSH and HTTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols TCP --destination-ports 9 22 80
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols TCP --destination-ports 9 22 80 -o none
     # Allow ICMP
     # echo "Creating rule to allow ICMP..."
     # az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -621,43 +1132,47 @@ then
     echo "Creating rule to allow NTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
-        --destination-addresses '*' --source-addresses "10.0.0.0/8" "20.0.0.0/6" --ip-protocols UDP --destination-ports "123"
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "20.0.0.0/6" --ip-protocols UDP --destination-ports "123" -o none
     # Example application collection with 2 rules (ipconfig.co, api.ipify.org)
     echo "Creating rule to allow ifconfig.co and api.ipify.org..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
-        --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443
+        --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 -o none
     az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
-        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 --rule-type ApplicationRule
+        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 --rule-type ApplicationRule -o none
     # Example application collection with wildcards (*.ubuntu.com)
     echo "Creating rule to allow *.ubuntu.com..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ubuntu --collection-priority 202 --action Allow --rule-name repos --rule-type ApplicationRule --description "ubuntucom" \
-        --target-fqdns 'ubuntu.com' '*.ubuntu.com' --source-addresses '*' --protocols Http=80 Https=443
+        --target-fqdns 'ubuntu.com' '*.ubuntu.com' --source-addresses '*' --protocols Http=80 Https=443 -o none
     # Mgmt traffic to Azure
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name azure --collection-priority 203 --action Allow --rule-name azmonitor --rule-type ApplicationRule --description "Azure Monitor" \
-        --target-fqdns '*.opinsights.azure.com' '*.azure-automation.net' --source-addresses '*' --protocols Https=443
+        --target-fqdns '*.opinsights.azure.com' '*.azure-automation.net' --source-addresses '*' --protocols Https=443 -o none
 
-    # Create Azure Firewalls in the virtual hubs
-    az network firewall create -n azfw1 -g $rg --vhub hub1 --policy $azfw_policy_name -l $location1 --sku AZFW_Hub --public-ip-count 1
-    az network firewall create -n azfw2 -g $rg --vhub hub2 --policy $azfw_policy_name -l $location2 --sku AZFW_Hub --public-ip-count 1
-
-    # Configure static routes to firewall in the VWAN hub route tables
+    # Create Azure Firewalls in the virtual hubs and configure static routes to firewall in the VWAN hub route tables
+    echo "Creating Azure Firewall in hub1..."
+    az network firewall create -n azfw1 -g $rg --vhub hub1 --policy $azfw_policy_name -l $location1 --sku AZFW_Hub --public-ip-count 1 -o none
     azfw1_id=$(az network firewall show -n azfw1 -g $rg --query id -o tsv)
     az network vhub route-table route add -n defaultRouteTable --vhub-name hub1 -g $rg \
         --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
-        --next-hop-type ResourceId --next-hop $azfw1_id
+        --next-hop-type ResourceId --next-hop $azfw1_id -o none
     az network vhub route-table route add -n hub1Vnet --vhub-name hub1 -g $rg \
         --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
-        --next-hop-type ResourceId --next-hop $azfw1_id
-    azfw2_id=$(az network firewall show -n azfw2 -g $rg --query id -o tsv)
-    az network vhub route-table route add -n defaultRouteTable --vhub-name hub2 -g $rg \
-        --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
-        --next-hop-type ResourceId --next-hop $azfw2_id
-    az network vhub route-table route add -n hub2Vnet --vhub-name hub2 -g $rg \
-        --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
-        --next-hop-type ResourceId --next-hop $azfw2_id
+        --next-hop-type ResourceId --next-hop $azfw1_id -o none
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        echo "Creating Azure Firewall in hub2..."
+        az network firewall create -n azfw2 -g $rg --vhub hub2 --policy $azfw_policy_name -l $location2 --sku AZFW_Hub --public-ip-count 1 -o none
+        azfw2_id=$(az network firewall show -n azfw2 -g $rg --query id -o tsv)
+        az network vhub route-table route add -n defaultRouteTable --vhub-name hub2 -g $rg \
+            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
+            --next-hop-type ResourceId --next-hop $azfw2_id -o none
+        az network vhub route-table route add -n hub2Vnet --vhub-name hub2 -g $rg \
+            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
+            --next-hop-type ResourceId --next-hop $azfw2_id -o none
+    fi
+
 
     # Azure Firewalls
     echo "Configuring Azure Firewalls..."
@@ -666,7 +1181,7 @@ then
         az monitor diagnostic-settings create -n mydiag --resource $fw_id --workspace $logws_id \
             --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
             --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
-                    {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
+                    {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
     done <<< "$fw_id_list"
 fi
 
@@ -684,88 +1199,126 @@ runcmd:
 EOF
 
 # Create spokes
-create_spoke 1 1
-create_spoke 1 2
-create_spoke 1 3
-create_spoke 2 1
-create_spoke 2 2
-create_spoke 2 3
+for spoke in $(seq 1 ${no_of_spokes})
+do
+    create_spoke 1 $spoke
+done
+if [[ "$no_of_hubs" == "2" ]]
+then
+    for spoke in $(seq 1 ${no_of_spokes})
+    do
+        create_spoke 2 $spoke
+    done
+fi
 
 # Backdoor for access from the testing device over the Internet
 myip=$(curl -s4 ifconfig.co)
-az network route-table create -n spokes-$location1 -g $rg -l $location1
-az network route-table route create -n mypc -g $rg --route-table-name spokes-$location1 --address-prefix "${myip}/32" --next-hop-type Internet
-az network vnet subnet update -n vm --vnet-name spoke11-$location1 -g $rg --route-table spokes-$location1
-az network vnet subnet update -n vm --vnet-name spoke12-$location1 -g $rg --route-table spokes-$location1
-az network vnet subnet update -n vm --vnet-name spoke13-$location1 -g $rg --route-table spokes-$location1
-az network route-table create -n spokes-$location2 -g $rg -l $location2
-az network route-table route create -n mypc -g $rg --route-table-name spokes-$location2 --address-prefix "${myip}/32" --next-hop-type Internet
-az network vnet subnet update -n vm --vnet-name spoke21-$location2 -g $rg --route-table spokes-$location2
-az network vnet subnet update -n vm --vnet-name spoke22-$location2 -g $rg --route-table spokes-$location2
-az network vnet subnet update -n vm --vnet-name spoke23-$location2 -g $rg --route-table spokes-$location2
+echo "Creating RT for spokes in $location1..."
+az network route-table create -n spokes-$location1 -g $rg -l $location1 -o none
+az network route-table route create -n mypc -g $rg --route-table-name spokes-$location1 --address-prefix "${myip}/32" --next-hop-type Internet -o none
+for spoke in $(seq 1 ${no_of_spokes})
+do
+    echo "Associating VNet spoke1${spoke}-${location1} to RT spokes-$location1..."
+    az network vnet subnet update -n vm --vnet-name spoke1${spoke}-${location1} -g $rg --route-table spokes-$location1 -o none
+done
+if [[ "$no_of_hubs" == "2" ]]
+then
+    if [[ "$location1" != "$location2" ]]
+    then
+    echo "Creating RT for spokes in $location2..."
+        az network route-table create -n spokes-$location2 -g $rg -l $location2 -o none
+        az network route-table route create -n mypc -g $rg --route-table-name spokes-$location2 --address-prefix "${myip}/32" --next-hop-type Internet -o none
+    fi
+    for spoke in $(seq 1 ${no_of_spokes})
+    do
+        echo "Associating VNet spoke2${spoke}-${location1} to RT spokes-$location2..."
+        az network vnet subnet update -n vm --vnet-name spoke2${spoke}-${location2} -g $rg --route-table spokes-$location2 -o none
+    done
+fi
 
-# Optional: spoke14/24 with NVA an indirect spokes
+# Optional: additional spokes with NVA and 2 indirect spokes attached to them
 if [[ "$indirect_spokes" == "yes" ]]
 then
+    indirect_spoke_id=$((no_of_spokes+1))
     # Create VMs and VNets
-    create_spoke 1 4
-    create_spoke 1 41 no
-    create_spoke 1 42 no
-    create_spoke 2 4
-    create_spoke 2 41 no
-    create_spoke 2 42 no
+    echo "Creating NVA spoke 1${indirect_spoke_id} and indirect spokes 1${indirect_spoke_id}1 and 1${indirect_spoke_id}2..."
+    create_spoke 1 ${indirect_spoke_id}
+    create_spoke 1 ${indirect_spoke_id}1 no
+    create_spoke 1 ${indirect_spoke_id}2 no
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        echo "Creating NVA spoke 2${indirect_spoke_id} and indirect spokes 2${indirect_spoke_id}1 and 2${indirect_spoke_id}2..."
+        create_spoke 2 ${indirect_spoke_id}
+        create_spoke 2 ${indirect_spoke_id}1 no
+        create_spoke 2 ${indirect_spoke_id}2 no
+    fi
+
     # Indirect spoke peerings
     echo "Creating VNet peerings to indirect spokes..."
-    az network vnet peering create -n 141to14 -g $rg --vnet-name spoke141-${location1} --remote-vnet spoke14-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet peering create -n 142to14 -g $rg --vnet-name spoke142-${location1} --remote-vnet spoke14-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet peering create -n 14to141 -g $rg --vnet-name spoke14-${location1} --remote-vnet spoke141-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet peering create -n 14to142 -g $rg --vnet-name spoke14-${location1} --remote-vnet spoke142-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet peering create -n 241to24 -g $rg --vnet-name spoke241-${location2} --remote-vnet spoke24-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet peering create -n 242to24 -g $rg --vnet-name spoke242-${location2} --remote-vnet spoke24-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet peering create -n 24to241 -g $rg --vnet-name spoke24-${location2} --remote-vnet spoke241-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet peering create -n 24to242 -g $rg --vnet-name spoke24-${location2} --remote-vnet spoke242-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n 1${indirect_spoke_id}1to1${indirect_spoke_id} -g $rg --vnet-name spoke1${indirect_spoke_id}1-${location1} --remote-vnet spoke1${indirect_spoke_id}-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n 1${indirect_spoke_id}2to1${indirect_spoke_id} -g $rg --vnet-name spoke1${indirect_spoke_id}2-${location1} --remote-vnet spoke1${indirect_spoke_id}-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n 14to1${indirect_spoke_id}1 -g $rg --vnet-name spoke1${indirect_spoke_id}-${location1} --remote-vnet spoke1${indirect_spoke_id}1-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n 14to1${indirect_spoke_id}2 -g $rg --vnet-name spoke1${indirect_spoke_id}-${location1} --remote-vnet spoke1${indirect_spoke_id}2-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        az network vnet peering create -n 2${indirect_spoke_id}1to2${indirect_spoke_id} -g $rg --vnet-name spoke2${indirect_spoke_id}1-${location2} --remote-vnet spoke2${indirect_spoke_id}-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
+        az network vnet peering create -n 2${indirect_spoke_id}2to2${indirect_spoke_id} -g $rg --vnet-name spoke2${indirect_spoke_id}2-${location2} --remote-vnet spoke2${indirect_spoke_id}-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
+        az network vnet peering create -n 24to2${indirect_spoke_id}1 -g $rg --vnet-name spoke2${indirect_spoke_id}-${location2} --remote-vnet spoke2${indirect_spoke_id}1-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
+        az network vnet peering create -n 24to2${indirect_spoke_id}2 -g $rg --vnet-name spoke2${indirect_spoke_id}-${location2} --remote-vnet spoke2${indirect_spoke_id}2-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
+    fi
     # Configure IP forwarding in the NVA NICs
     echo "Configuring IP forwarding in NVA NICs..."
-    vm_names=("spoke14-vm" "spoke24-vm")
+    vm_names=("spoke${indirect_spoke_id}4-vm" "spoke2${indirect_spoke_id}-vm")
     for vm_name in ${vm_names[@]}; do
         echo "Enabling IP forwarding for $vm_name..."
         vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
         az network nic update --ids $vm_nic_id --ip-forwarding -o none
     done
-    # RT for indirect spokes 141/142
+    # RT for indirect spokes 1${indirect_spoke_id}1/1${indirect_spoke_id}2
     echo "Creating route tables for indirect spokes with default route pointing to the NVA..."
     myip=$(curl -s4 ifconfig.co)
-    spoke14_nic_id=$(az vm show -n spoke14-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    spoke14_ip=$(az network nic show --ids $spoke14_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-    spoke24_nic_id=$(az vm show -n spoke24-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    spoke24_ip=$(az network nic show --ids $spoke24_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-    az network route-table create -n indirectspokes14-$location1 -g $rg -l $location1 -o none
-    az network route-table route create -n default -g $rg --route-table-name indirectspokes14-$location1 \
-        --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $spoke14_ip -o none
-    az network route-table route create -n mypc -g $rg --route-table-name indirectspokes14-$location1 \
+    nva1_nic_id=$(az vm show -n spoke1${indirect_spoke_id}-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    nva1_ip=$(az network nic show --ids $nva1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    az network route-table create -n indirectspokes-$location1 -g $rg -l $location1 -o none
+    az network route-table route create -n default -g $rg --route-table-name indirectspokes-$location1 \
+        --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $nva1_ip -o none
+    az network route-table route create -n mypc -g $rg --route-table-name indirectspokes-$location1 \
         --address-prefix "${myip}/32" --next-hop-type Internet -o none
-    az network vnet subnet update -n vm --vnet-name spoke141-${location1} -g $rg --route-table indirectspokes14-$location1 -o none
-    az network vnet subnet update -n vm --vnet-name spoke142-${location1} -g $rg --route-table indirectspokes14-$location1 -o none
-    az network route-table create -n indirectspokes24-$location2 -g $rg -l $location2 -o none
-    az network route-table route create -n default -g $rg --route-table-name indirectspokes24-$location2 \
-        --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $spoke24_ip -o none
-    az network route-table route create -n mypc -g $rg --route-table-name indirectspokes24-$location2 \
-        --address-prefix "${myip}/32" --next-hop-type Internet -o none
-    az network vnet subnet update -n vm --vnet-name spoke241-${location2} -g $rg --route-table indirectspokes24-$location2 -o none
-    az network vnet subnet update -n vm --vnet-name spoke242-${location2} -g $rg --route-table indirectspokes24-$location2 -o none
-    # RT with backdoor for spokes14/24 and default to Internet
+    az network vnet subnet update -n vm --vnet-name spoke1${indirect_spoke_id}1-${location1} -g $rg --route-table indirectspokes-$location1 -o none
+    az network vnet subnet update -n vm --vnet-name spoke1${indirect_spoke_id}2-${location1} -g $rg --route-table indirectspokes-$location1 -o none
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        nva2_nic_id=$(az vm show -n spoke2${indirect_spoke_id}-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+        az network route-table create -n indirectspokes-$location2 -g $rg -l $location2 -o none
+        az network route-table route create -n default -g $rg --route-table-name indirectspokes-$location2 \
+            --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $nva2_ip -o none
+        az network route-table route create -n mypc -g $rg --route-table-name indirectspokes-$location2 \
+            --address-prefix "${myip}/32" --next-hop-type Internet -o none
+        az network vnet subnet update -n vm --vnet-name spoke2${indirect_spoke_id}1-${location2} -g $rg --route-table indirectspokes-$location2 -o none
+        az network vnet subnet update -n vm --vnet-name spoke2${indirect_spoke_id}2-${location2} -g $rg --route-table indirectspokes-$location2 -o none
+    fi
+    # RT with backdoor for nva spokes and default to Internet
     echo "Creating route tables for the NVAs and adding default routing to the Internet..."
-    az network route-table create -n nva14-$location1 -g $rg -l $location1 -o none
-    az network route-table route create -n default -g $rg --route-table-name nva14-$location1 \
+    az network route-table create -n nva1${indirect_spoke_id}-$location1 -g $rg -l $location1 -o none
+    az network route-table route create -n default -g $rg --route-table-name nva1${indirect_spoke_id}-$location1 \
         --address-prefix "0.0.0.0/0" --next-hop-type Internet -o none
-    az network vnet subnet update -n vm --vnet-name spoke14-$location1 -g $rg --route-table nva14-$location1 -o none
-    az network route-table create -n nva24-$location2 -g $rg -l $location2 -o none
-    az network route-table route create -n default -g $rg --route-table-name nva24-$location2 \
-        --address-prefix "0.0.0.0/0" --next-hop-type Internet -o none
-    az network vnet subnet update -n vm --vnet-name spoke24-$location2 -g $rg --route-table nva24-$location2 -o none
+    az network vnet subnet update -n vm --vnet-name spoke1${indirect_spoke_id}-$location1 -g $rg --route-table nva1${indirect_spoke_id}-$location1 -o none
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        az network route-table create -n nva2${indirect_spoke_id}-$location2 -g $rg -l $location2 -o none
+        az network route-table route create -n default -g $rg --route-table-name nva2${indirect_spoke_id}-$location2 \
+            --address-prefix "0.0.0.0/0" --next-hop-type Internet -o none
+        az network vnet subnet update -n vm --vnet-name spoke2${indirect_spoke_id}-$location2 -g $rg --route-table nva2${indirect_spoke_id}-$location2 -o none
+    fi
     # Install BIRD in the NVAs
     echo "Installing BIRD in NVAs..."
-    vm_names=("spoke14-vm" "spoke24-vm")
+    if [[ "$no_of_hubs" == "1" ]]
+    then
+        vm_names=( "spoke1${indirect_spoke_id}-vm" )
+    else
+        vm_names=("spoke1${indirect_spoke_id}-vm" "spoke2${indirect_spoke_id}-vm")
+    fi
     for vm_name in ${vm_names[@]}; do
         echo "Installing BIRD in VM $vm_name..."
         nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -775,65 +1328,86 @@ then
     done
 fi
 
-# VM in branch1
-az vm create -n branch1-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-    --public-ip-address branch1-vm-pip --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
-    --subnet vm --subnet-address-prefix $branch1_vm_subnet --custom-data $cloudinit_file
-az vm extension set --vm-name branch1-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
-az network route-table create -n branch1vm-$location1 -g $rg -l $location1
-myip=$(curl -s4 ifconfig.co)
-az network route-table route create -n mypc -g $rg --route-table-name branch1vm-$location1 \
-    --address-prefix "${myip}/32" --next-hop-type Internet
-az network route-table route create -n default -g $rg --route-table-name branch1vm-$location1 \
-    --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch1_bgp_ip
-az network vnet subnet update -n vm --vnet-name branch1 -g $rg --route-table branch1vm-$location1
+# VMs in VPN branches
+if [[ "$deploy_vpngw" == "yes" ]]
+then
+    # VM in branch1
+    az vm create -n branch1-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+        --public-ip-address branch1-vm-pip --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
+        --subnet vm --subnet-address-prefix $branch1_vm_subnet --custom-data $cloudinit_file
+    az vm extension set --vm-name branch1-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
+    az network route-table create -n branch1vm-$location1 -g $rg -l $location1
+    myip=$(curl -s4 ifconfig.co)
+    az network route-table route create -n mypc -g $rg --route-table-name branch1vm-$location1 \
+        --address-prefix "${myip}/32" --next-hop-type Internet
+    az network route-table route create -n default -g $rg --route-table-name branch1vm-$location1 \
+        --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch1_bgp_ip
+    az network vnet subnet update -n vm --vnet-name branch1 -g $rg --route-table branch1vm-$location1
+    # VM in branch2
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        az vm create -n branch2-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+            --public-ip-address branch2-vm-pip --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
+            --subnet vm --subnet-address-prefix $branch2_vm_subnet --custom-data $cloudinit_file
+        az vm extension set --vm-name branch2-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
+        az network route-table create -n branch2vm-$location2 -g $rg -l $location2
+        az network route-table route create -n mypc -g $rg --route-table-name branch2vm-$location2 \
+            --address-prefix "${myip}/32" --next-hop-type Internet
+        az network route-table route create -n default -g $rg --route-table-name branch2vm-$location2 \
+            --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch2_bgp_ip
+        az network vnet subnet update -n vm --vnet-name branch2 -g $rg --route-table branch2vm-$location2
+    fi
+    # Configure IP forwarding in the CSR NICs
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        vm_names=("branch1-nva")
+    else
+        vm_names=("branch1-nva" "branch2-nva")
+    fi
+    for vm_name in ${vm_names[@]}; do
+        echo "Enabling IP forwarding for $vm_name..."
+        vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        az network nic update --ids $vm_nic_id --ip-forwarding
+    done
+fi
 
-# VM in branch2
-az vm create -n branch2-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-    --public-ip-address branch2-vm-pip --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
-    --subnet vm --subnet-address-prefix $branch2_vm_subnet --custom-data $cloudinit_file
-az vm extension set --vm-name branch2-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
-az network route-table create -n branch2vm-$location2 -g $rg -l $location2
-az network route-table route create -n mypc -g $rg --route-table-name branch2vm-$location2 \
-    --address-prefix "${myip}/32" --next-hop-type Internet
-az network route-table route create -n default -g $rg --route-table-name branch2vm-$location2 \
-    --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch2_bgp_ip
-az network vnet subnet update -n vm --vnet-name branch2 -g $rg --route-table branch2vm-$location2
-
-# Configure IP forwarding in the CSR NICs
-vm_names=("branch1-nva" "branch2-nva")
-for vm_name in ${vm_names[@]}; do
-    echo "Enabling IP forwarding for $vm_name..."
-    vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    az network nic update --ids $vm_nic_id --ip-forwarding
-done
-
-# Optional: configure BGP in the NVAs in spoke14 and spoke24 to VWAN
+# Optional: configure BGP in the NVAs in NVA spokes to VWAN
 if [[ "$nva_bgp" == "yes" ]]
 then
     # Variables
+    echo "Getting information about NVA in spoke 1${indirect_spoke_id}..."
     username=$(whoami)
-    spoke14_nic_id=$(az vm show -n spoke14-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    spoke14_ip=$(az network nic show --ids $spoke14_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-    spoke14_pip=$(az network public-ip show -n spoke14-pip -g $rg --query ipAddress -o tsv)
-    spoke14_default_gw=10.1.4.1
-    spoke14_asn=65014
+    nva1_nic_id=$(az vm show -n "spoke1${indirect_spoke_id}-vm" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    nva1_ip=$(az network nic show --ids $nva1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo "$nva1_ip"
+    nva1_pip=$(az network public-ip show -n "spoke1${indirect_spoke_id}-pip" -g $rg --query ipAddress -o tsv) && echo "$nva1_pip"
+    nva1_default_gw="10.1.${indirect_spoke_id}.1"
+    nva1_asn="6501${indirect_spoke_id}"
+    echo "Getting information about the Route Service in hub1..."
     hub1_rs_ip1=$(az network vhub show -n hub1 -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $hub1_rs_ip1
     hub1_rs_ip2=$(az network vhub show -n hub1 -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $hub1_rs_ip2
     hub1_rs_asn=$(az network vhub show -n hub1 -g $rg --query 'virtualRouterAsn' -o tsv) && echo $hub1_rs_asn
-    spoke24_nic_id=$(az vm show -n spoke24-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    spoke24_ip=$(az network nic show --ids $spoke24_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-    spoke24_pip=$(az network public-ip show -n spoke24-pip -g $rg --query ipAddress -o tsv)
-    spoke24_default_gw=10.2.4.1
-    spoke24_asn=65024
-    hub2_rs_ip1=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $hub2_rs_ip1
-    hub2_rs_ip2=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $hub2_rs_ip2
-    hub2_rs_asn=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterAsn' -o tsv) && echo $hub2_rs_asn
+    echo "Configuring static route in NVA1 for the hub address space $vwan_hub1_prefix"
+    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$nva1_pip" "sudo ip route add $vwan_hub1_prefix via $nva1_default_gw"
+    if [[ "$nva_in_hub2" == "yes" ]] && [[ "$no_of_hubs" == "2" ]]
+    then
+        echo "Getting information about NVA in spoke 2${indirect_spoke_id}..."
+        nva2_nic_id=$(az vm show -n "spoke2${indirect_spoke_id}-vm" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo "$nva2_ip"
+        nva2_pip=$(az network public-ip show -n "spoke2${indirect_spoke_id}-pip" -g $rg --query ipAddress -o tsv) && echo "$nva2_pip"
+        nva2_default_gw="10.2.${indirect_spoke_id}.1"
+        nva2_asn="6502${indirect_spoke_id}"
+        echo "Getting information about the Route Service in hub2..."
+        hub2_rs_ip1=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $hub2_rs_ip1
+        hub2_rs_ip2=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $hub2_rs_ip2
+        hub2_rs_asn=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterAsn' -o tsv) && echo $hub2_rs_asn
+        echo "Configuring static route in NVA2 for the hub address space $vwan_hub2_prefix"
+        ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$nva2_pip" "sudo ip route add $vwan_hub2_prefix via $nva2_default_gw"
+    fi
     # spoke14-vm config
-    bird_config_file=/tmp/bird14.conf
+    bird_config_file="/tmp/bird1${indirect_spoke_id}.conf"
     cat <<EOF > $bird_config_file
 log syslog all;
-router id $spoke14_ip;
+router id $nva1_ip;
 protocol device {
         scan time 10;
 }
@@ -841,23 +1415,23 @@ protocol direct {
     disabled;
 }
 protocol kernel {
+    preference 254;
+    learn;
+    merge paths on;
+    export all;
     import all;
-    export none;
+    #export none;
+    #disabled;
 }
 protocol static {
-    route 1.1.1.1/32 via $spoke14_default_gw;   # Test route
-    # route 10.1.1.0/24 via $spoke14_default_gw;  # To attract traffic to spoke11
-    # route 10.1.2.0/24 via $spoke14_default_gw;  # To attract traffic to spoke12
-    # route 10.1.3.0/24 via $spoke14_default_gw;  # To attract traffic to spoke13
-    # route 10.1.41.0/24 via $spoke14_default_gw;
-    # route 10.1.42.0/24 via $spoke14_default_gw;
-    # route 0.0.0.0/0 via $spoke14_default_gw;    # To attract traffic to Internet
-    route 10.1.40.0/22 via $spoke14_default_gw; # Summary to spokes141 and 142
+    route 1${indirect_spoke_id}.1${indirect_spoke_id}.1${indirect_spoke_id}.1${indirect_spoke_id}/32 via $nva1_default_gw;   # Test route
+    route 10.1.${indirect_spoke_id}1.0/24 via $nva1_default_gw; # Route to spoke1${spoke}1
+    route 10.1.${indirect_spoke_id}2.0/24 via $nva1_default_gw; # Route to spoke1${spoke}2
 }
 protocol bgp rs0 {
     description "VWAN Route Service instance 0";
     multihop;
-    local $spoke14_ip as $spoke14_asn;
+    local $nva1_ip as $nva1_asn;
     neighbor $hub1_rs_ip1 as $hub1_rs_asn;
         import filter {accept;};
         export filter {accept;};
@@ -865,20 +1439,24 @@ protocol bgp rs0 {
 protocol bgp rs1 {
     description "VWAN Route Service instance 1";
     multihop;
-    local $spoke14_ip as $spoke14_asn;
+    local $nva1_ip as $nva1_asn;
     neighbor $hub1_rs_ip2 as $hub1_rs_asn;
         import filter {accept;};
         export filter {accept;};
 }
 EOF
-    scp $bird_config_file "${spoke14_pip}:/home/${username}/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo systemctl restart bird"
-    # spoke24-vm config
-    bird_config_file=/tmp/bird24.conf
-    cat <<EOF > $bird_config_file
+    echo "Copying BIRD config file to NVA in spoke 1${indirect_spoke_id}..."
+    scp $bird_config_file "${nva1_pip}:/home/${username}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo systemctl restart bird"
+
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        # NVA in spoke24-vm config
+        bird_config_file=/tmp/bird2${indirect_spoke_id}.conf
+        cat <<EOF > $bird_config_file
 log syslog all;
-router id $spoke24_ip;
+router id $nva2_ip;
 protocol device {
         scan time 10;
 }
@@ -886,23 +1464,23 @@ protocol direct {
     disabled;
 }
 protocol kernel {
+    preference 254;
+    learn;
+    merge paths on;
+    export all;
     import all;
-    export none;
+    #export none;
+    #disabled;
 }
 protocol static {
-    route 2.2.2.2/32 via $spoke24_default_gw;   # Test route
-    # route 10.2.1.0/24 via $spoke24_default_gw;  # To attract traffic to spoke21
-    # route 10.2.2.0/24 via $spoke24_default_gw;  # To attract traffic to spoke22
-    # route 10.2.3.0/24 via $spoke24_default_gw;  # To attract traffic to spoke23
-    # route 10.2.41.0/24 via $spoke24_default_gw;
-    # route 10.2.42.0/24 via $spoke24_default_gw;
-    # route 0.0.0.0/0 via $spoke24_default_gw;    # To attract traffic to Internet
-    route 10.2.40.0/22 via $spoke24_default_gw; # Summary to spokes241 and 242
+    route 2${indirect_spoke_id}.2${indirect_spoke_id}.2${indirect_spoke_id}.2${indirect_spoke_id}/32 via $nva2_default_gw;   # Test route
+    route 10.2.${indirect_spoke_id}1.0/24 via $nva2_default_gw; # Route to spoke2${spoke}1
+    route 10.2.${indirect_spoke_id}2.0/24 via $nva2_default_gw; # Route to spoke2${spoke}2
 }
 protocol bgp rs0 {
     description "VWAN Route Service instance 0";
     multihop;
-    local $spoke24_ip as $spoke24_asn;
+    local $nva2_ip as $nva2_asn;
     neighbor $hub2_rs_ip1 as $hub2_rs_asn;
         import filter {accept;};
         export filter {accept;};
@@ -910,60 +1488,82 @@ protocol bgp rs0 {
 protocol bgp rs1 {
     description "VWAN Route Service instance 1";
     multihop;
-    local $spoke24_ip as $spoke24_asn;
+    local $nva2_ip as $nva2_asn;
     neighbor $hub2_rs_ip2 as $hub2_rs_asn;
         import filter {accept;};
         export filter {accept;};
 }
 EOF
-    scp $bird_config_file "${spoke24_pip}:/home/${username}/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo systemctl restart bird"
-    # Diagnostics for spoke14
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo birdc show protocols"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo birdc show route protocol rs0"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo birdc show route export rs0"
-    az network nic show-effective-route-table --ids $spoke14_nic_id -o table
-    # Diagnostics for spoke24
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo birdc show protocols"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo birdc show route protocol rs0"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo birdc show route export rs0"
-    az network nic show-effective-route-table --ids $spoke24_nic_id -o table
+        echo "Copying BIRD config file to NVA in spoke 2${indirect_spoke_id}..."
+        scp $bird_config_file "${nva2_pip}:/home/${username}/bird.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo systemctl restart bird"
+    fi
     # Now configure the VWAN side
-    spoke14_cx_id=$( az network vhub connection show -n spoke14 --vhub-name hub1 -g $rg -o tsv --query id)
-    az network vhub bgpconnection create -n spoke14 -g $rg --vhub-name hub1 --peer-asn "$spoke14_asn" --peer-ip "$spoke14_ip" --vhub-conn "$spoke14_cx_id"
-    spoke24_cx_id=$( az network vhub connection show -n spoke24 --vhub-name hub2 -g $rg -o tsv --query id)
-    az network vhub bgpconnection create -n spoke24 -g $rg --vhub-name hub2 --peer-asn "$spoke24_asn" --peer-ip "$spoke24_ip" --vhub-conn "$spoke24_cx_id"
+    nva1_cx_id=$( az network vhub connection show -n "spoke1${indirect_spoke_id}" --vhub-name hub1 -g $rg -o tsv --query id)
+    echo "Creating BGP peering to hub1..."
+    az network vhub bgpconnection create -n spoke1${indirect_spoke_id} -g $rg --vhub-name hub1 --peer-asn "$nva1_asn" --peer-ip "$nva1_ip" --vhub-conn "$nva1_cx_id" -o none
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        nva2_cx_id=$( az network vhub connection show -n spoke2${indirect_spoke_id} --vhub-name hub2 -g $rg -o tsv --query id)
+        echo "Creating BGP peering to hub2..."
+        az network vhub bgpconnection create -n spoke2${indirect_spoke_id} -g $rg --vhub-name hub2 --peer-asn "$nva2_asn" --peer-ip "$nva2_ip" --vhub-conn "$nva2_cx_id" -o none
+    fi
+    # Wait
+    echo "Waiting 30 seconds for BGP to come up..."
+    sleep 30
+    # Diagnostics for NVA in hub1
+    echo "Performing some checks on NVA in spoke1${indirect_spoke_id}..."
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo birdc show protocols"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo birdc show route protocol rs0"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo birdc show route export rs0"
+    az network nic show-effective-route-table --ids $nva1_nic_id -o table
+    # Diagnostics for NVA in hub2
+    if [[ "$nva_in_hub2" == "yes" ]] && [[ "$no_of_hubs" == "2" ]]
+    then
+        echo "Performing some checks on NVA in spoke2${indirect_spoke_id}..."
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo birdc show protocols"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo birdc show route protocol rs0"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo birdc show route export rs0"
+        az network nic show-effective-route-table --ids $nva2_nic_id -o table
+    fi
 fi
 
 # Optional: enable/disable SNAT in the NVAs
-spoke14_pip=$(az network public-ip show -n spoke14-pip -g $rg --query ipAddress -o tsv)
-spoke24_pip=$(az network public-ip show -n spoke24-pip -g $rg --query ipAddress -o tsv)
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -t nat -A POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -t nat -A POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -t nat -D POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -t nat -D POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -L -t nat"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -L -t nat"
-
-# Optional: enable/disable a rule to drop ICMP traffic in the NVA
-spoke14_pip=$(az network public-ip show -n spoke14-pip -g $rg --query ipAddress -o tsv)
-spoke24_pip=$(az network public-ip show -n spoke24-pip -g $rg --query ipAddress -o tsv)
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -A INPUT -p ICMP --icmp-type 8 -j DROP"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -A INPUT -p ICMP --icmp-type 8 -j DROP"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -A FORWARD -p ICMP --icmp-type 8 -j DROP"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -A FORWARD -p ICMP --icmp-type 8 -j DROP"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -D INPUT -p ICMP --icmp-type 8 -j DROP"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -D INPUT -p ICMP --icmp-type 8 -j DROP"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -D FORWARD -p ICMP --icmp-type 8 -j DROP"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -D FORWARD -p ICMP --icmp-type 8 -j DROP"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke14_pip "sudo iptables -L"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke24_pip "sudo iptables -L"
-
+if [[ "$indirect_spokes" == "yes" ]]
+then
+    nva1_pip=$(az network public-ip show -n "spoke1${indirect_spoke_id}-pip" -g $rg --query ipAddress -o tsv)
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -t nat -A POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -t nat -D POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE"
+    echo "Current NAT configuration in NVA in spoke 1${indirect_spoke_id}:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -L -t nat"
+    # Optional: enable/disable a rule to drop ICMP traffic in the NVA
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -A INPUT -p ICMP --icmp-type 8 -j DROP"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -A FORWARD -p ICMP --icmp-type 8 -j DROP"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -D INPUT -p ICMP --icmp-type 8 -j DROP"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -D FORWARD -p ICMP --icmp-type 8 -j DROP"
+    echo "Current iptables rules in NVA in spoke 1${indirect_spoke_id}:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo iptables -L"
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        nva2_pip=$(az network public-ip show -n "spoke2${indirect_spoke_id}-pip" -g $rg --query ipAddress -o tsv)
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -t nat -A POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -t nat -D POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE"
+        echo "Current NAT configuration in NVA in spoke 2${indirect_spoke_id}:"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -L -t nat"
+        # Optional: enable/disable a rule to drop ICMP traffic in the NVA
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -A INPUT -p ICMP --icmp-type 8 -j DROP"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -A FORWARD -p ICMP --icmp-type 8 -j DROP"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -D INPUT -p ICMP --icmp-type 8 -j DROP"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -D FORWARD -p ICMP --icmp-type 8 -j DROP"
+        echo "Current iptables rules in NVA in spoke 2${indirect_spoke_id}:"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo iptables -L"
+    fi
+fi
 
 # Optional: add some VMs with public IPs
 # This can be used to test AzFW default SNAT behavior
@@ -1016,12 +1616,114 @@ fi
 if [[ "$deploy_nva_hub1" == "yes" ]]
 then
     create_hub_nva 1
-    configure_hub_nva_bgp 1
+    #configure_hub_nva_bgp 1    # If no branches (only configures BGP to RS)
+    create_hub_nva_branch 1     # Takes care as well of the BGP config to the RS
 fi
-if [[ "$deploy_nva_hub2" == "yes" ]]
+if [[ "$deploy_nva_hub2" == "yes" ]] && [[ "$no_of_hubs" == "2" ]]
 then
     create_hub_nva 2
-    configure_hub_nva_bgp 2
+    #configure_hub_nva_bgp 2    # If no branches (only configures BGP to RS)
+    create_hub_nva_branch 2     # Takes care as well of the BGP config to the RS
+fi
+
+# Optional: ExpressRoute (WORK IN PROGRESS!!)
+if [[ "$deploy_er" == "yes" ]]
+then
+    # Create onprem ER branch
+    onprem_vnet_name=branch5
+    echo "Creating VNet branch5 to simulate an ER branch..."
+    az network vnet create -n $onprem_vnet_name -g $rg --address-prefix $branch5_prefix -o none
+    az network vnet subnet create -g $rg -n $branch5_vm_subnet_name --vnet-name $onprem_vnet_name --address-prefix $branch5_vm_subnet_prefix -o none
+    az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name $onprem_vnet_name --address-prefix $branch5_gw_subnet_prefix -o none
+    echo "Creating ER gateway in branch5 (--no-wait)..."
+    az network public-ip create -g $rg -n ${branch5_gw_name}-pip --allocation-method Dynamic --sku Basic -o none
+    az network vnet-gateway create -g $rg -n ${branch5_gw_name} --gateway-type ExpressRoute --sku Standard -l $branch5_location --vnet $onprem_vnet_name --public-ip-addresses "${branch5_gw_name}-pip" --no-wait -o none
+    # Create VWAN ER and circuits
+    echo "Creating ER gateway in hub1..."
+    az network express-route gateway create -g $rg -n hub1ergw --virtual-hub hub1 -l $location1 -o none
+    echo "Creating ER circuit in $hub1_er_pop"
+    az network express-route create -n hub1er --peering-location $hub1_er_pop -g $rg \
+        --bandwidth 50 Mbps --provider $er_provider -l $location1 --sku-family MeteredData --sku-tier $er_circuit_sku -o none
+    service_key_1=$(az network express-route show -n hub1er -g $rg --query serviceKey -o tsv) && echo "Service Key is $service_key_1"
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        echo "Creating ER gateway in hub2..."
+        az network express-route gateway create -g $rg -n hub2ergw --virtual-hub hub2 -l $location2 -o none
+        echo "Creating ER circuit in $hub2_er_pop"
+        az network express-route create -n hub2er --peering-location $hub2_er_pop -g $rg \
+            --bandwidth 50 Mbps --provider $er_provider -l $location2 --sku-family MeteredData --sku-tier $er_circuit_sku -o none
+        service_key_2=$(az network express-route show -n hub2er -g $rg --query serviceKey -o tsv) && echo "Service Key is $service_key_2"
+    fi
+    # Provision Megaport MCR in locations for hub1/hub2 (it could be the same)
+    if [[ -e "$megaport_script_location" ]]
+    then
+        echo "Creating MCR in $hub1_er_pop..."
+        $megaport_script_location -q -s=jomore-${hub1_er_pop} -a=create_mcr -k=$service_key_1
+        sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+        echo "Connecting MCR in $hub1_er_pop with ER circuit in hub1..."
+        $megaport_script_location -q -s=jomore-${hub1_er_pop} -a=create_vxc -k=$service_key_1
+        if [[ "$no_of_hubs" == "2" ]]
+        then
+            if [[ "$hub1_er_pop" != "$hub2_er_pop" ]]
+            then
+                echo "Creating MCR in $hub2_er_pop..."
+                $megaport_script_location -q -s=jomore-${hub2_er_pop} -a=create_mcr -k=$service_key_2
+                sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+            fi
+            echo "Connecting MCR in $hub2_er_pop with ER circuit in hub2..."
+            $megaport_script_location -q -s=jomore-${hub2_er_pop} -a=create_vxc -k=$service_key_2
+        fi
+    else
+        echo "Sorry, I cannot seem to find the script $megaport_script_location to interact with the Megaport API"
+    fi
+    # Wait until circuits are provisioned
+    circuit1_id=$(az network express-route show -n hub1er -g $rg -o tsv --query id) && echo "Circuit ID is $circuit1_id"
+    circuit1_state=$(az network express-route show -n hub1er -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit1_state"
+    echo "Waiting until ER circuit in hub1 is provisioned..."
+    until [[ "$circuit1_state" == "Provisioned" ]]
+    do
+        sleep 15
+        circuit1_state=$(az network express-route show -n hub1er -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit1_state_1"
+    done
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        circuit2_id=$(az network express-route show -n hub2er -g $rg -o tsv --query id) && echo "Circuit ID is $circuit2_id"
+        circuit2_state=$(az network express-route show -n hub2er -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit2_state"
+        echo "Waiting until ER circuit in hub2 is provisioned..."
+        until [[ "$circuit2_state" == "Provisioned" ]]
+        do
+            sleep 15
+            circuit2_state=$(az network express-route show -n hub2er -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit_state"
+        done
+    fi
+    # Create connections
+    peering_id_1=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name hub1er -g $rg -o tsv --query id) && echo "Private peering ID is $peering_id_1"
+    if [[ -z "$peering_id_1" ]]
+    then
+        echo "Could not find private peering for ER circuit 1, you might have to refresh in the portal?"
+    else
+        hub1_default_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n defaultRouteTable --query id -o tsv) && echo $hub1_default_rt_id
+        echo "Connecting branch5 to ER circuit 1..."
+        az network vpn-connection create -n "${branch5_gw_name}-${er_pop}-$RANDOM" -g $rg -l $branch5_location --vnet-gateway1 $branch5_gw_name --express-route-circuit2 $circuit1_id -o none
+        echo "Connecting VWAN hub1 to ER circuit 1..."
+        az network express-route gateway connection create --gateway-name hub1ergw -n "hub1ergw-${hub1_er_pop}" -g $rg --peering $peering_id_1 \
+            --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default -o none
+    fi
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        peering_id_2=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name hub2er -g $rg -o tsv --query id) && echo "Private peering ID is $peering_id_2"
+        if [[ -z "$peering_id_2" ]]
+        else
+            echo "Could not find private peering for ER circuit 2, you might have to refresh in the portal?"
+        then
+            hub2_default_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n defaultRouteTable --query id -o tsv) && echo $hub1_default_rt_id
+            echo "Connecting branch5 to ER circuit 2..."
+            az network vpn-connection create -n "${branch5_gw_name}-${er_pop}-$RANDOM" -g $rg -l $branch5_location --vnet-gateway1 $branch5_gw_name --express-route-circuit2 $circuit2_id -o none
+            echo "Connecting VWAN hub2 to ER circuit 2..."
+            az network express-route gateway connection create --gateway-name hub2ergw -n "hub2ergw-${hub2_er_pop}" -g $rg --peering $peering_id_2 \
+                --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id --labels default -o none
+        fi
+    fi
 fi
 
 ##############################
@@ -1314,6 +2016,11 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_lo
 #################
 
 # az group delete -n $rg -y --no-wait
+if [[ "$deploy_er" == "yes" ]]
+then
+    # Remove MCR from Megaport
+    $megaport_script_location -q -s=jomore -a=delete_mcr
+fi
 # locations=($location1 $location2)
 # for location in ${locations[@]}; do
 #     monitor_list=$(az network watcher connection-monitor list -l $location --query '[].name' -o tsv)
