@@ -233,20 +233,39 @@ echo "Connect to $aro_console_url (username kubeadmin, password $aro_pwd)"
 # Deploy sample app (public API) #
 ##################################
 
+# Create pods
 project_name=kuard
 oc new-project $project_name
 oc new-app --docker-image gcr.io/kuar-demo/kuard-amd64:1
 # Expose with clusterIP and router
-oc expose dc kuard-amd64 --port 8080 --name kuard
+oc expose deploy kuard-amd64 --port 8080 --name kuard
 oc expose svc kuard --name kuard
-
 # Expose with an internal ALB
 oc expose dc kuard-amd64 --port 8080 --type=LoadBalancer --name=kuardilb --dry-run -o yaml | awk '1;/metadata:/{ print "  annotations:\n    service.beta.kubernetes.io/azure-load-balancer-internal: \"true\"" }' | oc create -f -
 # Expose with an internal ALB in different subnet
 ilb_subnet_name=apps
 oc expose dc kuard-amd64 --port 8080 --type=LoadBalancer --name=kuard --dry-run -o yaml | awk '1;/metadata:/{ print "  annotations:\n    service.beta.kubernetes.io/azure-load-balancer-internal: \"true\"\n    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: \"'${ilb_subnet_name}'\"" }' | oc create -f -
-# Exposing ClusterIP Svc over a route
+# Exposing existing ClusterIP Svc over a route
 oc expose svc kuardilb
+# Expose with a public ALB
+oc expose deploy kuard-amd64 --port 80 --type=LoadBalancer --name=kuardplb
+
+# Sample pod running in privileged mode
+yaml_file=/tmp/privileged.yml
+cat <<EOF > $yaml_file
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-privileged
+spec:
+  containers:
+    - name: nginx-privileged
+      image: mcr.microsoft.com/oss/nginx/nginx:1.15.5-alpine
+      securityContext:
+        privileged: true
+EOF
+kubectl apply -f $yaml_file
+
 
 ############################
 #   Machine Sets and CA    #

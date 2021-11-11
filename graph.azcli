@@ -1,0 +1,54 @@
+##########################################################
+# Examples of Azure Graph queries and useful commands
+#
+# Jose Moreno, October 2021
+##########################################################
+
+# Sample queries
+# See more in https://docs.microsoft.com/azure/governance/resource-graph/samples/advanced?tabs=azure-cli
+
+# Kubernetes
+query="where type=~'microsoft.containerservice/managedclusters'"
+query="where type=='microsoft.containerservice/managedclusters' | distinct id"
+query="where type=='microsoft.containerservice/managedclusters' | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | where sku.tier=='Paid' | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | where properties.publicNetworkAccess=='Enabled' and isnull(properties.apiServerAccessProfile) | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | where isnotnull(properties.networkProfile.networkPolicy) | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | where isnotnull(properties.addonProfiles.httpApplicationRouting) | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | where isnotnull(properties.addonProfiles.omsagent) | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | where isnotnull(properties.addonProfiles.aciConnectorLinux) and properties.addonProfiles.aciConnectorLinux.enabled==true | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | where properties.nodeResourceGroup \!startswith 'MC_' | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | project name=name+"-"properties.agentPoolProfiles[].name"
+query="where type=='microsoft.containerservice/managedclusters' | project resourceGroup,name,pools=properties.agentPoolProfiles | mv-expand pools | where pools.osDiskType=='Managed' | project name=strcat(name,'-',pools.name), resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | project resourceGroup,name,pools=properties.agentPoolProfiles | mv-expand pools | where pools.mode=='User' | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | project resourceGroup,name,pools=properties.agentPoolProfiles | project name,resourceGroup,poolcount=array_length(pools) | where poolcount > 1"
+query="where type=='microsoft.containerservice/managedclusters' | where isnull(zones) | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | where properties.servicePrincipalProfile.clientId=='msi' | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | where isnull(properties.aadProfile) | distinct name,resourceGroup"
+query="where type=='microsoft.containerservice/managedclusters' | project resourceGroup,name,pools=properties.agentPoolProfiles | mv-expand pools | project subnetId=tostring(pools.vnetSubnetID) | where isnotempty(subnetId)"
+query="where type=='microsoft.network/virtualnetworks' | project resourceGroup,name,enableDdosProtection=properties.enableDdosProtection,subnets=properties.subnets | mv-expand subnets | project resourceGroup,name,enableDdosProtection,subnetId=tostring(subnets.id)"
+query="Resources | where type=~'microsoft.containerservice/managedclusters' | project resourceGroup,name,pools=properties.agentPoolProfiles 
+| mv-expand pools 
+| project subnetId=tostring(pools.vnetSubnetID)
+| where isnotempty(subnetId) 
+| join (Resources | where type=='microsoft.network/virtualnetworks' 
+| project resourceGroup,name,enableDdosProtection=tostring(properties.enableDdosProtection),subnets=properties.subnets 
+| mv-expand subnets 
+| project resourceGroup,name,enableDdosProtection,subnetId=tostring(subnets.id)) on subnetId
+| distinct resourceGroup,name,enableDdosProtection
+| where enableDdosProtection == 'false'"
+
+# Network
+query="where type=='microsoft.network/virtualnetworkgateways' | where not (tolower(properties.sku.name) contains 'az') | distinct name,resourceGroup"
+query="where type=='microsoft.network/routetables' | where properties.disableBgpRoutePropagation==true | distinct name,resourceGroup"
+query="where type=='microsoft.network/virtualnetworkgateways' | where tolower(properties.gatewayType) == 'vpn' | project  name,resourceGroup,ipcount=array_length(properties.ipConfigurations) | where ipcount==1"
+query="where type=='microsoft.network/networksecuritygroups'"
+
+# See available types
+query="distinct type"
+
+# Advanced properties
+query="Resources | where type == 'microsoft.compute/virtualmachines' | summarize count() by tostring(properties.extended.instanceView.powerState.code)
+
+# Run query
+az graph query -q "$query" --query data -o tsv

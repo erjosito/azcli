@@ -9,6 +9,7 @@
 rg=akstest
 location=westcentralus
 wait_interval=5s
+use_msi=yes
 # AKS
 aks_name=aks
 aks_rbac=yes
@@ -33,9 +34,8 @@ apim_subnet_prefix=10.13.12.0/24
 db_subnet_prefix=10.13.50.0/24
 akslb_subnet_prefix=10.13.77.0/24
 arm_subnet_prefix=10.13.79.0/24
+aci_subnet_name=aci
 aci_subnet_prefix=10.13.100.0/24
-# Identity
-use_msi=yes
 # Other resources
 kv_name=erjositoKeyvault
 acr_name=erjositoAcr
@@ -231,6 +231,13 @@ az aks update -g $rg -n $aks_name --enable-cluster-autoscaler --min-count 1 --ma
 # Modify autoscaler profile (see https://docs.microsoft.com/azure/aks/cluster-autoscaler#using-the-autoscaler-profile)
 az aks update -g $rg -n $aks_name --cluster-autoscaler-profile scale-down-unneeded-time=1m
 
+# Enable virtual node
+az network vnet subnet create -g $rg -n $aci_subnet_name --vnet-name $vnet_name --address-prefix $aci_subnet_prefix
+az aks enable-addons --addons virtual-node -n $aks_name -g $rg --subnet-name $aci_subnet_name
+
+# Enable Azure Policy
+az aks enable-addons --addons azure-policy -n $aks_name -g $rg
+
 # Add diag settings for cluster logs
 aks_id=$(az aks show -n $aks_name -g $rg --query id -o tsv)
 az monitor diagnostic-settings create -n mydiag --resource $aks_id --workspace $logws_id \
@@ -249,6 +256,13 @@ az aks update -g $rg -n $aks_name --enable-managed-identity -y
 # Update to new version
 new_aks_version=1.21.2
 az aks upgrade -n $aks_name -g $rg -k $new_aks_version -y
+
+#####################
+#  IP restrictions  #
+#####################
+
+myip=$(curl -s4 ifconfig.co) && echo $myip
+az aks update -g $rg -n $aks_name --api-server-authorized-ip-ranges "${myip}/32"
 
 #####################
 # Add a second pool #

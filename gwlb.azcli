@@ -1,0 +1,322 @@
+################################
+#
+# Jose Moreno, November 2021
+#
+################################
+
+# See https://docs.microsoft.com/en-us/azure/load-balancer/tutorial-gateway-cli
+
+# Variables
+rg=gwlb
+location=westeurope
+client1_vnet_name=client1
+client1_vnet_prefix=192.168.1.0/24
+client1_subnet_name=vm
+client1_subnet_prefix=192.168.1.0/26
+client1_vm1_name=client1vm1
+client1_lb_name=client1lb
+client1_internal_vni=900
+client1_internal_port=10800
+client1_external_vni=901
+client1_external_port=10801
+client2_vnet_name=client2
+client2_vnet_prefix=192.168.2.0/24
+client2_subnet_name=vm
+client2_subnet_prefix=192.168.2.0/26
+client2_vm1_name=client2vm1
+clien2_lb_name=client2lb
+client2_internal_vni=902
+client2_internal_port=10802
+client2_external_vni=903
+client2_external_port=10803
+nva_vnet_name=nva
+nva_type=linux # 'linux' or 'csr'
+nva_vnet_prefix=192.168.0.0/24
+nva_subnet_name=nva
+nva_subnet_prefix=192.168.0.0/26
+vm_nsg_name=vmnsg
+nva1_name=nva1
+nva_lb_name=nvalb
+vm_sku=Standard_B1s
+vm_cloudinit_filename=/tmp/vmcloudinit
+nva_cloudinit_filename=/tmp/nvacloudinit
+
+
+# Register feature
+feature_name=AllowGatewayLoadBalancer
+rp=Network
+state=$(az feature list -o table --query "[?contains(name, 'microsoft.${rp}/${feature_name}')].properties.state" -o tsv)
+if [[ "$state" == "Registered" ]]
+then
+    echo "$feature_name is already registered"
+else
+    echo "$feature_name state is $state, Registering feature $feature_name now..."
+    az feature register --name "$feature_name" --namespace Microsoft.$rp -o none
+    state=$(az feature list -o table --query "[?contains(name, 'Microsoft.${rp}/${feature_name}')].properties.state" -o tsv)
+    echo "Waiting for feature $feature_name to finish registering..."
+    wait_interval=15
+    until [[ "$state" == "Registered" ]]
+    do
+        sleep $wait_interval
+        state=$(az feature list -o table --query "[?contains(name, 'Microsoft.${rp}/${feature_name}')].properties.state" -o tsv)
+        echo "Current registration status for feature microsoft.${rp}/${feature_name} is $state"
+    done
+    echo "Registering resource provider Microsoft.$rp now..."
+    az provider register --namespace Microsoft.$rp
+fi
+
+# Create RG
+echo "Creating RG and VNets..."
+az group create -n $rg -l $location -o none
+az network vnet create -n $client1_vnet_name -g $rg --address-prefixes $client1_vnet_prefix --subnet-name $client1_subnet_name --subnet-prefixes $client1_subnet_prefix -o none
+az network vnet create -n $client2_vnet_name -g $rg --address-prefixes $client2_vnet_prefix --subnet-name $client2_subnet_name --subnet-prefixes $client2_subnet_prefix -o none
+az network vnet create -n $nva_vnet_name -g $rg --address-prefixes $nva_vnet_prefix --subnet-name $nva_subnet_name --subnet-prefixes $nva_subnet_prefix -o none
+
+# Create NSG for VMs and NVAs
+echo "Creating NSG..."
+myip=$(curl -s4 ifconfig.co)
+az network nsg create -n $vm_nsg_name -g $rg -o none
+az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --source-address-prefixes "${myip}/32" --destination-port-ranges 22 --access Allow --protocol Tcp  -o none
+az network nsg rule create -n web8080 --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp -o none
+az network nsg rule create -n https --nsg-name $vm_nsg_name -g $rg --priority 520 --destination-port-ranges 443 --access Allow --protocol Tcp -o none
+az network nsg rule create -n web80 --nsg-name $vm_nsg_name -g $rg --priority 530 --destination-port-ranges 80 --access Allow --protocol Tcp -o none
+az network nsg rule create -n vxlan --nsg-name $vm_nsg_name -g $rg --priority 540 --destination-port-ranges 4789 --access Allow --protocol Udp -o none
+az network nsg rule create -n tunnels --nsg-name $vm_nsg_name -g $rg --priority 550 --destination-port-ranges 10800-10801 --access Allow --protocol Udp -o none
+
+# Deploy a Linux VM with a troubleshooting web page for client 1
+echo "Creating VM in vnet $client1_vnet_name..."
+vm_name=$client1_vm1_name
+vm_pip_name="${vm_name}-pip"
+az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -o none
+cat <<EOF > $vm_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update && apt install -y python3-pip
+  - pip3 install flask
+  - wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
+  - python3 /root/myip.py &
+EOF
+az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
+   --vnet-name $client1_vnet_name --subnet $client1_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
+   --custom-data $vm_cloudinit_filename -o none
+client1_vm1_nic_id=$(az vm show -n $client1_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+client1_vm1_nic_name=$(echo $client1_vm1_nic_id | cut -d/ -f 9)
+client1_vm1_private_ip=$(az network nic show -n $client1_vm1_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+client1_vm1_public_ip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+echo "VM created in VNet $client1_vnet_name with private IP $client1_vm1_private_ip and public IP $client1_vm1_public_ip"
+
+# Deploy a Linux VM with a troubleshooting web page for client 2
+echo "Creating VM in vnet $client2_vnet_name..."
+vm_name=$client2_vm1_name
+vm_pip_name="${vm_name}-pip"
+az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -o none
+cat <<EOF > $vm_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update && apt install -y python3-pip
+  - pip3 install flask
+  - wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
+  - python3 /root/myip.py &
+EOF
+az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
+   --vnet-name $client2_vnet_name --subnet $client2_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
+   --custom-data $vm_cloudinit_filename -o none
+client2_vm1_nic_id=$(az vm show -n $client2_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+client2_vm1_nic_name=$(echo $client2_vm1_nic_id | cut -d/ -f 9)
+client2_vm1_private_ip=$(az network nic show -n $client2_vm1_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+client2_vm1_public_ip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+echo "VM created in VNet $client2_vnet_name with private IP $client2_vm1_private_ip and public IP $client2_vm1_public_ip"
+
+# Deploy the NVA
+echo "Creating NVA in VNet $nva_vnet_name..."
+nva1_pip_name="${nva1_name}-pip"
+# Linux
+if [[ "$nva_type" == "linux" ]]; then
+    cat <<EOF > $nva_cloudinit_filename
+#cloud-config
+runcmd:
+#- apt update
+- sysctl -w net.ipv4.ip_forward=1
+#- sysctl -w net.ipv6.conf.all.forwarding=1
+#- sysctl -w net.ipv4.conf.all.accept_redirects = 0 
+#- sysctl -w net.ipv4.conf.all.send_redirects = 0
+- iptables -A FORWARD -j ACCEPT
+#- iptables -t nat -A POSTROUTING ! -d '192.168.0.0/16' -o eth0 -j MASQUERADE
+EOF
+    az network public-ip create -g $rg -n $nva1_pip_name --sku standard --allocation-method static -o none
+    az vm create -n $nva1_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku --custom-data $nva_cloudinit_filename \
+    --vnet-name $nva_vnet_name --subnet $nva_subnet_name --nsg $vm_nsg_name --public-ip-address "$nva1_pip_name"
+    nva1_nic_id=$(az vm show -n $nva1_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $nva1_nic_id --ip-forwarding -o none
+    nva1_nic_name=$(echo $nva1_nic_id | cut -d/ -f 9)
+    nva1_private_ip=$(az network nic show -n $nva1_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    nva1_public_ip=$(az network public-ip show -n $nva1_pip_name -g $rg --query ipAddress -o tsv)
+    echo "Linux NVA created in VNet $nva_vnet_name with private IP $nva1_private_ip and public IP $nva1_public_ip"
+# CSR
+elif [[ "$nva_type" == 'csr' ]]; then
+    nva_size=Standard_B2ms
+    publisher=cisco
+    offer=cisco-csr-1000v
+    sku=16_12-byol
+    version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+    az network public-ip create -g $rg -n $nva1_pip_name --sku standard --allocation-method static -o none
+    az vm create -n $nva1_name -g $rg --image ${publisher}:${offer}:${sku}:${version} --generate-ssh-keys --nsg $vm_nsg_name --size $nva_size \
+        --public-ip-address $nva1_pip_name --vnet-name $nva_vnet_name --subnet $nva_subnet_name -o none
+    nva1_nic_id=$(az vm show -n $nva1_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $nva1_nic_id --ip-forwarding -o none
+    nva1_nic_name=$(echo $nva1_nic_id | cut -d/ -f 9)
+    nva1_private_ip=$(az network nic show -n $nva1_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    nva1_public_ip=$(az network public-ip show -n $nva1_pip_name -g $rg --query ipAddress -o tsv)
+    echo "Cisco CSR created in VNet $nva_vnet_name with private IP $nva1_private_ip and public IP $nva1_public_ip"
+else
+    echo "NVA type $nva_type not recognized, please use either 'linux' or 'csr'."
+fi
+
+# Create client1 public ALB
+echo "Creating client1 ALB..."
+client1_lb_name="${client1_vnet_name}-alb"
+client1_lb_pip_name="${client1_lb_name}-pip"
+az network public-ip create -g $rg -n $client1_lb_pip_name --sku standard --allocation-method static -o none
+client1_lb_public_ip=$(az network public-ip show -n $client1_lb_pip_name -g $rg --query ipAddress -o tsv)
+az network lb create -n $client1_lb_name -g $rg --sku Standard --vnet-name $client1_vnet_name --public-ip-address $client1_lb_pip_name --backend-pool-name vms --frontend-ip-name vmfrontend -o none
+az network lb probe create -n vmprobe --lb-name $client1_lb_name -g $rg --protocol tcp --port 8080 --interval 5 --threshold 2 -o none
+az network lb rule create -n vmrule --lb-name $client1_lb_name -g $rg -o none \
+    --protocol tcp --frontend-port 8080 --backend-port 8080 --frontend-ip-name vmfrontend --backend-pool-name vms --probe-name vmprobe
+client1_vm1_ipconfig_name=$(az network nic show --ids $client1_vm1_nic_id --query 'ipConfigurations[0].name' -o tsv)
+az network nic ip-config address-pool add --nic-name $client1_vm1_nic_name -g $rg --ip-config-name $client1_vm1_ipconfig_name --lb-name $client1_lb_name --address-pool vms -o none
+
+# Create client2 public ALB
+echo "Creating client2 ALB..."
+client2_lb_name="${client2_vnet_name}-alb"
+client2_lb_pip_name="${client2_lb_name}-pip"
+az network public-ip create -g $rg -n $client2_lb_pip_name --sku standard --allocation-method static -o none
+client2_lb_public_ip=$(az network public-ip show -n $client2_lb_pip_name -g $rg --query ipAddress -o tsv)
+az network lb create -n $client2_lb_name -g $rg --sku Standard --vnet-name $client2_vnet_name --public-ip-address $client2_lb_pip_name --backend-pool-name vms --frontend-ip-name vmfrontend -o none
+az network lb probe create -n vmprobe --lb-name $client2_lb_name -g $rg --protocol tcp --port 8080 --interval 5 --threshold 2 -o none
+az network lb rule create -n vmrule --lb-name $client2_lb_name -g $rg -o none \
+    --protocol tcp --frontend-port 8080 --backend-port 8080 --frontend-ip-name vmfrontend --backend-pool-name vms --probe-name vmprobe
+client2_vm1_ipconfig_name=$(az network nic show --ids $client2_vm1_nic_id --query 'ipConfigurations[0].name' -o tsv)
+az network nic ip-config address-pool add --nic-name $client2_vm1_nic_name -g $rg --ip-config-name $client2_vm1_ipconfig_name --lb-name $client2_lb_name --address-pool vms -o none
+
+# Test the VMs and LBs
+curl "http://${client1_vm1_public_ip}:8080/api/healthcheck"
+curl "http://${client1_lb_public_ip}:8080/api/healthcheck"
+curl "http://${client2_vm1_public_ip}:8080/api/healthcheck"
+curl "http://${client2_lb_public_ip}:8080/api/healthcheck"
+
+# Create NVA LB (SKU 'Gateway')
+echo "Creating gateway ALB..."
+az network lb create -n $nva_lb_name -g $rg --sku Gateway --vnet-name $nva_vnet_name --subnet $nva_subnet_name --backend-pool-name nvas --frontend-ip-name nvafrontend -o none
+az network lb address-pool tunnel-interface add --address-pool nvas --lb-name $nva_lb_name -g $rg --type External --protocol VXLAN --identifier '901'  --port '10801' -o none
+az network lb probe create -n nvaprobe --lb-name $nva_lb_name -g $rg --protocol tcp --port 22 --interval 5 --threshold 2 -o none
+az network lb rule create -n nvarule --lb-name $nva_lb_name -g $rg -o none \
+    --protocol All --frontend-port 0 --backend-port 0 --frontend-ip-name nvafrontend --backend-pool-name nvas --probe-name nvaprobe
+nva1_ipconfig_name=$(az network nic show --ids $nva1_nic_id --query 'ipConfigurations[0].name' -o tsv)
+nva_lb_ip=$(az network lb frontend-ip show -n nvafrontend --lb-name $nva_lb_name -g $rg --query privateIpAddress -o tsv)
+
+# Add NVA1 to NVA LB
+az network nic ip-config address-pool add --nic-name $nva1_nic_name -g $rg --ip-config-name $nva1_ipconfig_name --lb-name $nva_lb_name --address-pool nvas -o none
+
+# Update tunnel interfaces in the backend pool with other IDs/ports (optional)
+# az network nic ip-config address-pool remove --nic-name $nva1_nic_name -g $rg --ip-config-name $nva1_ipconfig_name --lb-name $nva_lb_name --address-pool nvas -o none
+# az network lb address-pool tunnel-interface update --index 0 --address-pool nvas --lb-name $nva_lb_name -g $rg --type Internal --protocol VXLAN --identifier '900' --port '10800' -o none
+# az network lb address-pool tunnel-interface update --index 1 --address-pool nvas --lb-name $nva_lb_name -g $rg --type External --protocol VXLAN --identifier '901' --port '10801' -o none
+# az network nic ip-config address-pool add --nic-name $nva1_nic_name -g $rg --ip-config-name $nva1_ipconfig_name --lb-name $nva_lb_name --address-pool nvas -o none
+
+# Chain client1 ALB with the GW ALB
+echo "Chaining ALB in client1 to NVA ALB..."
+nva_fe_id=$(az network lb frontend-ip show --lb-name $nva_lb_name -g $rg -n nvafrontend --query id -o tsv)
+az network lb frontend-ip update -n vmfrontend --lb-name $client1_lb_name -g $rg --public-ip-address $client1_lb_pip_name --gateway-lb $nva_fe_id -o none
+
+# Create tunnel interfaces in Linux NVA
+if [[ "$nva_type" == "linux" ]]; then
+    # Larger MTUs shouldnt be a problem these days
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ifconfig eth0 mtu 1600"
+    # Internal
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link add vxlan${client1_internal_vni} type vxlan id ${client1_internal_vni} remote ${nva_lb_ip} dstport ${client1_internal_port} nolearning"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link set vxlan${client1_internal_vni} up"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip route add ${client1_lb_public_ip}/32 dev vxlan${client1_internal_vni} metric 100"
+    # External
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link add vxlan${client1_external_vni} type vxlan id ${client1_external_vni} remote ${nva_lb_ip} dstport ${client1_external_port} nolearning"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link set vxlan${client1_external_vni} up"
+    # Optional: bridge both VXLAN interfaces together (cheating!!!)
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link add br-client1 type bridge"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link set vxlan${client1_internal_vni} master br-client1"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link set vxlan${client1_external_vni} master br-client1"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link set br-client1 up"
+    # Optional: delete all VXLAN interfaces and route
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip route delete ${client1_lb_public_ip}/32 dev vxlan${client1_internal_vni}"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link delete vxlan${client1_internal_vni}"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link delete vxlan${client1_external_vni}"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ip link delete br-client1"
+    # Optional: restart VM
+    # az vm restart -n $nva1_name -g $rg -o none
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo sysctl -w net.ipv4.ip_forward=1"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sudo ifconfig eth0 mtu 1600"
+
+# Create tunnel interfaces in the Cisco NVA
+# Cisco CSR not working, since in IOS-XE the VXLAN destination port is a global setting, not a per-interface configuration
+elif [[ "$nva_type" == 'csr' ]]; then
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip <<EOF
+config t
+    ip vrf Client1
+        rd 100:1
+        route-target both 100:1
+        address-family ipv4
+    ip vrf Client2
+        rd 200:1
+        route-target both 200:1
+        address-family ipv4
+    interface Tunnel10
+        description Client1-Internal
+        ip vrf forwarding Client1
+        tunnel mode vxlan ipv4 default-mac
+        tunnel destination $client_lb_public_ip
+        tunnel vxlan vni $client1_internal_vni
+    interface Tunnel11
+        description Client1-External
+        ip vrf forwarding Client1
+        tunnel mode vxlan ipv4 default-mac
+        tunnel destination $client_lb_public_ip
+        tunnel vxlan vni $client1_external_vni
+    interface Tunnel20
+        description Client2-Internal
+        ip vrf forwarding Client2
+        tunnel mode vxlan ipv4 default-mac
+        tunnel destination $client_lb_public_ip
+        tunnel vxlan vni $client2_internal_vni
+    interface Tunnel21
+        description Client2-External
+        ip vrf forwarding Client2
+        tunnel mode vxlan ipv4 default-mac
+        tunnel destination $client_lb_public_ip
+        tunnel vxlan vni $client2_external_vni
+    end
+    write mem
+EOF
+else
+    echo "NVA type $nva_type not recognized, please use either 'linux' or 'csr'."
+fi
+
+# Delete NVA (if required)
+# echo "Deleting NVA ${nva1_name}..."
+# nva1_disk_id=$(az vm show -n $nva1_name -g $rg --query 'storageProfile.osDisk.managedDisk.id' -o tsv)
+# az vm delete -n $nva1_name -g $rg -y
+# az network nic delete --ids $nva1_nic_id
+# az disk delete --ids $nva1_disk_id -y
+# az network public-ip delete -n $nva1_pip_name -g $rg
+
+# Diagnostics
+az network lb list -g $rg -o table
+az network lb frontend-ip list --lb-name $client1_lb_name -g $rg -o table
+az network lb address-pool list --lb-name $nva_lb_name -g $rg -o table
+az network lb address-pool tunnel-interface list --address-pool nvas --lb-name $nva_lb_name -g $rg -o table
+az network lb address-pool address list --pool-name nvas --lb-name $nva_lb_name -g $rg -o table
+az network lb probe list --lb-name $nva_lb_name -g $rg -o table
+az network lb rule list --lb-name $nva_lb_name -g $rg -o table
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "ip a"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "sysctl net.ipv4.ip_forward"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "ifconfig vxlan${client1_internal_vni}"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "ip -d link show vxlan${client1_internal_vni}"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "route -n"
+az network nic show --ids $nva1_nic_id --query enableIpForwarding -o tsv
