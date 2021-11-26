@@ -1,0 +1,83 @@
+# Variables
+rg=velocloud
+location=westeurope
+hub_vnet_name=hub
+hub_vnet_prefix=10.1.0.0/24
+hub_velo_subnet_public_name=velopub
+hub_velo_subnet_public_prefix=10.1.0.0/26
+hub_velo_subnet_private_name=velopriv
+hub_velo_subnet_private_prefix=10.1.0.64/26
+hub_velo1_name=velo1
+hub_velo1_nic_public_name=velo1nic1
+hub_velo1_nic_private_name=velo1nic2
+hub_velo1_pip_name=velo1pip
+spoke1_vnet_name=spoke1
+spoke1_vnet_prefix=10.1.11.0/24
+spoke1_vm_subnet_name=vm
+spoke1_vm_subnet_prefix=10.1.11.0/26
+spoke2_vnet_name=spoke2
+spoke2_vnet_prefix=10.1.12.0/24
+spoke2_vm_subnet_name=vm
+spoke2_vm_subnet_prefix=10.1.12.0/26
+velo_publisher=vmware-inc
+velo_offer=sol-42222-bbj
+velo_sku=vmware_sdwan_4x
+velo_version=4.2.1
+velo_ignore_cert_errors='true'
+velo_nsg_name=velonsg
+velo_cloudinit=/tmp/velocloudinit.txt
+velo_vm_size=Standard_B2ms
+sshkey=$(cat ~/.ssh/id_rsa.pub)
+keyvault_name=erjositoKeyvault
+velo1_token_secret_name=velocloudtoken1
+velo_vco_secret_name=velovco
+
+# Create RG and VNets
+echo "Creating RG and VNets..."
+az group create -n $rg -l $location -o none
+az network vnet create -n $hub_vnet_name -g $rg --address-prefixes $hub_vnet_prefix --subnet-name $hub_velo_subnet_public_name --subnet-prefixes $hub_velo_subnet_private_prefix -o none
+az network vnet subnet create -g $rg -n $hub_velo_subnet_private_name --vnet-name $hub_vnet_name --address-prefix $hub_velo_subnet_private_prefix -o none
+az network vnet create -n $spoke1_vnet_name -g $rg --address-prefixes $spoke1_vnet_prefix --subnet-name $spoke1_vm_subnet_name --subnet-prefixes $spoke1_vm_subnet_prefix -o none
+az network vnet create -n $spoke2_vnet_name -g $rg --address-prefixes $spoke2_vnet_prefix --subnet-name $spoke2_vm_subnet_name --subnet-prefixes $spoke2_vm_subnet_prefix -o none
+az network vnet peering create -n hubtospoke1 -g $rg --vnet-name $hub_vnet_name --remote-vnet $spoke1_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+az network vnet peering create -n spoke1tohub -g $rg --vnet-name $spoke1_vnet_name --remote-vnet $hub_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $hub_vnet_name --remote-vnet $spoke2_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke2_vnet_name --remote-vnet $hub_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+
+# Create VeloCloud NVA
+echo "Creating public IP, NSG and NICs..."
+az network public-ip create -g $rg -n $hub_velo1_pip_name --sku standard --allocation-method static -o none
+az network nsg create -n $velo_nsg_name -g $rg -o none
+az network nsg rule create --nsg-name $velo_nsg_name -g $rg -n VCMP --priority 1000 --destination-port-ranges 2426 --access Allow --protocol Udp -o none
+az network nsg rule create --nsg-name $velo_nsg_name -g $rg -n SSH --priority 1010 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+az network nsg rule create --nsg-name $velo_nsg_name -g $rg -n SNMP --priority 1020 --destination-port-ranges 161 --access Allow --protocol Udp -o none
+az network nic create -n "$hub_velo1_nic_public_name" -g $rg --vnet-name $hub_vnet_name --subnet $hub_velo_subnet_public_name --public-ip-address "$hub_velo1_pip_name" --ip-forwarding --network-security-group $velo_nsg_name -o none
+az network nic create -n "$hub_velo1_nic_private_name" -g $rg --vnet-name $hub_vnet_name --subnet $hub_velo_subnet_private_name --ip-forwarding --network-security-group $velo_nsg_name -o none
+# Get license keys (previously stored in an Azure Key Vault)
+velo1_token=$(az keyvault secret show --vault-name $keyvault_name -n $velo1_token_secret_name --query 'value' -o tsv)
+vco=$(az keyvault secret show --vault-name $keyvault_name -n $velo_vco_secret_name --query 'value' -o tsv)
+if [[ -n "$velo1_token" ]] && [[ -n "$vco" ]]
+then
+    echo "VeloCloud license and VCO successfully retrieved from Azure Key Vault $keyvault_name"
+else
+    echo "VeloCloud license and VCO could NOT be retrieved from Azure Key Vault $keyvault_name"
+fi
+cat <<EOF > $velo_cloudinit
+#cloud-config
+password: Velocloud123
+chpasswd: { expire: False }
+ssh_pwauth: True
+velocloud:
+ vce:
+   management_interface: false
+   vco: $vco
+   activation_code: $velo1_token
+   vco_ignore_cert_errors: $velo_ignore_cert_errors
+EOF
+velo_image_urn="${velo_publisher}:${velo_offer}:${velo_sku}:${velo_version}"
+echo "Accepting image terms and creating VM..."
+az vm image terms accept --urn "$velo_image_urn" -o none
+az vm create -n $hub_velo1_name -g $rg -l $location --image "$velo_image_urn" --size $velo_vm_size \
+    --admin-username "azure-user" --admin-password "Velocloud123" --authentication-type all --generate-ssh-keys \
+    --nics "$hub_velo1_nic_public_name" "$hub_velo1_nic_private_name" -o none
+

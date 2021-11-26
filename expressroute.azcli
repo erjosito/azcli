@@ -37,13 +37,14 @@ az network express-route create -n $er_circuit_name --peering-location $er_pop -
 service_key=$(az network express-route show -n $er_circuit_name -g $rg --query serviceKey -o tsv) && echo $service_key
 
 # Provision Megaport MCR in location
-if [[ -e "./megaport.sh" ]]
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+if [[ -e "$megaport_script_path" ]]
 then
-    ./megaport.sh -s=jomore-${er_pop} -a=create_mcr -k=$service_key
+    $megaport_script_path -s=jomore-${er_pop} -a=create_mcr -k=$service_key
     sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
-    ./megaport.sh -s=jomore-${er_pop} -a=create_vxc -k=$service_key
+    $megaport_script_path -s=jomore-${er_pop} -a=create_vxc -k=$service_key
 else
-    echo "Sorry, I cannot seem to find the script megaport.sh to interact with the Megaport API"
+    echo "Sorry, I cannot seem to find the script $megaport_script_path to interact with the Megaport API"
 fi
 
 # Create VNet and test VM
@@ -59,21 +60,21 @@ circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --q
 az network vpn-connection create -n "${ergw_name}-${er_pop}" -g $rg -l $location --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
 
 # Optional: create spoke associated to the previous VNet and configure the Hub VM as NVA
-spoke_vnet_name="ervnet-${er_pop}-spoke"
+spoke_vnet_name="ervnet-${er_pop}-spoke1"
+spoke_vm_name="vm-${er_pop}-spoke1"
 spoke_vnet_prefix=192.168.11.0/24
 spoke_vm_subnet_name=vm
 spoke_vm_subnet_prefix=192.168.11.64/26
-spoke_vm_name="vm-${er_pop}-spoke"
 spoke_vm_pip_name="${spoke_vm_name}-pip"
 az network vnet create -g $rg -n $spoke_vnet_name --address-prefix $spoke_vnet_prefix --subnet-name $spoke_vm_subnet_name --subnet-prefix $spoke_vm_subnet_prefix -l $location
 az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" \
-    --public-ip-address $spoke_vm_pip_name --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_vm_subnet_name -l $location
-az network vnet peering create -n hub2spoke -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
-az network vnet peering create -n spoke2hub -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
-spoke_vm_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-az network nic show-effective-route-table --ids $spoke_vm_nic_id -o table
-spoke_vm_pip=$(az network public-ip show -n $spoke_vm_pip_name --query ipAddress -o tsv -g $rg) && echo $spoke_vm_pip
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke_vm_pip "ip a"
+    --public-ip-address $spoke_vm_pip_name --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_vm_subnet_name -l $location --no-wait
+az network vnet peering create -n hubtospoke1 -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
+az network vnet peering create -n spoke1tohub -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
+spoke1_vm_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $spoke1_vm_nic_id -o table
+spoke1_vm_pip=$(az network public-ip show -n $spoke_vm_pip_name --query ipAddress -o tsv -g $rg) && echo $spoke_vm_pip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm_pip "ip a"
 # Route tables
 hub_vm_pip=$(az network public-ip show -n $vm_pip_name --query ipAddress -o tsv -g $rg) && echo $hub_vm_pip
 hub_vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -87,6 +88,23 @@ az network route-table route create --route-table-name spoke-${er_pop} -g $rg --
 az network vnet subnet update -g $rg --vnet-name $spoke_vnet_name -n $spoke_vm_subnet_name --route-table spoke-${er_pop}
 az network route-table create -n hub-${er_pop} -g $rg -l $location
 az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table hub-${er_pop}
+
+# Optional, create second spoke
+spoke_vnet_name="ervnet-${er_pop}-spoke2"
+spoke_vm_name="vm-${er_pop}-spoke2"
+spoke_vnet_prefix=192.168.12.0/24
+spoke_vm_subnet_name=vm
+spoke_vm_subnet_prefix=192.168.12.64/26
+spoke_vm_pip_name="${spoke_vm_name}-pip"
+az network vnet create -g $rg -n $spoke_vnet_name --address-prefix $spoke_vnet_prefix --subnet-name $spoke_vm_subnet_name --subnet-prefix $spoke_vm_subnet_prefix -l $location
+az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" \
+    --public-ip-address $spoke_vm_pip_name --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_vm_subnet_name -l $location --no-wait
+az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
+az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
+spoke2_vm_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $spoke2_vm_nic_id -o table
+spoke2_vm_pip=$(az network public-ip show -n $spoke_vm_pip_name --query ipAddress -o tsv -g $rg) && echo $spoke_vm_pip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm_pip "ip a"
 
 ###################################################
 # Optional: create second Vnet to simulate onprem #
@@ -169,7 +187,8 @@ az network vnet-gateway list-advertised-routes -n $ergw_name -g $rg -o table
 #######################
 
 # Remove MCR from Megaport
-# ./megaport.sh -q -s=jomore -a=delete_mcr
+# megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+# $megaport_script_path -q -s=jomore -a=delete_mcr
 
 # Delete RG
 # az group delete -n $rg -y --no-wait
