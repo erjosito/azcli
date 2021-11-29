@@ -79,5 +79,5 @@ echo "Accepting image terms and creating VM..."
 az vm image terms accept --urn "$velo_image_urn" -o none
 az vm create -n $hub_velo1_name -g $rg -l $location --image "$velo_image_urn" --size $velo_vm_size \
     --admin-username "azure-user" --admin-password "Velocloud123" --authentication-type all --generate-ssh-keys \
-    --nics "$hub_velo1_nic_public_name" "$hub_velo1_nic_private_name" -o none
+    --nics "$hub_velo1_nic_private_name" "$hub_velo1_nic_public_name" --custom-data $velo_cloudinit -o none
 

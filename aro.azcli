@@ -5,7 +5,7 @@
 # Control
 ingress_visibility=Private
 api_visibility=Public
-custom_domain=no
+custom_domain=yes
 domain=cloudtrooper.net  # If using custom_domain=yes. Assumes you own this domain and have it managed by Azure DNS
 nat_gateway=no           # Just for testing, this is not supported
 
