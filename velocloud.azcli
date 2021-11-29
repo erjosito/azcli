@@ -35,7 +35,7 @@ velo_vco_secret_name=velovco
 # Create RG and VNets
 echo "Creating RG and VNets..."
 az group create -n $rg -l $location -o none
-az network vnet create -n $hub_vnet_name -g $rg --address-prefixes $hub_vnet_prefix --subnet-name $hub_velo_subnet_public_name --subnet-prefixes $hub_velo_subnet_private_prefix -o none
+az network vnet create -n $hub_vnet_name -g $rg --address-prefixes $hub_vnet_prefix --subnet-name $hub_velo_subnet_public_name --subnet-prefixes $hub_velo_subnet_public_prefix -o none
 az network vnet subnet create -g $rg -n $hub_velo_subnet_private_name --vnet-name $hub_vnet_name --address-prefix $hub_velo_subnet_private_prefix -o none
 az network vnet create -n $spoke1_vnet_name -g $rg --address-prefixes $spoke1_vnet_prefix --subnet-name $spoke1_vm_subnet_name --subnet-prefixes $spoke1_vm_subnet_prefix -o none
 az network vnet create -n $spoke2_vnet_name -g $rg --address-prefixes $spoke2_vnet_prefix --subnet-name $spoke2_vm_subnet_name --subnet-prefixes $spoke2_vm_subnet_prefix -o none

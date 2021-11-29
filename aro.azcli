@@ -3,7 +3,7 @@
 # az extension add -n aro --index https://az.aroapp.io/preview
 
 # Control
-ingress_visibility=Public
+ingress_visibility=Private
 api_visibility=Public
 custom_domain=no
 domain=cloudtrooper.net  # If using custom_domain=yes. Assumes you own this domain and have it managed by Azure DNS
