@@ -27,9 +27,6 @@ test_vm2_name=test2
 test_vm2_pip=test2pip
 test_vm_size=Standard_B1s
 
-# ToDo:
-# - Explicit NSG for server to allow syslog traffic from ANY address
-
 # Create RG, VNet, subnets
 echo "Creating RG and VNet..."
 az group create -n $rg -l $location -o none
@@ -53,6 +50,16 @@ az network firewall policy rule-collection-group collection add-filter-collectio
     --action Allow --collection-priority 1010 --name icmp --rule-name icmp --source-addresses '*' --destination-addresses '*' \
     --ip-protocols icmp --destination-ports '*' -o none
 
+# Optional: Stop FW (deallocate IP config)
+# echo "Stopping Azure Firewall ${azfw_name}..."
+# az network firewall ip-config delete -n azfw-ipconfig -f $azfw_name -g $rg -o none
+
+# Optional: Start FW (allocate IP config)
+# echo "Restarting Azure Firewall ${azfw_name}..."
+# az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip --vnet-name $vnet_name -o none
+# az network firewall update -n $azfw_name -g $rg --firewall-policy $azfw_policy_name -o none
+# azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+
 # Create RT in client and server subnets
 azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
 echo "Creating route table ${client_rt_name}..."
@@ -66,13 +73,19 @@ az network route-table route create --route-table-name $server_rt_name -g $rg --
     --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
 az network vnet subnet update -g $rg --vnet-name $vnet_name -n $server_subnet_name --route-table $server_rt_name -o none
 
+# Optional: enable/disable the client route table, to send the syslog traffic thru the FW or bypass it
+# echo "Bypassing Firewall..."
+# az network vnet subnet update -g $rg --vnet-name $vnet_name -n $client_subnet_name --route-table '' -o none
+# echo "Using the Firewall..."
+# az network vnet subnet update -g $rg --vnet-name $vnet_name -n $client_subnet_name --route-table $client_rt_name -o none
+
 # Creating server VM with custom NSG allowing UDP 514
-myip=$(curl -s4 ifconfig.co)
 az network nsg create -n $server_nsg_name -g $rg -o none
 az network nsg rule create --nsg-name $server_nsg_name -g $rg -n syslogInbound --priority 1000 --destination-port-ranges 514 --access Allow --protocol Udp -o none
+myip=$(curl -s4 ifconfig.co)
 az network nsg rule create --nsg-name $server_nsg_name -g $rg -n sshInbound --priority 1010  --source-address-prefixes "${myip}/32" --destination-port-ranges 22 --access Allow --protocol Tcp -o none
 az vm create -n $server_vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $server_vm_size \
-   --vnet-name $vnet_name --subnet $server_subnet_name --nsg $server_nsg_name --public-ip-address "$server_vm_pip" --public-ip-sku Standard --no-wait -o none
+   --vnet-name $vnet_name --subnet $server_subnet_name --nsg $server_nsg_name --public-ip-address "$server_vm_pip" --public-ip-sku Standard -o none
 server_vm_nic_id=$(az vm show -n $server_vm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 server_vm_private_ip=$(az network nic show --ids $server_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
 echo "Server VM created with private IP ${server_vm_private_ip}"
@@ -90,13 +103,13 @@ EOF
 # With PIP/instance you hit pretty quickly the quota limits
 # az vmss create -n $client_vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys --public-ip-per-vm --lb "" \
 #     --vnet-name $vnet_name --subnet $client_subnet_name --vm-sku $client_vm_size --custom-data $client_vmss_cloudinit -o none \
-#     --instance-count 1 --no-wait
+#     --instance-count 1
 # Without PIP per instance
 az vmss create -n $client_vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys --lb "" \
     --vnet-name $vnet_name --subnet $client_subnet_name --vm-sku $client_vm_size --custom-data $client_vmss_cloudinit -o none \
-    --instance-count 10 --no-wait
-az vmss update -g $rg -n $client_vmss_name --set virtualMachineProfile.networkProfile.networkInterfaceConfigurations\[0\].enableIpForwarding="true"
-az vmss update-instances -g $rg --name $client_vmss_name --instance-ids "*"
+    --instance-count 10
+az vmss update -g $rg -n $client_vmss_name --set virtualMachineProfile.networkProfile.networkInterfaceConfigurations\[0\].enableIpForwarding="true" -o none
+az vmss update-instances -g $rg --name $client_vmss_name --instance-ids "*" -o none
 
 # Effective routes of server VM
 az network nic show-effective-route-table --ids $server_vm_nic_id -o table
@@ -104,9 +117,9 @@ az network nic show-effective-route-table --ids $server_vm_nic_id -o table
 # Create test VMs
 echo "Creating test VMs..."
 az vm create -n $test_vm1_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $test_vm_size \
-   --vnet-name $vnet_name --subnet $server_subnet_name --public-ip-address "$test_vm1_pip" --public-ip-sku Standard --no-wait -o none
+   --vnet-name $vnet_name --subnet $server_subnet_name --public-ip-address "$test_vm1_pip" --public-ip-sku Standard -o none
 az vm create -n $test_vm2_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $test_vm_size \
-   --vnet-name $vnet_name --subnet $server_subnet_name --public-ip-address "$test_vm2_pip" --public-ip-sku Standard --no-wait -o none
+   --vnet-name $vnet_name --subnet $server_subnet_name --public-ip-address "$test_vm2_pip" --public-ip-sku Standard -o none
 test_vm1_nic_id=$(az vm show -n $test_vm1_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 test_vm1_private_ip=$(az network nic show --ids $test_vm1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
 test_vm2_nic_id=$(az vm show -n $test_vm2_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -119,11 +132,11 @@ test_vm2_pip_ip=$(az network public-ip show -n $test_vm2_pip -g $rg --query ipAd
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $test_vm1_pip_ip "ping -c 10 $test_vm2_private_ip"
 
 # Scale up client VMSS
-az vmss scale -n $client_vmss_name -g $rg --new-capacity 10 -o none
-az vmss list-instances -n $client_vmss_name -g $rg -o table
+# az vmss scale -n $client_vmss_name -g $rg --new-capacity 10 -o none
+# az vmss list-instances -n $client_vmss_name -g $rg -o table
 
 # Restart VMSS images instance
-az vmss reimage -n $client_vmss_name -g $rg -o none
+# az vmss reimage -n $client_vmss_name -g $rg -o none
 
 # Azure Firewall throughput
 azfw_id=$(az network firewall show -n $azfw_name -g $rg --query id -o tsv)

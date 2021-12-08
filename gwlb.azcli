@@ -5,6 +5,9 @@
 ################################
 
 # See https://docs.microsoft.com/en-us/azure/load-balancer/tutorial-gateway-cli
+# Control variables
+create_jump_hosts=yes
+nva_type=linux # 'linux' or 'csr'
 
 # Variables
 rg=gwlb
@@ -19,6 +22,7 @@ client1_internal_vni=900
 client1_internal_port=10800
 client1_external_vni=901
 client1_external_port=10801
+client1_jumphost_name="client1-jumphost"
 client2_vnet_name=client2
 client2_vnet_prefix=192.168.2.0/24
 client2_subnet_name=vm
@@ -29,8 +33,8 @@ client2_internal_vni=902
 client2_internal_port=10802
 client2_external_vni=903
 client2_external_port=10803
+client2_jumphost_name="client2-jumphost"
 nva_vnet_name=nva
-nva_type=linux # 'linux' or 'csr'
 nva_vnet_prefix=192.168.0.0/24
 nva_subnet_name=nva
 nva_subnet_prefix=192.168.0.0/26
@@ -40,7 +44,6 @@ nva_lb_name=nvalb
 vm_sku=Standard_B1s
 vm_cloudinit_filename=/tmp/vmcloudinit
 nva_cloudinit_filename=/tmp/nvacloudinit
-
 
 # Register feature
 feature_name=AllowGatewayLoadBalancer
@@ -104,6 +107,35 @@ client1_vm1_nic_name=$(echo $client1_vm1_nic_id | cut -d/ -f 9)
 client1_vm1_private_ip=$(az network nic show -n $client1_vm1_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
 client1_vm1_public_ip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
 echo "VM created in VNet $client1_vnet_name with private IP $client1_vm1_private_ip and public IP $client1_vm1_public_ip"
+
+# Optional: deploy jump host in client1's VNet (so that you can remove the public IP from the web server)
+if [[ "$create_jump_hosts" == "yes" ]]
+then
+    echo "Creating jump host in vnet $client1_vnet_name..."
+    vm_name=$client1_jumphost_name
+    vm_pip_name="${vm_name}-pip"
+    az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -o none
+    az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
+    --vnet-name $client1_vnet_name --subnet $client1_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
+    --custom-data $vm_cloudinit_filename -o none
+    client1_jumphost_nic_id=$(az vm show -n $client1_jumphost_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    client1_jumphost_nic_name=$(echo $client1_jumphost_nic_id | cut -d/ -f 9)
+    client1_jumphost_private_ip=$(az network nic show -n $client1_jumphost_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    client1_jumphost_public_ip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+    echo "VM created in VNet $client1_vnet_name with private IP $client1_jumphost_private_ip and public IP $client1_jumphost_public_ip"
+    # Update the existing VM and remove the public IP
+    echo "Removing public IP address from ${client1_vm1_name}..."
+    client1_vm1_ipconfig_name=$(az network nic ip-config list --nic-name $client1_vm1_nic_name -g $rg --query '[0].name' -o tsv)
+    az network nic ip-config update -n $client1_vm1_ipconfig_name --nic-name $client1_vm1_nic_name -g $rg --public-ip-address '' -o none
+    # Verify access
+    echo "Verifying access to ${client1_jumphost_name}:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $client1_jumphost_public_ip "ip a"
+    echo "Verifying access to ${client1_vm1_name} over ${client1_jumphost_name}:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $client1_jumphost_public_ip $client1_vm1_private_ip "ip a"
+    # Optional: reset ILPIP in web server
+    # echo "Configuring ILPIP on ${client1_vm1_name}..."
+    # az network nic ip-config update -n $client1_vm1_ipconfig_name --nic-name $client1_vm1_nic_name -g $rg --public-ip-address "${client1_vm1_name}-pip" -o none
+fi
 
 # Deploy a Linux VM with a troubleshooting web page for client 2
 echo "Creating VM in vnet $client2_vnet_name..."
@@ -306,7 +338,21 @@ fi
 # az disk delete --ids $nva1_disk_id -y
 # az network public-ip delete -n $nva1_pip_name -g $rg
 
-# Diagnostics
+# Open an SSH session to the NVA if you want to see what is happening
+
+#########
+# Tests #
+#########
+
+# Send test traffic to the VM
+curl "http://${client1_lb_public_ip}:8080/api/healthcheck"
+# Send outbound traffic from VM
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $client1_jumphost_public_ip $client1_vm1_private_ip "curl ifconfig.co"
+
+###############
+# Diagnostics #
+###############
+
 az network lb list -g $rg -o table
 az network lb frontend-ip list --lb-name $client1_lb_name -g $rg -o table
 az network lb address-pool list --lb-name $nva_lb_name -g $rg -o table
@@ -320,3 +366,8 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "ifconfig vx
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "ip -d link show vxlan${client1_internal_vni}"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_public_ip "route -n"
 az network nic show --ids $nva1_nic_id --query enableIpForwarding -o tsv
+
+###########
+# Cleanup #
+###########
+# az group delete -n $rg --no-wait -y
