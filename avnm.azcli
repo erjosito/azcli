@@ -1,0 +1,102 @@
+# Control
+max_vnet_id=5
+hub_vnet_id=0
+
+# Variables
+rg=avnm
+location=westeurope
+ip_prefix="10.1"
+avnm_name=myavnm
+avnm_description="Test AVNM"
+avnm_vnetgroup_name=myvnets
+avnm_vnetgroup_description="All VNets in the RG"
+avnm_config_name=myconfig
+
+# Create RG and VNets
+echo "Creating resource group and VNets..."
+az group create -n $rg -l $location -o none
+for vnet_id in {0..$max_vnet_id}
+do
+    az network vnet create -n "vnet${vnet_id}" -g $rg --address-prefixes "${ip_prefix}.${vnet_id}.0/24" --subnet-name vm --subnet-prefixes "${ip_prefix}.${vnet_id}.0/26" -o none
+    az vm create -n "vnet${vnet_id}vm" -g $rg --image UbuntuLTS --generate-ssh-keys --size Standard_B1ms --vnet-name "vnet${vnet_id}" --subnet vm --public-ip-address ''
+    if [[ "$vnet_id" == "$hub_vnet_id" ]]
+    then
+        echo "Creating Basic VNG in hub VNet vnet${vnet_id}..."
+        az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name "vnet${vnet_id}" --address-prefix "${ip_prefix}.${vnet_id}.64/26" -o none
+        az network public-ip create -g $rg -n vngpip --sku Basic --allocation-method Dynamic -o none
+        az network vnet-gateway create --gateway-type Vpn -n hubvng --public-ip-addresses vngpip -g $rg --sku Basic --vnet "vnet${vnet_id}" --vpn-type PolicyBased
+    fi
+done
+
+# Add/remove tags to all or some VNets
+echo "Tagging VNets..."
+for vnet_id in {0..$max_vnet_id}
+do
+    if [[ "$vnet_id" == "$hub_vnet_id" ]]; then
+        role=hub
+    else
+        role=spoke
+    fi
+    vnet_arm_id=$(az network vnet show -n "vnet${vnet_id}" -g $rg --query id -o tsv)
+    az resource tag --ids $vnet_arm_id --tags "avnmtest=yes" "role=$role" -o none
+    # az resource tag --ids $vnet_arm_id --tags "avnmtest=no" -o none
+done
+
+# Create AVNM instance and VNet groups
+echo "Creating AVNM instance scoped to subscription..."
+subscription_id=$(az account show --query id -o tsv)
+# The scope-access "SecurityUser" not available yet (Dec'21)
+az network manager create -n $avnm_name -g $rg -l $location --description $avnm_description --display-name $avnm_name \
+    --scope-access SecurityAdmin Connectivity \
+    --network-manager-scopes subscriptions="/subscriptions/${subscription_id}" -o none
+condition_all="{ \"allOf\": [ {\"field\": \"tags['avnmtest']\", \"equals\": \"yes\" } ] }"
+condition_hubs="{ \"allOf\": [ {\"field\": \"tags['avnmtest']\", \"equals\": \"yes\" }, {\"field\": \"tags['role']\", \"equals\": \"hub\" } ] }"
+condition_spokes="{ \"allOf\": [ {\"field\": \"tags['avnmtest']\", \"equals\": \"yes\" }, {\"field\": \"tags['role']\", \"equals\": \"spoke\" } ] }"
+# Three groups are created, although actually only the spoke group is requried
+az network manager group create -n ${avnm_vnetgroup_name}-all --network-manager-name $avnm_name -g $rg \
+    --member-type Microsoft.Network/virtualNetworks --description ${avnm_vnetgroup_name}-all \
+    --conditional-membership $condition_all -o none
+az network manager group create -n ${avnm_vnetgroup_name}-hub --network-manager-name $avnm_name -g $rg \
+    --member-type Microsoft.Network/virtualNetworks --description ${avnm_vnetgroup_name}-hub \
+    --conditional-membership $condition_hubs -o none
+az network manager group create -n ${avnm_vnetgroup_name}-spokes --network-manager-name $avnm_name -g $rg \
+    --member-type Microsoft.Network/virtualNetworks --description ${avnm_vnetgroup_name}-spokes \
+    --conditional-membership $condition_spokes -o none
+
+# Create connectivity configs
+avnm_hubs_group_id=$(az network manager group show -n ${avnm_vnetgroup_name}-hub --network-manager-name $avnm_name -g $rg --query id -o tsv)
+avnm_spokes_group_id=$(az network manager group show -n ${avnm_vnetgroup_name}-spokes --network-manager-name $avnm_name -g $rg --query id -o tsv)
+hub_vnet_id=$(az network vnet show -n "vnet${hub_vnet_id}" -g $rg --query id -o tsv)
+# Hub and spoke #### NOT WORKING! ####
+# az network manager connect-config delete --configuration-name "${avnm_config_name}-hns" -n "$avnm_name" -g "$rg" -y
+az network manager connect-config create --configuration-name "${avnm_config_name}-hns" -n "$avnm_name" -g "$rg" --description "${avnm_config_name}-hns" \
+        --applies-to-groups group-connectivity="DirectlyConnected" is-global="False" network-group-id="$avnm_spokes_group_id" use-hub-gateway="False" \
+        --connectivity-topology "HubAndSpoke" --delete-existing-peering true --display-name "${avnm_config_name}-hns" --hubs resource-id="$hub_vnet_id" --is-global false
+hns_config_id=$(az network manager connect-config show --configuration-name "${avnm_config_name}-hns" -n "$avnm_name" -g "$rg" --query id -o tsv)
+# az network manager connect-config delete --configuration-name "${avnm_config_name}-hns" -n "$avnm_name" -g $rg -y
+# Full mesh
+az network manager connect-config create --configuration-name "${avnm_config_name}-fullmesh" -n "$avnm_name" -g "$rg" --description "${avnm_config_name}-fullmesh" \
+        --applies-to-groups group-connectivity="DirectlyConnected" is-global="False" network-group-id="$avnm_spokes_group_id" use-hub-gateway="false" \
+        --connectivity-topology "Mesh" --delete-existing-peering true --display-name "${avnm_config_name}-fullmesh" --is-global false
+mesh_config_id=$(az network manager connect-config show --configuration-name "${avnm_config_name}-fullmesh" -n "$avnm_name" -g "$rg" --query id -o tsv)
+
+# Deploy configs
+az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids $hns_config_id
+# az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids $mesh_config_id
+
+# Remove all deployments
+az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids ''
+
+
+# Diagnostics
+az network vnet list -g $rg -o table
+az network manager group list --network-manager-name ${avnm_name} -g $rg -o table
+az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-all" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
+az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-hub" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
+az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-spokes" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
+az network manager connect-config list --network-manager-name $avnm_name -g $rg -o table
+az network manager list-deploy-status --network-manager-name $avnm_name --deployment-types "Connectivity" "SecurityAdmin" --regions $location -g $rg
+az network manager list-deploy-status --network-manager-name $avnm_name --deployment-types "Connectivity" "SecurityAdmin" --regions $location -g $rg --query 'value[].{ConfigId:configurationIds[0], Status:deploymentStatus, Type:deploymentType}' -o table
+az vm list-ip-addresses -g $rg -o table
+az network nic list -g $rg -o table
+az network nic show-effective-route-table -n vnet1vmVMNIC -g $rg -o table

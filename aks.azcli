@@ -164,15 +164,16 @@ else
     id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
     if [[ -z "$id_id" ]]
     then
-        echo "Identity $id_name not found, creating a new..."
-        az identity create -n $id_name -g $rg
+        echo "Identity $id_name not found, creating a new one..."
+        az identity create -n $id_name -g $rg -o none
         id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
     else
         echo "Identity $id_name found with ID $id_id"
     fi
     id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
     vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
-    az role assignment create --scope $vnet_id --assignee $id_principal_id --role Contributor
+    sleep 15 # Time for creation to propagate
+    az role assignment create --scope $vnet_id --assignee $id_principal_id --role Contributor -o none
     # User identity
     identity_options="--enable-managed-identity --assign-identity $id_id"
     # System identity
@@ -184,9 +185,8 @@ az aks create -g $rg -n $aks_name -l $location \
     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
     ${(z)identity_options} \
     --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
-    --network-policy 'azure' --load-balancer-sku Standard \
+    --network-policy 'calico' --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
-    --node-osdisk-type ephemeral --node-osdisk-size 30 \
     --uptime-sla \
     --no-wait
 
@@ -541,13 +541,22 @@ helm install kured kured/kured --namespace kured --set nodeSelector."beta\.kuber
 vm_name=testvm
 vm_pip_name=testvm-pip
 vm_sku=Standard_B1s
-az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name --address-prefix $vm_subnet_prefix
+echo "Creating subnet..."
+az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name --address-prefix $vm_subnet_prefix -o none
+echo "Creating VM..."
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku -l $location \
-   --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $vm_pip_name
+   --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $vm_pip_name -o none
 vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
 node_ip=$(kubectl get node -o json | jq -r '.items[0].status.addresses[] | select(.type=="InternalIP") | .address') && echo $node_ip
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -m hmac-sha2-512 -J $vm_pip_address $node_ip "ip a"
+
+#######################
+# OpenVPN Server test #
+#######################
+
+# https://github.com/rishasi/OpenVPN-on-AKS
+
 
 ##########################
 #  Azure Firewall (WIP)  #
