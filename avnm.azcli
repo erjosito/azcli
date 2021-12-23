@@ -11,6 +11,10 @@ avnm_description="Test AVNM"
 avnm_vnetgroup_name=myvnets
 avnm_vnetgroup_description="All VNets in the RG"
 avnm_config_name=myconfig
+# VWAN
+vwan_name=avnmvwan
+vhub_name=hub
+vhub_prefix=192.168.0.0/23
 
 # Create RG and VNets
 echo "Creating resource group and VNets..."
@@ -63,6 +67,13 @@ az network manager group create -n ${avnm_vnetgroup_name}-spokes --network-manag
     --member-type Microsoft.Network/virtualNetworks --description ${avnm_vnetgroup_name}-spokes \
     --conditional-membership $condition_spokes -o none
 
+# Test subnet group
+subnet_condition="{ \"allOf\": [ {\"field\": \"name\", \"equals\": \"vm\" } ] }"
+az network manager group create -n subnetgroup --network-manager-name $avnm_name -g $rg \
+    --member-type "Microsoft.Network/virtualNetworks/subnets" --description "test subnet group" \
+    --conditional-membership $subnet_condition -o none
+
+
 # Create connectivity configs
 avnm_hubs_group_id=$(az network manager group show -n ${avnm_vnetgroup_name}-hub --network-manager-name $avnm_name -g $rg --query id -o tsv)
 avnm_spokes_group_id=$(az network manager group show -n ${avnm_vnetgroup_name}-spokes --network-manager-name $avnm_name -g $rg --query id -o tsv)
@@ -80,12 +91,54 @@ az network manager connect-config create --configuration-name "${avnm_config_nam
         --connectivity-topology "Mesh" --delete-existing-peering true --display-name "${avnm_config_name}-fullmesh" --is-global false
 mesh_config_id=$(az network manager connect-config show --configuration-name "${avnm_config_name}-fullmesh" -n "$avnm_name" -g "$rg" --query id -o tsv)
 
-# Deploy configs
-az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids $hns_config_id
-# az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids $mesh_config_id
+# Deploy connectivity configs
+# az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids $hns_config_id -o none
+az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids $mesh_config_id -o none
 
-# Remove all deployments
-az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids ''
+# Remove all deployments ##### NOT WORKING
+# az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids ''
+
+# Optional: create Virtual WAN
+az network vwan create -n $vwan_name -g $rg -l $location -o none
+az network vhub create --vwan $vwan_name -n $vhub_name --address-prefix $vhub_prefix -l $location -g $rg -o none --no-wait
+# Connect all VNets to virtual hub
+echo "Connecting VNets to Virtual Hub"
+for vnet_id in {0..$max_vnet_id}
+do
+    if [[ "$vnet_id" == "$hub_vnet_id" ]]; then
+        echo "Skipping VNet vnet${vnet_id}, since it is a hub"
+    else
+        echo "Connecting VNet vnet${vnet_id} to Virtual WAN hub ${vhub_name}..."
+        az network vhub connection create -n "vnet${vnet_id}" -g $rg --vhub-name ${vhub_name} --remote-vnet "vnet${vnet_id}" --internet-security true -o none
+    fi
+done
+
+# Create Security Admin Config
+sec_config_name="${avnm_config_name}-denyIcmp"
+az network manager security-admin-config create --configuration-name "$sec_config_name" --network-manager-name "$avnm_name" -g "$rg" --description "Deny ICMP" --delete-existing-ns-gs true -o none
+avnm_spokes_group_id=$(az network manager group show -n ${avnm_vnetgroup_name}-spokes --network-manager-name $avnm_name -g $rg --query id -o tsv)
+az network manager security-admin-config rule-collection create --configuration-name "$sec_config_name" --network-manager-name "$avnm_name" -g "$rg" -o none \
+    --rule-collection-name "AllowedTraffic" --description "Allowed Traffic" --display-name "Allowed Traffic" --applies-to-groups  network-group-id="$avnm_spokes_group_id"
+# Supported actions: Allow, AlwaysAllow, Deny
+az network manager security-admin-config rule-collection rule create --configuration-name  $sec_config_name --network-manager-name "$avnm_name" -g "$rg" -o none \
+    --rule-collection-name "AllowedTraffic" --rule-name "DropICMP" --kind "Custom" --protocol "Icmp" --access "Deny" --priority 32 --direction "Inbound"
+
+# Deploy security configs
+# SecurityAdmin supported (SecurityUser not yet)
+sec_config_id=$(az network manager security-admin-config show --configuration-name "${sec_config_name}" -n "$avnm_name" -g "$rg" --query id -o tsv)
+az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "SecurityAdmin" --target-locations $location --configuration-ids $sec_config_id -o none
+
+# Optional: testing subnet groups
+sec_config_name="${avnm_config_name}-allowTelnet"
+avnm_subnets_group_id=$(az network manager group show -n "subnetgroup" --network-manager-name $avnm_name -g $rg --query id -o tsv)
+az network manager security-admin-config create --configuration-name "$sec_config_name" --network-manager-name "$avnm_name" -g "$rg" --description "Allow Telnet" --delete-existing-ns-gs true -o none
+az network manager security-admin-config rule-collection create --configuration-name "$sec_config_name" --network-manager-name "$avnm_name" -g "$rg" -o none \
+    --rule-collection-name "AllowedSubnetTraffic" --description "Allowed Subnet Traffic" --display-name "Allowed Subnet Traffic" --applies-to-groups  network-group-id="$avnm_subnets_group_id"
+az network manager security-admin-config rule-collection rule create --configuration-name  $sec_config_name --network-manager-name "$avnm_name" -g "$rg" -o none \
+    --rule-collection-name "AllowedSubnetTraffic" --rule-name "AllowTelnet" --kind "Custom" --protocol "Tcp" --dest-port-ranges 23 --access "AlwaysAllow" --priority 40 --direction "Inbound"
+sec_config_id=$(az network manager security-admin-config show --configuration-name "${sec_config_name}" -n "$avnm_name" -g "$rg" --query id -o tsv)
+az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "SecurityAdmin" --target-locations $location --configuration-ids $sec_config_id -o none
+
 
 
 # Diagnostics
@@ -95,8 +148,15 @@ az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup
 az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-hub" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
 az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-spokes" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
 az network manager connect-config list --network-manager-name $avnm_name -g $rg -o table
+az network manager security-admin-config list --network-manager-name $avnm_name -g $rg -o table
+az network manager security-admin-config rule-collection list --configuration-name $sec_config_name --network-manager-name $avnm_name -g $rg -o table
+az network manager security-admin-config rule-collection rule list --configuration-name $sec_config_name --rule-collection-name "AllowedTraffic" --network-manager-name $avnm_name -g $rg -o table
 az network manager list-deploy-status --network-manager-name $avnm_name --deployment-types "Connectivity" "SecurityAdmin" --regions $location -g $rg
 az network manager list-deploy-status --network-manager-name $avnm_name --deployment-types "Connectivity" "SecurityAdmin" --regions $location -g $rg --query 'value[].{ConfigId:configurationIds[0], Status:deploymentStatus, Type:deploymentType}' -o table
+az network vnet peering list -g $rg -o table --vnet-name vnet1
 az vm list-ip-addresses -g $rg -o table
 az network nic list -g $rg -o table
-az network nic show-effective-route-table -n vnet1vmVMNIC -g $rg -o table
+az network nic show-effective-route-table -g $rg -o table -n vnet1vmVMNIC
+az network vhub list -g $rg -o table
+az network nsg list -o table -g $rg
+az network nic list-effective-nsg -g $rg -n vnet1vmVMNIC

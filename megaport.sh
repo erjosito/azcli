@@ -91,7 +91,9 @@ function get_mcr_status () {
     products_url="${base_url}/v2/products"
     products_json=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
     output=$(echo "$products_json" | jq -r "[ .data[] | select( .productUid | contains(\"${product_id}\")) | { provisioningStatus } ] | .[].provisioningStatus")
-    echo $output
+    if [[ "$quiet" == "no" ]]; then
+        echo $output
+    fi
 }
 
 function list_products () {
@@ -109,9 +111,11 @@ function list_products () {
     # Validate we have an output
     if [[ -n $output ]]
     then
-        echo $output | jq
+        if [[ "$quiet" == "no" ]]; then
+            echo $output | jq
+        fi
     else
-        echo "ERROR: output: $output"
+        log_msg "ERROR: output: $output"
     fi
 }
 
@@ -123,13 +127,13 @@ function create_mcr () {
         mcr_name="${mcr_name}-${name_suffix}"
     fi
     # Try to find an existing MCR (LIVE or otherwise):
-    echo "INFO: Checking if a live MCR with the string $product_string already exists..."
+    log_msg "INFO: Checking if a live MCR with the string $product_string already exists..."
     product_json=$(list_products LIVE)
     mcr_id=$(echo "$product_json" | jq -r '.[].productUid')
     mcr_status=$(echo "$product_json" | jq -r '.[].provisioningStatus')
     if [[ -z "$mcr_id" ]]
     then
-        log_msg "INFO: Creating MCR $mcr_name in Megaport location $location_id and ASN $mcr_asn..."
+        log_msg "INFO: Creating MCR $mcr_name in Megaport location '$location_id' and ASN '$mcr_asn'..."
         # Sending call to create MCR
         buy_url="${base_url}/v2/networkdesign/buy" 
         buy_payload_template='[{locationId: $locationId, productName: $productName, productType: "MCR2", portSpeed: 5000, config: { mcrAsn: $mcrAsn } } ]'
@@ -139,7 +143,9 @@ function create_mcr () {
             --arg mcrAsn "$mcr_asn" \
             "$buy_payload_template")
         buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
-        echo "$buy_response" | jq
+        if [[ "$quiet" == "no" ]]; then
+            echo "$buy_response" | jq
+        fi
     else
         log_msg "INFO: MCR $mcr_id already found (status $mcr_status), skipping creation"
     fi
@@ -157,7 +163,9 @@ function validate_key () {
         # Validate we have an output
         if [[ -n $filtered_response ]]
         then
-            echo $filtered_response | jq
+            if [[ "$quiet" == "no" ]]; then
+                echo $filtered_response | jq
+            fi
         else
             log_msg "ERROR: output: $validate_response"
         fi
@@ -185,7 +193,9 @@ function create_vxc () {
         --arg serviceKey "$service_key" \
         "$buy_payload_template")
     buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
-    echo "$buy_response" | jq
+    if [[ "$quiet" == "no" ]]; then
+        echo "$buy_response" | jq
+    fi
 }
 
 function cancel_product () {
@@ -194,7 +204,9 @@ function cancel_product () {
     cancel_url="${base_url}/v2/product/${product_id}/action/CANCEL_NOW" 
     log_msg "INFO: sending POST request to $cancel_url..."
     cancel_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" -X POST "$cancel_url" 2>/dev/null)
-    echo "$cancel_response" | jq
+    if [[ "$quiet" == "no" ]]; then
+        echo "$cancel_response" | jq
+    fi
 }
 
 # Checking dependencies
@@ -203,7 +215,7 @@ do
     binary_path=$(which "$binary")
     if [[ -z "$binary_path" ]]
     then
-        echo "It seems that $binary is not installed in the system. Please install it before trying this script again"
+        echo "ERROR: It seems that $binary is not installed in the system. Please install it before trying this script again"
         exit
     fi
 done
@@ -301,7 +313,7 @@ case $action in
                 log_msg "INFO: Getting Location ID from existing ER..."
                 er_json=$(validate_key "$service_key")
                 location_id=$(echo "$er_json" | jq -r '.ports[] | select (.name | contains("Primary")) | .locationId')
-                echo "INFO: Location ID derived from the supplied service key: $location_id"
+                log_msg "INFO: Location ID derived from the supplied service key: $location_id"
             fi
         fi
         create_mcr
