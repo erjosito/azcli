@@ -98,7 +98,8 @@ packages:
   - hping3
 runcmd:
   - apt update
-  - hping3 --udp --destport 514 --flood --numeric --data 50 --rand-source $server_vm_private_ip
+  #- hping3 --udp --destport 514 --flood --numeric --data 50 --rand-source $server_vm_private_ip
+  - hping3 --tcp --destport 80 --faster --numeric --data 50 $server_vm_private_ip
 EOF
 # With PIP/instance you hit pretty quickly the quota limits
 # az vmss create -n $client_vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys --public-ip-per-vm --lb "" \

@@ -72,6 +72,13 @@ az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --pub
 az network firewall update -n $azfw_name -g $rg -o none
 az network firewall policy create -n $azfw_policy_name -g $rg -o none
 az network firewall update -n $azfw_name -g $rg --firewall-policy $azfw_policy_name -o none
+az network firewall policy rule-collection-group create -n myrcg --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
+az network firewall policy rule-collection-group collection add-filter-collection --rule-type NetworkRule -g $rg --rcg-name myrcg --policy-name $azfw_policy_name \
+    --action Allow --collection-priority 1010 --name testnetrules --rule-name ifconfig --source-addresses '*' --destination-fqdns 'ifconfig.co' \
+    --ip-protocols Tcp --destination-ports 443 -o none
+# az network firewall policy rule-collection-group collection rule add --rule-type NetworkRule -g $rg --rcg-name myrcg --policy-name $azfw_policy_name \
+#     --collection-name testnetrules --name permitany --source-addresses '*' --destination-addresses '*' \
+#     --ip-protocols Any --destination-ports '*' -o none
 azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
 
 # DNS server VM
@@ -83,6 +90,9 @@ dns_vm_privateip=$(az network nic show --ids $dns_vm_nic_id --query 'ipConfigura
 echo "DNS server deployed to $dns_vm_privateip, $dns_vm_pip"
 echo "Installing dnsmasq"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo apt update -y && sudo apt -y install dnsmasq"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo sed -i '$ a\log-queries' /etc/dnsmasq.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl restart dnsmasq"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl status dnsmasq"
 echo "Adding sample DNS name $sample_fqdn with IP $sample_ip..."
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$dns_vm_pip" "sudo sed -i \"\$ a $sample_ip $sample_fqdn\" /etc/hosts"
 
@@ -127,6 +137,15 @@ az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace 
             {"category": "AzureFirewallDnsProxy", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
             {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
 
+# Associate a route table to the client VM subnet to send traffic to ifconfig.co (162.159.138.85, 162.159.137.85) through the firewall
+echo "Creating route table for client VM subnet..."
+az network route-table create -n clientrt -l $location -g $rg -o none
+az network route-table route create --route-table-name clientrt -g $rg -o none \
+    --address-prefix 162.159.138.85/32 -n ifconfigco1 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip
+az network route-table route create --route-table-name clientrt -g $rg -o none \
+    --address-prefix 162.159.137.85/32 -n ifconfigco2 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $client_vm_subnet_name --route-table clientrt -o none
+
 ###########
 # Testing #
 ###########
@@ -151,13 +170,18 @@ echo "Resolving on hub VM over a corporate DNS server the FQDN '${sample_fqdn}'.
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $sample_fqdn"
 echo "Resolving on hub VM public DNS name 'microsoft.com'"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup microsoft.com"
+# 4. Send traffic to ifconfig.co, which should go through the firewall and hit an FQDN-based network rule
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "curl -s4 http://ifconfig.co"  # This should not work (dropped by the FW)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "curl -s4 https://ifconfig.co" # This should work (allowed by the FW)
 
 # From spoke VNet
 # 1. Change the spoke VNet DNS custom server config (Azure DNS or Azure Firewall)
+echo "Setting Spoke VNet to use the corporate DNS server in $dns_vm_private_ip directly..."
+az network vnet update -n $spoke_vnet_name -g $rg --dns-servers $dns_vm_privateip -o none
 echo "Setting spoke VNet custom DNS servers to Azure Firewall..."
-az network vnet update -n $spoke_vnet_name -g $rg --dns-servers $azfw_private_ip
+az network vnet update -n $spoke_vnet_name -g $rg --dns-servers $azfw_private_ip -o none
 echo "Setting spoke VNet custom DNS servers to Azure DNS..."
-az network vnet update -n $spoke_vnet_name -g $rg --dns-servers ''
+az network vnet update -n $spoke_vnet_name -g $rg --dns-servers '' -o none
 # 2. Refresh DNS lease in spoke VM
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "sudo systemctl restart systemd-networkd"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "netplan ip leases eth0 | grep DNS"
@@ -195,11 +219,15 @@ fw_dns_logs_query='AzureDiagnostics
     ResponseDuration = extract("[0-9]*.?[0-9]+s$", 0, msg_s),
     SourcePort = tostring(SourcePortInt),
     QueryID =  tostring(QueryID)
-| project TimeGenerated,SourceIP,hostname,RequestType,ResponseDuration,details,msg_s
+| project TimeGenerated,SourceIP,hostname,RequestType,ResponseDuration,details
+| where hostname contains "contoso"
 | order by TimeGenerated
 | take 20 '
-# az monitor log-analytics query -w $logws_customerid --analytics-query $fw_net_logs_query -o tsv
+az monitor log-analytics query -w $logws_customerid --analytics-query $fw_net_logs_query -o tsv
 az monitor log-analytics query -w $logws_customerid --analytics-query $fw_dns_logs_query -o tsv
+
+# dnsmasq logs
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "cat /var/log/syslog | grep dnsmasq | grep contoso | tail -10"
 
 ######################
 # PowerShell (begin) #
