@@ -8,17 +8,17 @@
 # Variables
 akv_name=erjositoKeyvault
 
-########################
-# Import cert into AKV #
-########################
+####################################
+# Import cert (.pem/.key) into AKV #
+####################################
 
 # Variables
-pem_file="./yourcert.pem"
+pem_file="./yourcert.pem or .crt"
 key_file="./yourkey.key"
 key_password="your_key_password"
-cert_name=cloudtroopernet
+cert_name=akv_cert_name
 
-# Combine PEM and key in one pfx file (pkcs#12)
+# Combine .pem and .key in one pfx file (pkcs#12)
 pfx_file=".${pem_file}.pfx"
 openssl pkcs12 -export -in $pem_file -inkey $key_file -out $pfx_file -passin pass:$key_password -passout pass:$key_password
 
@@ -28,6 +28,7 @@ az keyvault certificate import --vault-name $akv_name -n $cert_name \
 
 # Verify
 az keyvault certificate list --vault-name $akv_name -o table
+az keyvault certificate show -n $cert_name --vault-name $akv_name -o table
 
 #####################
 # Self-signed cert  #

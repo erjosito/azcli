@@ -98,17 +98,26 @@ packages:
   - hping3
 runcmd:
   - apt update
-  #- hping3 --udp --destport 514 --flood --numeric --data 50 --rand-source $server_vm_private_ip
-  - hping3 --tcp --destport 80 --faster --numeric --data 50 $server_vm_private_ip
+  - hping3 --udp --destport 514 --flood --numeric --data 50 --rand-source $server_vm_private_ip
+  #- hping3 --tcp --destport 80 --faster --numeric --data 50 $server_vm_private_ip
 EOF
 # With PIP/instance you hit pretty quickly the quota limits
 # az vmss create -n $client_vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys --public-ip-per-vm --lb "" \
 #     --vnet-name $vnet_name --subnet $client_subnet_name --vm-sku $client_vm_size --custom-data $client_vmss_cloudinit -o none \
 #     --instance-count 1
+
 # Without PIP per instance
-az vmss create -n $client_vmss_name -g $rg -l $location --image UbuntuLTS --generate-ssh-keys --lb "" \
+az vmss create -n $client_vmss_name -g $rg -l $location --image UbuntuLTS  --lb "" --generate-ssh-keys \
     --vnet-name $vnet_name --subnet $client_subnet_name --vm-sku $client_vm_size --custom-data $client_vmss_cloudinit -o none \
     --instance-count 10
+
+# With PIP per instance, specific private key
+public_key="ssh-rsa blahblah"
+az vmss create -n $client_vmss_name -g $rg -l $location --image UbuntuLTS --lb "" --public-ip-per-vm --ssh-key-values $public_key \
+    --vnet-name $vnet_name --subnet $client_subnet_name --vm-sku $client_vm_size --custom-data $client_vmss_cloudinit -o none \
+    --instance-count 10
+
+# Update existing VMSS
 az vmss update -g $rg -n $client_vmss_name --set virtualMachineProfile.networkProfile.networkInterfaceConfigurations\[0\].enableIpForwarding="true" -o none
 az vmss update-instances -g $rg --name $client_vmss_name --instance-ids "*" -o none
 

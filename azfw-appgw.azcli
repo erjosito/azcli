@@ -61,7 +61,7 @@ runcmd:
   - apt update && apt install -y python3-pip
   - pip3 install flask
   - wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
-  - python3 /root/myip.py &
+  - python3 /root/myip.py >/root/myip.log 2>&1 &
 EOF
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
    --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
@@ -143,7 +143,7 @@ az network firewall policy create -n "$azfw_policy_name" -g $rg --sku Premium --
 az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location
 azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
 azfw_policy_id=$(az network firewall policy show -n $azfw_policy_name -g $rg --query id -o tsv)
-az network firewall create -n $azfw_name -g $rg -l $location --tier Premium --policy $azfw_policy_id # Not working yet...
+az network firewall create -n $azfw_name -g $rg -l $location --tier Premium --policy $azfw_policy_id # Not working yet (Feb 11 2022)...
 azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id) && echo $azfw_id
 az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
@@ -205,7 +205,7 @@ else
   az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $fw_dns_name -a $azfw_pip_address
 fi
 
-# Verify Linux VM deployed correctly and SSH is working fine
+# Verify Linux VM deployed correctly and SSH is working fine (not going through the AzFW yet)
 vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
 curl ${vm_pip_address}:8080/api/healthcheck
@@ -250,8 +250,8 @@ http {
 EOF
 scp "$nginx_config_file" "${vm_pip_address}:~/"
 # Put public certs in NGINX. Note: you need to have some public certs in advance
-cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper_chain.pem"
-key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper.key"
+cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2022/star_cloudtrooper_net_chain.pem"
+key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2022/star_cloudtrooper_net.key"
 scp "$cert_file" "${vm_pip_address}:~/ssl.crt"
 scp "$key_file" "${vm_pip_address}:~/ssl.key"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo mv ./* /etc/nginx/"
@@ -280,7 +280,7 @@ else
   az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $vm_dns_name -a $vm_pip_address
 fi
 vm_fqdn="${vm_dns_name}.${public_domain}" && echo $vm_fqdn
-curl -k "https://${vm_fqdn}/api/healthcheck"
+curl "https://${vm_fqdn}/api/healthcheck"
 
 ######################
 # Deploy App Gateway #
@@ -311,12 +311,22 @@ then
     # cert_sid=$(az keyvault certificate show -n "$cert_name" --vault-name "$akv_name" --query sid -o tsv)
     # az network application-gateway ssl-cert create -n "$cert_name" --gateway-name "$appgw_name" -g "$rg" --keyvault-secret-id "$cert_sid"
     pfx_file="/tmp/appgwcert.pfx"
+    if [[ -e "$pfx_file" ]]; then
+        rm $pfx_file
+    fi
     az keyvault secret download -n "$cert_name" --vault-name "$akv_name" --encoding base64 --file "$pfx_file"
     cert_passphrase=''
     az network application-gateway ssl-cert create -g "$rg" --gateway-name "$appgw_name" -n "$cert_name" --cert-file "$pfx_file" --cert-password "$cert_passphrase" -o none
 else
     echo "Cert $cert_name already exists in application gateway $appgw_name"
 fi
+
+# Add custom probe (with path /api/healthcheck) to initial config (port 8080)
+echo "Creating custom probe for port 8080..."
+az network application-gateway probe create -g "$rg" --gateway-name "$appgw_name" \
+--name vmprobe8080 --protocol Http --host-name-from-http-settings --match-status-codes 200-399 --port 8080 --path "/api/healthcheck" -o none
+http_settings_name=$(az network application-gateway http-settings list -g $rg --gateway-name $appgw_name -o tsv --query '[0].name')
+az network application-gateway http-settings update -g $rg --gateway-name $appgw_name -n $http_settings_name --probe vmprobe8080 --host-name-from-backend-pool -o none
 
 # Root cert from firewall
 root_cert_id=$(az network application-gateway ssl-cert show -n azfwroot --gateway-name "$appgw_name" -g "$rg" --query id -o tsv 2>/dev/null)
@@ -336,10 +346,10 @@ fi
 #     echo "Intermediate certificate already present in Application Gateway $appgw_name"
 # fi
 
-# HTTP Settings and probe
+# HTTP Settings and probe for HTTPS
 echo "Creating probe and HTTP settings..."
 az network application-gateway probe create -g "$rg" --gateway-name "$appgw_name" \
---name testvmprobe --protocol Https --host-name-from-http-settings --match-status-codes 200-399 --port 443 --path /api/healthcheck -o none
+--name testvmprobe --protocol Https --host-name-from-http-settings --match-status-codes 200-399 --port 443 --path "/api/healthcheck" -o none
 az network application-gateway http-settings create -g "$rg" --gateway-name "$appgw_name" --port 443 \
 --name testvmsettings --protocol https --host-name ${vm_fqdn} --probe testvmprobe --root-certs azfwroot -o none
 
@@ -426,6 +436,33 @@ bad_file_url=https://raw.githubusercontent.com/wicar/malware.wicar.org/master/da
 wget -q $bad_file_url -O $bad_file
 curl -k -F "data=@${bad_file}" "https://${appgw_fqdn}/api/filesize"
 
+
+############################################################################################
+# Verify AzFW DNS requirement (host HTTP header must resolve to the packet destination IP) #
+############################################################################################
+
+# Verify everything is working
+curl "https://${appgw_fqdn}/api/healthcheck"
+
+# Remove private DNS records
+az network private-dns record-set a remove-record --record-set-name "${vm_dns_name}" -z $public_domain -g $rg -a $vm_private_ip -o none
+az network private-dns record-set a remove-record --record-set-name "${vm_dns_name}-private" -z $public_domain -g $rg -a $vm_private_ip -o none
+
+# The app should stop working after a while
+curl "https://${appgw_fqdn}/api/healthcheck"
+
+# Get AzFW raw messages (all)
+query='AzureDiagnostics
+| where TimeGenerated >= ago(5m) 
+| where ResourceType == "AZUREFIREWALLS" 
+| project TimeGenerated, msg_s
+| order by TimeGenerated'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+
+# Re-add records for split DNS
+az network private-dns record-set a add-record --record-set-name "${vm_dns_name}" -z $public_domain -g $rg -a $vm_private_ip -o none
+az network private-dns record-set a add-record --record-set-name "${vm_dns_name}-private" -z $public_domain -g $rg -a $vm_private_ip -o none
+
 ########################
 # Query AzMonitor logs #
 ########################
@@ -438,7 +475,7 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $query -o 
 # AzFW Net rules
 query_net='AzureDiagnostics
 | where ResourceType == "AZUREFIREWALLS" 
-| where Category == "AzureFirewallNetworkRule"
+| where Category == "AzureFirewallNetworkRule"
 | where TimeGenerated >= ago(5m) 
 | project TimeGenerated, msg_s
 | take 100 '
@@ -480,6 +517,13 @@ query='AzureDiagnostics
     IDSPriority = tostring(IDSPriorityInt)
 | project msg_original,TimeGenerated,Protocol,SourceIP,SourcePort,Target,TargetPort,URL,Action, NatDestination, OperationName,ThreatIntel,IDSSignatureID,IDSSignatureDescription,IDSPriority,IDSClassification,RuleCollection,Rule,WebCategory
 | project-away msg_original
+| order by TimeGenerated'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+# AzFW raw messages (all)
+query='AzureDiagnostics
+| where TimeGenerated >= ago(5m) 
+| where ResourceType == "AZUREFIREWALLS" 
+| project TimeGenerated, msg_s
 | order by TimeGenerated'
 az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
 # AppGW Log Categories
@@ -562,6 +606,9 @@ az network public-ip list -g $rg -o table
 # Virtual Machines
 az vm list -g $rg -o table
 
+# Subnets
+az network vnet subnet list --vnet-name $vnet_name -g $rg -o table
+
 # Azure Firewall
 az network firewall nat-rule collection list -f $azfw_name -g $rg -o table
 az network firewall nat-rule list -c VMTraffic -f $azfw_name -g $rg --query rules -o table
@@ -573,19 +620,26 @@ az network firewall application-rule list -c AllowAll -f $azfw_name -g $rg --que
 # Azure Firewall: SNAT configuration
 # No yet supported with CLI (https://docs.microsoft.com/en-us/azure/firewall/snat-private-range)
 
+# Records in private DNS zone
+az network private-dns record-set a list -z $public_domain -g $rg --query '[].{RecordName:name,IPv4Address:aRecords[0].ipv4Address}' -o table
+az network private-dns record-set list -z $public_domain -g $rg -o table
+az network private-dns record-set a list -z $public_domain -g $rg -o table
+az network private-dns record-set a show -n $vm_dns_name -z $public_domain -g $rg -o table
+az network private-dns record-set a show -n "${vm_dns_name}-private" -z $public_domain -g $rg -o table
+
 # App Gateway
-az network application-gateway list -g $appgw_rg -o table
-az network application-gateway http-listener list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway frontend-ip list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway probe list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway address-pool list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway rule show -g $appgw_rg --gateway-name $appgw_name -n rule1
-az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name -o table
-rule=$(az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name --query '[0].name' -o tsv)
-az network application-gateway rule show -g $appgw_rg --gateway-name $appgw_name -n $rule
-az network application-gateway url-path-map list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway http-settings list -g $appgw_rg --gateway-name $appgw_name -o table
+az network application-gateway list -g $rg -o table
+az network application-gateway http-listener list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway frontend-ip list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway probe list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway address-pool list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway rule list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway rule show -g $rg --gateway-name $appgw_name -n rule1
+az network application-gateway rule list -g $rg --gateway-name $appgw_name -o table
+rule=$(az network application-gateway rule list -g $rg --gateway-name $appgw_name --query '[0].name' -o tsv)
+az network application-gateway rule show -g $rg --gateway-name $appgw_name -n $rule
+az network application-gateway url-path-map list -g $rg --gateway-name $appgw_name -o table
+az network application-gateway http-settings list -g $rg --gateway-name $appgw_name -o table
 
 # Delete VM
 vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -594,5 +648,29 @@ az vm delete -n $vm_name -g $rg -y
 az disk delete --ids $vm_disk_id -y
 az network nic delete --ids $vm_nic_id
 
-# Cleanup all
-az group delete -n $rg -y --no-wait
+########
+# Stop #
+########
+
+az vm deallocate -n $vm_name -g $rg --no-wait -o none
+az network application-gateway stop -g $rg -n $appgw_name --no-wait -o none
+ipconfig_name=$(az network firewall ip-config list -f $azfw_name -g $rg --query '[0].name' -o tsv)
+az network firewall ip-config delete -f $azfw_name -g $rg -n $ipconfig_name
+
+#########
+# Start #
+#########
+
+az network application-gateway start -g $rg -n $appgw_name --no-wait -o none
+az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+az network firewall update -n $azfw_name -g $rg
+azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+az vm start -n $vm_name -g $rg -o none
+vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "python3 /root/myip.py &"
+
+###############
+# Cleanup all #
+###############
+
+# az group delete -n $rg -y --no-wait
