@@ -19,22 +19,23 @@
 
 # Control
 no_of_hubs=2         # 1 or 2 hubs
-no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
+no_of_spokes=3       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=no        # Whether firewalls are provisioned in the hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
-indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
-nva_bgp=yes          # If using an NVA in spoke14/24, whether configuring BGP on it towards VWAN
+indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
+nva_bgp=no           # If using an NVA in spoke14/24, whether configuring BGP on it towards VWAN
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
-nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
-nva_in_hub2=yes      # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=no      # Whether VPN GWs should be deployed
-deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
+deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
+route_thru_nva=yes   # Whether a static pointing to the NVA in the last spoke is configured
 # Generic variables
-rg=vwan
+rg=vwaneastus
 vwan=vwan
-location1=westcentralus
-location2=westcentralus
+location1=eastus
+location2=westus
 password=Microsoft123!
 vwan_hub1_prefix=192.168.0.0/23
 vwan_hub2_prefix=192.168.2.0/23
@@ -1236,6 +1237,82 @@ then
     done
 fi
 
+# Optional: route through NVA (convert VM  to NVA and add static route in defaultRT)
+if [[ "$route_thru_nva" == "yes" ]]
+then
+    nva_spoke_id=$no_of_spokes
+    # Hub 1: Configure IP fwding for the NVAs
+    vm_name="spoke1${nva_spoke_id}-vm"
+    echo "Enabling IP Forwarding for ${vm_name}..."
+    vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $vm_nic_id --ip-forwarding -o none
+    # Hub 2: Configure IP fwding for the NVAs
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        vm_name="spoke2${nva_spoke_id}-vm"
+        echo "Enabling IP Forwarding for ${vm_name}..."
+        vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        az network nic update --ids $vm_nic_id --ip-forwarding -o none
+    fi
+    # Hub 1: Configure NVA VNet connection to not learn the default route, and add route to route-table
+    cx_name="spoke1${nva_spoke_id}"
+    cx_id=$(az network vhub connection show --vhub-name hub1 -g $rg -n $cx_name --query id -o tsv)
+    echo "Adding default route to defaultRouteTable in hub1..."
+    az network vhub route-table route add -n defaultRouteTable -g $rg --vhub-name hub1 --destination-type CIDR --destinations "0.0.0.0/0" --next-hop-type ResourceId --next-hop $cx_id --route-name default -o none
+    az network vhub connection update --ids $cx_id --set "enableInternetSecurity=false" -o none
+    # Hub 1: Adding route to Vnet connection
+    vm_name="spoke1${nva_spoke_id}-vm"
+    echo "Finding out IP address for NVA ${vm_name}..."
+    vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    nva_ip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "Private IP address for ${vm_name} is ${nva_ip}"
+    vnet_route="{
+        \"name\": \"default\",
+        \"nextHopIpAddress\": \"${nva_ip}\",
+        \"addressPrefixes\": [ \"0.0.0.0/0\" ]}"
+    # Delete all existing routes in the VNet connection
+    vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+    while [[ -n "$vnet_route_name" ]]
+    do
+        # If there was a route, delete it first
+        echo "Previous route $vnet_route_name detected, deleting first..."
+        az network vhub connection update --ids $cx_id --remove "routingConfiguration.vnetRoutes.staticRoutes" "0" -o none
+        vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+    done
+    echo "Creating static route in connection $cx_id with next hop ${nva_ip}..."
+    az network vhub connection update --ids $cx_id --add "routingConfiguration.vnetRoutes.staticRoutes" $vnet_route -o none
+    # Hub 2: Configure NVA VNet connection to not learn the default route, and add route to route-table
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        cx_name="spoke2${nva_spoke_id}"
+        cx_id=$(az network vhub connection show --vhub-name hub2 -g $rg -n $cx_name --query id -o tsv)
+        echo "Adding default route to defaultRouteTable in hub2..."
+        az network vhub route-table route add -n defaultRouteTable -g $rg --vhub-name hub2 --destination-type CIDR --destinations "0.0.0.0/0" --next-hop-type ResourceId --next-hop $cx_id --route-name default -o none
+        az network vhub connection update --ids $cx_id --set "enableInternetSecurity=false" -o none
+        # Hub 2: Adding route to Vnet connection
+        vm_name="spoke2${nva_spoke_id}-vm"
+        echo "Finding out IP address for NVA ${vm_name}..."
+        vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        nva_ip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+        echo "Private IP address for ${vm_name} is ${nva_ip}"
+        vnet_route="{
+            \"name\": \"default\",
+            \"nextHopIpAddress\": \"${nva_ip}\",
+            \"addressPrefixes\": [ \"0.0.0.0/0\" ]}"
+        # Delete all existing routes in the VNet connection
+        vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+        while [[ -n "$vnet_route_name" ]]
+        do
+            # If there was a route, delete it first
+            echo "Previous route $vnet_route_name detected, deleting first..."
+            az network vhub connection update --ids $cx_id --remove "routingConfiguration.vnetRoutes.staticRoutes" "0" -o none
+            vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+        done
+        echo "Creating static route in connection $cx_id with next hop ${nva_ip}..."
+        az network vhub connection update --ids $cx_id --add "routingConfiguration.vnetRoutes.staticRoutes" $vnet_route -o none
+    fi
+fi
+
 # Optional: additional spokes with NVA and 2 indirect spokes attached to them
 if [[ "$indirect_spokes" == "yes" ]]
 then
@@ -1713,9 +1790,9 @@ then
     then
         peering_id_2=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name hub2er -g $rg -o tsv --query id) && echo "Private peering ID is $peering_id_2"
         if [[ -z "$peering_id_2" ]]
-        else
-            echo "Could not find private peering for ER circuit 2, you might have to refresh in the portal?"
         then
+            echo "Could not find private peering for ER circuit 2, you might have to refresh in the portal?"
+        else
             hub2_default_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n defaultRouteTable --query id -o tsv) && echo $hub1_default_rt_id
             echo "Connecting branch5 to ER circuit 2..."
             az network vpn-connection create -n "${branch5_gw_name}-${er_pop}-$RANDOM" -g $rg -l $branch5_location --vnet-gateway1 $branch5_gw_name --express-route-circuit2 $circuit2_id -o none

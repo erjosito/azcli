@@ -148,6 +148,7 @@ azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id) && ec
 az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
     --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "AzureFirewallDnsProxy", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
             {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
 az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name
 az network firewall update -n $azfw_name -g $rg
@@ -448,7 +449,7 @@ curl "https://${appgw_fqdn}/api/healthcheck"
 az network private-dns record-set a remove-record --record-set-name "${vm_dns_name}" -z $public_domain -g $rg -a $vm_private_ip -o none
 az network private-dns record-set a remove-record --record-set-name "${vm_dns_name}-private" -z $public_domain -g $rg -a $vm_private_ip -o none
 
-# The app should stop working after a while
+# The app should stop working after a while (everything keeps working!!!!!)
 curl "https://${appgw_fqdn}/api/healthcheck"
 
 # Get AzFW raw messages (all)
@@ -652,22 +653,28 @@ az network nic delete --ids $vm_nic_id
 # Stop #
 ########
 
+# VM (server)
 az vm deallocate -n $vm_name -g $rg --no-wait -o none
-az network application-gateway stop -g $rg -n $appgw_name --no-wait -o none
+# App GW
+az network application-gateway stop -g $rg -n $appgw_name -o none
+# Az FW
 ipconfig_name=$(az network firewall ip-config list -f $azfw_name -g $rg --query '[0].name' -o tsv)
-az network firewall ip-config delete -f $azfw_name -g $rg -n $ipconfig_name
+az network firewall ip-config delete -f $azfw_name -g $rg -n $ipconfig_name -o none
 
 #########
 # Start #
 #########
 
-az network application-gateway start -g $rg -n $appgw_name --no-wait -o none
-az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
-az network firewall update -n $azfw_name -g $rg
-azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+# VM (server)
 az vm start -n $vm_name -g $rg -o none
 vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "python3 /root/myip.py &"
+# AppGW
+az network application-gateway start -g $rg -n $appgw_name --no-wait -o none
+# AzFW
+az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+az network firewall update -n $azfw_name -g $rg -o none
+azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo $azfw_private_ip
 
 ###############
 # Cleanup all #

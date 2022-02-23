@@ -8,10 +8,16 @@
 #   to another DNS server running on a VM (dnsmasq).
 ############################################################################
 
+# Control variables
+create_azfw=no          # Whether an AzFW is created in the hub with DNS configured
+create_onpremdns=no     # Whether a dnsmasq server is configured to simulate an onprem server
+create_spokes=yes       # Create spokes
+
 # Variables
-rg=azfw
+# Note: '10.0.1.0/24;10.0.2.0/24;10.0.3.0/24' are reserved IPs!!!!!
+rg=dns
 location=westeurope
-vnet_name=dns
+vnet_name=hub
 vnet_prefix=192.168.0.0/16
 azfw_name=azfwdns
 azfw_policy_name=azfwdnspolicy
@@ -39,12 +45,26 @@ private_dns_zone=contoso.corp
 private_dns_host=test
 private_dns_fqdn="${private_dns_host}.${private_dns_zone}"
 private_dns_ip="5.6.7.8"
-spoke_vnet_name=spoke1
-spoke_vnet_prefix='10.0.1.0/24'
-spoke_subnet_name=vm
-spoke_subnet_prefix='10.0.1.0/26'
-spoke_vm_name=spokeclientvm
-spoke_vm_pip_name="${spoke_vm_name}-pip"
+spoke1_vnet_name=spoke1
+spoke1_vnet_prefix='10.1.1.0/24'
+spoke1_subnet_name=vm
+spoke1_subnet_prefix='10.1.1.0/26'
+spoke1_vm_name=spoke1clientvm
+spoke1_vm_pip_name="${spoke1_vm_name}-pip"
+spoke1_resolver_in_subnet_name=resolverin
+spoke1_resolver_in_subnet_prefix=10.1.1.64/28
+spoke1_resolver_out_subnet_name=resolverout
+spoke1_resolver_out_subnet_prefix=10.1.1.80/28
+spoke2_vnet_name=spoke2
+spoke2_vnet_prefix='10.1.2.0/24'
+spoke2_subnet_name=vm
+spoke2_subnet_prefix='10.1.2.0/26'
+spoke2_vm_name=spoke2clientvm
+spoke2_vm_pip_name="${spoke2_vm_name}-pip"
+spoke2_resolver_in_subnet_name=resolverin
+spoke2_resolver_in_subnet_prefix=10.1.2.64/28
+spoke2_resolver_out_subnet_name=resolverout
+spoke2_resolver_out_subnet_prefix=10.1.2.80/28
 
 # RG and vnets
 echo "Creating RG and VNet..."
@@ -54,47 +74,68 @@ az network vnet subnet create -n $client_subnet_name --vnet-name $vnet_name -g $
 az network vnet subnet create -n $dns_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $dns_subnet_prefix -o none
 az network vnet subnet create -n $resolver_in_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $resolver_in_subnet_prefix -o none
 az network vnet subnet create -n $resolver_out_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $resolver_out_subnet_prefix -o none
-az network vnet create -n $spoke_vnet_name -g $rg --address-prefixes $spoke_vnet_prefix --subnet-name $spoke_subnet_name --subnet-prefixes $spoke_subnet_prefix -o none
-az network vnet peering create -n hubtospoke -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
-az network vnet peering create -n spoketohub -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+if [[ "$create_spokes" == "yes" ]]
+then
+    # Spoke 1
+    az network vnet create -n $spoke1_vnet_name -g $rg --address-prefixes $spoke1_vnet_prefix --subnet-name $spoke1_subnet_name --subnet-prefixes $spoke1_subnet_prefix -o none
+    az network vnet peering create -n hubtospoke1 -g $rg --vnet-name $vnet_name --remote-vnet $spoke1_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n spoke1tohub -g $rg --vnet-name $spoke1_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet subnet create -n $spoke1_resolver_in_subnet_name --vnet-name $spoke1_vnet_name -g $rg --address-prefixes $spoke1_resolver_in_subnet_prefix -o none
+    az network vnet subnet create -n $spoke1_resolver_out_subnet_name --vnet-name $spoke1_vnet_name -g $rg --address-prefixes $spoke1_resolver_out_subnet_prefix -o none
+    # Spoke 2
+    az network vnet create -n $spoke2_vnet_name -g $rg --address-prefixes $spoke2_vnet_prefix --subnet-name $spoke2_subnet_name --subnet-prefixes $spoke2_subnet_prefix -o none
+    az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $vnet_name --remote-vnet $spoke2_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke2_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet subnet create -n $spoke2_resolver_in_subnet_name --vnet-name $spoke2_vnet_name -g $rg --address-prefixes $spoke2_resolver_in_subnet_prefix -o none
+    az network vnet subnet create -n $spoke2_resolver_out_subnet_name --vnet-name $spoke2_vnet_name -g $rg --address-prefixes $spoke2_resolver_out_subnet_prefix -o none
+fi
 
 # Private DNS Zone
 echo "Creating private DNS Zone..."
 az network private-dns zone create -n $private_dns_zone -g $rg -o none
 az network private-dns record-set a add-record --record-set-name $private_dns_host -z $private_dns_zone -g $rg -a $private_dns_ip -o none
 az network private-dns link vnet create -g $rg -z $private_dns_zone -n $vnet_name --virtual-network $vnet_name --registration-enabled false -o none
+# Alternatively, create the link with autoregistration
+# az network private-dns link vnet delete -g $rg -z $private_dns_zone -n $vnet_name -y -o none
+# az network private-dns link vnet create -g $rg -z $private_dns_zone -n $vnet_name --virtual-network $vnet_name --registration-enabled true -o none
 
-# Azure Firewall
-echo "Creating Azure Firewall..."
-az network firewall create -n $azfw_name -g $rg -l $location -o none
-az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -o none
-az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
-az network firewall update -n $azfw_name -g $rg -o none
-az network firewall policy create -n $azfw_policy_name -g $rg -o none
-az network firewall update -n $azfw_name -g $rg --firewall-policy $azfw_policy_name -o none
-az network firewall policy rule-collection-group create -n myrcg --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
-az network firewall policy rule-collection-group collection add-filter-collection --rule-type NetworkRule -g $rg --rcg-name myrcg --policy-name $azfw_policy_name \
-    --action Allow --collection-priority 1010 --name testnetrules --rule-name ifconfig --source-addresses '*' --destination-fqdns 'ifconfig.co' \
-    --ip-protocols Tcp --destination-ports 443 -o none
-# az network firewall policy rule-collection-group collection rule add --rule-type NetworkRule -g $rg --rcg-name myrcg --policy-name $azfw_policy_name \
-#     --collection-name testnetrules --name permitany --source-addresses '*' --destination-addresses '*' \
-#     --ip-protocols Any --destination-ports '*' -o none
-azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+# Create Azure Firewall
+if [[ "$create_azfw" == "yes" ]]
+then
+    echo "Creating Azure Firewall..."
+    az network firewall create -n $azfw_name -g $rg -l $location -o none
+    az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -o none
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+    az network firewall policy create -n $azfw_policy_name -g $rg -o none
+    az network firewall update -n $azfw_name -g $rg --firewall-policy $azfw_policy_name -o none
+    az network firewall policy rule-collection-group create -n myrcg --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
+    az network firewall policy rule-collection-group collection add-filter-collection --rule-type NetworkRule -g $rg --rcg-name myrcg --policy-name $azfw_policy_name \
+        --action Allow --collection-priority 1010 --name testnetrules --rule-name ifconfig --source-addresses '*' --destination-fqdns 'ifconfig.co' \
+        --ip-protocols Tcp --destination-ports 443 -o none
+    # az network firewall policy rule-collection-group collection rule add --rule-type NetworkRule -g $rg --rcg-name myrcg --policy-name $azfw_policy_name \
+    #     --collection-name testnetrules --name permitany --source-addresses '*' --destination-addresses '*' \
+    #     --ip-protocols Any --destination-ports '*' -o none
+    azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+fi
 
-# DNS server VM
-echo "Creating DNS server VM..."
-az vm create -n $dns_vm_name -g $rg --vnet-name $vnet_name --subnet $dns_subnet_name --public-ip-address $dns_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
-dns_vm_pip=$(az network public-ip show -n $dns_vm_pip_name -g $rg --query ipAddress -o tsv)
-dns_vm_nic_id=$(az vm show -n $dns_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-dns_vm_privateip=$(az network nic show --ids $dns_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-echo "DNS server deployed to $dns_vm_privateip, $dns_vm_pip"
-echo "Installing dnsmasq"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo apt update -y && sudo apt -y install dnsmasq"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo sed -i '$ a\log-queries' /etc/dnsmasq.conf"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl restart dnsmasq"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl status dnsmasq"
-echo "Adding sample DNS name $sample_fqdn with IP $sample_ip..."
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$dns_vm_pip" "sudo sed -i \"\$ a $sample_ip $sample_fqdn\" /etc/hosts"
+# DNS server VM in hub to simulate onprem DNS (to test fwding from Azure DNS Resolver)
+if [[ "$create_azfw" == "yes" ]]
+then
+    echo "Creating DNS server VM..."
+    az vm create -n $dns_vm_name -g $rg --vnet-name $vnet_name --subnet $dns_subnet_name --public-ip-address $dns_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
+    dns_vm_pip=$(az network public-ip show -n $dns_vm_pip_name -g $rg --query ipAddress -o tsv)
+    dns_vm_nic_id=$(az vm show -n $dns_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    dns_vm_privateip=$(az network nic show --ids $dns_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "DNS server deployed to $dns_vm_privateip, $dns_vm_pip"
+    echo "Installing dnsmasq"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo apt update -y && sudo apt -y install dnsmasq"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo sed -i '$ a\log-queries' /etc/dnsmasq.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl restart dnsmasq"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl status dnsmasq"
+    echo "Adding sample DNS name $sample_fqdn with IP $sample_ip..."
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$dns_vm_pip" "sudo sed -i \"\$ a $sample_ip $sample_fqdn\" /etc/hosts"
+fi
 
 # Client VM (hub)
 echo "Creating client VM in hub VNet..."
@@ -104,47 +145,99 @@ client_vm_nic_id=$(az vm show -n $client_vm_name -g $rg --query 'networkProfile.
 client_vm_privateip=$(az network nic show --ids $client_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
 echo "Client VM deployed to $client_vm_privateip, $client_vm_pip"
 
-# Client VM (spoke)
-echo "Creating client VM in spoke VNet ${spoke_vnet_name}..."
-az vm create -n $spoke_vm_name -g $rg --vnet-name $spoke_vnet_name --subnet $spoke_subnet_name --public-ip-address $spoke_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
-spoke_vm_pip=$(az network public-ip show -n $spoke_vm_pip_name -g $rg --query ipAddress -o tsv)
-spoke_vm_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-spoke_vm_privateip=$(az network nic show --ids $spoke_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-echo "Client VM deployed to $spoke_vm_privateip, $spoke_vm_pip"
+# Client VM (spoke1)
+if [[ "$create_spokes" == "yes" ]]
+then
+    echo "Creating client VM in spoke1 VNet ${spoke1_vnet_name}..."
+    az vm create -n $spoke1_vm_name -g $rg --vnet-name $spoke1_vnet_name --subnet $spoke1_subnet_name --public-ip-address $spoke1_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
+    spoke1_vm_pip=$(az network public-ip show -n $spoke1_vm_pip_name -g $rg --query ipAddress -o tsv)
+    spoke1_vm_nic_id=$(az vm show -n $spoke1_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    spoke1_vm_privateip=$(az network nic show --ids $spoke1_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "Client VM deployed to $spoke1_vm_privateip, $spoke1_vm_pip"
+fi
+
+# Client VM (spoke2)
+if [[ "$create_spokes" == "yes" ]]
+then
+    echo "Creating client VM in spoke2 VNet ${spoke2_vnet_name}..."
+    az vm create -n $spoke2_vm_name -g $rg --vnet-name $spoke2_vnet_name --subnet $spoke2_subnet_name --public-ip-address $spoke2_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
+    spoke2_vm_pip=$(az network public-ip show -n $spoke2_vm_pip_name -g $rg --query ipAddress -o tsv)
+    spoke2_vm_nic_id=$(az vm show -n $spoke2_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    spoke2_vm_privateip=$(az network nic show --ids $spoke2_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "Client VM deployed to $spoke2_vm_privateip, $spoke2_vm_pip"
+fi
 
 # Configure DNS settings in Azure Firewall policy
-echo "Enabling DNS proxy in Azure Firewall policy ${azfw_policy_name}..."
-# This can be either the Azure DNS Resolver's inbound endpoint IP address, or the Azure DNS IP (if the ruleset is linked to the VNet)
-az network firewall policy update -n $azfw_policy_name -g $rg --enable-dns-proxy --dns-servers '168.63.129.16' -o none
-# az network firewall policy update -n $azfw_policy_name -g $rg --enable-dns-proxy --dns-servers '192.168.101.4' -o none
+if [[ "$create_azfw" == "yes" ]]
+then
+    echo "Enabling DNS proxy in Azure Firewall policy ${azfw_policy_name}..."
+    # This can be either the Azure DNS Resolver's inbound endpoint IP address, or the Azure DNS IP (if the ruleset is linked to the VNet)
+    az network firewall policy update -n $azfw_policy_name -g $rg --enable-dns-proxy --dns-servers '168.63.129.16' -o none
+    # az network firewall policy update -n $azfw_policy_name -g $rg --enable-dns-proxy --dns-servers '192.168.101.4' -o none
+fi
 
 # Configure Logging in the Azure Firewall
-logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
-if [[ -z "$logws_name" ]]
+if [[ "$create_azfw" == "yes" ]]
 then
-    echo "Creating new Log Analytics workspace"
-    logws_name=log$RANDOM
-    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
-else
-    echo "Log Analytics workspace $logws_name found"
+    logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+    if [[ -z "$logws_name" ]]
+    then
+        echo "Creating new Log Analytics workspace"
+        logws_name=log$RANDOM
+        az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+    else
+        echo "Log Analytics workspace $logws_name found"
+    fi
+    logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+    logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+    azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+    az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id -o none \
+        --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+        --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+                {"category": "AzureFirewallDnsProxy", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
 fi
-logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
-logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
-azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
-az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id -o none \
-    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
-    --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
-            {"category": "AzureFirewallDnsProxy", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
-            {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' >/dev/null
 
 # Associate a route table to the client VM subnet to send traffic to ifconfig.co (162.159.138.85, 162.159.137.85) through the firewall
-echo "Creating route table for client VM subnet..."
-az network route-table create -n clientrt -l $location -g $rg -o none
-az network route-table route create --route-table-name clientrt -g $rg -o none \
-    --address-prefix 162.159.138.85/32 -n ifconfigco1 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip
-az network route-table route create --route-table-name clientrt -g $rg -o none \
-    --address-prefix 162.159.137.85/32 -n ifconfigco2 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip
-az network vnet subnet update -g $rg --vnet-name $vnet_name -n $client_vm_subnet_name --route-table clientrt -o none
+if [[ "$create_azfw" == "yes" ]]
+then
+    echo "Creating route table for client VM subnet..."
+    az network route-table create -n clientrt -l $location -g $rg -o none
+    az network route-table route create --route-table-name clientrt -g $rg -o none \
+        --address-prefix 162.159.138.85/32 -n ifconfigco1 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip
+    az network route-table route create --route-table-name clientrt -g $rg -o none \
+        --address-prefix 162.159.137.85/32 -n ifconfigco2 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip
+    az network vnet subnet update -g $rg --vnet-name $vnet_name -n $client_vm_subnet_name --route-table clientrt -o none
+fi
+
+# Set the hub and spoke VNets to the inbound endpoint of the hub resolver
+hub_resolver_ip="192.168.101.4"
+echo "Setting VNets to use the hub DNS Resolver IP $hub_resolver_ip..."
+az network vnet update -n $vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+if [[ "$create_spokes" == "yes" ]]
+then
+    az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+    az network vnet update -n $spoke2_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+fi
+# Refresh DNS lease VM
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "sudo systemctl restart systemd-networkd"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "netplan ip leases eth0 | grep DNS"
+if [[ "$create_spokes" == "yes" ]]
+then
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "sudo systemctl restart systemd-networkd"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "netplan ip leases eth0 | grep DNS"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke2_vm_pip" "sudo systemctl restart systemd-networkd"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke2_vm_pip" "netplan ip leases eth0 | grep DNS"
+fi
+
+#############################
+#  DNS resolution examples  #
+#############################
+
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $client_vm_name"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup ${client_vm_name}.${private_dns_zone}"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $client_vm_privateip"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup ${private_dns_host}.${private_dns_zone}"
 
 ###########
 # Testing #
@@ -177,26 +270,47 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "curl -s4 h
 # From spoke VNet
 # 1. Change the spoke VNet DNS custom server config (Azure DNS or Azure Firewall)
 echo "Setting Spoke VNet to use the corporate DNS server in $dns_vm_private_ip directly..."
-az network vnet update -n $spoke_vnet_name -g $rg --dns-servers $dns_vm_privateip -o none
+az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $dns_vm_privateip -o none
 echo "Setting spoke VNet custom DNS servers to Azure Firewall..."
-az network vnet update -n $spoke_vnet_name -g $rg --dns-servers $azfw_private_ip -o none
+az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $azfw_private_ip -o none
 echo "Setting spoke VNet custom DNS servers to Azure DNS..."
-az network vnet update -n $spoke_vnet_name -g $rg --dns-servers '' -o none
+az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers '' -o none
 # 2. Refresh DNS lease in spoke VM
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "sudo systemctl restart systemd-networkd"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "netplan ip leases eth0 | grep DNS"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "sudo systemctl restart systemd-networkd"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "netplan ip leases eth0 | grep DNS"
 # 3. Test 3 names from the spoke VM: an FQDN on a private DNS zone, a corp FQDN (defined in the DNS server), and a public FQDN
 echo "Resolving on spoke VM over a private DNS zone the FQDN '${private_dns_fqdn}'..."
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "nslookup $private_dns_fqdn"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup $private_dns_fqdn"
 echo "Resolving on spoke VM over a corporate DNS server the FQDN '${sample_fqdn}'..."
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "nslookup $sample_fqdn"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup $sample_fqdn"
 echo "Resolving on spoke VM public DNS name 'microsoft.com'"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "nslookup microsoft.com"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup microsoft.com"
 
-# Diagnostics
-az network nic show --ids $client_vm_nic_id --query 'dnsSettings.dnsServers[0]' -o tsv
+###############
+# Diagnostics #
+###############
+
+# OS DNS settings
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "netplan ip leases eth0 | grep DNS"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "netplan ip leases eth0 | grep DNS"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke2_vm_pip" "netplan ip leases eth0 | grep DNS"
+
+# NIC DNS settings
+az network nic show --ids $client_vm_nic_id --query 'dnsSettings.dnsServers[0]' -o tsv
+az network nic show --ids $spoke1_vm_nic_id --query 'dnsSettings.dnsServers[0]' -o tsv
+az network nic show --ids $spoke2_vm_nic_id --query 'dnsSettings.dnsServers[0]' -o tsv
+
+# VNet DNS settings
+az network vnet show -n $vnet_name -g $rg --query 'dhcpOptions.dnsServers[0]'
+az network vnet show -n $spoke1_name -g $rg --query 'dhcpOptions.dnsServers[0]'
+az network vnet show -n $spoke2_name -g $rg --query 'dhcpOptions.dnsServers[0]'
+
+# Az FW DNS config
 az network firewall policy show -n $azfw_policy_name -g $rg --query 'dnsSettings'
+
+# Private DNS
+az network private-dns link vnet list -g $rg -z $private_dns_zone -o table
+az network private-dns record-set a list -z $private_dns_zone -g $rg --query '[].{RecordName:name,IPv4Address:aRecords[0].ipv4Address}' -o table
 
 # Azure Firewall DNS logs
 fw_net_logs_query='AzureDiagnostics
@@ -234,10 +348,10 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "cat /var/log/sy
 ######################
 
 # Variables
-$ResourceGroupName = "azfw"
-$VNetName = "dns"
+$ResourceGroupName = "dns"
+$VNetName = "hub"
 $SpokeVNetName = "spoke1"
-$ResolverName = "myresolver"
+$ResolverName = "hubresolver"
 $Location = "westeurope"
 $SubnetInName = "resolverin"
 $SubnetOutName = "resolverout"
@@ -253,18 +367,18 @@ Install-Module Az.DnsResolver -RequiredVersion 0.1.5
 Get-InstalledModule -Name Az.DnsResolver
 Connect-AzAccount -Environment AzureCloud
 Select-AzSubscription -SubscriptionObject (Get-AzSubscription -SubscriptionId $SubscriptionId)
-Register-AzResourceProvider -ProviderNamespace Microsoft.Network
-# Create resolver
+Register-AzResourceProvider -Feature ManagedResolver -ProviderNamespace Microsoft.Network
+# Register-AzResourceProvider -ProviderNamespace Microsoft.Network
+
+# Create resolver in hub
 $VNet = Get-AzVirtualNetwork -Name $VNetName -ResourceGroupName $ResourceGroupName
 New-AzDnsResolver -Name $ResolverName -ResourceGroupName $ResourceGroupName -Location $Location -VirtualNetworkId $VNet.Id
 $Resolver = Get-AzDnsResolver -Name $ResolverName -ResourceGroupName $ResourceGroupName
 $Resolver.ToJsonString()
 # Configure endpoints
 $SubnetIn = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $VNet -Name $SubnetInName
-$ipConfigOne = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMethod Dynamic -SubnetId $SubnetIn.Id
-$ipConfigTwo = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMethod Dynamic -SubnetId $SubnetIn.Id
-# New-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName -IPConfiguration $ipConfigOne,$ipConfigTwo
-New-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName -IPConfiguration $ipConfigOne
+$ipConfigIn = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMethod Dynamic -SubnetId $SubnetIn.Id
+New-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName -IPConfiguration $ipConfigIn
 $EndpointIn = Get-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
 $EndpointIn.ToJsonString()
 $SubnetOut = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $VNet -Name $SubnetOutName
@@ -284,16 +398,56 @@ $(Get-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName
 $Context = Get-AzContext
 $VnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $VNet.Name -VirtualNetworkId $VNet.Id -SubscriptionId $Context.Subscription.Id
 Get-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName
-# Link to Spoke VNet
+# OPTIONAL: Link hub Resolver to spoke VNet
+$SpokeVNetName = "spoke1"
 $SpokeVNet = Get-AzVirtualNetwork -Name $SpokeVNetName -ResourceGroupName $ResourceGroupName
 $SpokeVnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $SpokeVNetName -VirtualNetworkId $SpokeVNet.Id -SubscriptionId $Context.Subscription.Id
 Get-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName
+# OPTIONAL: Create another resolver in spoke VNet
+$SpokeVNetName = "spoke1"
+$SpokeVNet = Get-AzVirtualNetwork -Name $SpokeVNetName -ResourceGroupName $ResourceGroupName
+$SpokeResolverName = $SpokeVNetName+ "resolver"
+$SpokeEndpointInName = $SpokeVNetName+ "in"
+$SpokeEndpointOutName = $SpokeVNetName+ "out"
+$SpokeRulesetName = $SpokeVNetName+ "ruleset"
+New-AzDnsResolver -Name $SpokeResolverName -ResourceGroupName $ResourceGroupName -Location $Location -VirtualNetworkId $SpokeVNet.Id
+$SpokeResolver = Get-AzDnsResolver -Name $SpokeResolverName -ResourceGroupName $ResourceGroupName
+$SpokeResolver.ToJsonString()
+$SpokeSubnetIn = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $SpokeVNet -Name $SubnetInName
+$SpokeIpConfigIn = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMethod Dynamic -SubnetId $SpokeSubnetIn.Id
+New-AzDnsResolverInboundEndpoint -Name $SpokeEndpointInName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName -IPConfiguration $SpokeIpConfigIn
+$SpokeEndpointIn = Get-AzDnsResolverInboundEndpoint -Name $SpokeEndpointInName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
+$SpokeEndpointIn.ToJsonString()
+$SpokeSubnetOut = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $SpokeVNet -Name $SubnetOutName
+New-AzDnsResolverOutboundEndpoint -DnsResolverName $SpokeResolverName -Name $SpokeEndpointOutName -ResourceGroupName $ResourceGroupName -SubnetId $SpokeSubnetOut.Id
+$SpokeEndpointOut = Get-AzDnsResolverOutboundEndpoint -Name $SpokeEndpointOutName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
+$SpokeEndpointOut.ToJsonString()
+New-AzDnsForwardingRuleset -Name $SpokeRulesetName -ResourceGroupName $ResourceGroupName -DnsResolverOutboundEndpoint $SpokeEndpointOut -Location $Location
+$SpokeRuleset = Get-AzDnsForwardingRuleset -Name $SpokeRulesetName -ResourceGroupName $ResourceGroupName
+$SpokeVnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $SpokeRuleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $SpokeVNet.Name -VirtualNetworkId $SpokeVNet.Id -SubscriptionId $Context.Subscription.Id
+Get-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $SpokeRuleset.Name -ResourceGroupName $ResourceGroupName
+# OPTIONAL: fwd rule from hub DNS Resolver to Spoke DNS Resolver for reverse DNS
+$TargetDNS = New-AzDnsResolverTargetDnsServerObject -IPAddress "10.1.1.68" -Port 53
+$TargetDomain = "1.1.10.in-addr.arpa."
+$RuleName = "spoke1"
+# Get-AzDnsResolverTargetDnsServerObject | ft
+$ForwardingRule = New-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $SpokeRuleset.Name -Name $RuleName -DomainName $TargetDomain -ForwardingRuleState "Enabled" -TargetDnsServer @($TargetDNS)
+$(Get-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name).ToJsonString()
+
 # DANGER: Delete resources
+# Hub
 Remove-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $VNetName
 Remove-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $SpokeVNetName
+Remove-AzDNSForwardingRuleset -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name
 Remove-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
 Remove-AzDnsResolverOutboundEndpoint -Name $EndpointOutName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
 Remove-AzDnsResolver -Name $ResolverName -ResourceGroupName $ResourceGroupName
+# Spoke
+Remove-AzDNSForwardingRuleset -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $SpokeRuleset.Name
+Remove-AzDnsResolverInboundEndpoint -Name $SpokeEndpointInName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
+Remove-AzDnsResolverOutboundEndpoint -Name $SpokeEndpointOutName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
+Remove-AzDnsResolver -Name $SpokeResolverName -ResourceGroupName $ResourceGroupName
+
 
 ####################
 # PowerShell (end) #
