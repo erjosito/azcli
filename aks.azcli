@@ -14,8 +14,9 @@ use_msi=yes
 aks_name=aks
 aks_rbac=yes
 aks_service_cidr=10.0.0.0/16
-vm_size=Standard_B2ms    # Other possible values: Standard_B2ms, Standard_D2_v3
+vm_size=Standard_B2ms    # Some possible values: Standard_B2ms, Standard_D2_v3
 preview_version=no
+network_plugin=kubenet
 # Vnet
 vnet_name=aksVnet
 vnet_prefix=10.13.0.0/16
@@ -184,11 +185,10 @@ fi
 az aks create -g $rg -n $aks_name -l $location \
     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
     ${(z)identity_options} \
-    --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
+    --network-plugin $network_plugin --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
     --network-policy 'calico' --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
-    --dns-name-prefix cloudtrooper \
-    --enable-private-cluster --private-dns-zone none
+    --dns-name-prefix cloudtrooper
 
 # Other options you can use in the previous command
     # --enable-private-cluster --private-dns-zone none --disable-public-fqdn \
@@ -285,6 +285,9 @@ az aks nodepool list --cluster-name $aks_name -g $rg -o table
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=1
 kubectl create deployment sqlapi --image=erjosito/sqlapi:1.0 --port=8080 --replicas=1
+
+# Service with kubectl
+kubectl expose deploy sqlapi --port=80 --target-port=8080
 
 # Service
 yaml_file=/tmp/svc.yaml
@@ -550,6 +553,7 @@ az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm
 vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
 node_ip=$(kubectl get node -o json | jq -r '.items[0].status.addresses[] | select(.type=="InternalIP") | .address') && echo $node_ip
+# Connect to an AKS node over the jump VM
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -m hmac-sha2-512 -J $vm_pip_address $node_ip "ip a"
 
 #######################
@@ -557,6 +561,125 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -m hmac-sha2-512 -J $vm_pip_
 #######################
 
 # https://github.com/rishasi/OpenVPN-on-AKS
+
+# Server pod
+helm repo add stenic https://stenic.github.io/helm-charts
+helm install openvpnserver --set "service.type=LoadBalancer" --set "service.gui.type=LoadBalancer" --set "service.admin.type=LoadBalancer" stenic/openvpn-as
+k get svc
+
+# Open iptables in the server???
+openvpn_server_pod=$(k get pod -l app.kubernetes.io/instance=openvpnserver -o json | jq -r '.items[0].metadata.name') && echo $openvpn_server_pod
+kubectl exec $openvpn_server_pod -- iptables -A INPUT -i as0t+ -j ACCEPT
+kubectl exec $openvpn_server_pod -- iptables -A FORWARD -i as0t+ -j ACCEPT
+
+# default credentials: altmin/passw0rd -> Download client portal from the 9443 svc to current directory
+client_ovpn_file=./client.ovpn
+
+# Client file for VM (using public IPs)
+# Replace in the file the OpenVPN Server Pod IP with the Service IP (ALB)
+clientvm_ovpn_file=./clientvm.ovpn
+cp $client_ovpn_file $clientvm_ovpn_file
+pip_1194_udp=$(kubectl get service openvpnserver-openvpn-as-udp -o json | jq -r '.status.loadBalancer.ingress[0].ip') && echo $pip_1194_udp
+pip_9443_tcp=$(kubectl get service openvpnserver-openvpn-as-tcp -o json | jq -r '.status.loadBalancer.ingress[0].ip') && echo $pip_9443_tcp
+private_ip=$(k get pod -l app.kubernetes.io/instance=openvpnserver -o json | jq -r '.items[0].status.podIP') && echo $private_ip
+sed -i "s/$private_ip 1194 udp/$pip_1194_udp 1194 udp/g" $clientvm_ovpn_file
+sed -i "s/$private_ip 9443 tcp/$pip_9443_tcp 9443 tcp/g" $clientvm_ovpn_file
+
+# Client file for VM (using cluster IPs)
+clientpod_ovpn_file=./clientpod.ovpn
+cp $client_ovpn_file $clientpod_ovpn_file
+clusterip_1194_udp=$(kubectl get service openvpnserver-openvpn-as-udp -o json | jq -r '.spec.clusterIP') && echo $clusterip_1194_udp
+clusterip_9443_tcp=$(kubectl get service openvpnserver-openvpn-as-tcp -o json | jq -r '.spec.clusterIP') && echo $clusterip_9443_tcp
+sed -i "s/$private_ip 1194 udp/$clusterip_1194_udp 1194 udp/g" $clientpod_ovpn_file
+sed -i "s/$private_ip 9443 tcp/$clusterip_9443_tcp 9443 tcp/g" $clientpod_ovpn_file
+
+# Client pod
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  creationTimestamp: null
+  labels:
+    run: openvpn-client
+  name: openvpn-client
+spec:
+  containers:
+  - image: debian
+    name: openvpn-client
+    command:
+      - sleep
+      - "36000"
+    securityContext:
+      capabilities:
+        add: ["NET_ADMIN"]
+    resources: {}
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+EOF
+
+# Copy client file and generate credentials file
+credentials_file=/tmp/login.conf
+cat <<EOF > $credentials_file
+altmin
+passw0rd
+EOF
+kubectl cp $credentials_file openvpn-client:/tmp/login.conf
+
+# Run in pod:
+kubectl cp $clientpod_ovpn_file openvpn-client:/tmp/client.ovpn
+kubectl exec openvpn-client -- apt update -y
+kubectl exec openvpn-client -- apt install curl openvpn psmisc -y
+kubectl exec openvpn-client -- mkdir -p /dev/net
+kubectl exec openvpn-client -- mknod /dev/net/tun c 10 200
+kubectl exec openvpn-client -- chmod 600 /dev/net/tun
+kubectl exec openvpn-client -- cat /dev/net/tun
+kubectl exec openvpn-client -- ls -al /tmp/client.ovpn
+
+# Start VPN in client pod
+kubectl exec openvpn-client -- openvpn --config /tmp/client.ovpn --auth-user-pass /tmp/login.conf --daemon --log-append /var/log/syslog
+
+# Troubleshoot client pod
+kubectl exec openvpn-client -- ip a
+kubectl exec openvpn-client -- ip route
+
+# Troubleshoot server pod
+openvpn_server_pod=$(k get pod -l app.kubernetes.io/instance=openvpnserver -o json | jq -r '.items[0].metadata.name') && echo $openvpn_server_pod
+kubectl exec $openvpn_server_pod -- sysctl net.ipv4.ip_forward
+kubectl exec $openvpn_server_pod -- ip a
+kubectl exec $openvpn_server_pod -- ip route
+
+# Stop VPN in client pod
+kubectl exec openvpn-client -- killall openvpn
+
+# Create client VM in a new VNet
+vpnclient_vm_name=vpnclientvm
+vpnclient_vnet_name=vpnclientvm
+vpnclient_vnet_prefix=172.16.31.0/24
+vpnclient_subnet_name=vpnclientvm
+vpnclient_subnet_prefix=172.16.31.0/26
+vpnclient_pip_name="${vpnclient_vm_name}-pip"
+vpnclient_vm_sku=Standard_B1s
+echo "Creating VNet and subnet..."
+az network vnet create -g $rg --name $vpnclient_vnet_name --address-prefix $vpnclient_subnet_prefix --subnet-name $vpnclient_subnet_name --subnet-prefix $vpnclient_subnet_prefix -o none
+echo "Creating VM..."
+az vm create -n $vpnclient_vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vpnclient_vm_sku -l $location \
+   --vnet-name $vpnclient_vnet_name --subnet $vpnclient_subnet_name --public-ip-address $vpnclient_pip_name -o none
+vpnclient_pip_address=$(az network public-ip show -n $vpnclient_pip_name -g $rg --query ipAddress -o tsv) && echo $vpnclient_pip_address
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vpnclient_pip_address "ip a"
+
+# Install openvpn client and copy ovpn profile (see OpenVPN section)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vpnclient_pip_address "sudo apt-get install openvpn -y"
+user=$(whoami)
+scp $clientvm_ovpn_file ${vpnclient_pip_address}:/home/${user}/client.ovpn
+scp $credentials_file ${vpnclient_pip_address}:/home/${user}/login.conf
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vpnclient_pip_address "ls -al"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vpnclient_pip_address "sudo openvpn --config /home/${user}/client.ovpn --auth-user-pass /home/${user}/login.conf --daemon --log-append /var/log/syslog"
+
+# Install sample app
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vpnclient_pip_address "sudo apt update && sudo apt install -y python3-pip"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vpnclient_pip_address "sudo pip3 install flask"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vpnclient_pip_address "sudo wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vpnclient_pip_address "sudo python3 /root/myip.py >/root/myip.log 2>&1 &"
 
 
 ##########################

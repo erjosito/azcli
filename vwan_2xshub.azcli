@@ -1311,6 +1311,27 @@ then
         echo "Creating static route in connection $cx_id with next hop ${nva_ip}..."
         az network vhub connection update --ids $cx_id --add "routingConfiguration.vnetRoutes.staticRoutes" $vnet_route -o none
     fi
+    # Hub 1: configure IP fwding and NAT on NVAs
+    vm_name="spoke1${nva_spoke_id}-vm"
+    echo "Finding out public IP address for NVA ${vm_name}..."
+    vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    nva_pip_id=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+    nva_pip=$(az network public-ip show --ids $nva_pip_id --query 'ipAddress' -o tsv)
+    echo "Public IP address for ${vm_name} is ${nva_pip}. Configuring IP forwarding and SNAT at OS level..."
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo sysctl -w net.ipv4.ip_forward=1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo iptables -t nat -A POSTROUTING ! -d 10.0.0.0/8 -o eth0 -j MASQUERADE"
+    # Hub 2: configure IP fwding and NAT on NVAs
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        vm_name="spoke2${nva_spoke_id}-vm"
+        echo "Finding out public IP address for NVA ${vm_name}..."
+        vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        nva_pip_id=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+        nva_pip=$(az network public-ip show --ids $nva_pip_id --query 'ipAddress' -o tsv)
+        echo "Public IP address for ${vm_name} is ${nva_pip}. Configuring IP forwarding and SNAT at OS level..."
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo sysctl -w net.ipv4.ip_forward=1"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo iptables -t nat -A POSTROUTING ! -d 10.0.0.0/8 -o eth0 -j MASQUERADE"
+    fi
 fi
 
 # Optional: additional spokes with NVA and 2 indirect spokes attached to them
