@@ -288,7 +288,7 @@ function connect_gws () {
     then
         bgp_option=""
     else
-        bgp_option="--enablebgp"
+        bgp_option="--enable-bgp"
     fi
     # 1->2A
     az network vpn-connection create -n "vng${gw1_id}tovng${gw2_id}a" -g "$rg" --vnet-gateway1 "vng${gw1_id}" \
