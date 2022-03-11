@@ -18,19 +18,20 @@
 ###############
 
 # Control
-no_of_hubs=2         # 1 or 2 hubs
-no_of_spokes=3       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
+no_of_hubs=1         # 1 or 2 hubs
+no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=no        # Whether firewalls are provisioned in the hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
-nva_bgp=no           # If using an NVA in spoke14/24, whether configuring BGP on it towards VWAN
+nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
 nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
-deploy_vpngw=no      # Whether VPN GWs should be deployed
+deploy_vpngw=yes     # Whether VPN GWs should be deployed
 deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
-route_thru_nva=yes   # Whether a static pointing to the NVA in the last spoke is configured
+route_thru_nva=no    # Whether a static pointing to the NVA in the last spoke is configured
+
 # Generic variables
 rg=vwaneastus
 vwan=vwan
@@ -920,12 +921,18 @@ then
         --public-ip-address branch1-pip --public-ip-address-allocation static --private-ip-address $branch1_bgp_ip \
         --vnet-name branch1 --vnet-address-prefix $branch1_prefix --subnet nva --subnet-address-prefix $branch1_subnet -o none
     branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
-    az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan \
-        --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --ip-address $branch1_ip --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100 -o none
-    az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
+    # az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan \
+    #     --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --ip-address $branch1_ip --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100 -o none
+    # az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
+    #     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
+    #     --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default --internet-security true -o none
+    az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100 --ip-address $branch1_ip  \
+        --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --with-link -o none
+    # az network vpn-site link add -n branch1 -g $rg --ip-address $branch1_ip --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --site-name branch1 --link-speed-in-mbps 100 --link-provider-name msft -o none
+    branch1_link_id=$(az network vpn-site link list --site-name branch1 -g $rg --query '[0].id' -o tsv)
+    az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 --with-link true --vpn-site-link $branch1_link_id \
         --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
         --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default --internet-security true -o none
-
     if [[ "$no_of_hubs" == "2" ]]
     then
         # Create CSR to simulate branch2
@@ -934,9 +941,10 @@ then
             --public-ip-address branch2-pip --public-ip-address-allocation static --private-ip-address $branch2_bgp_ip \
             --vnet-name branch2 --vnet-address-prefix $branch2_prefix --subnet nva --subnet-address-prefix $branch2_subnet -o none
         branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)
-        az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan \
+        az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan --with-link --device-vendor cisco --device-model csr --link-speed 100 \
             --asn $branch2_asn --bgp-peering-address $branch2_bgp_ip --ip-address $branch2_ip --address-prefixes ${branch2_ip}/32 -o none
-        az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 \
+        branch2_link_id=$(az network vpn-site link list --site-name branch1 -g $rg --query '[0].id' -o tsv)
+        az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 --with-link true --vpn-site-link $branch2_link_id \
             --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
             --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id  --labels default --internet-security true -o none
     fi
