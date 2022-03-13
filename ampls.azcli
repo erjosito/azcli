@@ -43,10 +43,14 @@ logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 logws_key=$(az monitor log-analytics workspace get-shared-keys -n $logws_name -g $rg --query 'primarySharedKey' -o tsv)
 
-# Create DNS Zones
+# Create DNS Zones, and link them to the hub VNet
 for zone in privatelink.agentsvc.azure-automation.net privatelink.blob.core.windows.net privatelink.monitor.azure.com privatelink.ods.opinsights.azure.com privatelink.oms.opinsights.azure.com
 do
     az network private-dns zone create -n $zone -g $rg --no-wait -o none
+done
+for zone in privatelink.agentsvc.azure-automation.net privatelink.blob.core.windows.net privatelink.monitor.azure.com privatelink.ods.opinsights.azure.com privatelink.oms.opinsights.azure.com
+do
+    az network private-dns link vnet create -g $rg -z $zone -n hub --virtual-network hub --registration-enabled false -o none
 done
 
 # Create Private Link Scope and associate with AzMonitor
@@ -56,17 +60,25 @@ az monitor private-link-scope scoped-resource create -n $logws_name --linked-res
 # Create Private Endpoint
 ampls_id=$(az monitor private-link-scope show -n ampls -g $rg --query id -o tsv)
 az network vnet subnet create -g $rg --vnet-name hub -n endpoints --address-prefix "192.168.0.64/26" -o none
+az network vnet subnet update -n endpoints -g $rg --vnet-name hub --disable-private-endpoint-network-policies true -o none
 az network private-endpoint create -n ampls -g $rg --vnet-name hub --subnet endpoints --private-connection-resource-id $ampls_id --connection-name ampls -l $location --group-id azuremonitor -o none
 
 # Create Zone Groups
-# THIS IS A NIGHTMARE!
 zone=privatelink.agentsvc.azure-automation.net
 zone_dash=$(echo $zone | tr '.' '-')
-az network private-endpoint dns-zone-group create --endpoint-name ampls -g $rg -n default --zone-name $zone_dash --private-dns-zone $zone
+az network private-endpoint dns-zone-group create --endpoint-name ampls -g $rg -n default --zone-name $zone_dash --private-dns-zone $zone -o none
 for zone in privatelink.blob.core.windows.net privatelink.monitor.azure.com privatelink.ods.opinsights.azure.com privatelink.oms.opinsights.azure.com
 do
-    zone_dash=$(echo $zone | tr '.' '-)
-    az network private-endpoint dns-zone-group add --endpoint-name ampls -g $rg -n default --zone-name $zone_dash --private-dns-zone $zone
+    zone_dash=$(echo $zone | tr '.' '-')
+    az network private-endpoint dns-zone-group add --endpoint-name ampls -g $rg -n default --zone-name $zone_dash --private-dns-zone $zone -o none
+done
+
+# Refresh DNS server configuration in VMs (we updated the VNets after the VMs were up)
+for spoke_id in $(seq 1 ${num_spokes})
+do
+    pip_name="${spoke_id}-pip"
+    pip=$(az network public-ip show -n $pip_name -g $rg --query 'ipAddress' -o tsv)
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$pip" "sudo systemctl restart systemd-networkd"
 done
 
 # Associate VMs to AzMonitor
@@ -80,11 +92,20 @@ done
 query='Heartbeat
 | where TimeGenerated > ago(15m)
 | extend PrivateIP = tostring(ComputerPrivateIPs[0])
-| summarize count() by Computer, ComputerIP, PrivateIP
-//| where ComputerIP contains "fd40"
-//| count'
+| summarize count() by Computer, ComputerIP, PrivateIP'
 az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
 
-# Cleanup
+# Diagnostics
+az network private-endpoint dns-zone-group list --endpoint-name ampls -g $rg
+for zone in privatelink.agentsvc.azure-automation.net privatelink.blob.core.windows.net privatelink.monitor.azure.com privatelink.ods.opinsights.azure.com privatelink.oms.opinsights.azure.com
+do
+    az network private-dns record-set a list -z $zone -g $rg --query '[].[aRecords[0].ipv4Address, fqdn]' -o tsv
+done
+
+
+###########
+# Cleanup #
 # DANGER! #
+###########
+
 # az group delete -y --no-wait -n $rg
