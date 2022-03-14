@@ -519,8 +519,8 @@ az network vnet subnet update -g $rg --vnet-name $hub1_vnet_name -n $hub1_nva_su
 # If multiple hubs and not using VXLAN, we need to overwrite the route for the remote hub on the local NVA subnet with next hop the remote ALB
 if [[ "$hub_no" == "2" ]] && [[ "use_vxlan" == "no" ]]
 then
-      echo "Adding route in hub1 NVA subnet for $hub2_spoke_summary and next hop $hub2_lb_private_ip..."
-      az network route-table route create --route-table-name $hub1_nva_rt_name -g $rg --address-prefix $hub2_spoke_summary -n hub2 --next-hop-type VirtualAppliance --next-hop-ip-address $hub2_lb_private_ip -o none
+      echo "Adding route in hub1 NVA subnet for $hub2_spoke_summary and next hop $hub2_lb_ip..."
+      az network route-table route create --route-table-name $hub1_nva_rt_name -g $rg --address-prefix $hub2_spoke_summary -n hub2 --next-hop-type VirtualAppliance --next-hop-ip-address $hub2_lb_ip -o none
 fi
 # If using 2-NIC NVAs, we need to create RTs for the second NIC
 if [[ "$nva_type" == "linux2nic" ]]
@@ -532,7 +532,7 @@ then
       az network route-table update -n $hub1_nva_rt2_name -g $rg --disable-bgp-route-propagation true -o none
       if [[ "$hub_no" == "2" ]] && [[ "use_vxlan" == "no" ]]
       then
-            az network route-table route create --route-table-name $hub1_nva_rt2_name -g $rg --address-prefix $hub2_spoke_summary -n hub2 --next-hop-type VirtualAppliance --next-hop-ip-address $hub2_lb_private_ip -o none
+            az network route-table route create --route-table-name $hub1_nva_rt2_name -g $rg --address-prefix $hub2_spoke_summary -n hub2 --next-hop-type VirtualAppliance --next-hop-ip-address $hub2_lb_ip -o none
       fi
 fi
 # Hub2
@@ -542,10 +542,10 @@ then
       az network route-table create -n $hub2_nva_rt_name -g $rg -l $hub2_location -o none
       az network vnet subnet update -g $rg --vnet-name $hub2_vnet_name -n $hub2_nva_subnet_name --route-table $hub2_nva_rt_name -o none
       # If multiple hubs and not using VXLAN, we need to overwrite the route for the remote hub on the local NVA subnet with next hop the remote ALB
-      if [[ "$hub_no" == "2" ]] && [[ "use_vxlan" == "no" ]]
+      if [[ "use_vxlan" == "no" ]]
       then
-            echo "Adding route in hub1 NVA subnet for $hub2_spoke_summary and next hop $hub2_lb_private_ip..."
-            az network route-table route create --route-table-name $hub2_nva_rt_name -g $rg --address-prefix $hub1_spoke_summary -n hub1 --next-hop-type VirtualAppliance --next-hop-ip-address $hub1_lb_private_ip -o none
+            echo "Adding route in hub1 NVA subnet for $hub2_spoke_summary and next hop $hub2_lb_ip..."
+            az network route-table route create --route-table-name $hub2_nva_rt_name -g $rg --address-prefix $hub1_spoke_summary -n hub1 --next-hop-type VirtualAppliance --next-hop-ip-address $hub1_lb_ip -o none
       fi
       if [[ "$nva_type" == "linux2nic" ]]
       then
@@ -562,13 +562,14 @@ then
       fi
 fi
 
-# Create VXLAN tunnels between Linux NVAs in both hubs
-if [[ "$hub_no" == "2" ]]
+# Create VXLAN tunnels between Linux NVAs in both hubs and configure static routing
+if [[ "$hub_no" == "2" ]] && [[ "$nva_type" == "linux1nic" || "$nva_type" == "linux2nic" ]]
 then
       if [[ "$use_vxlan" == "yes" ]]
       then
             if [[ "$nva_type" == "linux1nic" ]]
             then
+                  # IF using VXLAN and single-NIC Linux
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link add vxlan0 type vxlan id 1 remote $hub2_nva_private_ip dstport 4789 dev eth0"
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link set vxlan0 up"
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip addr add ${hub1_nva_overlay_ip}/30 dev vxlan0"
@@ -583,6 +584,21 @@ then
                   # If not usig VXLAN tunnels but 2ary NICs, create routes to the 2ary NIC
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip route add $hub2_nva_private_ip2/32 via $hub1_nva_default_gw2"
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip route add $hub1_nva_private_ip2/32 via $hub2_nva_default_gw2"
+            fi
+      else
+            # If not using VXLAN
+            # Static routes so that the learnt BGP routes for the remote hub do not create routing loops
+            echo "Setting static routes in the Linux NVAs..."
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva1) "sudo ip route add $(get_1st_private_ip hub2nva1)/32 via $hub1_nva_default_gw"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva1) "sudo ip route add $(get_1st_private_ip hub1nva1)/32 via $hub2_nva_default_gw"
+            if [[ "$nva_no" == "2" ]]
+            then
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva1) "sudo ip route add $(get_1st_private_ip hub2nva2)/32 via $hub1_nva_default_gw"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva2) "sudo ip route add $(get_1st_private_ip hub2nva1)/32 via $hub1_nva_default_gw"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva2) "sudo ip route add $(get_1st_private_ip hub2nva2)/32 via $hub1_nva_default_gw"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva1) "sudo ip route add $(get_1st_private_ip hub1nva2)/32 via $hub2_nva_default_gw"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva2) "sudo ip route add $(get_1st_private_ip hub1nva1)/32 via $hub2_nva_default_gw"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva2) "sudo ip route add $(get_1st_private_ip hub1nva2)/32 via $hub2_nva_default_gw"
             fi
       fi
 fi
@@ -631,14 +647,14 @@ then
             # Get NVA Data
             hub1_nva_name="hub1nva${nva_id}"
             hub1_nva_pip="${hub1_nva_name}-pip"
-            echo "$hub1_nva_name info:"
-            hub1_nva_pip_ip=$(az network public-ip show -n $hub1_nva_pip -g $rg --query ipAddress -o tsv) && echo $hub1_nva_pip_ip
-            hub1_nva_private_ip=$(get_1st_private_ip $hub1_nva_name) && echo $hub1_nva_private_ip
-            hub1_nva_default_gw=$(first_ip "$hub1_nva_subnet_prefix") && echo $hub1_nva_default_gw
+            echo "Getting $hub1_nva_name info..."
+            hub1_nva_pip_ip=$(az network public-ip show -n $hub1_nva_pip -g $rg --query ipAddress -o tsv)
+            hub1_nva_private_ip=$(get_1st_private_ip $hub1_nva_name)
+            hub1_nva_default_gw=$(first_ip "$hub1_nva_subnet_prefix")
             if [[ "$nva_type" == "linux2nic" ]]
             then
-                  hub1_nva_private_ip2=$(az network nic show -n "${hub1_nva_name}-nic1" -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub1_nva_private_ip2
-                  hub1_nva_default_gw2=$(first_ip "$hub1_nva_subnet2_prefix") && echo $hub1_nva_default_gw2
+                  hub1_nva_private_ip2=$(az network nic show -n "${hub1_nva_name}-nic1" -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+                  hub1_nva_default_gw2=$(first_ip "$hub1_nva_subnet2_prefix")
             fi
             # BGP next hop for the local hub prefix
             if [[ "$next_hop" == "lb" ]]
@@ -706,7 +722,8 @@ protocol bgp rs1 from PEERS {
       export filter TO_RS;
 }
 EOF
-            hub1_nva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "whoami") && echo $hub1_nva_user
+            hub1_nva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "whoami")
+            echo "Uploading BIRD config file to ${hub1_nva_name}..."
             scp $bird_config_file "${hub1_nva_pip_ip}:/home/${hub1_nva_user}/bird.conf"
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo mv /home/${hub1_nva_user}/bird.conf /etc/bird/bird.conf"
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo systemctl restart bird"
@@ -722,14 +739,14 @@ else
             # Get NVA Data
             hub1_nva_name="hub1nva${nva_id}"
             hub1_nva_pip="${hub1_nva_name}-pip"
-            echo "$hub1_nva_name info:"
-            hub1_nva_pip_ip=$(az network public-ip show -n $hub1_nva_pip -g $rg --query ipAddress -o tsv) && echo $hub1_nva_pip_ip
-            hub1_nva_private_ip=$(get_1st_private_ip $hub1_nva_name) && echo $hub1_nva_private_ip
-            hub1_nva_default_gw=$(first_ip "$hub1_nva_subnet_prefix") && echo $hub1_nva_default_gw
+            echo "Getting $hub1_nva_name info..."
+            hub1_nva_pip_ip=$(az network public-ip show -n $hub1_nva_pip -g $rg --query ipAddress -o tsv)
+            hub1_nva_private_ip=$(get_1st_private_ip $hub1_nva_name)
+            hub1_nva_default_gw=$(first_ip "$hub1_nva_subnet_prefix")
             if [[ "$nva_type" == "linux2nic" ]]
             then
-                  hub1_nva_private_ip2=$(az network nic show -n "${hub1_nva_name}-nic1" -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub1_nva_private_ip2
-                  hub1_nva_default_gw2=$(first_ip "$hub1_nva_subnet2_prefix") && echo $hub1_nva_default_gw2
+                  hub1_nva_private_ip2=$(az network nic show -n "${hub1_nva_name}-nic1" -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+                  hub1_nva_default_gw2=$(first_ip "$hub1_nva_subnet2_prefix")
             fi
             # BGP next hop for the local hub prefix
             if [[ "$next_hop" == "lb" ]]
@@ -758,6 +775,8 @@ protocol kernel {
 protocol static {
       route $hub1_rs_ip1/32 via $hub1_nva_default_gw;
       route $hub1_rs_ip2/32 via $hub1_nva_default_gw;
+      route $(get_1st_private_ip hub2nva1)/32 via $hub1_nva_default_gw;
+      $([[ "$nva_no" == "2" ]] && echo "route $(get_1st_private_ip hub2nva2)/32 via $hub1_nva_default_gw;" || echo "")
       route 1${nva_id}.1${nva_id}.1${nva_id}.1${nva_id}/32 via $hub1_nva_default_gw;  # Test route
       $([[ "$use_vxlan" == "yes" && "$hub_no" == "2" ]] && echo "route $hub2_nva_overlay_ip/32 via \"vxlan0\";" || echo "")
       $([[ "$nva_type" == "linux2nic" && "$hub_no" == "2" ]] && echo "route $hub2_nva_private_ip2/32 via $hub1_nva_default_gw2;" || echo "")
@@ -784,6 +803,14 @@ filter TO_RS {
             accept;
       }
 }
+filter TO_NVA {
+      # Accept test route
+      if (net = 2${nva_id}.2${nva_id}.2${nva_id}.2${nva_id}/32) then { accept; }
+      # Drop other long prefixes (see /32 in static routes)
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      # Accept everything else
+      else { accept; }
+}
 protocol bgp rs0 from PEERS {
       description "RouteServer instance 0";
       neighbor $hub1_rs_ip1 as $hub1_rs_asn;
@@ -800,21 +827,22 @@ protocol bgp hub2nva1 from PEERS {
       description "Hub 2 NVA1";
       $([[ "$use_vxlan" == "yes" && "$hub_no" == "2" ]] && echo "neighbor $hub2_nva_overlay_ip as $hub2_nva_asn;" || echo "")
       $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux2nic" ]] && echo "neighbor $hub2_nva_private_ip2 as $hub2_nva_asn;" || echo "")
-      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" ]] && echo "neighbor $(get-get_1st_private_ip hub2nva1) as $hub2_nva_asn;" || echo "")
+      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" ]] && echo "neighbor $(get_1st_private_ip hub2nva1) as $hub2_nva_asn;" || echo "")
       import all;
-      export all;
+      export filter TO_NVA;
 }
 protocol bgp hub2nva2 from PEERS {
       description "Hub 2 NVA2";
-      $([[ "$nva_no" == "1" ]] && echo "      disabled;" || echo "      # disabled")
-      $([[ "$use_vxlan" == "yes" && "$hub_no" == "2" ]] && echo "      neighbor $hub2_nva_overlay_ip as $hub2_nva_asn;" || echo "")
-      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" && "$nva_no" == "2" ]] && echo "      neighbor $(get-get_1st_private_ip hub2nva2) as $hub2_nva_asn;" || echo "")
-      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" && "$nva_no" == "1" ]] && echo "      neighbor 1.2.3.4 as $hub2_nva_asn;" || echo "")
+      $([[ "$nva_no" == "1" ]] && echo "disabled;" || echo "# disabled")
+      $([[ "$use_vxlan" == "yes" && "$hub_no" == "2" ]] && echo "neighbor $hub2_nva_overlay_ip as $hub2_nva_asn;" || echo "")
+      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" && "$nva_no" == "2" ]] && echo "neighbor $(get_1st_private_ip hub2nva2) as $hub2_nva_asn;" || echo "")
+      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" && "$nva_no" == "1" ]] && echo "neighbor 1.2.3.4 as $hub2_nva_asn;" || echo "")
       import all;
-      export all;
+      export filter TO_NVA;
 }
 EOF
             hub1_nva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "whoami")
+            echo "Uploading BIRD config file to ${hub1_nva_name}..."
             scp $bird_config_file "${hub1_nva_pip_ip}:/home/${hub1_nva_user}/bird.conf"
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo mv /home/${hub1_nva_user}/bird.conf /etc/bird/bird.conf"
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo systemctl restart bird"
@@ -826,14 +854,14 @@ EOF
             # Get NVA Data
             hub2_nva_name="hub2nva${nva_id}"
             hub2_nva_pip="${hub2_nva_name}-pip"
-            echo "$hub2_nva_name info:"
-            hub2_nva_pip_ip=$(az network public-ip show -n $hub2_nva_pip -g $rg --query ipAddress -o tsv) && echo $hub2_nva_pip_ip
-            hub2_nva_private_ip=$(get_1st_private_ip $hub2_nva_name) && echo $hub2_nva_private_ip
-            hub2_nva_default_gw=$(first_ip "$hub2_nva_subnet_prefix") && echo $hub2_nva_default_gw
+            echo "Getting $hub2_nva_name info..."
+            hub2_nva_pip_ip=$(az network public-ip show -n $hub2_nva_pip -g $rg --query ipAddress -o tsv)
+            hub2_nva_private_ip=$(get_1st_private_ip $hub2_nva_name)
+            hub2_nva_default_gw=$(first_ip "$hub2_nva_subnet_prefix")
             if [[ "$nva_type" == "linux2nic" ]]
             then
-                  hub2_nva_private_ip2=$(az network nic show -n "${hub2_nva_name}-nic1" -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub2_nva_private_ip2
-                  hub2_nva_default_gw2=$(first_ip "$hub2_nva_subnet2_prefix") && echo $hub2_nva_default_gw2
+                  hub2_nva_private_ip2=$(az network nic show -n "${hub2_nva_name}-nic1" -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+                  hub2_nva_default_gw2=$(first_ip "$hub2_nva_subnet2_prefix")
             fi
             # BGP next hop for the local hub prefix
             if [[ "$next_hop" == "lb" ]]
@@ -862,13 +890,11 @@ protocol kernel {
 protocol static {
       route $hub2_rs_ip1/32 via $hub2_nva_default_gw;
       route $hub2_rs_ip2/32 via $hub2_nva_default_gw;
-      route 2${nva_id}.2${nva_id}.2${nva_id}.2${nva_id}/32 via $hub1_nva_default_gw;  # Test route
+      route $(get_1st_private_ip hub1nva1)/32 via $hub2_nva_default_gw;
+      $([[ "$nva_no" == "2" ]] && echo "route $(get_1st_private_ip hub1nva2)/32 via $hub2_nva_default_gw;" || echo "")
+      route 2${nva_id}.2${nva_id}.2${nva_id}.2${nva_id}/32 via $hub2_nva_default_gw;  # Test route
       $([[ "$use_vxlan" == "yes" && "$hub_no" == "2" ]] && echo "route $hub1_nva_overlay_ip/32 via \"vxlan0\";" || echo "")
       $([[ "$nva_type" == "linux2nic" && "$hub_no" == "2" ]] && echo "route $hub1_nva_private_ip2/32 via $hub2_nva_default_gw2;" || echo "")
-      route $hub2_spoke_summary via $hub2_nva_default_gw;
-
-      # route $hub1_nva_overlay_ip/32 via "vxlan0";
-      route $hub1_nva_private_ip2/32 via $hub2_nva_default_gw2;
       route $hub2_spoke_summary via $hub2_nva_default_gw;
 }
 filter TO_RS {
@@ -888,9 +914,17 @@ filter TO_RS {
             accept;
       }
 }
+filter TO_NVA {
+      # Accept test route
+      if (net = 2${nva_id}.2${nva_id}.2${nva_id}.2${nva_id}/32) then { accept; }
+      # Drop other long prefixes (see /32 in static routes)
+      if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      # Accept everything else
+      else { accept; }
+}
 template bgp PEERS {
-local as $hub2_nva_asn;
-multihop;
+      local as $hub2_nva_asn;
+      multihop;
 }
 protocol bgp rs0 from PEERS {
       description "RouteServer instance 0";
@@ -908,21 +942,22 @@ protocol bgp hub1nva1 from PEERS {
       description "Hub 1 NVA1";
       $([[ "$use_vxlan" == "yes" && "$hub_no" == "2" ]] && echo "neighbor $hub1_nva_overlay_ip as $hub1_nva_asn;" || echo "")
       $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux2nic" ]] && echo "neighbor $hub1_nva_private_ip2 as $hub1_nva_asn;" || echo "")
-      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" ]] && echo "neighbor $(get-get_1st_private_ip hub1nva1) as $hub1_nva_asn;" || echo "")
+      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" ]] && echo "neighbor $(get_1st_private_ip hub1nva1) as $hub1_nva_asn;" || echo "")
       import all;
-      export all;
+      export filter TO_NVA;
 }
 protocol bgp hub1nva2 from PEERS {
       description "Hub 1 NVA2";
-      $([[ "$nva_no" == "1" ]] && echo "      disabled;" || echo "      # disabled")
-      $([[ "$use_vxlan" == "yes" && "$hub_no" == "2" ]] && echo "      neighbor $hub1_nva_overlay_ip as $hub1_nva_asn;" || echo "")
-      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" && "$nva_no" == "2" ]] && echo "      neighbor $(get-get_1st_private_ip hub1nva2) as $hub1_nva_asn;" || echo "")
-      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" && "$nva_no" == "1" ]] && echo "      neighbor 1.2.3.4 as $hub1_nva_asn;" || echo "")
+      $([[ "$nva_no" == "1" ]] && echo "disabled;" || echo "# disabled")
+      $([[ "$use_vxlan" == "yes" && "$hub_no" == "2" ]] && echo "neighbor $hub1_nva_overlay_ip as $hub1_nva_asn;" || echo "")
+      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" && "$nva_no" == "2" ]] && echo "neighbor $(get_1st_private_ip hub1nva2) as $hub1_nva_asn;" || echo "")
+      $([[ "$use_vxlan" == "no" && "$hub_no" == "2" && "$nva_type" == "linux1nic" && "$nva_no" == "1" ]] && echo "neighbor 1.2.3.4 as $hub1_nva_asn;" || echo "")
       import all;
-      export all;
+      export filter TO_NVA;
 }
 EOF
             hub2_nva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "whoami")
+            echo "Uploading BIRD config file to ${hub2_nva_name}..."
             scp $bird_config_file "${hub2_nva_pip_ip}:/home/${hub2_nva_user}/bird.conf"
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo mv /home/${hub2_nva_user}/bird.conf /etc/bird/bird.conf"
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo systemctl restart bird"
@@ -1007,14 +1042,14 @@ az network routeserver peering list-learned-routes -n hub2nva --routeserver $hub
 az network routeserver peering list-advertised-routes -n hub2nva --routeserver $hub2_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
 
 # Effective routes in nva NICs
-hub1_nva_nic_id=$(az network nic show -n "${hub1_nva_name}-nic0" -g $rg --query id -o tsv)
-hub1_nva_nic2_id=$(az network nic show -n "${hub1_nva_name}-nic1" -g $rg --query id -o tsv)
-hub2_nva_nic_id=$(az network nic show -n "${hub2_nva_name}-nic0" -g $rg --query id -o tsv)
-hub2_nva_nic2_id=$(az network nic show -n "${hub2_nva_name}-nic1" -g $rg --query id -o tsv)
-az network nic show-effective-route-table --ids $hub1_nva_nic_id -o table
-az network nic show-effective-route-table --ids $hub1_nva_nic2_id -o table
-az network nic show-effective-route-table --ids $hub2_nva_nic_id -o table
-az network nic show-effective-route-table --ids $hub1_nva_nic2_id -o table
+hub1_nva1_nic0_id=$(az vm show -n "hub1nva1" -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+hub1_nva2_nic0_id=$(az vm show -n "hub1nva2" -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+hub2_nva1_nic0_id=$(az vm show -n "hub2nva1" -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+hub2_nva2_nic0_id=$(az vm show -n "hub2nva2" -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $hub1_nva1_nic0_id -o table
+az network nic show-effective-route-table --ids $hub1_nva2_nic0_id -o table
+az network nic show-effective-route-table --ids $hub2_nva1_nic0_id -o table
+az network nic show-effective-route-table --ids $hub2_nva2_nic0_id -o table
 
 # Effective routes in spokes
 spoke11_vm_nic_id=$(az vm show -n "$spoke11_vm_name" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
