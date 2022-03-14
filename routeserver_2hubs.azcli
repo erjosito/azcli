@@ -13,6 +13,7 @@ create_azfw=yes       # Whether an AzFW is created in the hub
 flowlogs2logws=yes    # Whether Flow Logs are sent to an LA workspace too
 stress_test_routes=no # Whether running a stress test on the number of routes by creating many VNets peered to the hub
 next_hop=lb           # Either 'azfw', 'lb' or 'nva'. If 'lb', it sets the advertised next hop to ARS as the internal LB private IP
+use_vxlan=no          # Whether using VXLAN encap between the NVAs in different hubs
 
 # Variables
 rg=routeserver
@@ -209,7 +210,7 @@ fi
 storage_account1_name=$(az storage account list -g $rg -o tsv --query "[?location=='$hub1_location'].name" | head -1)
 if [[ -z "$storage_account1_name" ]]; then
       echo "No storage account found in $hub1_location, creating one..."
-      storage_account1_name=vwan$RANDOM${hub1_location}
+      storage_account1_name=rslogs$RANDOM${hub1_location}
       az storage account create -n $storage_account1_name -g $rg --sku Standard_LRS --kind StorageV2 -l $hub1_location -o none
 else
       echo "Storage account $storage_account1_name found in $hub1_location, using it for NSG flow flogs"
@@ -217,10 +218,11 @@ fi
 if [[ "$flowlogs2logws" == yes ]]
 then
       echo "Configuring Flow Logs for NSG $hub1_nsg_name into storage account $storage_account1_name and LA workspace ${hub1_logws_name}..."
-      az network watcher flow-log create -l $hub1_location -n flowlog-$hub1_location -g $rg --nsg $hub1_nsg_name --storage-account $storage_account1_name --log-version 2 --retention 7 --workspace $hub1_logws_id -o none
+      az network watcher flow-log create -l $hub1_location -n flowlog$RANDOM -g $rg --nsg $hub1_nsg_name --storage-account $storage_account1_name --log-version 2 --retention 7 \
+            --traffic-analytics true --workspace $hub1_logws_id --interval 10 -o none
 else
       echo "Configuring Flow Logs for NSG $hub1_nsg_name into storage account $storage_account1_name..."
-      az network watcher flow-log create -l $hub1_location -n flowlog-$hub1_location -g $rg --nsg $hub1_nsg_name --storage-account $storage_account1_name --log-version 2 --retention 7 -o none
+      az network watcher flow-log create -l $hub1_location -n flowlog$RANDOM -g $rg --nsg $hub1_nsg_name --storage-account $storage_account1_name --log-version 2 --retention 7 -o none
 fi
 # Configure flow logs for NSGs in location 2
 if [[ "$hub_no" == "2" ]]
@@ -228,7 +230,7 @@ then
       storage_account2_name=$(az storage account list -g $rg -o tsv --query "[?location=='$hub2_location'].name" | head -1)
       if [[ -z "$storage_account2_name" ]]; then
             echo "No storage account found in $hub2_location, creating one..."
-            storage_account2_name=vwan$RANDOM${hub2_location}
+            storage_account2_name=rslogs$RANDOM${hub2_location}
             az storage account create -n $storage_account2_name -g $rg --sku Standard_LRS --kind StorageV2 -l $hub2_location -o none
       else
             echo "Storage account $storage_account2_name found in $hub2_location, using it for NSG flow flogs"
@@ -236,10 +238,11 @@ then
       if [[ "$flowlogs2logws" == yes ]]
       then
             echo "Configuring Flow Logs for NSG $hub2_nsg_name into storage account $storage_account2_name and LA workspace ${hub2_logws_name}..."
-            az network watcher flow-log create -l $hub2_location -n flowlog-$hub2_location -g $rg --nsg $hub2_nsg_name --storage-account $storage_account2_name --log-version 2 --retention 7 --workspace $hub2_logws_id -o none
+            az network watcher flow-log create -l $hub2_location -n flowlog$RANDOM -g $rg --nsg $hub2_nsg_name --storage-account $storage_account2_name --log-version 2 --retention 7 \
+                  --traffic-analytics true --workspace $hub2_logws_id --interval 10 -o none
       else
             echo "Configuring Flow Logs for NSG $hub2_nsg_name into storage account $storage_account2_name..."
-            az network watcher flow-log create -l $hub2_location -n flowlog-$hub2_location -g $rg --nsg $hub2_nsg_name --storage-account $storage_account2_name --log-version 2 --retention 7 -o none
+            az network watcher flow-log create -l $hub2_location -n flowlog$RANDOM -g $rg --nsg $hub2_nsg_name --storage-account $storage_account2_name --log-version 2 --retention 7 -o none
       fi
 fi
 
@@ -297,7 +300,7 @@ then
       az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 2000 -o none
       az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
       --name NetworkTraffic --collection-priority 2500 --action Allow --rule-name permitAll --rule-type NetworkRule --description "Permit all traffic" \
-      --destination-addresses '*' --destination-ports '*' --source-addresses '*' --ip-protocols '*' -o none
+      --destination-addresses '*' --destination-ports '*' --source-addresses '*' --ip-protocols 'Any' -o none
       azfw_policy_id=$(az network firewall policy show -n $azfw_policy_name -g $rg --query id -o tsv)
 
       # Hub1 AzFW
@@ -305,12 +308,13 @@ then
       hub1_azfw_name=azfw1
       hub1_azfw_pip_name="${hub1_azfw_name}-pip"
       echo "Creating Azure Firewall ${hub1_azfw_name}..."
-      az network public-ip create -g $rg -n $hub1_azfw_pip_name --sku Standard --allocation-method static -l $hub1_location --policy $azfw_policy_id -o none
+      az network public-ip create -g $rg -n $hub1_azfw_pip_name --sku Standard --allocation-method static -l $hub1_location -o none
       hub1_azfw_ip=$(az network public-ip show -g $rg -n $hub1_azfw_pip_name --query ipAddress -o tsv)
-      az network firewall create -n $hub1_azfw_name -g $rg -l $hub1_location -o none
+      az network firewall create -n $hub1_azfw_name -g $rg -l $hub1_location --policy $azfw_policy_id -o none
       hub1_azfw_id=$(az network firewall show -n $hub1_azfw_name -g $rg -o tsv --query id)
       az network firewall ip-config create -f $hub1_azfw_name -n "${hub1_azfw_name}-ipconfig" -g $rg --public-ip-address $hub1_azfw_pip_name --vnet-name $hub1_vnet_name -o none
       az network firewall update -n $hub1_azfw_name -g $rg -o none
+      hub1_azfw_private_ip=$(az network firewall show -n $hub1_azfw_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
       # Logs
       az monitor diagnostic-settings create -n mydiag --resource $hub1_azfw_id --workspace $hub1_logws_id \
             --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
@@ -324,12 +328,13 @@ then
             hub2_azfw_name=azfw2
             hub2_azfw_pip_name="${hub2_azfw_name}-pip"
             echo "Creating Azure Firewall ${hub2_azfw_name}..."
-            az network public-ip create -g $rg -n $hub2_azfw_pip_name --sku Standard --allocation-method static -l $hub2_location --policy $azfw_policy_id -o none
+            az network public-ip create -g $rg -n $hub2_azfw_pip_name --sku Standard --allocation-method static -l $hub2_location -o none
             hub2_azfw_ip=$(az network public-ip show -g $rg -n $hub2_azfw_pip_name --query ipAddress -o tsv)
-            az network firewall create -n $hub2_azfw_name -g $rg -l $hub2_location -o none
+            az network firewall create -n $hub2_azfw_name -g $rg -l $hub2_location --policy $azfw_policy_id -o none
             hub2_azfw_id=$(az network firewall show -n $hub2_azfw_name -g $rg -o tsv --query id)
             az network firewall ip-config create -f $hub2_azfw_name -n "${hub2_azfw_name}-ipconfig" -g $rg --public-ip-address $hub2_azfw_pip_name --vnet-name $hub2_vnet_name -o none
             az network firewall update -n $hub2_azfw_name -g $rg -o none
+            hub2_azfw_private_ip=$(az network firewall show -n $hub2_azfw_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
             # Logs
             az monitor diagnostic-settings create -n mydiag --resource $hub2_azfw_id --workspace $hub2_logws_id \
                   --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
@@ -538,22 +543,25 @@ fi
 # Create VXLAN tunnels between Linux NVAs in both hubs
 if [[ "$hub_no" == "2" ]]
 then
-      if [[ "$nva_type" == "linux1nic" ]]
+      if [[ "$use_vxlan" == "yes" ]]
       then
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link add vxlan0 type vxlan id 1 remote $hub2_nva_private_ip dstport 4789 dev eth0"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link set vxlan0 up"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip addr add ${hub1_nva_overlay_ip}/30 dev vxlan0"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip route add $hub2_nva_private_ip/32 via $hub1_nva_default_gw"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ifconfig eth0 mtu 1600"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip link add vxlan0 type vxlan id 1 remote $hub1_nva_private_ip dstport 4789 dev eth0"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip link set vxlan0 up"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip addr add ${hub2_nva_overlay_ip}/30 dev vxlan0"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip route add $hub1_nva_private_ip/32 via $hub2_nva_default_gw"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ifconfig eth0 mtu 1600"
-      else
-            # If not usig VXLAN tunnels but 2ary NICs, create routes to the 2ary NIC
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip route add $hub2_nva_private_ip2/32 via $hub1_nva_default_gw2"
-            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip route add $hub1_nva_private_ip2/32 via $hub2_nva_default_gw2"
+            if [[ "$nva_type" == "linux1nic" ]]
+            then
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link add vxlan0 type vxlan id 1 remote $hub2_nva_private_ip dstport 4789 dev eth0"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link set vxlan0 up"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip addr add ${hub1_nva_overlay_ip}/30 dev vxlan0"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip route add $hub2_nva_private_ip/32 via $hub1_nva_default_gw"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ifconfig eth0 mtu 1600"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip link add vxlan0 type vxlan id 1 remote $hub1_nva_private_ip dstport 4789 dev eth0"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip link set vxlan0 up"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip addr add ${hub2_nva_overlay_ip}/30 dev vxlan0"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip route add $hub1_nva_private_ip/32 via $hub2_nva_default_gw"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ifconfig eth0 mtu 1600"
+            else
+                  # If not usig VXLAN tunnels but 2ary NICs, create routes to the 2ary NIC
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip route add $hub2_nva_private_ip2/32 via $hub1_nva_default_gw2"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "sudo ip route add $hub1_nva_private_ip2/32 via $hub2_nva_default_gw2"
+            fi
       fi
 fi
 
@@ -611,6 +619,17 @@ then
                   hub1_nva_default_gw2=$(first_ip "$hub1_nva_subnet2_prefix") && echo $hub1_nva_default_gw2
             fi
 
+            # BGP next hop for the local hub prefix
+            if [[ "$next_hop" == "lb" ]]
+            then
+                  local_hub_prefix_next_hop=$hub1_lb_ip
+            elif [[ "$next_hop" == "azfw" ]]
+            then
+                  local_hub_prefix_next_hop=$hub1_azfw_private_ip
+            else
+                  local_hub_prefix_next_hop=$hub1_nva_private_ip
+            fi
+
             # Hub1 NVA bird config file
             bird_config_file=/tmp/bird.conf
             cat <<EOF > $bird_config_file
@@ -645,7 +664,7 @@ filter TO_RS {
       # Optionally set next hop for hub prefix as the LB
       if (net = $hub1_spoke_summary) then
       {
-            bgp_next_hop = $([[ "$next_hop" == "lb" ]] && echo "$hub1_lb_ip" || echo "$hub1_nva_private_ip");
+            bgp_next_hop = $local_hub_prefix_next_hop;
             accept;
       }
       # Accept everything else
@@ -898,6 +917,44 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke21_vm_pip "ping $spoke
 # Connectivity tests (SSH)
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $spoke11_vm_pip $spoke12_vm_private_ip "ping -c 5 $spoke11_vm_private_ip" # SSH works, ICMP doesnt
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $spoke12_vm_pip $spoke11_vm_private_ip "ping -c 5 $spoke12_vm_private_ip" # SSH works, ICMP doesnt
+
+########
+# Logs #
+########
+
+# You might want to register the feature for logging the network rule name
+az feature register --name AFWEnableNetworkRuleNameLogging --namespace Microsoft.Network
+az provider register -n Microsoft.Network --wait
+
+# Show tables
+az monitor log-analytics workspace table list --workspace-name $hub1_logws_name -g $rg -o table
+
+# AzFW Network Logs
+query='AzureDiagnostics
+| where Category == "AzureFirewallNetworkRule"
+| where TimeGenerated >= ago(30m) 
+| parse msg_s with Protocol " request from " SourceIP ":" SourcePortInt:int " to " TargetIP ":" TargetPortInt:int *
+| parse msg_s with * ". Action: " Action
+//| parse msg_s with * " was " Action1b " to " NatDestination
+//| parse msg_s with Protocol2 " request from " SourceIP2 " to " TargetIP2 ". Action: " Action2
+| extend SourcePort = tostring(SourcePortInt),TargetPort = tostring(TargetPortInt)
+//| extend Action = case(Action1a == "", case(Action1b == "",Action2,Action1b), Action1a),Protocol = case(Protocol == "", Protocol2, Protocol),SourceIP = case(SourceIP == "", SourceIP2, SourceIP),TargetIP = case(TargetIP == "", TargetIP2, TargetIP),SourcePort = case(SourcePort == "", "N/A", SourcePort),TargetPort = case(TargetPort == "", "N/A", TargetPort),NatDestination = case(NatDestination == "", "N/A", NatDestination)
+//| where Action == "Deny" 
+//| project TimeGenerated, msg_s, Protocol, SourceIP, SourcePort, TargetIP, TargetPort, Action  // with msg_s
+//| project TimeGenerated, Protocol, SourceIP, SourcePort, TargetIP, TargetPort, Action, Resource  // without msg_s
+| take 20 '
+
+# All AzureDiagnostics
+query='AzureDiagnostics
+| where TimeGenerated >= ago(5m) 
+| summarize count() by Category'
+
+# Traffic Analytics
+query='AzureNetworkAnalytics_CL
+| where TimeGenerated >= ago(5m) 
+| take 20'
+
+az monitor log-analytics query -w $hub1_logws_customerid --analytics-query $query -o tsv
 
 
 ##############################
