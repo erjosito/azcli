@@ -597,15 +597,19 @@ then
             # Static routes so that the learnt BGP routes for the remote hub do not create routing loops
             echo "Setting static routes in the Linux NVAs..."
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva1) "sudo ip route add $(get_1st_private_ip hub2nva1)/32 via $hub1_nva_default_gw"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva1) "sudo ip route add ${hub2_lb_ip}/32 via $hub1_nva_default_gw"
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva1) "sudo ip route add $(get_1st_private_ip hub1nva1)/32 via $hub2_nva_default_gw"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva1) "sudo ip route add ${hub1_lb_ip}/32 via $hub2_nva_default_gw"
             if [[ "$nva_no" == "2" ]]
             then
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva1) "sudo ip route add $(get_1st_private_ip hub2nva2)/32 via $hub1_nva_default_gw"
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva2) "sudo ip route add $(get_1st_private_ip hub2nva1)/32 via $hub1_nva_default_gw"
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva2) "sudo ip route add $(get_1st_private_ip hub2nva2)/32 via $hub1_nva_default_gw"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub1nva2) "sudo ip route add ${hub2_lb_ip}/32 via $hub1_nva_default_gw"
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva1) "sudo ip route add $(get_1st_private_ip hub1nva2)/32 via $hub2_nva_default_gw"
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva2) "sudo ip route add $(get_1st_private_ip hub1nva1)/32 via $hub2_nva_default_gw"
                   ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva2) "sudo ip route add $(get_1st_private_ip hub1nva2)/32 via $hub2_nva_default_gw"
+                  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $(get_pip hub2nva2) "sudo ip route add ${hub1_lb_ip}/32 via $hub2_nva_default_gw"
             fi
       fi
 fi
@@ -782,6 +786,7 @@ protocol kernel {
 protocol static {
       route $hub1_rs_ip1/32 via $hub1_nva_default_gw;
       route $hub1_rs_ip2/32 via $hub1_nva_default_gw;
+      route $hub2_lb_ip/32 via $hub1_nva_default_gw;
       route $(get_1st_private_ip hub2nva1)/32 via $hub1_nva_default_gw;
       $([[ "$nva_no" == "2" ]] && echo "route $(get_1st_private_ip hub2nva2)/32 via $hub1_nva_default_gw;" || echo "")
       route 1${nva_id}.1${nva_id}.1${nva_id}.1${nva_id}/32 via $hub1_nva_default_gw;  # Test route
@@ -826,8 +831,13 @@ filter TO_NVA {
       if (net = 22.22.22.22/32) then { accept; }
       # Drop other long prefixes (see /32 in static routes)
       if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      # Drop prefixes originated by the local ARS (advertise only the self-generated summary)
+      if ( bgp_path ~ [= $hub1_nva_asn 65515 =] ) then { reject; }
       # Accept everything else
-      else { accept; }
+      else {
+            bgp_next_hop = $local_hub_prefix_next_hop;
+            accept; 
+      }
 }
 protocol bgp rs0 from PEERS {
       description "RouteServer instance 0";
@@ -908,6 +918,7 @@ protocol kernel {
 protocol static {
       route $hub2_rs_ip1/32 via $hub2_nva_default_gw;
       route $hub2_rs_ip2/32 via $hub2_nva_default_gw;
+      route $hub1_lb_ip/32 via $hub2_nva_default_gw;
       route $(get_1st_private_ip hub1nva1)/32 via $hub2_nva_default_gw;
       $([[ "$nva_no" == "2" ]] && echo "route $(get_1st_private_ip hub1nva2)/32 via $hub2_nva_default_gw;" || echo "")
       route 2${nva_id}.2${nva_id}.2${nva_id}.2${nva_id}/32 via $hub2_nva_default_gw;  # Test route
@@ -942,8 +953,13 @@ filter TO_NVA {
       if (net = 2${nva_id}.2${nva_id}.2${nva_id}.2${nva_id}/32) then { accept; }
       # Drop other long prefixes (see /32 in static routes)
       if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
+      # Drop prefixes originated by the local ARS (advertise only the self-generated summary)
+      if ( bgp_path ~ [= $hub2_nva_asn 5515 =] ) then { reject; }
       # Accept everything else
-      else { accept; }
+      else {
+            bgp_next_hop = $local_hub_prefix_next_hop;
+            accept; 
+      }
 }
 template bgp PEERS {
       local as $hub2_nva_asn;
@@ -1015,14 +1031,36 @@ do
             nva_name="hub${hub_id}nva${nva_id}"
             pip_var=hub${hub_id}_nva${nva_id}_pip
             declare $pip_var=$(get_pip $nva_name)
+            nic_id_var=hub${hub_id}_nva${snva_id}_nic_id
+            declare $nic_id_var=$(az vm show -n "${nva_name}" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
             private_ip_var=hub${hub_id}_nva${nva_id}_private_ip
-            declare $private_ip_var=$(get_1st_private_ip $nva_name)
+            declare $private_ip_var=$(az network nic show --ids ${(P)nic_id_var} --query 'ipConfigurations[0].privateIpAddress' -o tsv)
       done
+      # Route Server
+      rs_name_var=hub${hub_id}_rs_name
+      rs_name=${(P)rs_name_var}
+      rs_ip1_var=hub${hub_id}_rs_ip1
+      rs_ip2_var=hub${hub_id}_rs_ip2
+      rs_asn_var=hub${hub_id}_rs_asn
+      declare $rs_ip1_var=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv)
+      declare $rs_ip2_var=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[1]' -o tsv)
+      declare $rs_asn_var=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAsn' -o tsv)
+      # LBs
+      nva_lb_name=hub${hub_id}_nva
+      lb_ip_var=hub${hub_id}_lb_ip
+      declare $lb_ip_var=$(az network lb frontend-ip show -n nvafrontend --lb-name $nva_lb_name -g $rg --query privateIpAddress -o tsv)
+      # Firewalls (optional)
+      if [[ "$create_azfw" == "yes" ]]
+      then
+            azfw_name=azfw${hub_id}
+            azfw_ip_var=hub${hub_id}_azfw_private_ip
+            declare $azfw_ip_var=$(az network firewall show -n $azfw_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+      fi
 done
 
 
 # Diagnose all NVAs
-cmd="ip a"
+cmd="sudo birdc show protocols"
 for hub_id in $(seq 1 $hub_no)
 do
       for nva_id in $(seq 1 $nva_no)
