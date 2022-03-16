@@ -28,6 +28,7 @@ hub1_nva_subnet_prefix=10.1.1.0/24
 hub1_nva_subnet2_name=nva2ary
 hub1_nva_subnet2_prefix=10.1.11.0/24
 hub1_nva_overlay_ip=192.168.0.1
+hub1_nva_asn=65001
 hub1_vm_subnet_name=vm
 hub1_vm_subnet_prefix=10.1.2.0/24
 hub1_gw_subnet_prefix=10.1.3.0/24
@@ -51,6 +52,7 @@ hub2_nva_subnet_name=nva1ary
 hub2_nva_subnet_prefix=10.2.1.0/24
 hub2_nva_subnet2_name=nva2ary
 hub2_nva_subnet2_prefix=10.2.11.0/24
+hub2_nva_asn=65002
 hub2_vm_subnet_name=vm
 hub2_vm_subnet_prefix=10.2.2.0/24
 hub2_gw_subnet_prefix=10.2.3.0/24
@@ -66,6 +68,36 @@ spoke22_vnet_prefix=10.2.17.0/24
 spoke22_vm_subnet_name=vm
 spoke22_vm_subnet_prefix=10.2.17.0/26
 azfw_policy_name=azfwpolicy
+
+# Auxiliary function to manipulate CIDR
+function first_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
+
+# Auxiliary function to get the first private IP of a VM (whose name is supplied as argument)
+function get_1st_private_ip(){
+      vm_name=$1
+      nic_id=$(az vm show -n "$vm_name" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+      private_ip=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $private_ip
+}
+
+# Auxiliary function to get the public IP of a VM (whose name is supplied as argument)
+function get_pip(){
+      vm_name=$1
+      nic_id=$(az vm show -n "$vm_name" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+      pip_id=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+      pip=$(az network public-ip show --ids $pip_id --query 'ipAddress' -o tsv) && echo $pip
+}
+
+
+###########
+#  Start  #
+###########
 
 # Create Vnets
 echo "Creating VNets..."
@@ -343,31 +375,6 @@ then
       fi
 fi
 
-# Auxiliary function to manipulate CIDR
-function first_ip(){
-    subnet=$1
-    IP=$(echo $subnet | cut -d/ -f 1)
-    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
-    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
-    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
-    echo "$NEXT_IP"
-}
-
-# Auxiliary function to get the first private IP of a VM (whose name is supplied as argument)
-function get_1st_private_ip(){
-      vm_name=$1
-      nic_id=$(az vm show -n "$vm_name" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-      private_ip=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $private_ip
-}
-
-# Auxiliary function to get the public IP of a VM (whose name is supplied as argument)
-function get_pip(){
-      vm_name=$1
-      nic_id=$(az vm show -n "$vm_name" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-      pip_id=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
-      pip=$(az network public-ip show --ids $pip_id --query 'ipAddress' -o tsv) && echo $pip
-}
-
 # Create NVA: Ubuntu VM with Bird and StrongSwan
 if [[ "$nva_type" == "linux1nic" ]] || [[ "$nva_type" == "linux2nic" ]]
 then
@@ -383,8 +390,8 @@ runcmd:
 - apt update 
 - UCF_FORCE_CONFOLD=1 DEBIAN_FRONTEND=noninteractive apt install -y bird strongswan
 - sysctl -w net.ipv4.ip_forward=1
-- sysctl -w net.ipv4.conf.all.accept_redirects = 0 
-- sysctl -w net.ipv4.conf.all.send_redirects = 0
+- sysctl -w net.ipv4.conf.all.accept_redirects=0 
+- sysctl -w net.ipv4.conf.all.send_redirects=0
 EOF
 
       # Hub1 NVA creation
@@ -608,13 +615,13 @@ for nva_id in $(seq 1 $nva_no)
 do
       hub1_nva_name="hub1nva${nva_id}"
       hub1_nva_private_ip=$(get_1st_private_ip $hub1_nva_name)
-      echo "Creating ARS peering to ${hub1_nva_name}..."
+      echo "Creating ARS peering between ${hub1_rs_name} and  ${hub1_nva_name}..."
       az network routeserver peering create --routeserver $hub1_rs_name -g $rg --peer-ip $hub1_nva_private_ip --peer-asn $hub1_nva_asn -n $hub1_nva_name -o none
       if [[ "$hub_no" == "2" ]]
       then
             hub2_nva_name="hub2nva${nva_id}"
-            hub2_nva_private_ip=$(get_1st_private_ip $hub1_nva_name)
-            echo "Creating ARS peering to ${hub2_nva_name}..."
+            hub2_nva_private_ip=$(get_1st_private_ip $hub2_nva_name)
+            echo "Creating ARS peering between ${hub2_rs_name} and ${hub2_nva_name}..."
             az network routeserver peering create --routeserver $hub2_rs_name -g $rg --peer-ip $hub2_nva_private_ip --peer-asn $hub2_nva_asn -n $hub2_nva_name -o none
       fi
 done
@@ -787,12 +794,20 @@ template bgp PEERS {
       multihop;
 }
 filter TO_RS {
-      # Accept test route
-      if (net = 1${nva_id}.1${nva_id}.1${nva_id}.1${nva_id}/32) then { accept; }
+      # Accept test routes
+      if (net = 11.11.11.11/32) then { accept; }
+      if (net = 12.12.12.12/32) then { accept; }
+      if (net = 21.21.21.21/32) then { accept; }
+      if (net = 22.22.22.22/32) then { accept; }
       # Drop other long prefixes (see /32 in static routes)
       if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
-      # Optionally set next hop for hub prefix as the LB
+      # Optionally set next hop for local/remote hub prefixes as the LB
       if (net = $hub1_spoke_summary) then
+      {
+            bgp_next_hop = $local_hub_prefix_next_hop;
+            accept;
+      }
+      if (net = $hub2_spoke_summary) then
       {
             bgp_next_hop = $local_hub_prefix_next_hop;
             accept;
@@ -804,8 +819,11 @@ filter TO_RS {
       }
 }
 filter TO_NVA {
-      # Accept test route
-      if (net = 2${nva_id}.2${nva_id}.2${nva_id}.2${nva_id}/32) then { accept; }
+      # Accept test routes
+      if (net = 11.11.11.11/32) then { accept; }
+      if (net = 12.12.12.12/32) then { accept; }
+      if (net = 21.21.21.21/32) then { accept; }
+      if (net = 22.22.22.22/32) then { accept; }
       # Drop other long prefixes (see /32 in static routes)
       if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
       # Accept everything else
@@ -902,7 +920,12 @@ filter TO_RS {
       if (net = 2${nva_id}.2${nva_id}.2${nva_id}.2${nva_id}/32) then { accept; }
       # Drop other long prefixes (see /32 in static routes)
       if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
-      # Optionally set next hop for hub prefix as the LB
+      # Optionally set next hop for local/remote hub prefixes as the LB
+      if (net = $hub1_spoke_summary) then
+      {
+            bgp_next_hop = $local_hub_prefix_next_hop;
+            accept;
+      }
       if (net = $hub2_spoke_summary) then
       {
             bgp_next_hop = $local_hub_prefix_next_hop;
@@ -967,6 +990,36 @@ fi
 ##############################
 #        Diagnostics         #
 ##############################
+
+# Set variables (the (P) operator only works in zsh, not in bash)
+for hub_id in $(seq 1 $hub_no)
+do
+      # Spokes
+      for spoke_id in $(seq 1 2)
+      do
+            vnet_name_var=spoke${hub_id}${spoke_id}_vnet_name
+            vm_name_var=${(P)vnet_name_var}_vm_name
+            declare $vm_name_var="${(P)vnet_name_var}-vm"
+            pip_name_var=spoke${hub_id}${spoke_id}_vm_pip_name
+            declare $pip_name_var="${(P)vm_name_var}-pip"
+            nic_id_var=spoke${hub_id}${spoke_id}_vm_nic_id
+            declare $nic_id_var=$(az vm show -n "${(P)vm_name_var}" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+            private_ip_var=spoke${hub_id}${spoke_id}_vm_private_ip
+            declare $private_ip_var=$(az network nic show --ids ${(P)nic_id_var} --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+            pip_var=spoke${hub_id}${spoke_id}_vm_pip
+            declare $pip_var=$(az network public-ip show -n ${(P)pip_name_var} -g $rg --query 'ipAddress' -o tsv)
+      done
+      # NVAs
+      for nva_id in $(seq 1 $nva_no)
+      do
+            nva_name="hub${hub_id}nva${nva_id}"
+            pip_var=hub${hub_id}_nva${nva_id}_pip
+            declare $pip_var=$(get_pip $nva_name)
+            private_ip_var=hub${hub_id}_nva${nva_id}_private_ip
+            declare $private_ip_var=$(get_1st_private_ip $nva_name)
+      done
+done
+
 
 # Diagnose all NVAs
 cmd="ip a"

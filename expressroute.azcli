@@ -5,12 +5,12 @@
 #################################
 
 # Control
-location=germanywestcentral
-er_location=germanywestcentral
-er_pop=Frankfurt
+location=southcentralus
+er_location=southcentralus
+er_pop=Dallas
 er_circuit_sku=Standard
-create_spoke=yes
-simulate_onprem=yes
+create_spoke=no
+simulate_onprem=no
 
 # Other possible pop/region combinations with megaport:
 # location=germanywestcentral
