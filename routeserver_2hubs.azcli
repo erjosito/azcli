@@ -954,7 +954,7 @@ filter TO_NVA {
       # Drop other long prefixes (see /32 in static routes)
       if ( net ~ [ 0.0.0.0/0{30,32} ] ) then { reject; }
       # Drop prefixes originated by the local ARS (advertise only the self-generated summary)
-      if ( bgp_path ~ [= $hub2_nva_asn 5515 =] ) then { reject; }
+      if ( bgp_path ~ [= $hub2_nva_asn 65515 =] ) then { reject; }
       # Accept everything else
       else {
             bgp_next_hop = $local_hub_prefix_next_hop;
@@ -1031,7 +1031,7 @@ do
             nva_name="hub${hub_id}nva${nva_id}"
             pip_var=hub${hub_id}_nva${nva_id}_pip
             declare $pip_var=$(get_pip $nva_name)
-            nic_id_var=hub${hub_id}_nva${snva_id}_nic_id
+            nic_id_var=hub${hub_id}_nva${nva_id}_nic_id
             declare $nic_id_var=$(az vm show -n "${nva_name}" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
             private_ip_var=hub${hub_id}_nva${nva_id}_private_ip
             declare $private_ip_var=$(az network nic show --ids ${(P)nic_id_var} --query 'ipConfigurations[0].privateIpAddress' -o tsv)
