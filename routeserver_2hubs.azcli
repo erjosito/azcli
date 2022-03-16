@@ -502,7 +502,7 @@ EOF
                   echo "Creating LB ${nva_lb_name}..."
                   az network lb create -n $nva_lb_name -g $rg -l $hub2_location --sku Standard --vnet-name $hub2_vnet_name --subnet $hub2_nva_subnet_name --frontend-ip-name nvafrontend --backend-pool-name nvas -o none
                   az network lb probe create -n nvaprobe --lb-name $nva_lb_name -g $rg --protocol tcp --port 22 -o none
-                  az network lb rule create -n nvahaports --lb-name $nva_lb_name -g $rg --protocol All --frontend-port '*' --frontend-ip-name nvafrontend --backend-pool-name nvas --probe-name nvaprobe -o none
+                  az network lb rule create -n nvahaports --lb-name $nva_lb_name -g $rg --protocol All --frontend-port 0 --backend-port 0 --frontend-ip-name nvafrontend --backend-pool-name nvas --probe-name nvaprobe -o none
                   hub2_lb_ip=$(az network lb frontend-ip show -n nvafrontend --lb-name $nva_lb_name -g $rg --query privateIpAddress -o tsv)
                   for nva_id in $(seq 1 $nva_no)
                   do
