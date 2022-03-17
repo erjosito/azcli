@@ -14,6 +14,9 @@ flowlogs2logws=yes    # Whether Flow Logs are sent to an LA workspace too
 stress_test_routes=no # Whether running a stress test on the number of routes by creating many VNets peered to the hub
 next_hop=lb           # Either 'azfw', 'lb' or 'nva'. If 'lb', it sets the advertised next hop to ARS as the internal LB private IP
 use_vxlan=no          # Whether using VXLAN encap between the NVAs in different hubs
+create_onprem=yes     # Whether onprem will be simulated with an additional network
+onprem_vpn=yes        # Whether onprem will be connected via S2S VPN + BGP
+onprem_er=no          # Whether onprem will be connected via ExpressRoute (not implemented yet)
 
 # Variables
 rg=routeserver
@@ -27,7 +30,7 @@ hub1_nva_subnet_name=nva1ary
 hub1_nva_subnet_prefix=10.1.1.0/24
 hub1_nva_subnet2_name=nva2ary
 hub1_nva_subnet2_prefix=10.1.11.0/24
-hub1_nva_overlay_ip=192.168.0.1
+hub1_nva_overlay_ip=10.251.0.1
 hub1_nva_asn=65001
 hub1_vm_subnet_name=vm
 hub1_vm_subnet_prefix=10.1.2.0/24
@@ -58,7 +61,7 @@ hub2_vm_subnet_prefix=10.2.2.0/24
 hub2_gw_subnet_prefix=10.2.3.0/24
 hub2_azfw_subnet_prefix=10.2.15.0/24
 hub2_spoke_summary=10.2.0.0/16
-hub2_nva_overlay_ip=192.168.0.2
+hub2_nva_overlay_ip=10.251.0.2
 spoke21_vnet_name=spoke21
 spoke21_vnet_prefix=10.2.16.0/24
 spoke21_vm_subnet_name=vm
@@ -195,9 +198,9 @@ az network nsg rule create -n SSHin --nsg-name "$hub1_nsg_name" -g $rg --priorit
 az network nsg rule create -n ICMPin --nsg-name "$hub1_nsg_name" -g $rg --priority 1010 --destination-port-ranges '*' --access Allow --protocol Icmp --direction Inbound -o none
 az network nsg rule create -n IKEin --nsg-name "$hub1_nsg_name" -g $rg --priority 1020 --destination-port-ranges 4500 --access Allow --protocol Udp --direction Inbound -o none
 az network nsg rule create -n IPsecin --nsg-name "$hub1_nsg_name" -g $rg --priority 1030 --destination-port-ranges 500 --access Allow --protocol Udp --direction Inbound -o none
-az network nsg rule create -n RFC1918in --nsg-name "$hub1_nsg_name" -g $rg --priority 1040 --source-address-prefixes '10.0.0.0/8' '192.168.0.0/16' '172.16.0.0/12' --destination-address-prefixes '10.0.0.0/8' '192.168.0.0/16' '172.16.0.0/12' --destination-port-ranges '*' --access Allow --protocol '*' --direction Inbound -o none
+az network nsg rule create -n RFC1918in --nsg-name "$hub1_nsg_name" -g $rg --priority 1040 --source-address-prefixes '10.0.0.0/8' '10.251.0.0/16' '172.16.0.0/12' --destination-address-prefixes '10.0.0.0/8' '10.251.0.0/16' '172.16.0.0/12' --destination-port-ranges '*' --access Allow --protocol '*' --direction Inbound -o none
 az network nsg rule create -n ICMPout --nsg-name "$hub1_nsg_name" -g $rg --priority 1000 --destination-port-ranges '*' --access Allow --protocol Icmp --direction Outbound -o none
-az network nsg rule create -n RFC1918out --nsg-name "$hub1_nsg_name" -g $rg --priority 1010 --source-address-prefixes '10.0.0.0/8' '192.168.0.0/16' '172.16.0.0/12' --destination-address-prefixes '10.0.0.0/8' '192.168.0.0/16' '172.16.0.0/12' --destination-port-ranges '*' --access Allow --protocol '*' --direction Outbound -o none
+az network nsg rule create -n RFC1918out --nsg-name "$hub1_nsg_name" -g $rg --priority 1010 --source-address-prefixes '10.0.0.0/8' '10.251.0.0/16' '172.16.0.0/12' --destination-address-prefixes '10.0.0.0/8' '10.251.0.0/16' '172.16.0.0/12' --destination-port-ranges '*' --access Allow --protocol '*' --direction Outbound -o none
 if [[ "$hub_no" == "2" ]]
 then
       hub2_nsg_name="hub2-nsg"
@@ -206,9 +209,9 @@ then
       az network nsg rule create -n ICMPin --nsg-name "$hub2_nsg_name" -g $rg --priority 1010 --destination-port-ranges '*' --access Allow --protocol Icmp --direction Inbound -o none
       az network nsg rule create -n IKEin --nsg-name "$hub2_nsg_name" -g $rg --priority 1020 --destination-port-ranges 4500 --access Allow --protocol Udp --direction Inbound -o none
       az network nsg rule create -n IPsecin --nsg-name "$hub2_nsg_name" -g $rg --priority 1030 --destination-port-ranges 500 --access Allow --protocol Udp --direction Inbound -o none
-      az network nsg rule create -n RFC1918in --nsg-name "$hub2_nsg_name" -g $rg --priority 1040 --source-address-prefixes '10.0.0.0/8' '192.168.0.0/16' '172.16.0.0/12' --destination-address-prefixes '10.0.0.0/8' '192.168.0.0/16' '172.16.0.0/12' --destination-port-ranges '*' --access Allow --protocol '*' --direction Inbound -o none
+      az network nsg rule create -n RFC1918in --nsg-name "$hub2_nsg_name" -g $rg --priority 1040 --source-address-prefixes '10.0.0.0/8' '10.251.0.0/16' '172.16.0.0/12' --destination-address-prefixes '10.0.0.0/8' '10.251.0.0/16' '172.16.0.0/12' --destination-port-ranges '*' --access Allow --protocol '*' --direction Inbound -o none
       az network nsg rule create -n ICMPout --nsg-name "$hub2_nsg_name" -g $rg --priority 1000 --destination-port-ranges '*' --access Allow --protocol Icmp --direction Outbound -o none
-      az network nsg rule create -n RFC1918out --nsg-name "$hub2_nsg_name" -g $rg --priority 1010 --source-address-prefixes '10.0.0.0/8' '192.168.0.0/16' '172.16.0.0/12' --destination-address-prefixes '10.0.0.0/8' '192.168.0.0/16' '172.16.0.0/12' --destination-port-ranges '*' --access Allow --protocol '*' --direction Outbound -o none
+      az network nsg rule create -n RFC1918out --nsg-name "$hub2_nsg_name" -g $rg --priority 1010 --source-address-prefixes '10.0.0.0/8' '10.251.0.0/16' '172.16.0.0/12' --destination-address-prefixes '10.0.0.0/8' '10.251.0.0/16' '172.16.0.0/12' --destination-port-ranges '*' --access Allow --protocol '*' --direction Outbound -o none
 fi
 
 # Create Log Analytics workspaces in each region (or find an existing one in RG)
@@ -1003,6 +1006,204 @@ EOF
       done
 fi
 
+# Onprem
+if [[ "$create_onprem" == "yes" ]]
+then
+      # Variables
+      onprem_vnet_name=onprem
+      onprem_vnet_prefix=10.251.0.0/16
+      onprem_nva_subnet_name=onprem
+      onprem_nva_subnet_prefix=10.251.0.0/24
+      onprem_gw_subnet_name=GatewaySubnet
+      onprem_gw_subnet_prefix=10.251.1.0/24
+      onprem_linuxnva_asn=65100
+      onprem_linuxnva_name=onpremnva
+      onprem_linuxnva_pip=${onprem_linuxnva_name}-pip
+      onprem_linuxnva_ip=10.251.0.20
+      linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
+      vpngw_name=hub1vpngw
+      vpngw_pip1_name=${vpngw_name}-pip1
+      vpngw_pip2_name=${vpngw_name}-pip2
+      vpngw_asn=65515
+      # Random PSG
+      vpn_psk=$(openssl rand -base64 64)
+      vpn_psk=${vpn_psk//$'\n'/}  # Remove line breaks
+
+      # Create onprem VNet
+      az network vnet create -n $onprem_vnet_name -g $rg --address-prefixes $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefixes $onprem_nva_subnet_prefix -o none
+      az network vnet subnet create -g $rg --vnet-name $onprem_vnet_name -n GatewaySubnet --address-prefix $onprem_gw_subnet_prefix -o none
+
+      # VPN S2S
+      if [[ "$onprem_vpn" == "yes" ]]
+      then
+            # VNG in hub1 (probably to be customized in the future)
+            az network public-ip create -g $rg -n $vpngw_pip1_name -o none
+            az network public-ip create -g $rg -n $vpngw_pip2_name -o none
+            az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet $hub1_vnet_name -n $vpngw_name --asn $vpngw_asn --public-ip-address $vpngw_pip1_name $vpngw_pip2_name -o none
+            # Onprem Linux NVA
+            cat <<EOF > $linuxnva_cloudinit_file
+#cloud-config
+runcmd:
+- apt update && apt install -y bird strongswan
+- sysctl -w net.ipv4.ip_forward=1
+- sysctl -w net.ipv4.conf.all.accept_redirects = 0 
+- sysctl -w net.ipv4.conf.all.send_redirects = 0
+EOF
+            # NSG
+            echo "Creating NSG ${onprem_linuxnva_name}-nsg..."
+            az network nsg create -n "${onprem_linuxnva_name}-nsg" -g $rg -o none
+            az network nsg rule create -n SSH --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+            az network nsg rule create -n IKE --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp -o none
+            az network nsg rule create -n IPsec --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp -o none
+            az network nsg rule create -n ICMP --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp -o none
+            # Onprem NVA
+            echo "Creating VM ${onprem_linuxnva_name}..."
+            nva_size=Standard_B1s
+            az vm create -n $onprem_linuxnva_name -g $rg -l $hub1_location --image ubuntuLTS --generate-ssh-keys \
+                  --public-ip-address $onprem_linuxnva_pip --public-ip-sku Standard --vnet-name $onprem_vnet_name --size $nva_size --subnet $onprem_nva_subnet_name \
+                  --custom-data $linuxnva_cloudinit_file --private-ip-address "$onprem_linuxnva_ip" --nsg "${onprem_linuxnva_name}-nsg" -o none
+            onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+            az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding -o none
+            echo "Retrieving info of onprem NVA ${onprem_linuxnva_name}..."
+            onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $rg --query ipAddress -o tsv) && echo "- Public IP address $onprem_linuxnva_pip_ip"
+            onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo "- Private IP address $onprem_linuxnva_private_ip"
+            onprem_linuxnva_default_gw=$(first_ip "$onprem_nva_subnet_prefix") && echo "- Default gateway $onprem_linuxnva_default_gw"
+            # Get VNG data
+            echo "Retrieving info about VPN GW ${vpngw_name}..."
+            vpngw_pip_1=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]' -o tsv) && echo "- First public IP: $vpngw_pip_1"
+            vpngw_private_ip_1=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]' -o tsv) && echo "- First private IP: $vpngw_private_ip_1"
+            vpngw_pip_2=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]' -o tsv) && echo "- Second public IP: $vpngw_pip_2"
+            vpngw_private_ip_2=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]' -o tsv) && echo "- Second private IP: $vpngw_private_ip_2"
+            vpngw_asn=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.asn' -o tsv) && echo "- BGP ASN: $vpngw_asn"
+            # LNG and connection
+            az network local-gateway create -g $rg -n $onprem_linuxnva_name --gateway-ip-address $onprem_linuxnva_pip_ip --local-address-prefixes "${onprem_linuxnva_private_ip}/32" --asn $onprem_linuxnva_asn --bgp-peering-address $onprem_linuxnva_private_ip --peer-weight 0 -o none
+            az network vpn-connection create -g $rg --shared-key $vpn_psk --enable-bgp -n $onprem_linuxnva_name --vnet-gateway1 $vpngw_name --local-gateway2 $onprem_linuxnva_name -o none
+
+            # Configure StrongSwan VPN with BGP
+            # See https://blog.sys4.de/routing-based-vpn-with-strongswan-de.html
+            # See https://wiki.strongswan.org/projects/strongswan/wiki/RouteBasedVPN
+
+            echo "Configuring VPN between onprem (${onprem_linuxnva_pip_ip}/${onprem_linuxnva_private_ip}) and Azure (${vpngw_pip_1}/${vpngw_private_ip_1} and ${vpngw_pip_2}/${vpngw_private_ip_2})"
+            # Create VTI tunnels for BGP
+            echo "Creating vti interfaces in $onprem_linuxnva_name..."
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti0 local $onprem_linuxnva_private_ip remote $vpngw_pip_1 mode vti key 11"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti1 local $onprem_linuxnva_private_ip remote $vpngw_pip_2 mode vti key 12"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip link set up dev vti0"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti1.disable_policy=1"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip link set up dev vti1"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route add ${vpngw_private_ip_1}/32 dev vti0"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route add ${vpngw_private_ip_2}/32 dev vti1"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
+            # StrongSwan config files
+            psk_file=/tmp/ipsec.secrets
+            cat <<EOF > $psk_file
+$onprem_linuxnva_pip_ip $vpngw_pip_1 : PSK "$vpn_psk"
+$onprem_linuxnva_pip_ip $vpngw_pip_2 : PSK "$vpn_psk"
+EOF
+            ipsec_file=/tmp/ipsec.conf
+            cat <<EOF > $ipsec_file
+config setup
+      charondebug="all"
+      uniqueids=yes
+      strictcrlpolicy=no
+conn vpngw0
+      authby=secret
+      leftid=$onprem_linuxnva_pip_ip
+      leftsubnet=0.0.0.0/0
+      right=$vpngw_pip_1
+      rightsubnet=0.0.0.0/0
+      ike=aes256-sha2_256-modp1024!
+      esp=aes256-sha2_256!
+      keyingtries=0
+      ikelifetime=1h
+      lifetime=8h
+      dpddelay=30
+      dpdtimeout=120
+      dpdaction=restart
+      auto=start
+      mark=11
+conn vpngw1
+      authby=secret
+      leftid=$onprem_linuxnva_pip_ip
+      leftsubnet=0.0.0.0/0
+      right=$vpngw_pip_2
+      rightsubnet=0.0.0.0/0
+      ike=aes256-sha2_256-modp1024!
+      esp=aes256-sha2_256!
+      keyingtries=0
+      ikelifetime=1h
+      lifetime=8h
+      dpddelay=30
+      dpdtimeout=120
+      dpdaction=restart
+      auto=start
+      mark=12
+EOF
+            username=$(whoami)
+            echo "Copying IPsec config files to ${onprem_linuxnva_name}..."
+            scp $psk_file $onprem_linuxnva_pip_ip:/home/$username/ipsec.secrets
+            scp $ipsec_file $onprem_linuxnva_pip_ip:/home/$username/ipsec.conf
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo mv ./ipsec.* /etc/"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart ipsec"
+
+            # Configure BGP with Bird (onprem)
+            bird_config_file=/tmp/bird.conf
+            cat <<EOF > $bird_config_file
+log syslog all;
+router id $onprem_linuxnva_private_ip;
+protocol device {
+      scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      preference 254;
+      learn;
+      merge paths on;
+      import filter {
+            if net ~ ${vpngw_private_ip_1}/32 then accept;
+            if net ~ ${vpngw_private_ip_2}/32 then accept;
+            else reject;
+      };
+      export filter {
+            if net ~ ${vpngw_private_ip_1}/32 then accept;
+            if net ~ ${vpngw_private_ip_2}/32 then accept;
+            else accept;
+      };
+}
+protocol static {
+      import all;
+      route 251.251.251.251/32 via $onprem_linuxnva_default_gw;
+      route $onprem_vnet_prefix via $onprem_linuxnva_default_gw;
+}
+protocol bgp vng0 {
+      description "BGP to Azure VNG instance0";
+      multihop;
+      local $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
+      neighbor $vpngw_private_ip_1 as $vpngw_asn;
+      import filter {accept;};
+      export filter {accept;};
+}
+protocol bgp vng1 {
+      description "BGP to Azure VNG instance1";
+      multihop;
+      local $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
+      neighbor $vpngw_private_ip_2 as $vpngw_asn;
+      import filter {accept;};
+      export filter {accept;};
+}
+EOF
+            # Deploy config files
+            echo "Copying BGP config files to ${onprem_linuxnva_name}..."
+            username=$(whoami)
+            scp $bird_config_file "${onprem_linuxnva_pip_ip}:/home/${username}/bird.conf"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart bird"
+      fi
+fi
+
 ##############################
 #        Diagnostics         #
 ##############################
@@ -1087,14 +1288,14 @@ az network vnet peering list --vnet-name $spoke22_vnet_name -g $rg -o table
 # VXLAN interfaces
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ip a"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ip route"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping -c 3 192.168.0.2"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping -c 3 192.168.0.6"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping -c 3 10.251.0.2"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping -c 3 10.251.0.6"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ip a"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ip route"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ping -c 3 192.168.0.1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ping -c 3 10.251.0.1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "ip a"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "ip route"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "ping -c 3 192.168.0.5"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "ping -c 3 10.251.0.5"
 
 # BGP adjacencies
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo birdc show protocols"
@@ -1225,8 +1426,8 @@ az monitor log-analytics query -w $hub1_logws_customerid --analytics-query $quer
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva2_pip_ip "ip a"
 
 # # VXLAN tunnels between hub1-nva and hub2-nva2
-# hub1_nva2_overlay_ip=192.168.0.5
-# hub2_nva2_overlay_ip=192.168.0.6
+# hub1_nva2_overlay_ip=10.251.0.5
+# hub2_nva2_overlay_ip=10.251.0.6
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link add vxlan1 type vxlan id 2 remote $hub2_nva2_private_ip dstport 4789 dev eth0"
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip link set vxlan1 up"
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "sudo ip addr add ${hub1_nva2_overlay_ip}/30 dev vxlan1"
