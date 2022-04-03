@@ -767,7 +767,7 @@ EOF
 #############
 
 # Start: create RG
-az group create -n $rg -l $location1
+az group create -n $rg -l $location1 -o none
 
 # vwan and hubs
 echo "Creating Virtual WAN and Virtual Hubs..."

@@ -823,6 +823,7 @@ filter TO_RS {
       # Accept everything else
       else {
             bgp_path.delete(65515);  # In case routes from a VNG arrive here
+            bgp_next_hop = $local_hub_prefix_next_hop;
             accept;
       }
 }
@@ -948,6 +949,7 @@ filter TO_RS {
       # Accept everything else
       else {
             bgp_path.delete(65515);  # In case routes from a VNG arrive here
+            bgp_next_hop = $local_hub_prefix_next_hop;
             accept;
       }
 }
@@ -1178,13 +1180,18 @@ protocol static {
       route 251.251.251.251/32 via $onprem_linuxnva_default_gw;
       route $onprem_vnet_prefix via $onprem_linuxnva_default_gw;
 }
+filter TO_VNG {
+      bgp_path.prepend($onprem_linuxnva_asn);
+      bgp_path.prepend($onprem_linuxnva_asn);
+      accept; 
+}
 protocol bgp vng0 {
       description "BGP to Azure VNG instance0";
       multihop;
       local $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
       neighbor $vpngw_private_ip_1 as $vpngw_asn;
       import filter {accept;};
-      export filter {accept;};
+      export filter TO_VNG;
 }
 protocol bgp vng1 {
       description "BGP to Azure VNG instance1";
@@ -1192,7 +1199,7 @@ protocol bgp vng1 {
       local $onprem_linuxnva_private_ip as $onprem_linuxnva_asn;
       neighbor $vpngw_private_ip_2 as $vpngw_asn;
       import filter {accept;};
-      export filter {accept;};
+      export filter TO_VNG;
 }
 EOF
             # Deploy config files
