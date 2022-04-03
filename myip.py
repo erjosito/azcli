@@ -54,6 +54,15 @@ def get_default_gateway():
 
             return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
 
+# Flask route to print all HTTP headers
+@app.route("/api/headers", methods=['GET'])
+def headers():
+    if request.method == 'GET':
+        try:
+            return jsonify(dict(request.headers))
+        except Exception as e:
+            return jsonify(str(e))
+        
 # Flask route for healthchecks
 @app.route("/api/healthcheck", methods=['GET'])
 def healthcheck():
