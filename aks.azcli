@@ -16,7 +16,7 @@ aks_rbac=yes
 aks_service_cidr=10.0.0.0/16
 vm_size=Standard_B2ms    # Some possible values: Standard_B2ms, Standard_D2_v3
 preview_version=no
-network_plugin=kubenet
+network_plugin=azure     # azure/kubenet
 # Vnet
 vnet_name=aksVnet
 vnet_prefix=10.13.0.0/16
@@ -564,15 +564,17 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -m hmac-sha2-512 -J $vm_pip_
 
 # Server pod
 helm repo add stenic https://stenic.github.io/helm-charts
-helm install openvpnserver --set "service.type=LoadBalancer" --set "service.gui.type=LoadBalancer" --set "service.admin.type=LoadBalancer" stenic/openvpn-as
+helm install openvpnserver --set "service.type=LoadBalancer" --set "service.gui.type=LoadBalancer" --set "service.admin.type=LoadBalancer"
 k get svc
 
-# Open iptables in the server???
+# Open iptables in the server - Is this really required???
 openvpn_server_pod=$(k get pod -l app.kubernetes.io/instance=openvpnserver -o json | jq -r '.items[0].metadata.name') && echo $openvpn_server_pod
 kubectl exec $openvpn_server_pod -- iptables -A INPUT -i as0t+ -j ACCEPT
 kubectl exec $openvpn_server_pod -- iptables -A FORWARD -i as0t+ -j ACCEPT
 
-# default credentials: altmin/passw0rd -> Download client portal from the 9443 svc to current directory
+# default credentials: altmin/passw0rd -> Download client profile from the 9443 svc to current directory
+pip_943_tcp=$(kubectl get service openvpnserver-openvpn-as-admin -o json | jq -r '.status.loadBalancer.ingress[0].ip')
+echo "Connect to http://${pip_943_tcp}:943 to download the client profile"
 client_ovpn_file=./client.ovpn
 
 # Client file for VM (using public IPs)
@@ -663,7 +665,7 @@ echo "Creating VNet and subnet..."
 az network vnet create -g $rg --name $vpnclient_vnet_name --address-prefix $vpnclient_subnet_prefix --subnet-name $vpnclient_subnet_name --subnet-prefix $vpnclient_subnet_prefix -o none
 echo "Creating VM..."
 az vm create -n $vpnclient_vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vpnclient_vm_sku -l $location \
-   --vnet-name $vpnclient_vnet_name --subnet $vpnclient_subnet_name --public-ip-address $vpnclient_pip_name -o none
+   --vnet-name $vpnclient_vnet_name --subnet $vpnclient_subnet_name --public-ip-address $vpnclient_pip_name --public-ip-sku Standard -o none
 vpnclient_pip_address=$(az network public-ip show -n $vpnclient_pip_name -g $rg --query ipAddress -o tsv) && echo $vpnclient_pip_address
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vpnclient_pip_address "ip a"
 
