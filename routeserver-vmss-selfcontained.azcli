@@ -17,8 +17,8 @@
 ##############################################################
 
 # Control
-healthcheck_script_url='https://github.com/erjosito/azcli/blob/master/routeserver-vmss-selfcontained-healthcheck.py'
-housekeeping_script_url='https://github.com/erjosito/azcli/blob/master/routeserver-vmss-selfcontained-config.sh'
+healthcheck_script_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-healthcheck.py'
+housekeeping_script_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-config.sh'
 
 # Variables
 rg=rsvmss
@@ -41,7 +41,8 @@ vm_size=Standard_B1s
 publisher=Canonical
 offer=UbuntuServer
 sku=18.04-LTS
-version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
+# version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
+version=latest
 nva_asn=65001
 nva_name=nva
 nva_pip=${nva_name}-pip
@@ -133,9 +134,8 @@ az network nsg rule create -n SSH --nsg-name "${nva_name}-nsg" -g $rg --priority
 # az network nsg rule create -n IKE --nsg-name "${nva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp -o none  # Not required since no IPsec
 # az network nsg rule create -n IPsec --nsg-name "${nva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp -o none  # Not required since no IPsec
 az network nsg rule create -n ICMP --nsg-name "${nva_name}-nsg" -g $rg --priority 1030 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp -o none
-az network nsg rule create -n Webin --nsg-name "${nva_name}-nsg" -g $rg --priority 1040 --source-address-prefixes 'VirtualNetwork' --destination-port-ranges 80 443 --access Allow --protocol Tcp -o none
+az network nsg rule create -n Webin --nsg-name "${nva_name}-nsg" -g $rg --priority 1040 --source-address-prefixes 'VirtualNetwork' --destination-port-ranges 8080 --access Allow --protocol Tcp -o none  # To troubleshoot the HTTP healthchecks
 az network nsg rule create -n ICMPout --nsg-name "${nva_name}-nsg" -g $rg --priority 1130 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp  --direction Outbound -o none
-az network nsg rule create -n Webout --nsg-name "${nva_name}-nsg" -g $rg --priority 1140 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges 80 443 --access Allow --protocol Tcp --direction Outbound -o none
 
 # Create Azure Firewall
 echo "Creating Azure Firewall..."
@@ -157,18 +157,21 @@ nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
 cat <<EOF > $nva_cloudinit_file
 #cloud-config
 packages:
-  - bird python3-pip az-cli jq
+  - bird
+  - python3-pip
+  - jq
 runcmd:
-  - sysmtemctl restart bird
-  - pip3 install flask
-  - wget $healthcheck_script_url -P /root/
-  - python3 /root/routeserver-vmss-selfcontained-healthcheck.py &
-  - wget $housekeeping_script_url -P /root/
-  - chmod 755 /root/routeserver-vmss-selfcontained-housekeeping.sh
-  - touch /var/spool/cron/root
-  - /usr/bin/crontab /var/spool/cron/root
-  - echo "*/5 * * * * /root/routeserver-vmss-selfcontained-housekeeping.sh" >> /var/spool/cron/root
+  - [ systemctl, restart, bird ]
+  - [ pip3, install, flask ]
+  - [ wget, "$healthcheck_script_url", "-P", "/root/" ]
+  - [ python3, "/root/routeserver-vmss-selfcontained-healthcheck.py", "&" ]
+  - [ wget, "$housekeeping_script_url", "-P", "/root/" ]
+  - [ chmod, "755", "/root/routeserver-vmss-selfcontained-config.sh" ]
+  - curl -sL "https://aka.ms/InstallAzureCLIDeb" | bash
 write_files:
+- path: /etc/crontab
+  append: true
+  content: */5 * * * * root /root/routeserver-vmss-selfcontained-housekeeping.sh
 - content: |
     log syslog all;
     protocol device {
@@ -205,7 +208,7 @@ write_files:
         local as $nva_asn;
         neighbor $rs_ip1 as $rs_asn;
             import filter {accept;};
-            export filter {accept;};
+            export filter TO_RS;
     }
     protocol bgp rs1 {
         description "Route Server instance 1";
@@ -213,7 +216,7 @@ write_files:
         local as $nva_asn;
         neighbor $rs_ip2 as $rs_asn;
             import filter {accept;};
-            export filter {accept;};
+            export filter TO_RS;
     }
   path: /etc/bird/bird.conf
 EOF
@@ -223,20 +226,17 @@ echo "Creating VMSS..."
 az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
     --vnet-name $vnet_name --subnet $nva_subnet_name \
     --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1 -o none
-az vmss update -n $nva_name -g $rg --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].enableIpForwarding=true' -o none
-az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
+# az vmss update -n $nva_name -g $rg --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].enableIpForwarding=true' -o none  # Not needed, because NVA not in the data plane
+# az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
 az vmss list-instance-connection-info -n $nva_name -g $rg -o table
 
 # Scale NVA VMSS in and out
 az vmss scale -n $nva_name -g $rg --new-capacity 2 -o none
 
-# See job runs
-az automation job list --automation-account-name $auto_account_name -g $rg -o table
-
 # See adjacencies in RS
 az network routeserver peering list --routeserver rs -g nva -o table
 
-# See adjacencies in NVA
+# See adjacencies in NVAs
 vm_list=$(az vmss list-instance-connection-info -n $nva_name -g $rg | grep ':')
 while IFS= read -r vm; do
     vm=$(echo $vm | cut -d\" -f 4)
@@ -246,6 +246,14 @@ while IFS= read -r vm; do
     echo "Connecting to IP $vm_ip port $vm_port..."
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_ip -p $vm_port "sudo birdc show protocols"
 done <<< "$vm_list"
+
+# SSH to first VMSS instance
+vm1=$(az vmss list-instance-connection-info -n $nva_name -g $rg | grep ':' | head -1)
+vm=$(echo $vm1 | cut -d\" -f 4)
+vm_ip=$(echo $vm | cut -d: -f 1)
+vm_port=$(echo $vm | cut -d: -f 2)
+echo "Connecting to VM $vm on IP $vm_ip and port $vm_port..."
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $vm_ip -p $vm_port
 
 # See effective routes in VM
 azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -261,4 +269,5 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azurevm_pip_ip "curl -s4 if
 ###############
 
 # az vmss delete -n $nva_name -g $rg
+# az network firewall delete -n $azfw_name -g $rg --no-wait
 # az group delete -y --no-wait -n $rg

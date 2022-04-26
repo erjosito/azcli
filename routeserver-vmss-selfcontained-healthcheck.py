@@ -18,6 +18,8 @@ def get_web_port():
         print("Port supplied as environment variable:", web_port)
     return web_port
 
+app = Flask(__name__)
+
 # Flask route for healthchecks
 @app.route("/api/healthcheck", methods=['GET'])
 def healthcheck():
