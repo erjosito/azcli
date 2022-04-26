@@ -150,10 +150,19 @@ az network firewall update -n $azfw_name -g $rg -o none
 azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
 echo "Azure Firewall created with private IP $azfw_private_ip"
 
+# Create managed identity for VMSS
+echo "Creating managed identity and assigning contributor role to RG..."
+id_name="$nva_name"
+az identity create -n $id_name -g $rg -o none
+id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
+id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
+rg_id=$(az group show -n $rg --query id -o tsv)
+az role assignment create --scope $rg_id --assignee $id_principal_id --role 'Contributor' -o none
+
 # Create Cloudinit file that will be used by the VMSS with Bird, python and Flask (Python/Flask required to provide "smart" HTTP probes)
 # Azure CLI is installed to to run housekeeping tasks
 echo "Creating cloudinit file for VMSS..."
-nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
+nva_default_gw=$(first_ip "$nva_subnet_prefix")
 cat <<EOF > $nva_cloudinit_file
 #cloud-config
 packages:
@@ -164,16 +173,16 @@ runcmd:
   - [ systemctl, restart, bird ]
   - [ pip3, install, flask ]
   - [ wget, "$healthcheck_script_url", "-P", "/root/" ]
-  - [ python3, "/root/routeserver-vmss-selfcontained-healthcheck.py", "&" ]
   - [ wget, "$housekeeping_script_url", "-P", "/root/" ]
   - [ chmod, "755", "/root/routeserver-vmss-selfcontained-config.sh" ]
   - [ wget, "https://aka.ms/InstallAzureCLIDeb", "-O", "/root/install_azcli.sh" ]
-  - curl -sL "https://aka.ms/InstallAzureCLIDeb" | bash
+  - bash /root/install_azcli.sh
+  - python3 /root/routeserver-vmss-selfcontained-healthcheck.py &
 write_files:
 - path: /etc/crontab
   append: true
   content: |
-    */5 * * * * root /root/routeserver-vmss-selfcontained-housekeeping.sh
+    */5 * * * * root /root/routeserver-vmss-selfcontained-config.sh
 - content: |
     log syslog all;
     protocol device {
@@ -226,7 +235,7 @@ EOF
 # Create a VMSS using previous cloudinit file
 echo "Creating VMSS..."
 az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
-    --vnet-name $vnet_name --subnet $nva_subnet_name \
+    --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id \
     --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1 -o none
 # az vmss update -n $nva_name -g $rg --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].enableIpForwarding=true' -o none  # Not needed, because NVA not in the data plane
 # az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
