@@ -17,7 +17,7 @@
 ##############################################################
 
 # Control
-healthcheck_script_url=""
+healthcheck_script_url="https://github.com/erjosito/azcli/blob/master/routeserver-vmss-selfcontained-healthcheck.py"
 housekeeping_script_url=""
 
 # Variables
@@ -157,7 +157,7 @@ nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
 cat <<EOF > $nva_cloudinit_file
 #cloud-config
 packages:
-  - bird python3-pip az-cli
+  - bird python3-pip az-cli jq
 runcmd:
   - sysmtemctl restart bird
   - pip3 install flask
