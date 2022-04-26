@@ -25,11 +25,14 @@ app = Flask(__name__)
 def healthcheck():
     if request.method == 'GET':
         try:
-          output_stream = os.popen('echo "birdc show protocols"')
-          birdc_output = output_stream.read()
+          output_stream = os.popen('birdc show protocols | grep rs0 | awk \'{print $6}\'')
+          rs0_status = output_stream.read()
+          output_stream = os.popen('birdc show protocols | grep rs1 | awk \'{print $6}\'')
+          rs1_status = output_stream.read()
           msg = {
             'health': 'OK',
-            'bird_status': birdc_output
+            'rs0_status': rs0_status.rstrip('\n'),
+            'rs1_status': rs1_status.rstrip('\n')
           }          
           return jsonify(msg)
         except Exception as e:
