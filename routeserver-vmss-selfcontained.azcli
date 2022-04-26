@@ -17,8 +17,8 @@
 ##############################################################
 
 # Control
-healthcheck_script_url="https://github.com/erjosito/azcli/blob/master/routeserver-vmss-selfcontained-healthcheck.py"
-housekeeping_script_url=""
+healthcheck_script_url='https://github.com/erjosito/azcli/blob/master/routeserver-vmss-selfcontained-healthcheck.py'
+housekeeping_script_url='https://github.com/erjosito/azcli/blob/master/routeserver-vmss-selfcontained-config.sh'
 
 # Variables
 rg=rsvmss
@@ -161,6 +161,13 @@ packages:
 runcmd:
   - sysmtemctl restart bird
   - pip3 install flask
+  - wget $healthcheck_script_url -P /root/
+  - python3 /root/routeserver-vmss-selfcontained-healthcheck.py &
+  - wget $housekeeping_script_url -P /root/
+  - chmod 755 /root/routeserver-vmss-selfcontained-housekeeping.sh
+  - touch /var/spool/cron/root
+  - /usr/bin/crontab /var/spool/cron/root
+  - echo "*/5 * * * * /root/routeserver-vmss-selfcontained-housekeeping.sh" >> /var/spool/cron/root
 write_files:
 - content: |
     log syslog all;
