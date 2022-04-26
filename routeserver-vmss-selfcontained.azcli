@@ -167,11 +167,13 @@ runcmd:
   - [ python3, "/root/routeserver-vmss-selfcontained-healthcheck.py", "&" ]
   - [ wget, "$housekeeping_script_url", "-P", "/root/" ]
   - [ chmod, "755", "/root/routeserver-vmss-selfcontained-config.sh" ]
+  - [ wget, "https://aka.ms/InstallAzureCLIDeb", "-O", "/root/install_azcli.sh" ]
   - curl -sL "https://aka.ms/InstallAzureCLIDeb" | bash
 write_files:
 - path: /etc/crontab
   append: true
-  content: */5 * * * * root /root/routeserver-vmss-selfcontained-housekeeping.sh
+  content: |
+    */5 * * * * root /root/routeserver-vmss-selfcontained-housekeeping.sh
 - content: |
     log syslog all;
     protocol device {
