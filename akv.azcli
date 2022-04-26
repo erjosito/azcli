@@ -21,6 +21,7 @@ cert_name=akv_cert_name
 # Combine .pem and .key in one pfx file (pkcs#12)
 pfx_file=".${pem_file}.pfx"
 openssl pkcs12 -export -in $pem_file -inkey $key_file -out $pfx_file -passin pass:$key_password -passout pass:$key_password
+openssl pkcs12 -export -in $pem_file -inkey $key_file -out $pfx_file -passout pass:$key_password  # No password for private key
 
 # Add certificate
 az keyvault certificate import --vault-name $akv_name -n $cert_name \
