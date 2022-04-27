@@ -181,12 +181,13 @@ runcmd:
   - [ chmod, "755", "/root/routeserver-vmss-selfcontained-config.sh" ]
   - [ wget, "https://aka.ms/InstallAzureCLIDeb", "-O", "/root/install_azcli.sh" ]
   - bash /root/install_azcli.sh
+  - /root/routeserver-vmss-selfcontained-config.sh
   - python3 /root/routeserver-vmss-selfcontained-healthcheck.py &
 write_files:
-- path: /etc/crontab
-  append: true
-  content: |
-    */5 * * * * root /root/routeserver-vmss-selfcontained-config.sh
+# - path: /etc/crontab
+#   append: true
+#   content: |
+#     */5 * * * * root /root/routeserver-vmss-selfcontained-config.sh
 - content: |
     log syslog all;
     protocol device {
@@ -236,20 +237,36 @@ write_files:
   path: /etc/bird/bird.conf
 EOF
 
+# Create a Standard LB for instance monitoring and self healing
+echo "Creating Azure LB..."
+lb_name=$nva_name
+lb_probe_name=$nva_name
+nva_subnet_id=$(az network vnet subnet show -n $nva_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+# az network lb create -n $lb_name -g $rg  --sku Standard --subnet $nva_subnet_id -o none
+az network lb create -n $lb_name -g $rg  --sku Standard -o none
+# az network lb probe create -n $lb_probe_name --lb-name $lb_name -g $rg --protocol tcp --port 179 --interval 30 --threshold 3 -o none
+az network lb probe create -n $lb_probe_name --lb-name $lb_name -g $rg --protocol http --port 8080 --path '/api/healthcheck' --interval 30 --threshold 3 -o none
+
 # Create a VMSS using previous cloudinit file
+# The value of parameter automaticRepairsPolicy.repairAction is invalid. !!!!!!
 echo "Creating VMSS..."
 az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
     --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id \
     --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1 -o none
+    # --load-balancer $lb_name --health-probe $lb_probe_name --automatic-repairs-grace-period 30 --automatic-repairs-action replace \
 # az vmss update -n $nva_name -g $rg --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].enableIpForwarding=true' -o none  # Not needed, because NVA not in the data plane
 # az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
+# echo 'Creating inbound NAT rule...'
+# lb_frontend_name=$(az network lb frontend-ip list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
+# lb_backend_name=$(az network lb address-pool list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
+# az network lb inbound-nat-rule create --backend-port 22 --lb-name $lb_name --name ssh --protocol Tcp -g $rg --backend-pool-name $lb_backend_name --frontend-ip-name $lb_frontend_name --frontend-port-range-start 1022 --frontend-port-range-start 1030
 az vmss list-instance-connection-info -n $nva_name -g $rg -o table
 
 # Scale NVA VMSS in and out
 az vmss scale -n $nva_name -g $rg --new-capacity 2 -o none
 
 # See adjacencies in RS
-az network routeserver peering list --routeserver rs -g nva -o table
+az network routeserver peering list --routeserver rs -g $rg -o table
 
 # See adjacencies in NVAs
 vm_list=$(az vmss list-instance-connection-info -n $nva_name -g $rg | grep ':')
@@ -284,5 +301,6 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azurevm_pip_ip "curl -s4 if
 ###############
 
 # az vmss delete -n $nva_name -g $rg
+# az network lb delete -n $lb_name -g $rg
 # az network firewall delete -n $azfw_name -g $rg --no-wait
 # az group delete -y --no-wait -n $rg
