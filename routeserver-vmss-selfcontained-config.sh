@@ -89,7 +89,7 @@ else
 fi
 wget -q -O /root/routes.txt $routes_url
 if cmp -s /root/routes.txt /root/routes.old.txt; then
-    echo "No change in downloaded routes, nothing else to do." | adddate >$log_file
+    echo "No change in downloaded routes, nothing else to do." | adddate >>$log_file
 else
     file_name=/etc/bird/bird.conf
     cp /etc/bird/bird.conf.template $file_name
