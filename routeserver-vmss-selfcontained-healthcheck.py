@@ -40,7 +40,7 @@ def healthcheck():
 
 # Flask route to run config
 @app.route("/api/config", methods=['GET'])
-def healthcheck():
+def config():
     if request.method == 'GET':
         try:
           output_stream = os.popen('/root/routeserver-vmss-selfcontained-config.sh')
