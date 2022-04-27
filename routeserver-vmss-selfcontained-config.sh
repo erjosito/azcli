@@ -73,8 +73,8 @@ wget -q -O /root/routes.txt $routes_url
 default_gw=$(/sbin/ip route | awk '/default/ { print $3 }')
 line_no=$(grep -n '# Routes advertised' $file_name | cut -d: -f1)
 line_no=$((line_no+1))
-cat /root/routes.txt |
-while read prefix; do
+routes=$(cat /root/routes.txt)
+for prefix in $routes; do
     echo "Adding route for $prefix to BIRD configuration..." | adddate >>$log_file
     sed -i "${line_no}i\\    route $prefix via ${default_gw};" "$file_name"
 done
