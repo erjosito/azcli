@@ -66,4 +66,14 @@ else
 fi
 
 # Update routes in bird.conf
-# sed -i "27i\\$text$station" /etc/bird/bird.conf
+file_name=/etc/bird/bird.conf
+cp /etc/bird.bird.conf.template $file_name
+routes_url=$(cat /root/routes_url)
+wget -q -O /root/routes.txt
+default_gw=$(/sbin/ip route | awk '/default/ { print $3 }')
+line_no=$(grep -n '# Routes advertised' $file_name | cut -d: -f1)
+line_no=$((line_no+1))
+cat /root/routes.txt |
+while read prefix; do
+    sed -i "${line_no}i\\        route $prefix via ${default_gw};" "$file_name"
+done

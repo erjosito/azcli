@@ -38,6 +38,22 @@ def healthcheck():
         except Exception as e:
           return jsonify(str(e))
 
+# Flask route to run config
+@app.route("/api/config", methods=['GET'])
+def healthcheck():
+    if request.method == 'GET':
+        try:
+          output_stream = os.popen('/root/routeserver-vmss-selfcontained-config.sh')
+          output = output_stream.read()
+          msg = {
+            'health': 'OK',
+            'config_output': output.rstrip('\n'),
+          }          
+          return jsonify(msg)
+        except Exception as e:
+          return jsonify(str(e))
+
+
 # Ignore warnings
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")

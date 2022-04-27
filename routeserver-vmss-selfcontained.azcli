@@ -19,6 +19,7 @@
 # Control
 healthcheck_script_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-healthcheck.py'
 housekeeping_script_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-config.sh'
+routes_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-routes.txt'
 
 # Variables
 rg=rsvmss
@@ -174,7 +175,6 @@ packages:
   - python3-pip
   - jq
 runcmd:
-  - [ systemctl, restart, bird ]
   - [ pip3, install, flask ]
   - [ wget, "$healthcheck_script_url", "-P", "/root/" ]
   - [ wget, "$housekeeping_script_url", "-P", "/root/" ]
@@ -182,12 +182,16 @@ runcmd:
   - [ wget, "https://aka.ms/InstallAzureCLIDeb", "-O", "/root/install_azcli.sh" ]
   - bash /root/install_azcli.sh
   - /root/routeserver-vmss-selfcontained-config.sh
+  - [ systemctl, restart, bird ]
   - python3 /root/routeserver-vmss-selfcontained-healthcheck.py &
 write_files:
 # - path: /etc/crontab
 #   append: true
 #   content: |
 #     */5 * * * * root /root/routeserver-vmss-selfcontained-config.sh
+- content: |
+    $routes_url
+  path: /root/routes_url
 - content: |
     log syslog all;
     protocol device {
@@ -209,10 +213,9 @@ write_files:
     }
     protocol static {
         import all;
-        # Default route
-        route 0.0.0.0/0 via $nva_default_gw;
-        # Vnet prefix to cover the RS' IPs
-        route $vnet_prefix via $nva_default_gw;
+        # Example: 
+        # route 0.0.0.0/0 via $nva_default_gw;
+        # Routes advertised --DONT CHANGE THIS LINE--
     }
     filter TO_RS {
         bgp_next_hop = $azfw_private_ip;
@@ -234,7 +237,7 @@ write_files:
             import filter {accept;};
             export filter TO_RS;
     }
-  path: /etc/bird/bird.conf
+  path: /etc/bird/bird.conf.template
 EOF
 
 # Create a Standard LB for instance monitoring and self healing
