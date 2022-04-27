@@ -82,7 +82,11 @@ fi
 # Update routes in bird.conf if the files have changed
 # First download the routes and compare to the existing ones
 routes_url=$(cat /root/routes_url)
-mv /root/routes.txt /root/routes.old.txt
+if [[ -e /root/routes.txt ]]; then
+    mv /root/routes.txt /root/routes.old.txt
+else
+    touch /root/routes.old.txt
+fi
 wget -q -O /root/routes.txt $routes_url
 if cmp -s /root/routes.txt /root/routes.old.txt; then
     echo "No change in downloaded routes, nothing else to do." | adddate >$log_file
