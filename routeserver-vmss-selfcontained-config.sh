@@ -80,7 +80,6 @@ else
 fi
 
 # Update routes in bird.conf if the files have changed
-
 # First download the routes and compare to the existing ones
 routes_url=$(cat /root/routes_url)
 mv /root/routes.txt /root/routes.old.txt
@@ -103,3 +102,28 @@ else
     systemctl restart bird
 fi
 rm /root/routes.old.txt
+
+# Cleanup not used adjacencies. Get private IP addresses of the VMSS
+vmss_name=$(echo $metadata | jq -r '.compute.vmScaleSetName')
+vmss_ips=$(az vmss nic list --vmss-name $vmss_name -g $rg --query '[].ipConfigurations[].privateIpAddress' -o tsv)
+peer_ips=$(az network routeserver peering list --routeserver $rs_name -g $rg --query '[].peerIp' -o tsv)
+for peer_ip in $peer_ips; do
+    echo "Seeing if RS peer $peer_ip can be deleted..." | adddate >>$log_file
+    match="false"
+    for vmss_ip in $vmss_ips; do
+        if [[ "$peer_ip" == "$vmss_ip" ]]; then
+            match="true"
+        fi
+    done
+    # If no match was found, it means that there is a BGP peer for some IP that does not exist in the VMSS
+    if [[ "$match" == "false" ]]; then
+        rs_peer=$(az network routeserver peering list --routeserver "$rs_name" -g "$rg" --query "[?peerIp=='$peer_ip']" -o json)
+        rs_peer_name=$(echo "$rs_peer" | jq -r '.[0].name' 2>/dev/null)
+        if [[ -n "$rs_peer_name" ]]; then
+            echo "Deleting BGP peer $rs_peer_name with IP address $peer_ip..." | adddate >>$log_file
+            az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$peer_name" -o none
+        else
+            echo "Could not find name for BGP peer with IP address $peer_ip" | adddate >>$log_file
+        fi
+    fi
+done
