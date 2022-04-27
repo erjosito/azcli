@@ -65,19 +65,27 @@ else
     fi
 fi
 
-# Update routes in bird.conf
-file_name=/etc/bird/bird.conf
-cp /etc/bird/bird.conf.template $file_name
+# Update routes in bird.conf if the files have changed
+
+# First download the routes and compare to the existing ones
 routes_url=$(cat /root/routes_url)
+mv /root/routes.txt /root/routes.old.txt
 wget -q -O /root/routes.txt $routes_url
-default_gw=$(/sbin/ip route | awk '/default/ { print $3 }')
-line_no=$(grep -n '# Routes advertised' $file_name | cut -d: -f1)
-line_no=$((line_no+1))
-routes=$(cat /root/routes.txt)
-for prefix in $routes; do
-    echo "Adding route for $prefix to BIRD configuration..." | adddate >>$log_file
-    sed -i "${line_no}i\\    route $prefix via ${default_gw};" "$file_name"
-done
-# route_no=$(cat /root/routes.txt | wc -l)
-# echo "$route_no routes added to BIRD configuration" | adddate >>$log_file
-systemctl restart bird
+if cmp -s /root/routes.txt /root/routes.old.txt; then
+    echo "No change in downloaded routes, nothing else to do." | adddate >$log_file
+else
+    file_name=/etc/bird/bird.conf
+    cp /etc/bird/bird.conf.template $file_name
+    default_gw=$(/sbin/ip route | awk '/default/ { print $3 }')
+    line_no=$(grep -n '# Routes advertised' $file_name | cut -d: -f1)
+    line_no=$((line_no+1))
+    routes=$(cat /root/routes.txt)
+    for prefix in $routes; do
+        echo "Adding route for $prefix to BIRD configuration..." | adddate >>$log_file
+        sed -i "${line_no}i\\    route $prefix via ${default_gw};" "$file_name"
+    done
+    # route_no=$(cat /root/routes.txt | wc -l)
+    # echo "$route_no routes added to BIRD configuration" | adddate >>$log_file
+    systemctl restart bird
+fi
+rm /root/routes.old.txt

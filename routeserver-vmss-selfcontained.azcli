@@ -185,10 +185,10 @@ runcmd:
   - [ systemctl, restart, bird ]
   - python3 /root/routeserver-vmss-selfcontained-healthcheck.py &
 write_files:
-# - path: /etc/crontab
-#   append: true
-#   content: |
-#     */5 * * * * root /root/routeserver-vmss-selfcontained-config.sh
+- path: /etc/crontab
+  append: true
+  content: |
+    */5 * * * * root /root/routeserver-vmss-selfcontained-config.sh
 - content: |
     $routes_url
   path: /root/routes_url
