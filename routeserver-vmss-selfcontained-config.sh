@@ -38,14 +38,14 @@ if [[ -n $existing_peer_name ]]; then
     if [[ "$existing_peer_name" == "$myname" ]] && [[ "$existing_peer_asn" == "$myasn" ]]; then
         if [[ "$existing_peer_state" == "Failed" ]]; then
             echo "Peer $existing_peer_name already found in ARS $rs_name with state $existing_peer_state, deleting and recreating..." | adddate >>$log_file
-            az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$existing_peer_name" -o none
+            az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$existing_peer_name" -y -o none
             az network routeserver peering create --routeserver "$rs_name" -g "$rg" --peer-ip "$myip" --peer-asn "$myasn" -n "$myname" -o none
         else
             echo "Peer $existing_peer_name already found in ARS $rs_name with state $existing_peer_state, no need to do anything" | adddate >>$log_file
         fi
     else
         echo "Deleting existing peer $existing_peer_name with IP $myip and ASN $existing_peer_asn, does not match $myname and $myasn..." | adddate >>$log_file
-        az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$existing_peer_name" -o none
+        az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$existing_peer_name" -y -o none
         echo "Configuring ARS $rs_name in RG $rg to peer to $myname on IP address $myip and ASN $myasn..." | adddate >>$log_file
         az network routeserver peering create --routeserver "$rs_name" -g "$rg" --peer-ip "$myip" --peer-asn "$myasn" -n "$myname" -o none
     fi
@@ -60,14 +60,14 @@ else
         if [[ "$existing_peer_ip" == "$myip" ]] && [[ "$existing_peer_asn" == "$myasn" ]]; then
             if [[ "$existing_peer_state" == "Failed" ]]; then
                 echo "Peer $myname already found in ARS $rs_name with state $existing_peer_state, deleting and recreating..." | adddate >>$log_file
-                az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$myname" -o none
+                az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$myname" -y -o none
                 az network routeserver peering create --routeserver "$rs_name" -g "$rg" --peer-ip "$myip" --peer-asn "$myasn" -n "$myname" -o none
             else
                 echo "Peer $existing_peer_name already found in ARS $rs_name, no need to do anything" | adddate >>$log_file
             fi
         else
             echo "Deleting existing peer $myname with IP $existing_peer_ip ASN $existing_peer_asn, does not match $myip and $myasn..." | adddate >>$log_file
-            az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$myname" -o none
+            az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$myname" -y -o none
             echo "Configuring ARS $rs_name in RG $rg to peer to $myname on IP address $myip and ASN $myasn..." | adddate >>$log_file
             az network routeserver peering create --routeserver "$rs_name" -g "$rg" --peer-ip "$myip" --peer-asn "$myasn" -n "$myname" -o none
         fi
@@ -125,7 +125,7 @@ for peer_ip in $peer_ips; do
         rs_peer_name=$(echo "$rs_peer" | jq -r '.[0].name' 2>/dev/null)
         if [[ -n "$rs_peer_name" ]]; then
             echo "Deleting BGP peer $rs_peer_name with IP address $peer_ip..." | adddate >>$log_file
-            az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$peer_name" -o none
+            az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$peer_name" -y -o none
         else
             echo "Could not find name for BGP peer with IP address $peer_ip" | adddate >>$log_file
         fi
