@@ -25,7 +25,7 @@ rg=$(echo "$metadata" | jq -r '.compute.resourceGroupName')
 rs_name=$(az network routeserver list -g "$rg" --query '[0].name' -o tsv)
 
 # Get local IP and ASN
-myasn=$(grep 'local as' /etc/bird/bird.conf | head -1)
+myasn=$(grep 'local as' /etc/bird/bird.conf.template | head -1)
 myasn=$(echo "$myasn" | awk '{print $3}' | cut -d ';' -f 1)
 myip=$(hostname -I | tr -d ' ')
 

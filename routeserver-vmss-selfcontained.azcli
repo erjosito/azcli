@@ -266,7 +266,7 @@ az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:$
 az vmss list-instance-connection-info -n $nva_name -g $rg -o table
 
 # Scale NVA VMSS in and out
-az vmss scale -n $nva_name -g $rg --new-capacity 2 -o none
+az vmss scale -n $nva_name -g $rg --new-capacity 3 -o none
 
 # See adjacencies in RS
 az network routeserver peering list --routeserver rs -g $rg -o table
