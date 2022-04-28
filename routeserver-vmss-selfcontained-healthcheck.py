@@ -29,14 +29,20 @@ def healthcheck():
           rs0_status = output_stream.read()
           output_stream = os.popen('birdc show protocols | grep rs1 | awk \'{print $6}\'')
           rs1_status = output_stream.read()
+          rs0_status = rs0_status.rstrip('\n')
+          rs1_status = rs1_status.rstrip('\n')
+          if (rs0_status == "Established") and (rs1_status == "Established"):
+            return_code = 200
+          else:
+            return_code = 503
           msg = {
             'health': 'OK',
-            'rs0_status': rs0_status.rstrip('\n'),
-            'rs1_status': rs1_status.rstrip('\n')
+            'rs0_status': rs0_status,
+            'rs1_status': rs1_status
           }          
-          return jsonify(msg)
+          return jsonify(msg), return_code
         except Exception as e:
-          return jsonify(str(e))
+          return jsonify(str(e)), 500
 
 # Flask route to run config
 @app.route("/api/config", methods=['GET'])
