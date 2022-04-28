@@ -87,7 +87,9 @@ if [[ -e /root/routes.txt ]]; then
 else
     touch /root/routes.old.txt
 fi
-wget -q -O /root/routes.txt $routes_url
+wget -q -O /root/routes.txt "$routes_url"
+route_no=$(cat /root/routes.txt | wc -l)
+echo "$route_no routes downloaded from $routes_url, adding now to BIRD configuration..." | adddate >>$log_file
 if cmp -s /root/routes.txt /root/routes.old.txt; then
     echo "No change in downloaded routes, nothing else to do." | adddate >>$log_file
 else
@@ -101,16 +103,14 @@ else
         echo "Adding route for $prefix to BIRD configuration..." | adddate >>$log_file
         sed -i "${line_no}i\\    route $prefix via ${default_gw};" "$file_name"
     done
-    # route_no=$(cat /root/routes.txt | wc -l)
-    # echo "$route_no routes added to BIRD configuration" | adddate >>$log_file
     systemctl restart bird
 fi
 rm /root/routes.old.txt
 
-# Cleanup not used adjacencies. Get private IP addresses of the VMSS
-vmss_name=$(echo $metadata | jq -r '.compute.vmScaleSetName')
-vmss_ips=$(az vmss nic list --vmss-name $vmss_name -g $rg --query '[].ipConfigurations[].privateIpAddress' -o tsv)
-peer_ips=$(az network routeserver peering list --routeserver $rs_name -g $rg --query '[].peerIp' -o tsv)
+# Cleanup not used adjacencies from ARS. Get private IP addresses of the VMSS
+vmss_name=$(echo "$metadata" | jq -r '.compute.vmScaleSetName')
+vmss_ips=$(az vmss nic list --vmss-name "$vmss_name" -g "$rg" --query '[].ipConfigurations[].privateIpAddress' -o tsv)
+peer_ips=$(az network routeserver peering list --routeserver "$rs_name" -g "$rg" --query '[].peerIp' -o tsv)
 for peer_ip in $peer_ips; do
     echo "Seeing if RS peer $peer_ip can be deleted..." | adddate >>$log_file
     match="false"
@@ -125,7 +125,7 @@ for peer_ip in $peer_ips; do
         rs_peer_name=$(echo "$rs_peer" | jq -r '.[0].name' 2>/dev/null)
         if [[ -n "$rs_peer_name" ]]; then
             echo "Deleting BGP peer $rs_peer_name with IP address $peer_ip..." | adddate >>$log_file
-            az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$peer_name" -y -o none
+            az network routeserver peering delete --routeserver "$rs_name" -g "$rg" -n "$rs_peer_name" -y -o none
         else
             echo "Could not find name for BGP peer with IP address $peer_ip" | adddate >>$log_file
         fi

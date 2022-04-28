@@ -254,7 +254,7 @@ az network lb probe create -n $lb_probe_name --lb-name $lb_name -g $rg --protoco
 # The value of parameter automaticRepairsPolicy.repairAction is invalid. !!!!!!
 echo "Creating VMSS..."
 az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
-    --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id \
+    --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id -z 1 2 3 \
     --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1 -o none
     # --load-balancer $lb_name --health-probe $lb_probe_name --automatic-repairs-grace-period 30 --automatic-repairs-action replace \
 # az vmss update -n $nva_name -g $rg --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].enableIpForwarding=true' -o none  # Not needed, because NVA not in the data plane
@@ -271,7 +271,7 @@ az vmss scale -n $nva_name -g $rg --new-capacity 3 -o none
 # See adjacencies in RS
 az network routeserver peering list --routeserver rs -g $rg -o table
 
-# See adjacencies in NVAs
+# See adjacencies in all NVA instances
 vm_list=$(az vmss list-instance-connection-info -n $nva_name -g $rg | grep ':')
 while IFS= read -r vm; do
     vm=$(echo $vm | cut -d\" -f 4)
@@ -293,6 +293,13 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=no $vm_ip -p $vm_port
 # See effective routes in VM
 azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 az network nic show-effective-route-table --ids $azurevm_nic_id -o table
+
+# Learned routes from ARS for all BGP peers
+peer_list=$(az network routeserver peering list --routeserver rs -g $rg --query '[].name' -o tsv)
+while IFS= read -r peer; do
+    echo "Learned routes from $peer:"
+    az network routeserver peering list-learned-routes -n $peer --routeserver rs -g $rg --query 'RouteServiceRole_IN_0' -o table
+done <<< "$peer_list"
 
 # Ping from VM
 azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddress -o tsv -g $rg) && echo $azurevm_pip_ip
