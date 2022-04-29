@@ -268,7 +268,7 @@ if [[ "$custom_lb" == "yes" ]]; then
     az network lb inbound-nat-rule create --backend-port 22 --lb-name $lb_name --name ssh --protocol Tcp -g $rg --backend-pool-name $lb_backend_name --frontend-ip-name $lb_frontend_name --frontend-port-range-start 1022 --frontend-port-range-start 1030
 else
     az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
-        --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id -z 1 2 3 --lb-sku Standard \
+        --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id -z 1 2 3 \
         --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1 -o none
 fi
 az vmss list-instance-connection-info -n $nva_name -g $rg -o table
@@ -282,8 +282,9 @@ if [[ "$autorepair" == "extension" ]]
     "port": "8080",
     "requestPath": "/api/healthcheck"
 }
-    EOF
+EOF
     az vmss extension set -n ApplicationHealthLinux --publisher Microsoft.ManagedServices --version 1.0 -g $rg --vmss-name $nva_name --settings /tmp/health_extension.json -o none
+    az vmss update -n $nva_name -g $rg --enable-automatic-repairs true --automatic-repairs-grace-period 30 -o none
 elif [[ "$autorepair" == "probe" ]] && [[ "custom_lb" == "yes" ]]; then
     # Get ALB associated to VMSS and create a LB rule and healthprobe
     vmss_lb_name=$(az vmss show -n $nva_name -g $rg --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[0].loadBalancerBackendAddressPools[0].id' -o tsv | cut -d/ -f9)

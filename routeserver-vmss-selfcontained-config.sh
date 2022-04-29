@@ -29,6 +29,18 @@ myasn=$(grep 'local as' /etc/bird/bird.conf.template | head -1)
 myasn=$(echo "$myasn" | awk '{print $3}' | cut -d ';' -f 1)
 myip=$(hostname -I | tr -d ' ')
 
+# Sometimes cloudinit doesnt make it on time to create the /etc/bird/bird.conf.template file
+if [[ -z "$myasn" ]]; then
+    sleep 30
+    myasn=$(grep 'local as' /etc/bird/bird.conf.template | head -1)
+    myasn=$(echo "$myasn" | awk '{print $3}' | cut -d ';' -f 1)
+fi
+
+if [[ -z "$myasn" ]] || [[ -z "$rs_name" ]] || [[ -z "$subscription_id" ]]; then
+    echo "Could not retrieve required variables, exiting now..." | adddate >>$log_file
+    exit 1
+fi
+
 # Look for another peer with the same IP
 existing_peer=$(az network routeserver peering list --routeserver "$rs_name" -g "$rg" --query "[?peerIp=='$myip']" -o json)
 existing_peer_name=$(echo "$existing_peer" | jq -r '.[0].name' 2>/dev/null)
