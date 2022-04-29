@@ -20,6 +20,8 @@
 healthcheck_script_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-healthcheck.py'
 housekeeping_script_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-config.sh'
 routes_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-routes.txt'
+autorecovery=extension # can be 'extension' or 'probe'
+custom_lb=no
 
 # Variables
 rg=rsvmss
@@ -241,29 +243,63 @@ write_files:
 EOF
 
 # Create a Standard LB for instance monitoring and self healing
-echo "Creating Azure LB..."
-lb_name=$nva_name
-lb_probe_name=$nva_name
-nva_subnet_id=$(az network vnet subnet show -n $nva_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-# az network lb create -n $lb_name -g $rg  --sku Standard --subnet $nva_subnet_id -o none
-az network lb create -n $lb_name -g $rg  --sku Standard -o none
-# az network lb probe create -n $lb_probe_name --lb-name $lb_name -g $rg --protocol tcp --port 179 --interval 30 --threshold 3 -o none
-az network lb probe create -n $lb_probe_name --lb-name $lb_name -g $rg --protocol http --port 8080 --path '/api/healthcheck' --interval 30 --threshold 3 -o none
+if [[ "$custom_lb" == "yes" ]]; then
+    echo "Creating Azure LB..."
+    lb_name=$nva_name
+    lb_probe_name=$nva_name
+    nva_subnet_id=$(az network vnet subnet show -n $nva_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+    # az network lb create -n $lb_name -g $rg  --sku Standard --subnet $nva_subnet_id -o none
+    az network lb create -n $lb_name -g $rg  --sku Standard -o none
+    # az network lb probe create -n $lb_probe_name --lb-name $lb_name -g $rg --protocol tcp --port 179 --interval 30 --threshold 3 -o none
+    az network lb probe create -n $lb_probe_name --lb-name $lb_name -g $rg --protocol http --port 8080 --path '/api/healthcheck' --interval 30 --threshold 3 -o none
+fi
 
 # Create a VMSS using previous cloudinit file
 # The value of parameter automaticRepairsPolicy.repairAction is invalid. !!!!!!
 echo "Creating VMSS..."
-az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
-    --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id -z 1 2 3 \
-    --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1 -o none
-    # --load-balancer $lb_name --health-probe $lb_probe_name --automatic-repairs-grace-period 30 --automatic-repairs-action replace \
-# az vmss update -n $nva_name -g $rg --set 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].enableIpForwarding=true' -o none  # Not needed, because NVA not in the data plane
-# az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
-# echo 'Creating inbound NAT rule...'
-# lb_frontend_name=$(az network lb frontend-ip list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
-# lb_backend_name=$(az network lb address-pool list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
-# az network lb inbound-nat-rule create --backend-port 22 --lb-name $lb_name --name ssh --protocol Tcp -g $rg --backend-pool-name $lb_backend_name --frontend-ip-name $lb_frontend_name --frontend-port-range-start 1022 --frontend-port-range-start 1030
+if [[ "$custom_lb" == "yes" ]]; then
+    az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
+        --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id -z 1 2 3 --lb-sku Standard \
+        --load-balancer $lb_name --health-probe $lb_probe_name --automatic-repairs-grace-period 30 --automatic-repairs-action replace \
+        --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1 -o none
+    echo 'Creating inbound NAT rule...'
+    lb_frontend_name=$(az network lb frontend-ip list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
+    lb_backend_name=$(az network lb address-pool list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
+    az network lb inbound-nat-rule create --backend-port 22 --lb-name $lb_name --name ssh --protocol Tcp -g $rg --backend-pool-name $lb_backend_name --frontend-ip-name $lb_frontend_name --frontend-port-range-start 1022 --frontend-port-range-start 1030
+else
+    az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
+        --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id -z 1 2 3 --lb-sku Standard \
+        --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1 -o none
+fi
 az vmss list-instance-connection-info -n $nva_name -g $rg -o table
+
+if [[ "$autorepair" == "extension" ]]
+    # Alternative: configure App Health Extension
+    echo "Enabling Application Health Extension in the VMSS..."
+    cat <<EOF > /tmp/health_extension.json
+{
+    "protocol": "http",
+    "port": "8080",
+    "requestPath": "/api/healthcheck"
+}
+    EOF
+    az vmss extension set -n ApplicationHealthLinux --publisher Microsoft.ManagedServices --version 1.0 -g $rg --vmss-name $nva_name --settings /tmp/health_extension.json -o none
+elif [[ "$autorepair" == "probe" ]] && [[ "custom_lb" == "yes" ]]; then
+    # Get ALB associated to VMSS and create a LB rule and healthprobe
+    vmss_lb_name=$(az vmss show -n $nva_name -g $rg --query 'virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[0].loadBalancerBackendAddressPools[0].id' -o tsv | cut -d/ -f9)
+    vmss_lb_probe_name=$nva_name
+    az network lb probe create -n $vmss_lb_probe_name --lb-name $vmss_lb_name -g $rg --protocol http --port 8080 --path '/api/healthcheck' --interval 30 --threshold 3 -o none
+    vmss_lb_probe_id=$(az network lb probe show -n $vmss_lb_probe_name --lb-name $vmss_lb_name -g $rg --query id -o tsv)
+    vmss_lb_frontend_name=$(az network lb frontend-ip list --lb-name $vmss_lb_name -g $rg --query '[0].name' -o tsv)
+    vmss_lb_backend_name=$(az network lb address-pool list --lb-name $vmss_lb_name -g $rg --query '[0].name' -o tsv)
+    az network lb rule create -n port8080 --lb-name $vmss_lb_name -g $rg -o none \
+        --protocol tcp --frontend-port 8080 --backend-port 8080 --frontend-ip-name $vmss_lb_frontend_name --backend-pool-name $vmss_lb_backend_name --probe-name $vmss_lb_probe_name
+    az vmss update -n $nva_name -g $rg --set "virtualMachineProfile.networkProfile.healthProbe={\"id\": \"$vmss_lb_probe_id\"}" -o none
+    az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
+    az vmss update -n $nva_name -g $rg --enable-automatic-repairs true --automatic-repairs-grace-period 30 -o none
+    az vmss update -n $nva_name -g $rg --set 'automaticRepairsPolicy.repairAction=Replace' -o none
+    az vmss show -n $nva_name -g $rg --query 'automaticRepairsPolicy'
+fi 
 
 # Scale NVA VMSS in and out
 az vmss scale -n $nva_name -g $rg --new-capacity 3 -o none
