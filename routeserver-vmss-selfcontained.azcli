@@ -87,6 +87,16 @@ function wait_until_finished {
      fi
 }
 
+# Create Log Analytics workspace
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
+if [[ -z "$logws_name" ]]
+then
+    logws_name=log$RANDOM
+    az monitor log-analytics workspace create -n $logws_name -g $rg
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customer_id=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+
 # Create Vnets and subnets
 echo "Creating RG and VNet..."
 az group create -n $rg -l $location -o none
@@ -152,6 +162,13 @@ az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --pub
 az network firewall update -n $azfw_name -g $rg -o none
 azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
 echo "Azure Firewall created with private IP $azfw_private_ip"
+
+# Enable firewall logs
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
 
 # Create managed identity for VMSS
 id_name="$nva_name"
@@ -273,17 +290,19 @@ else
 fi
 az vmss list-instance-connection-info -n $nva_name -g $rg -o table
 
+# Configure Autorepair
 if [[ "$autorepair" == "extension" ]]
     # Alternative: configure App Health Extension
     echo "Enabling Application Health Extension in the VMSS..."
     cat <<EOF > /tmp/health_extension.json
 {
     "protocol": "http",
-    "port": "8080",
+    "port": 8080,
     "requestPath": "/api/healthcheck"
 }
 EOF
     az vmss extension set -n ApplicationHealthLinux --publisher Microsoft.ManagedServices --version 1.0 -g $rg --vmss-name $nva_name --settings /tmp/health_extension.json -o none
+    az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
     az vmss update -n $nva_name -g $rg --enable-automatic-repairs true --automatic-repairs-grace-period 30 -o none
 elif [[ "$autorepair" == "probe" ]] && [[ "custom_lb" == "yes" ]]; then
     # Get ALB associated to VMSS and create a LB rule and healthprobe
@@ -301,6 +320,13 @@ elif [[ "$autorepair" == "probe" ]] && [[ "custom_lb" == "yes" ]]; then
     az vmss update -n $nva_name -g $rg --set 'automaticRepairsPolicy.repairAction=Replace' -o none
     az vmss show -n $nva_name -g $rg --query 'automaticRepairsPolicy'
 fi 
+
+# Installing Azure Monitor and Log Analytics extension
+echo "Installing Azure Monitor and Log Analytics extension..."
+az vmss extension set --vmss-name $nva_name -g $rg -n AzureMonitorLinuxAgent  --publisher Microsoft.Azure.Monitor -o none
+az vmss extension set --vmss-name $nva_name -g $rg -n OmsAgentForLinux --publisher Microsoft.EnterpriseCloud.Monitoring -o none \
+    --protected-settings "{\"workspaceKey\":\"$logws_key\"}" --settings "{\"workspaceId\":\"$logws_customer_id\",\"skipDockerProviderInstall\": true}"
+az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
 
 # Scale NVA VMSS in and out
 az vmss scale -n $nva_name -g $rg --new-capacity 3 -o none
@@ -342,6 +368,26 @@ done <<< "$peer_list"
 azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddress -o tsv -g $rg) && echo $azurevm_pip_ip
 az network public-ip list -o table -g $rg
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azurevm_pip_ip "curl -s4 ifconfig.co"  # The public IP should be the VMSS' public ALB
+
+######################
+# Azure Monitor Logs #
+######################
+
+# AzFW Log Categories
+query='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| distinct Category '
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+# AzFW Net rules
+query_net='AzureDiagnostics
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallNetworkRule"
+| where TimeGenerated >= ago(5m) 
+| project TimeGenerated, msg_s
+| take 100 '
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_net -o tsv
+# VM logs
+
 
 ###############
 # Danger Zone #
