@@ -96,6 +96,7 @@ then
 fi
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customer_id=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+logws_key=$(az monitor log-analytics workspace get-shared-keys -g $rg -n $logws_name --query primarySharedKey -o tsv)
 
 # Create Vnets and subnets
 echo "Creating RG and VNet..."
@@ -292,7 +293,7 @@ az vmss list-instance-connection-info -n $nva_name -g $rg -o table
 
 # Configure Autorepair
 if [[ "$autorepair" == "extension" ]]
-    # Alternative: configure App Health Extension
+    # Configure App Health Extension
     echo "Enabling Application Health Extension in the VMSS..."
     cat <<EOF > /tmp/health_extension.json
 {
@@ -321,12 +322,16 @@ elif [[ "$autorepair" == "probe" ]] && [[ "custom_lb" == "yes" ]]; then
     az vmss show -n $nva_name -g $rg --query 'automaticRepairsPolicy'
 fi 
 
-# Installing Azure Monitor and Log Analytics extension
+# Install Azure Monitor and Log Analytics extension
 echo "Installing Azure Monitor and Log Analytics extension..."
-az vmss extension set --vmss-name $nva_name -g $rg -n AzureMonitorLinuxAgent  --publisher Microsoft.Azure.Monitor -o none
-az vmss extension set --vmss-name $nva_name -g $rg -n OmsAgentForLinux --publisher Microsoft.EnterpriseCloud.Monitoring -o none \
-    --protected-settings "{\"workspaceKey\":\"$logws_key\"}" --settings "{\"workspaceId\":\"$logws_customer_id\",\"skipDockerProviderInstall\": true}"
-az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
+if [[ -n "$logws_customer_id" ]] && [[ -n "$logws_key" ]]; then
+    az vmss extension set --vmss-name $nva_name -g $rg -n AzureMonitorLinuxAgent  --publisher Microsoft.Azure.Monitor -o none
+    az vmss extension set --vmss-name $nva_name -g $rg -n OmsAgentForLinux --publisher Microsoft.EnterpriseCloud.Monitoring -o none \
+        --protected-settings "{\"workspaceKey\":\"$logws_key\"}" --settings "{\"workspaceId\":\"$logws_customer_id\",\"skipDockerProviderInstall\": true}"
+    az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none
+else
+    echo "Please set the Az Monitor workspace variables"
+fi
 
 # Scale NVA VMSS in and out
 az vmss scale -n $nva_name -g $rg --new-capacity 3 -o none
@@ -369,6 +374,18 @@ azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddres
 az network public-ip list -o table -g $rg
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azurevm_pip_ip "curl -s4 ifconfig.co"  # The public IP should be the VMSS' public ALB
 
+#################
+# Other options #
+#################
+
+# ER Gateway
+echo "Creating ER Gateway..."
+az network public-ip create -g $rg -n ergw_pip --allocation-method Dynamic --sku Basic -l $location -o none
+az network vnet-gateway create -g $rg -n ergw --gateway-type ExpressRoute --sku Standard -l $location --vnet $vnet_name --public-ip-addresses ergw_pip -o none --no-wait
+# Delete
+# az network vnet-gateway delete -g $rg -n ergw --no-wait -o none
+
+
 ######################
 # Azure Monitor Logs #
 ######################
@@ -377,7 +394,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $azurevm_pip_ip "curl -s4 if
 query='AzureDiagnostics 
 | where ResourceType == "AZUREFIREWALLS" 
 | distinct Category '
-az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
+az monitor log-analytics query -w $logws_customer_id --analytics-query $query -o tsv
 # AzFW Net rules
 query_net='AzureDiagnostics
 | where ResourceType == "AZUREFIREWALLS" 
@@ -385,15 +402,18 @@ query_net='AzureDiagnostics
 | where TimeGenerated >= ago(5m) 
 | project TimeGenerated, msg_s
 | take 100 '
-az monitor log-analytics query -w $logws_customerid --analytics-query $query_net -o tsv
+az monitor log-analytics query -w $logws_customer_id --analytics-query $query_net -o tsv
 # VM logs
-
+query_syslog='Syslog 
+| top 100 by TimeGenerated desc '
+az monitor log-analytics query -w $logws_customer_id --analytics-query $query_syslog -o tsv
 
 ###############
 # Danger Zone #
 ###############
 
 # az vmss delete -n $nva_name -g $rg
+# az network routeserver delete -n rs -g $rg -y
 # az network lb delete -n $lb_name -g $rg
 # az network firewall delete -n $azfw_name -g $rg --no-wait
 # az group delete -y --no-wait -n $rg
