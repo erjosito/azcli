@@ -166,10 +166,20 @@ echo "Azure Firewall created with private IP $azfw_private_ip"
 
 # Enable firewall logs
 azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
-az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id -o none \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
     --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
             {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+
+# Allow-all rule
+echo "Creating firewall rules..."
+az network firewall policy rule-collection-group create -n myrcg --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
+# az network firewall policy rule-collection-group collection rule add --rule-type NetworkRule -g $rg --rcg-name myrcg --policy-name $azfw_policy_name \
+#     --action Allow --collection-priority 1020 --collection-name testnetrules --name permitany --source-addresses '*' --destination-addresses '*' \
+#     --ip-protocols Any --destination-ports '*' -o none
+az network firewall policy rule-collection-group collection add-filter-collection --rule-type NetworkRule -g $rg --rcg-name myrcg --policy-name $azfw_policy_name \
+    --action Allow --collection-priority 1010 --name allowany --rule-name allowany --source-addresses '*' --destination-addresses '*' \
+    --ip-protocols Any --destination-ports '*' -o none
 
 # Create managed identity for VMSS
 id_name="$nva_name"
@@ -299,7 +309,9 @@ if [[ "$autorepair" == "extension" ]]
 {
     "protocol": "http",
     "port": 8080,
-    "requestPath": "/api/healthcheck"
+    "requestPath": "/api/healthcheck",
+    "intervalInSeconds": 30,
+    "numberOfProbes": 1
 }
 EOF
     az vmss extension set -n ApplicationHealthLinux --publisher Microsoft.ManagedServices --version 1.0 -g $rg --vmss-name $nva_name --settings /tmp/health_extension.json -o none
@@ -385,6 +397,40 @@ az network vnet-gateway create -g $rg -n ergw --gateway-type ExpressRoute --sku 
 # Delete
 # az network vnet-gateway delete -g $rg -n ergw --no-wait -o none
 
+# Spokes
+for spoke_id in {1..2}; do
+    spoke_vnet_name="spoke${spoke_id}"
+    spoke_vnet_prefix="10.1${spoke_id}.0.0/16"
+    spoke_vm_subnet_name=vm
+    spoke_vm_subnet_prefix="10.1${spoke_id}.0.0/24"
+    echo "Creating VNet ${spoke_vnet_name} with prefix ${spoke_vnet_prefix}..."
+    az network vnet create -g $rg -n $spoke_vnet_name --address-prefix $spoke_vnet_prefix --subnet-name $spoke_vm_subnet_name --subnet-prefix $spoke_vm_subnet_prefix -o none
+    az network vnet peering create -n hubtospoke${spoke_id} -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
+    az network vnet peering create -n spoke${spoke_id}tohub -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
+    spoke_vm_name="$spoke_vnet_name"
+    az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${spoke_vm_name}-nsg" \
+        --public-ip-address "${spoke_vm_name}-pip" --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_vm_subnet_name --no-wait -o none
+done
+
+# NSG Flow Logs and Az FW diag settings to storage
+storage_account_name=$(az storage account list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the storage account name if it already existed
+if [[ -z "$storage_account_name" ]]
+then
+    storage_account_name=log$RANDOM
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location -o none
+fi
+nsg_list=$(az network nsg list -g $rg -o tsv --query '[].name')
+while IFS= read -r nsg_name; do
+    echo "Creating flow log definition for NSG ${nsg_name}..."
+    az network watcher flow-log create -l $location -n "${nsg_name}-${location}" -g $rg \
+        --nsg $nsg_name --storage-account $storage_account_name --log-version 2 --retention 7 \
+        --workspace $logws_id --interval 10 --traffic-analytics true -o none
+done <<< "$nsg_list"
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az monitor diagnostic-settings create -n storagediag --resource $azfw_id --storage-account $storage_account_name -o none \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
 
 ######################
 # Azure Monitor Logs #
