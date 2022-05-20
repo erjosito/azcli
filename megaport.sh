@@ -59,6 +59,10 @@ do
                mcr_asn="${i#*=}"
                shift # past argument=value
                ;;
+          -g|--google-cloud)
+               gcp=yes
+               shift # past argument=value
+               ;;
           -q|--quiet)
                quiet=yes
                shift # past argument=value
@@ -198,6 +202,49 @@ function create_vxc () {
     fi
 }
 
+function validate_gcp_key () {
+    if [[ -z "$service_key" ]]
+    then
+        log_msg "ERROR: no attachment key identified, please use the argument -k or --service-key" 1>&2
+    else
+        validate_url="${base_url}/v2/secure/google/${service_key}"
+        log_msg "INFO: Sending request to URL $validate_url..."
+        validate_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" -X GET "$validate_url" 2>/dev/null)
+        filtered_response=$(echo $validate_response | jq -r ".data | { ports: [ .megaports[0]? | { name, locationId, productId, productUid }] }")
+        # Validate we have an output
+        if [[ -n $filtered_response ]]
+        then
+            echo $filtered_response | jq
+        else
+            log_msg "ERROR: output: $validate_response"
+        fi
+    fi
+}
+
+function create_gcp_vxc () {
+    # Defaults
+    vxc_name="${product_string}-gcp"
+    mcr_id=$1
+    port_id=$2
+    # Append name suffix if required
+    if [[ -n "$name_suffix" ]]
+    then
+        vxc_name="${vxc_name}-${name_suffix}"
+    fi
+    # Sending call to create VXC
+    buy_url="${base_url}/v2/networkdesign/buy" 
+    buy_payload_template='[{ productUid: $mcrId, associatedVxcs: [{ productName: $vxcName, rateLimit: 50, aEnd: { vlan: 0 }, bEnd: { productUid: $portId, partnerConfig: { connectType: "Google", pairingKey: $serviceKey }} }] }]'
+    buy_payload=$(jq -n \
+        --arg mcrId "$mcr_id" \
+        --arg vxcName "$vxc_name" \
+        --arg portId "$port_id" \
+        --arg serviceKey "$service_key" \
+        "$buy_payload_template")
+    buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
+    echo "$buy_response" | jq
+
+}
+
 function cancel_product () {
     # Sending call to delete product
     product_id=$1
@@ -329,19 +376,31 @@ case $action in
         done
         ;;
     validate)
-        validate_key "$service_key"
+        if [[ "$gcp" == "yes" ]]; then
+            validate_gcp_key "$service_key"
+        else
+            validate_key "$service_key"
+        fi
         ;;
     create_vxc)
         log_msg "INFO: Getting MCR ID from the list of LIVE products..."
         mcr_id=$(list_products "LIVE" | jq -r '.[].productUid')
         log_msg "INFO: MCR ID $mcr_id"
-        log_msg "INFO: Getting GUIDs for ExpressRoute ports..."
-        er_json=$(validate_key "$service_key")
-        id_1ary=$(echo "$er_json" | jq -r '.ports[] | select (.name | contains("Primary")) | .productUid')
-        id_2ary=$(echo "$er_json" | jq -r '.ports[] | select (.name | contains("Secondary")) | .productUid')
-        log_msg "INFO: ExpressRoute port GUIDs are $id_1ary and $id_2ary"
-        create_vxc "1ary" "$mcr_id" "$id_1ary"
-        create_vxc "2ary" "$mcr_id" "$id_2ary"
+        if [[ "$gcp" == "yes" ]]; then
+            log_msg "INFO: Getting GUIDs for ExpressRoute ports..."
+            validation_json=$(validate_gcp_key "$service_key")
+            port_id=$(echo "$validation_json" | jq -r '.ports[0] | .productUid')
+            log_msg "INFO: Port ID found: $port_id"
+            create_gcp_vxc "$mcr_id" "$port_id"
+        else
+            log_msg "INFO: Getting GUIDs for ExpressRoute ports..."
+            er_json=$(validate_key "$service_key")
+            id_1ary=$(echo "$er_json" | jq -r '.ports[] | select (.name | contains("Primary")) | .productUid')
+            id_2ary=$(echo "$er_json" | jq -r '.ports[] | select (.name | contains("Secondary")) | .productUid')
+            log_msg "INFO: ExpressRoute port GUIDs are $id_1ary and $id_2ary"
+            create_vxc "1ary" "$mcr_id" "$id_1ary"
+            create_vxc "2ary" "$mcr_id" "$id_2ary"
+        fi
         ;;
     *)
         log_msg "ERROR: sorry, I didnt quite understand the action $action"

@@ -1,0 +1,247 @@
+###############################################
+# Scripts to test AVS networking connectivity
+# It doesnt include setting up AVS
+#
+# Jose Moreno, May 2022
+###############################################
+
+
+# Control
+simulate_onprem=no
+create_2nd_region=no
+
+#############
+# Variables #
+#############
+rg=avstest
+er_circuit_sku=Standard
+er_provider=Megaport
+linux_vm_size=Standard_B1s
+windows_vm_size=Standard_B2s
+# Location 1
+location1=germanywestcentral
+er1_location=germanywestcentral
+er1_pop=Frankfurt
+er1_circuit_name="er-${er1_pop}"
+ergw1_name="ergw-${er1_pop}"
+ergw1_pip="${ergw1_name}-pip"
+vnet1_name="ervnet-${er1_pop}"
+vnet1_prefix=192.168.11.0/24
+vm_subnet1_name=vm
+vm_subnet1_prefix=192.168.11.64/26
+gw_subnet1_prefix=192.168.11.0/26
+vm1_name="vm-${er1_pop}"
+vm1_pip_name="${vm1_name}-pip"
+winvm1_name="winvm-${er1_pop}"
+winvm1_pip_name="${winvm1_name}-pip"
+winvm1_username=$(who)
+mcr1_asn=65001
+# Location 2
+location2=southcentralus
+er2_location=southcentralus
+er2_pop=Dallas
+er2_circuit_name="er-${er2_pop}"
+ergw2_name="ergw-${er2_pop}"
+ergw2_pip="${ergw2_name}-pip"
+vnet2_name="ervnet-${er2_pop}"
+vnet2_prefix=192.168.12.0/24
+vm_subnet2_name=vm
+vm_subnet2_prefix=192.168.12.64/26
+gw_subnet2_prefix=192.168.12.0/26
+vm2_name="vm-${er2_pop}"
+vm2_pip_name="${vm2_name}-pip"
+mcr2_asn=65002
+# Secrets
+akv_name=erjositoKeyvault
+vcenter_username_secret=vcenterUsername
+vcenter_password_secret=vcenterPassword
+nsxmgr_username_secret=vcenterUsername
+nsxmgr_password_secret=vcenterPassword
+avs_er_key_secret=avsExpressRouteKey
+default_password_secret=defaultPassword
+# AVS details
+vcenter_ip=10.252.2.2
+nsxmgr_ip=10.252.2.3
+# gcloud variables
+project_name=onprem
+project_id="${project_name}${RANDOM}"
+machine_type=e2-micro
+gcp_asn=16550
+region1=europe-west3
+zone1=europe-west3-b
+gcp_vm1_name=vm1
+gcp_vpc1_name=vpc1
+gcp_subnet1_name=vm1
+gcp_subnet1_prefix='192.168.12.0/24'
+attachment1_name=attachment1
+router1_name=router1
+region2=us-west2
+zone2=us-west2-b
+vm2_name=vm2
+vpc2_name=vpc2
+subnet2_name=vm2
+subnet2_prefix='192.168.22.0/24'
+attachment2_name=attachment2
+router2_name=router2
+
+
+#############
+# Functions #
+#############
+
+# Wait for resource to be created
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
+# Wait until GCP attachment is ready
+function wait_for_gcp_attachment_ready () {
+    wait_interval=15
+    attachment_name=$1
+    region_name=$2
+    echo "Waiting for attachment $attachment_name to become ready..."
+    start_time=`date +%s`
+    state=$(gcloud compute interconnects attachments describe $attachment_name --region $region_name --format json | jq -r '.state')
+    until [[ "$state" == "ACTIVE" ]] || [[ -z "$state" ]]
+    do
+        sleep $wait_interval
+        state=$(gcloud compute interconnects attachments describe $attachment_name --region $region_name --format json | jq -r '.state')
+    done
+    if [[ -z "$state" ]]; then
+        echo "Something really bad happened..."
+    else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Attachment $attachment_name state is $state, wait time $minutes minutes and $seconds seconds"
+    fi
+}
+
+############
+#   Code   #
+############
+
+# Get secrets
+akv_rg_found=$(az keyvault list -o tsv --query "[?name=='$akv_name'].resourceGroup" 2>/dev/null)
+if [[ -n ${akv_rg_found} ]]
+then
+    echo "INFO: AKV ${akv_name} found in resource group $akv_rg_found"
+    akv_rg="$akv_rg_found"
+    vcenter_username=$(az keyvault secret show --vault-name $akv_name -n $vcenter_username_secret --query 'value' -o tsv 2>/dev/null)
+    vcenter_password=$(az keyvault secret show --vault-name $akv_name -n $vcenter_password_secret --query 'value' -o tsv 2>/dev/null)
+    nsxmgr_username=$(az keyvault secret show --vault-name $akv_name -n $nsxmgr_username_secret --query 'value' -o tsv 2>/dev/null)
+    nsxmgr_password=$(az keyvault secret show --vault-name $akv_name -n $nsxmgr_password_secret --query 'value' -o tsv 2>/dev/null)
+    avs_er_key=$(az keyvault secret show --vault-name $akv_name -n $avs_er_key_secret --query 'value' -o tsv 2>/dev/null)
+    default_password=$(az keyvault secret show --vault-name $akv_name -n $default_password_secret --query 'value' -o tsv 2>/dev/null)
+else
+    echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
+fi
+
+# Create ER circuit (we need the service key to create the MCR)
+az network express-route create -n $er1_circuit_name --peering-location $er1_pop -g $rg -o none \
+    --bandwidth 50 Mbps --provider $er_provider -l $er1_location --sku-family MeteredData --sku-tier $er_circuit_sku
+service_key1=$(az network express-route show -n $er1_circuit_name -g $rg --query serviceKey -o tsv)
+
+# Start creating MCR router (takes a while)
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+if [[ -e "$megaport_script_path" ]]
+then
+    echo "Creating Megaport Cloud Router..."
+    $megaport_script_path -s=jomore-${er1_pop} -a=create_mcr --asn=$mcr1_asn -k=$service_key1
+else
+    echo "Sorry, I cannot seem to find the script $megaport_script_path to interact with the Megaport API"
+fi
+
+# Create VNet with subnets, and kick off the creation of the ER GW
+echo "Creating resource group..."
+az group create -n $rg -l $location1 -o none
+echo "Creating VNet and VMs (linux/win)..."
+az network vnet create -g $rg -n $vnet1_name --address-prefix $vnet1_prefix --subnet-name $vm_subnet1_name --subnet-prefix $vm_subnet1_prefix -l $location1 -o none
+az network vnet subnet create -g $rg --vnet-name $vnet1_name -n GatewaySubnet --address-prefix $gw_subnet1_prefix -o none
+az network public-ip create -g $rg -n $ergw1_pip --allocation-method Dynamic --sku Basic -l $location1 -o none
+az network vnet-gateway create -g $rg -n $ergw1_name --gateway-type ExpressRoute --sku Standard -l $location1 --vnet $vnet1_name --public-ip-addresses $ergw1_pip --no-wait -o none
+az vm create -n $vm1_name -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys --nsg "${vm1_name}-nsg" -o none --public-ip-sku Standard \
+    --public-ip-address $vm1_pip_name --vnet-name $vnet1_name --size $linux_vm_size --subnet $vm_subnet1_name -l $location1
+az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $win_user --admin-password $win_password --size $win_vm_sku \
+   --vnet-name $appgw_vnet_name --subnet $win_subnet_name --public-ip-address $win_pip_name
+
+# If simulate onprem, create VPC and VM in gcloud
+if [[ "$simulate_onprem" == "yes" ]]; then
+    # Get environment info
+    account=$(gcloud info --format json | jq -r '.config.account')
+    billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
+    billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
+    # Create project
+    gcloud projects create $project_id --name $project_name
+    gcloud config set project $project_id
+    gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
+    gcloud services enable compute.googleapis.com
+    # VPC and instance
+    gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+    gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1
+    gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
+    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="ip a"
+    # Create interconnect
+    gcloud compute routers create $router1_name --project=$project_id --network=$gcp_vpc1_name --asn=$gcp_asn --region=$region1
+    gcloud compute interconnects attachments partner create $attachment1_name --region $region1 --router $router1_name --edge-availability-domain availability-domain-1
+    pairing_key1=$(gcloud compute interconnects attachments describe $attachment1_name --region $region1 --format json | jq -r '.pairingKey')
+    # Create VXC in Megaport
+    $megaport_script_path -g -s=jomore-${er1_pop} -a=create_vxc -k=$pairing_key1
+    # Activate attachment
+    # wait_for_gcp_attachment_ready $attachment1_name $region1
+    sleep 120
+    gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --admin-enabled
+    gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --no-enable-admin
+fi
+
+# To Do: 2nd region
+if [[ "$create_2nd_region" == "yes" ]]; then
+fi
+
+
+############
+# Stop VMs #
+############
+
+az vm deallocate -n $vm1_name -g $rg --no-wait -o none
+
+#######################
+#  Cleanup - Danger!  #
+#######################
+
+# Remove MCR from Megaport
+# megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+# $megaport_script_path -q -s=jomore -a=delete_mcr
+
+# Deleter ER 
+# az network express-route delete -n $er1_circuit_name -g $rg --no-wait
+# az network vnet-gateway delete -g $rg -n $ergw1_name --no-wait 
+
+# Delete RG
+# az group delete -n $rg -y --no-wait
+
+# Delete GCP project
+# if [[ "$simulate_onprem" == "yes" ]]; then
+#     gcloud projects delete "$project_id" --quiet
+# fi
