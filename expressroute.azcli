@@ -5,11 +5,11 @@
 #################################
 
 # Control
-location=southcentralus
-er_location=southcentralus
-er_pop=Dallas
+location=germanywestcentral
+er_location=germanywestcentral
+er_pop=Frankfurt
 er_circuit_sku=Standard
-create_spoke=yes
+create_spoke=no
 simulate_onprem=no
 
 # Other possible pop/region combinations with megaport:
@@ -71,7 +71,7 @@ echo "Creating ER Gateway..."
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix -o none
 az network public-ip create -g $rg -n $ergw_pip --allocation-method Dynamic --sku Basic -l $location -o none
 az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $vnet_name --public-ip-addresses $ergw_pip -o none
-circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id -o none
+circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id
 az network vpn-connection create -n "${ergw_name}-${er_pop}" -g $rg -l $location --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id -o none
 
 # Optional: create spoke associated to the previous VNet and configure the Hub VM as NVA
