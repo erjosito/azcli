@@ -28,13 +28,14 @@ ergw1_pip="${ergw1_name}-pip"
 vnet1_name="ervnet-${er1_pop}"
 vnet1_prefix=192.168.11.0/24
 vm_subnet1_name=vm
-vm_subnet1_prefix=192.168.11.64/26
-gw_subnet1_prefix=192.168.11.0/26
-vm1_name="vm-${er1_pop}"
-vm1_pip_name="${vm1_name}-pip"
+vm_subnet1_prefix=192.168.11.64/27
+gw_subnet1_prefix=192.168.11.0/27
+rs_subnet1_prefix=192.168.11.32/27
+linvm1_name="linvm-${er1_pop}"
+linvm1_pip_name="${linvm1_name}-pip"
 winvm1_name="winvm-${er1_pop}"
 winvm1_pip_name="${winvm1_name}-pip"
-winvm1_username=$(who)
+winvm1_username=$(whoami)
 mcr1_asn=65001
 # Location 2
 location2=southcentralus
@@ -46,10 +47,11 @@ ergw2_pip="${ergw2_name}-pip"
 vnet2_name="ervnet-${er2_pop}"
 vnet2_prefix=192.168.12.0/24
 vm_subnet2_name=vm
-vm_subnet2_prefix=192.168.12.64/26
-gw_subnet2_prefix=192.168.12.0/26
-vm2_name="vm-${er2_pop}"
-vm2_pip_name="${vm2_name}-pip"
+vm_subnet2_prefix=192.168.12.64/27
+gw_subnet2_prefix=192.168.12.0/27
+rs_subnet2_prefix=192.168.12.32/27
+linvm2_name="linvm-${er2_pop}"
+linvm2_pip_name="${linvm2_name}-pip"
 mcr2_asn=65002
 # Secrets
 akv_name=erjositoKeyvault
@@ -58,10 +60,12 @@ vcenter_password_secret=vcenterPassword
 nsxmgr_username_secret=vcenterUsername
 nsxmgr_password_secret=vcenterPassword
 avs_er_key_secret=avsExpressRouteKey
+avs_er_circuit_id_secret=avsExpressRouteCircuitId
 default_password_secret=defaultPassword
 # AVS details
-vcenter_ip=10.252.2.2
-nsxmgr_ip=10.252.2.3
+vcenter_ip=10.2.252.2
+nsxmgr_ip=10.2.252.3
+avs_vm_ip=192.168.5.4
 # gcloud variables
 project_name=onprem
 project_id="${project_name}${RANDOM}"
@@ -151,6 +155,7 @@ then
     nsxmgr_username=$(az keyvault secret show --vault-name $akv_name -n $nsxmgr_username_secret --query 'value' -o tsv 2>/dev/null)
     nsxmgr_password=$(az keyvault secret show --vault-name $akv_name -n $nsxmgr_password_secret --query 'value' -o tsv 2>/dev/null)
     avs_er_key=$(az keyvault secret show --vault-name $akv_name -n $avs_er_key_secret --query 'value' -o tsv 2>/dev/null)
+    avs_er_circuit_id=$(az keyvault secret show --vault-name $akv_name -n $avs_er_circuit_id_secret --query 'value' -o tsv 2>/dev/null)
     default_password=$(az keyvault secret show --vault-name $akv_name -n $default_password_secret --query 'value' -o tsv 2>/dev/null)
 else
     echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
@@ -177,12 +182,13 @@ az group create -n $rg -l $location1 -o none
 echo "Creating VNet and VMs (linux/win)..."
 az network vnet create -g $rg -n $vnet1_name --address-prefix $vnet1_prefix --subnet-name $vm_subnet1_name --subnet-prefix $vm_subnet1_prefix -l $location1 -o none
 az network vnet subnet create -g $rg --vnet-name $vnet1_name -n GatewaySubnet --address-prefix $gw_subnet1_prefix -o none
+az network vnet subnet create -g $rg --vnet-name $vnet1_name -n RouteServerSubnet --address-prefix $rs_subnet1_prefix -o none
 az network public-ip create -g $rg -n $ergw1_pip --allocation-method Dynamic --sku Basic -l $location1 -o none
 az network vnet-gateway create -g $rg -n $ergw1_name --gateway-type ExpressRoute --sku Standard -l $location1 --vnet $vnet1_name --public-ip-addresses $ergw1_pip --no-wait -o none
-az vm create -n $vm1_name -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys --nsg "${vm1_name}-nsg" -o none --public-ip-sku Standard \
-    --public-ip-address $vm1_pip_name --vnet-name $vnet1_name --size $linux_vm_size --subnet $vm_subnet1_name -l $location1
-az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $win_user --admin-password $win_password --size $win_vm_sku \
-   --vnet-name $appgw_vnet_name --subnet $win_subnet_name --public-ip-address $win_pip_name
+az vm create -n $linvm1_name -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys --nsg "${linvm1_name}-nsg" -o none --public-ip-sku Standard \
+    --public-ip-address $linvm1_pip_name --vnet-name $vnet1_name --size $linux_vm_size --subnet $vm_subnet1_name -l $location1 --no-wait
+az vm create -n $winvm1_name -g $rg --image win2019datacenter --admin-username $winvm1_username --admin-password $default_password --size $windows_vm_size \
+   --vnet-name $vnet1_name --subnet $vm_subnet1_name --public-ip-address $winvm1_pip_name --public-ip-sku Standard --nsg "${winvm1_name}-nsg" --no-wait
 
 # If simulate onprem, create VPC and VM in gcloud
 if [[ "$simulate_onprem" == "yes" ]]; then
@@ -215,16 +221,41 @@ if [[ "$simulate_onprem" == "yes" ]]; then
     gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --no-enable-admin
 fi
 
+# Connect AVS with Azure VNet
+ergw1_id=$(az network vnet-gateway show -n $ergw1_name -g $rg --query id -o tsv)
+wait_until_finished $ergw1_id
+az network vpn-connection create -n avs2vnet -g $rg --authorization-key $avs_er_key --vnet-gateway1 $ergw1_id --express-route-circuit2 $avs_er_circuit_id -o none
+
+# Test connectivty thru Linux VM to AVS VM
+linvm1_pip=$(az network public-ip show -n $linvm1_pip_name -g $rg --query ipAddress -o tsv)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip "ping $avs_vm_ip -c 5"
+
+# Get NSX T0 name
+nsx_auth_string="${nsxmgr_username}:${nsxmgr_password}"
+nsx_auth_base64=$(echo $nsx_auth_string | base64)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip "sudo apt install -y jq"
+cmd="curl -ks -X GET -H \"Accept: application/json\" -u '${nsxmgr_username}:${nsxmgr_password}' https://$nsxmgr_ip/policy/api/v1/infra/tier-0s/"
+t0_id=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip $cmd | jq -r '.results[0].id')
+# Get BGP Routes
+cmd="curl -ks -X GET -H \"Accept: application/json\" -u '${nsxmgr_username}:${nsxmgr_password}' https://${nsxmgr_ip}/policy/api/v1/infra/tier-0s/${t0_id}/locale-services/${t0_id}-LOCALE-SERVICES/bgp/neighbors/${t0_id}-A/routes"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip $cmd | jq -r '.results[0].egde_node_routes[0].routes[] | {network,next_hop,local_pref,weight,med,as_path}|join("\t")'   # Note the "egde" typo!!!
+# Get BGP neighbors
+cmd="curl -ks -X GET -H \"Accept: application/json\" -u '${nsxmgr_username}:${nsxmgr_password}' https://${nsxmgr_ip}/policy/api/v1/infra/tier-0s/${t0_id}/locale-services/${t0_id}-LOCALE-SERVICES/bgp/neighbors/status"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip $cmd | jq -r '.results[] | {neighbor_address,remote_as_number,connection_state,keep_alive_interval,hold_time_interval,source_address}|join("\t")'   # Note the "egde" typo!!!
+
+{{nsx_base_url}}/policy/api/v1/infra/tier-0s/TNT34-T0/locale-services/TNT34-T0-LOCALE-SERVICES/bgp/neighbors/status
+
 # To Do: 2nd region
 if [[ "$create_2nd_region" == "yes" ]]; then
+    echo "This script only supports one region at this time..."cluster/api-service
 fi
-
 
 ############
 # Stop VMs #
 ############
 
-az vm deallocate -n $vm1_name -g $rg --no-wait -o none
+az vm deallocate -n $linvm1_name -g $rg --no-wait -o none
+az vm deallocate -n $winvm1_name -g $rg --no-wait -o none
 
 #######################
 #  Cleanup - Danger!  #
