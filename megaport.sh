@@ -115,9 +115,7 @@ function list_products () {
     # Validate we have an output
     if [[ -n $output ]]
     then
-        if [[ "$quiet" == "no" ]]; then
-            echo $output | jq
-        fi
+        echo $output | jq
     else
         log_msg "ERROR: output: $output"
     fi
@@ -298,7 +296,7 @@ else
     megaport_user=$(az keyvault secret show --vault-name $akv_name -n $usr_secret_name --query 'value' -o tsv 2>/dev/null)
     if [[ -z "$megaport_user" ]]
     then
-        read -p "I could not find any username in AKV $akv_name, please enter your Megaport user name to add it as secret: " megaport_user
+        read -p "I could not find any username in AKV $akv_name in the secret ${usr_secret_name}, please enter your Megaport user name to add it as secret: " megaport_user
         az keyvault secret set --vault-name $akv_name --name $usr_secret_name --value $megaport_user -o none
     else
         log_msg "INFO: Megaport username successfully retrieved from Azure Key Vault $akv_name"
@@ -401,6 +399,14 @@ case $action in
             create_vxc "1ary" "$mcr_id" "$id_1ary"
             create_vxc "2ary" "$mcr_id" "$id_2ary"
         fi
+        ;;
+    bgp_routes)
+        log_msg "INFO: Getting MCR ID from the list of LIVE products..."
+        mcr_id=$(list_products "LIVE" | jq -r '.[].productUid')
+        bgp_routes_url="${base_url}/v2/product/mcr2/${mcr_id}/diagnostics/routes/bgp"
+        log_msg "INFO: Sending request to URL $bgp_routes_url..."
+        bgp_routes_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" -X GET "$bgp_routes_url" 2>/dev/null)
+        echo $bgp_routes_response | jq
         ;;
     *)
         log_msg "ERROR: sorry, I didnt quite understand the action $action"
