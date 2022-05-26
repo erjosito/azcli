@@ -454,7 +454,7 @@ az network route-table create -n vm1rt -g $rg --disable-bgp-route-propagation -o
 az network vnet subnet update -n $vm_subnet1_name --vnet-name $vnet1_name -g $rg --route-table vm1rt -o none
 
 # Create RT and attach it to the Gateway subnet
-az network route-table create -n vng1rt -g $rg --disable-bgp-route-propagation -o none
+az network route-table create -n vng1rt -g $rg -o none
 az network vnet subnet update -n GatewaySubnet --vnet-name $vnet1_name -g $rg --route-table vng1rt -o none
 az network route-table route create -g $rg --route-table-name vng1rt -n summary -o none \
     --next-hop-type VirtualAppliance --address-prefix 192.168.0.0/16 --next-hop-ip-address $azfw1_private_ip
@@ -590,17 +590,17 @@ az vm start -n $winvm1_name -g $rg --no-wait -o none
 #######################
 
 # Remove MCR from Megaport
-# megaport_script_path="/home/jose/repos/azcli/megaport.sh"
-# $megaport_script_path -q -s=jomore -a=delete_mcr
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+$megaport_script_path -q -s=jomore -a=delete_mcr
 
 # Deleter ER 
-# az network express-route delete -n $er1_circuit_name -g $rg --no-wait
-# az network vnet-gateway delete -g $rg -n $ergw1_name --no-wait 
+az network express-route delete -n $er1_circuit_name -g $rg --no-wait
+az network vnet-gateway delete -g $rg -n $ergw1_name --no-wait 
 
 # Delete RG
-# az group delete -n $rg -y --no-wait
+az group delete -n $rg -y --no-wait
 
 # Delete GCP project
-# if [[ "$simulate_onprem" == "yes" ]]; then
-#     gcloud projects delete "$project_id" --quiet
-# fi
+if [[ "$simulate_onprem" == "yes" ]]; then
+    gcloud projects delete "$project_id" --quiet
+fi
