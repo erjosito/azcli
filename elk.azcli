@@ -1,0 +1,123 @@
+##################################################
+# Lab for Elastic Stack on Azure
+#
+# Credits: Getting Started with Elastic Stack 8.0
+# Jose Moreno
+# May 2022
+##################################################
+
+# Variables
+rg=elk
+location=westeurope
+elk_vm_size=
+vnet_name=elk
+vnet_prefix=10.99.64.0/22
+elk_subnet_name=elk
+elk_subnet_prefix=10.99.64.0/27
+vm_subnet_name=vm
+vm_subnet_prefix=10.99.64.32/27
+elk_vm_name=elk
+elk_vm_size=Standard_B2ms
+elk_cloudinit_file=/tmp/elk_cloudinit.txt
+nginx_vm_name=nginx
+nginx_vm_size=Standard_B1s
+nginx_cloudinit_file=/tmp/nginx_cloudinit.txt
+akv_name=erjositoKeyvault
+default_password_secret=defaultPassword
+
+# Get secrets
+akv_rg_found=$(az keyvault list -o tsv --query "[?name=='$akv_name'].resourceGroup" 2>/dev/null)
+if [[ -n ${akv_rg_found} ]]
+then
+    echo "INFO: AKV ${akv_name} found in resource group $akv_rg_found"
+    default_password=$(az keyvault secret show --vault-name $akv_name -n $default_password_secret --query 'value' -o tsv 2>/dev/null)
+else
+    echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
+fi
+
+# Create RG and VNets
+echo "Creating RG and VNet..."
+az group create -n $rg -l $location -o none
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix -l $location -o none
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $elk_subnet_name --address-prefix $elk_subnet_prefix -o none
+
+# Create NSGs
+echo "Creating NSGs..."
+az network nsg create -n "${elk_vm_name}-nsg" -g $rg -o none
+az network nsg rule create -n SSH --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+az network nsg rule create -n Kibana --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 5601 --access Allow --protocol Tcp -o none
+az network nsg rule create -n ElasticSearch --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 9200 --access Allow --protocol Tcp -o none
+az network nsg rule create -n ICMP --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1030 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp -o none
+az network nsg create -n "${nginx_vm_name}-nsg" -g $rg -o none
+az network nsg rule create -n SSH --nsg-name "${nginx_vm_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+az network nsg rule create -n Web80 --nsg-name "${nginx_vm_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 80 --access Allow --protocol Tcp -o none
+az network nsg rule create -n Web443 --nsg-name "${nginx_vm_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 443 --access Allow --protocol Tcp -o none
+az network nsg rule create -n ICMP --nsg-name "${nginx_vm_name}-nsg" -g $rg --priority 1030 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp -o none
+
+# Create Elastic Search VM
+echo "Creating cloudinit file for Elastic Search..."
+cat <<EOF > $elk_cloudinit_file
+#cloud-config
+packages:
+  - jq
+  - apt-transport-https
+runcmd:
+  - wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | apt-key add -
+  - echo "deb https://artifacts.elastic.co/packages/8.x/apt stable main" | tee /etc/apt/sources.list.d/elastic-8.x.list
+  - apt update && apt install -y elasticsearch kibana logstash
+  - apt install -y filebeat metricbeat
+  - systemctl enable elasticsearch
+  - systemctl enable kibana
+  - systemctl start elasticsearch
+  - systemctl start kibana
+EOF
+echo "Creating Elastic Stack VM..."
+az vm create -n $elk_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${elk_vm_name}-nsg" -o none \
+    --custom-data $elk_cloudinit_file --public-ip-sku Standard --public-ip-address "${elk_vm_name}-pip" \
+    --vnet-name $vnet_name --size $elk_vm_size --subnet $elk_subnet_name -l $location --no-wait
+
+# Create test nginx VM
+echo "Creating cloudinit file for Nginx VM..."
+cat <<EOF > $nginx_cloudinit_file
+#cloud-config
+packages:
+  - jq
+  - nginx
+  - apt-transport-https
+runcmd:
+  - cd /tmp
+  - git clone https://github.com/PacktPublishing/Getting-Started-with-Elastic-Stack-8.0.git
+  - mkdir -p /var/www/elastic-stack-server
+  - cp -r Getting-Started-with-Elastic-Stack-8.0/Chapter6/html-webpage/* /var/www/elastic-stack-server
+EOF
+echo "Creating Elastic Stack VM..."
+az vm create -n $nginx_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${nginx_vm_name}-nsg" -o none \
+    --custom-data $nginx_cloudinit_file --public-ip-sku Standard --public-ip-address "${nginx_vm_name}-pip" \
+    --vnet-name $vnet_name --size $nginx_vm_size --subnet $vm_subnet_name -l $location --no-wait
+
+# Make sure to reset the elastic user's password with elasticsearch-setup-password or elasticsearch-reset-password !!!!
+ssh $elk_pip "sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -i"
+ssh $elk_pip "sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana -i"
+
+# Verify Elastic Search VM
+elk_pip=$(az network public-ip show -n "${elk_vm_name}-pip" -g $rg --query ipAddress -o tsv)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "systemctl status elasticsearch"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "systemctl status kibana"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u elastic:${default_password} https://localhost:9200"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u kibana_system:${default_password} https://localhost:9200/_xpack/security/_authenticate?pretty"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u elastic:${default_password} https://localhost:9200/_cluster/health"
+
+# Configure ElasticSearch and Kibana
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/network.host/c\network.host: 0.0.0.0' /etc/elasticsearch/elasticsearch.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart elasticsearch"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/server.host/c\server.host: \"0.0.0.0\"' /etc/kibana/kibana.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/server.name/c\server.name: \"elastictest\"' /etc/kibana/kibana.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.username/c\elasticsearch.username: \"kibana\"' /etc/kibana/kibana.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.password/c\elasticsearch.password: \"$default_password\"' /etc/kibana/kibana.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.hosts/c\elasticsearch.hosts: [\"https://localhost:9200\"]' /etc/kibana/kibana.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.ssl.verificationMode/c\elasticsearch.ssl.verificationMode: none' /etc/kibana/kibana.yml"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i -e '$ axpack.reporting.kibanaServer.hostname: localhost' /etc/kibana/kibana.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart kibana"
+
+
+
