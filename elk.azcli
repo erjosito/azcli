@@ -85,6 +85,9 @@ packages:
   - nginx
   - apt-transport-https
 runcmd:
+  - wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | apt-key add -
+  - echo "deb https://artifacts.elastic.co/packages/8.x/apt stable main" | tee /etc/apt/sources.list.d/elastic-8.x.list
+  - apt update && apt install -y filebeat
   - cd /tmp
   - git clone https://github.com/PacktPublishing/Getting-Started-with-Elastic-Stack-8.0.git
   - mkdir -p /var/www/elastic-stack-server
@@ -119,5 +122,35 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elas
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i -e '$ axpack.reporting.kibanaServer.hostname: localhost' /etc/kibana/kibana.yml"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart kibana"
 
+# Configure NGINX server
+nginx_pip=$(az network public-ip show -n "${nginx_vm_name}-pip" -g $rg --query ipAddress -o tsv)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/root \/var\/www\/html/c\        root \/var\/www\/elastic-stack-server;' /etc/nginx/sites-available/default"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart nginx"
 
+# Configure filebeat agent
+elk_nic_id=$(az vm show -n $elk_vm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+elk_private_ip=$(az network nic show --ids $elk_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl enable filebeat"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/hosts: \[\"localhost:9200\"\]/c\  hosts: [\"https://$elk_private_ip:9200\"]' /etc/filebeat/filebeat.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/username: /c\  username: \"elastic\"' /etc/filebeat/filebeat.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/password: /c\  password: \"$default_password\"' /etc/filebeat/filebeat.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/protocol: /c\  protocol: \"https\"' /etc/filebeat/filebeat.yml"
+verification_mode=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo grep verification_mode /etc/filebeat/filebeat.yml")
+if [[ -z "$verification_mode" ]]; then
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/protocol: /a  verification_mode: \"none\"' /etc/filebeat/filebeat.yml"
+else
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/verification_mode: /c\  verification_mode: \"none\"' /etc/filebeat/filebeat.yml"
+fi
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
+
+# Configure nginx module (to do before enabling?)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/error:/{n;s/.*/    enabled: true/}' /etc/filebeat/modules.d/nginx.yml.disabled"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/access:/{n;s/.*/    enabled: true/}' /etc/filebeat/modules.d/nginx.yml.disabled"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/syslog:/{n;s/.*/    enabled: true/}' /etc/filebeat/modules.d/system.yml.disabled"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
+
+# Load modules
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat modules enable nginx"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" --modules nginx --dashboards --pipelines"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
 
