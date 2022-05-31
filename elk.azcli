@@ -137,9 +137,9 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/pa
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/protocol: /c\  protocol: \"https\"' /etc/filebeat/filebeat.yml"
 verification_mode=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo grep verification_mode /etc/filebeat/filebeat.yml")
 if [[ -z "$verification_mode" ]]; then
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/protocol: /a  verification_mode: \"none\"' /etc/filebeat/filebeat.yml"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/protocol: /a  ssl.verification_mode: none' /etc/filebeat/filebeat.yml"
 else
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/verification_mode: /c\  verification_mode: \"none\"' /etc/filebeat/filebeat.yml"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/verification_mode: /c\  ssl.verification_mode: none' /etc/filebeat/filebeat.yml"
 fi
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
 
@@ -151,6 +151,10 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl r
 
 # Load modules
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat modules enable nginx"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" --modules nginx --dashboards --pipelines"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules nginx --dashboards --pipelines"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --index-management"
+# See https://github.com/elastic/beats/issues/30916
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules nginx --dashboards --pipelines -M \"nginx.access.enabled=true\""
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules nginx --dashboards --pipelines -M \"nginx.error.enabled=true\""
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
 
