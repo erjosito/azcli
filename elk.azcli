@@ -87,7 +87,7 @@ packages:
 runcmd:
   - wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | apt-key add -
   - echo "deb https://artifacts.elastic.co/packages/8.x/apt stable main" | tee /etc/apt/sources.list.d/elastic-8.x.list
-  - apt update && apt install -y filebeat
+  - apt update && apt install -y filebeat metricbeat
   - cd /tmp
   - git clone https://github.com/PacktPublishing/Getting-Started-with-Elastic-Stack-8.0.git
   - mkdir -p /var/www/elastic-stack-server
@@ -138,9 +138,8 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/pr
 verification_mode=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo grep verification_mode /etc/filebeat/filebeat.yml")
 if [[ -z "$verification_mode" ]]; then
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/protocol: /a  ssl.verification_mode: none' /etc/filebeat/filebeat.yml"
-else
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/verification_mode: /c\  ssl.verification_mode: none' /etc/filebeat/filebeat.yml"
 fi
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/verification_mode: /c\  ssl.verification_mode: none' /etc/filebeat/filebeat.yml"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
 
 # Configure nginx module (to do before enabling?)
@@ -158,3 +157,69 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat se
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules nginx --dashboards --pipelines -M \"nginx.error.enabled=true\""
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
 
+# Install metricbeat if it wasnt installed and configure
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '$ a\server {\n  server_name 127.0.0.1;\n  location /server_status {\n    stub_status;\n    allow 127.0.0.1;\n    deny all;\n  }\n}\n' /etc/nginx/sites-enabled/default"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart nginx"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo apt install -y metricbeat"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl enable metricbeat"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/hosts: \[\"localhost:9200\"\]/c\  hosts: [\"https://$elk_private_ip:9200\"]' /etc/metricbeat/metricbeat.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/username: /c\  username: \"elastic\"' /etc/metricbeat/metricbeat.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/password: /c\  password: \"$default_password\"' /etc/metricbeat/metricbeat.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/protocol: /c\  protocol: \"https\"' /etc/metricbeat/metricbeat.yml"
+verification_mode=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo grep verification_mode /etc/metricbeat/metricbeat.yml")
+if [[ -z "$verification_mode" ]]; then
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/protocol: /a  ssl.verification_mode: none' /etc/metricbeat/metricbeat.yml"
+fi
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/verification_mode: /c\  ssl.verification_mode: none' /etc/metricbeat/metricbeat.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo metricbeat modules enable nginx"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/metricsets/c\  metricsets:' /etc/metricbeat/modules.d/nginx.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/stubstatus/c\    - stubstatus' /etc/metricbeat/modules.d/nginx.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo metricbeat modules enable system"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo metricbeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\""
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl start metricbeat"
+
+# Create Azure Service Principal if not existing
+keyvault_name=erjositoKeyvault
+purpose=metricbeat
+keyvault_name=erjositoKeyvault
+keyvault_appid_secret_name=$purpose-sp-appid
+keyvault_password_secret_name=$purpose-sp-secret
+sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
+sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
+if [[ -z "$sp_app_id" ]] || [[ -z "$sp_app_secret" ]]
+then
+    echo "Creating new Service Principal..."
+    sp_name=$purpose
+    sp_output=$(az ad sp create-for-rbac --name $sp_name --skip-assignment 2>/dev/null)
+    sp_app_id=$(echo $sp_output | jq -r '.appId')
+    sp_app_secret=$(echo $sp_output | jq -r '.password')
+    az keyvault secret set --vault-name $keyvault_name --name $keyvault_appid_secret_name --value $sp_app_id -o none
+    az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $sp_app_secret -o none
+    subscription_id=$(az account show -o tsv --query id)
+    echo "Assigning Reader role to new Service Principal..."
+    az role assignment create --scope "/subscriptions/${subscription_id}" --assignee $sp_app_id --role Reader -o none
+else
+    echo "Service Principal $sp_app_id and password located in Azure Key Vault $keyvault_name"
+fi
+
+# Configure metricbeat Azure module. We will use the nginx host to collect the metrics
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo metricbeat modules enable azure"
+subscription_id=$(az account show -o tsv --query id)
+tenant_id=$(az account show -o tsv --query tenantId)
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  tenant_id/c\  tenant_id: \"$tenant_id\"' /etc/metricbeat/modules.d/azure.yml"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  subscription_id/c\  subscription_id: \"$subscription_id\"' /etc/metricbeat/modules.d/azure.yml"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  client_id/c\  client_id: \"$sp_app_id\"' /etc/metricbeat/modules.d/azure.yml"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  client_secret/c\  client_secret: \"$sp_app_secret\"' /etc/metricbeat/modules.d/azure.yml"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo metricbeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\""
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart metricbeat"
+# Alternatively, using the keystore (not tested, but recommended!)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "echo -n \"$sp_app_id\" | sudo metricbeat keystore add AZURE_CLIENT_ID --stdin --force"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "echo -n \"$sp_app_secret\" | sudo metricbeat keystore add AZURE_CLIENT_SECRET --stdin"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "echo -n \"$tenant_id\" | sudo metricbeat keystore add AZURE_TENANT_ID --stdin"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "echo -n \"$subscription_id\" | sudo metricbeat keystore add AZURE_SUBSCRIPTION_ID --stdin"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  tenant_id/c\  tenant_id: \x27\${AZURE_TENANT_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  subscription_id/c\  subscription_id: \x27\${AZURE_SUBSCRIPTION_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  client_id/c\  client_id: \x27\${AZURE_CLIENT_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  client_secret/c\  client_secret: \x27\${AZURE_SECRET_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart metricbeat"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo metricbeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\""

@@ -33,18 +33,21 @@ keyvault_password_secret_name=$purpose-sp-secret
 sp_app_id=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_appid_secret_name --query 'value' -o tsv)
 sp_app_secret=$(az keyvault secret show --vault-name $keyvault_name -n $keyvault_password_secret_name --query 'value' -o tsv)
 
-# Verify whether SP has expired, and if so, renew it
-sp_end_date=$(az ad app show --id $sp_app_id --query 'passwordCredentials[0].endDate' -o tsv)
-sp_end_date=$(date --date="$sp_end_date" +%s)
-now=$(date +%s)
-if [[ $sp_end_date < $now ]]
+# If a secret was found, verify whether SP has expired, and if so, renew it
+if [[ -n "$sp_app_id" ]] || [[ -n "$sp_app_secret" ]]
 then
-    echo "SP expired, extending one year"
-    new_password=$(az ad app credential reset --id $sp_app_id --years 1 --query password -o tsv)
-    az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $new_password -o none
-    sp_app_secret=$new_password
-else
-    echo "SP not expired"
+    sp_end_date=$(az ad app show --id $sp_app_id --query 'passwordCredentials[0].endDate' -o tsv)
+    sp_end_date=$(date --date="$sp_end_date" +%s)
+    now=$(date +%s)
+    if [[ $sp_end_date < $now ]]
+    then
+        echo "SP expired, extending one year"
+        new_password=$(az ad app credential reset --id $sp_app_id --years 1 --query password -o tsv)
+        az keyvault secret set --vault-name $keyvault_name --name $keyvault_password_secret_name --value $new_password -o none
+        sp_app_secret=$new_password
+    else
+        echo "SP not expired"
+    fi
 fi
 
 # If either is blank, create new SP with the required name
