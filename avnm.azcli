@@ -1,36 +1,123 @@
 # Control
 max_vnet_id=5
 hub_vnet_id=0
+ip_version=ipv6    # Can be 'ipv4' or 'ipv6'
+create_vwan=no     # Can be 'vwan' or 'hns'
+overload_ipv4=yes  # If yes, the same spoke IPv4 prefix will be used for all spokes
+public_ips=yes     # If yes, public IPs will be added to the VMs
+create_vpngw=no    # If yes, create VPNGW in the hub
+create_ergw=no     # If yes, create ERGW in the hub
 
 # Variables
 rg=avnm
 location=westeurope
 ip_prefix="10.1"
+ipv6_prefix=ace:cab:de
+nsg_name=avnmnsg
 avnm_name=myavnm
 avnm_description="Test AVNM"
 avnm_vnetgroup_name=myvnets
 avnm_vnetgroup_description="All VNets in the RG"
 avnm_config_name=myconfig
-# VWAN
 vwan_name=avnmvwan
 vhub_name=hub
 vhub_prefix=192.168.0.0/23
 
-# Create RG and VNets
-echo "Creating resource group and VNets..."
+# Create RG, NSG and VNets
+echo "Creating resource group..."
 az group create -n $rg -l $location -o none
+echo "Creating NSG..."
+az network nsg create -n "$nsg_name" -g $rg -o none
+az network nsg rule create -n SSH --nsg-name $nsg_name -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+az network nsg rule create -n ICMP --nsg-name $nsg_name -g $rg --priority 1010 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp -o none
 for vnet_id in {0..$max_vnet_id}
 do
-    az network vnet create -n "vnet${vnet_id}" -g $rg --address-prefixes "${ip_prefix}.${vnet_id}.0/24" --subnet-name vm --subnet-prefixes "${ip_prefix}.${vnet_id}.0/26" -o none
-    az vm create -n "vnet${vnet_id}vm" -g $rg --image UbuntuLTS --generate-ssh-keys --size Standard_B1ms --vnet-name "vnet${vnet_id}" --subnet vm --public-ip-address ''
-    if [[ "$vnet_id" == "$hub_vnet_id" ]]
-    then
-        echo "Creating Basic VNG in hub VNet vnet${vnet_id}..."
-        az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name "vnet${vnet_id}" --address-prefix "${ip_prefix}.${vnet_id}.64/26" -o none
-        az network public-ip create -g $rg -n vngpip --sku Basic --allocation-method Dynamic -o none
-        az network vnet-gateway create --gateway-type Vpn -n hubvng --public-ip-addresses vngpip -g $rg --sku Basic --vnet "vnet${vnet_id}" --vpn-type PolicyBased
+    if [[ "$overload_ipv4" == "yes" ]]; then
+        ipv4_vnet="10.1.0.0/24"
+        ipv4_subnet="10.1.0.0/26"
+    else
+        ipv4_vnet="${ip_prefix}.${vnet_id}.0/24"
+        ipv4_subnet="${ip_prefix}.${vnet_id}.0/26"
+    fi
+    vnet_id_hex=$(printf "%02x" "$vnet_id")
+    if [[ "$ipv_version" == "ipv4" ]]; then
+        echo "Creating VNet vnet${vnet_id} with prefix ${ipv4_vnet}..."
+        az network vnet create -n "vnet${vnet_id}" -g $rg --address-prefixes $ipv4_vnet --subnet-name vm --subnet-prefixes $ipv4_subnet -o none
+        if [[ "$public_ips" == "yes" ]]; then
+            az vm create -n "vnet${vnet_id}vm" -g $rg --image UbuntuLTS --generate-ssh-keys --size Standard_B1ms --vnet-name "vnet${vnet_id}" --subnet vm  --nsg $nsg_name --public-ip-address "vnet${vnet_id}vm-pip" --public-ip-sku Standard --no-wait -o none
+        else
+            az vm create -n "vnet${vnet_id}vm" -g $rg --image UbuntuLTS --generate-ssh-keys --size Standard_B1ms --vnet-name "vnet${vnet_id}" --subnet vm  --nsg $nsg_name --public-ip-address '' --public-ip-sku Standard --no-wait -o none
+        fi
+    else
+        ipv6_vnet="${ipv6_prefix}${vnet_id_hex}::/48"
+        ipv6_subnet="${ipv6_prefix}${vnet_id_hex}:11::/64"
+        echo "Creating VNet vnet${vnet_id} with prefixes ${ipv4_vnet} and ${ipv6_vnet}..."
+        az network vnet create -n "vnet${vnet_id}" -g $rg --address-prefixes $ipv4_vnet $ipv6_vnet --subnet-name vm --subnet-prefixes $ipv4_subnet $ipv6_subnet -o none
+        if [[ "$public_ips" == "yes" ]]; then
+            az network public-ip create -n "vnet${vnet_id}vm-pipv4" -g $rg -l $location --sku Standard --allocation-method static --version IPv4 -z 1 2 3 -o none
+            az network public-ip create -n "vnet${vnet_id}vm-pipv6" -g $rg -l $location --sku Standard --allocation-method static --version IPv6 -z 1 2 3 -o none
+            az network nic create -g $rg -n "vnet${vnet_id}-nic0" --vnet-name "vnet${vnet_id}" --subnet vm --network-security-group $nsg_name --public-ip-address "vnet${vnet_id}vm-pipv4"
+            az network nic ip-config create -g $rg -n myIPv6config --nic-name "vnet${vnet_id}-nic0" --private-ip-address-version IPv6 --vnet-name "vnet${vnet_id}" --subnet vm --public-ip-address "vnet${vnet_id}vm-pipv6"
+            az vm create -n "vnet${vnet_id}vm" -g $rg --image UbuntuLTS --generate-ssh-keys --size Standard_B1ms --nics "vnet${vnet_id}-nic0" --no-wait -o none
+        else
+            az network nic create -g $rg -n "vnet${vnet_id}-nic0" --vnet-name "vnet${vnet_id}" --subnet vm --network-security-group $nsg_name --public-ip-address '' -o none
+            az network nic ip-config create -g $rg -n myIPv6config --nic-name "vnet${vnet_id}-nic0" --private-ip-address-version IPv6 --vnet-name "vnet${vnet_id}" --subnet vm --public-ip-address '' -o none
+            az vm create -n "vnet${vnet_id}vm" -g $rg --image UbuntuLTS --generate-ssh-keys --size Standard_B1ms --nics "vnet${vnet_id}-nic0" --no-wait -o none
+        fi
+    fi
+    # Optionally, create additional VPN GW in hub (vnet_id=0)
+    if [[ "$vnet_id" == "$hub_vnet_id" ]] && [[ "$create_vpngw" == "yes" ]]; then
+        if [[ "$ip_version" == "ipv4" ]]; then
+            echo "Creating Basic VPN VNG in hub VNet vnet${vnet_id}..."
+            ipv4_subnet="${ip_prefix}.${vnet_id}.64/26"
+            az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name "vnet${vnet_id}" --address-prefixes $ipv4_subnet -o none
+            az network public-ip create -g $rg -n vpngw-pip --sku Basic --allocation-method Dynamic -o none
+            az network vnet-gateway create --gateway-type Vpn -n hub-vpngw --public-ip-addresses vngpip -g $rg --sku Basic --vnet "vnet${vnet_id}" --vpn-type PolicyBased
+        fi
+    fi
+    # Optionally, create additional ER GW in hub (vnet_id=0)
+    if [[ "$vnet_id" == "$hub_vnet_id" ]] && [[ "$create_ergw" == "yes" ]]; then
+        if [[ "$ip_version" == "ipv4" ]]; then
+            echo "Creating ExpressRoute gateway in hub VNet vnet${vnet_id}..."
+            ipv4_subnet="${ip_prefix}.${vnet_id}.64/26"
+            az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name "vnet${vnet_id}" --address-prefixes $ipv4_subnet -o none
+            az network public-ip create -g $rg -n ergw-pip --sku Standard --allocation-method Static -o none
+            az network vnet-gateway create -g $rg -n hub-ergw --gateway-type ExpressRoute --sku Standard -l $location --vnet "vnet${vnet_id}" --public-ip-addresses ergw-pip --no-wait -o none
+        else
+            echo "Creating ExpressRoute gateway in hub VNet vnet${vnet_id}..."
+            ipv4_subnet="${ip_prefix}.${vnet_id}.64/26"
+            ipv6_subnet="${ipv6_prefix}${vnet_id_hex}:12::/64"
+            az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name "vnet${vnet_id}" --address-prefixes $ipv4_subnet $ipv6_subnet -o none
+            az network public-ip create -g $rg -n ergw-pip --sku Standard --allocation-method Static -o none
+            az network vnet-gateway create -g $rg -n hub-ergw --gateway-type ExpressRoute --sku Standard -l $location --vnet "vnet${vnet_id}" --public-ip-addresses ergw-pip --no-wait -o none
+        fi
     fi
 done
+
+# Optionally create ER circuit and Megaport configuration
+if [[ "$create_ergw" == "yes" ]]; then
+    er_location=germanywestcentral
+    er_pop=Frankfurt
+    er_circuit_sku=Standard
+    er_provider=Megaport
+    er_circuit_name="er-$er_pop"
+    ergw_name=hub-ergw
+    ergw_pip=ergw-pip
+    mcr_asn=65001
+    az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg -o none \
+        --bandwidth 50 Mbps --provider $er_provider -l $er_location --sku-family MeteredData --sku-tier $er_circuit_sku
+    service_key=$(az network express-route show -n $er_circuit_name -g $rg --query serviceKey -o tsv)
+    megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+    if [[ -e "$megaport_script_path" ]]
+    then
+        echo "Creating Megaport Cloud Router and configuring circuit..."
+        $megaport_script_path -q -s=jomore-${er_pop} -a=create_mcr -k=$service_key --asn=$mcr_asn
+        # sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+        # $megaport_script_path -q -s=jomore-${er_pop} -a=create_vxc -k=$service_key
+    else
+        echo "Sorry, I cannot seem to find the script $megaport_script_path to interact with the Megaport API"
+    fi
+fi
 
 # Add/remove tags to all or some VNets
 echo "Tagging VNets..."
@@ -56,7 +143,8 @@ az network manager create -n $avnm_name -g $rg -l $location --description $avnm_
 condition_all="{ \"allOf\": [ {\"field\": \"tags['avnmtest']\", \"equals\": \"yes\" } ] }"
 condition_hubs="{ \"allOf\": [ {\"field\": \"tags['avnmtest']\", \"equals\": \"yes\" }, {\"field\": \"tags['role']\", \"equals\": \"hub\" } ] }"
 condition_spokes="{ \"allOf\": [ {\"field\": \"tags['avnmtest']\", \"equals\": \"yes\" }, {\"field\": \"tags['role']\", \"equals\": \"spoke\" } ] }"
-# Three groups are created, although actually only the spoke group is requried
+
+# Three groups are created, although actually only the spoke group is requried (DOES NOT WORK!!!!!)
 az network manager group create -n ${avnm_vnetgroup_name}-all --network-manager-name $avnm_name -g $rg \
     --member-type Microsoft.Network/virtualNetworks --description ${avnm_vnetgroup_name}-all \
     --conditional-membership $condition_all -o none
@@ -67,12 +155,11 @@ az network manager group create -n ${avnm_vnetgroup_name}-spokes --network-manag
     --member-type Microsoft.Network/virtualNetworks --description ${avnm_vnetgroup_name}-spokes \
     --conditional-membership $condition_spokes -o none
 
-# Test subnet group
+# Optional: Test subnet group
 subnet_condition="{ \"allOf\": [ {\"field\": \"name\", \"equals\": \"vm\" } ] }"
 az network manager group create -n subnetgroup --network-manager-name $avnm_name -g $rg \
     --member-type "Microsoft.Network/virtualNetworks/subnets" --description "test subnet group" \
     --conditional-membership $subnet_condition -o none
-
 
 # Create connectivity configs
 avnm_hubs_group_id=$(az network manager group show -n ${avnm_vnetgroup_name}-hub --network-manager-name $avnm_name -g $rg --query id -o tsv)
@@ -99,19 +186,21 @@ az network manager post-commit --network-manager-name $avnm_name -g $rg --commit
 # az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids ''
 
 # Optional: create Virtual WAN
-az network vwan create -n $vwan_name -g $rg -l $location -o none
-az network vhub create --vwan $vwan_name -n $vhub_name --address-prefix $vhub_prefix -l $location -g $rg -o none --no-wait
-# Connect all VNets to virtual hub
-echo "Connecting VNets to Virtual Hub"
-for vnet_id in {0..$max_vnet_id}
-do
-    if [[ "$vnet_id" == "$hub_vnet_id" ]]; then
-        echo "Skipping VNet vnet${vnet_id}, since it is a hub"
-    else
-        echo "Connecting VNet vnet${vnet_id} to Virtual WAN hub ${vhub_name}..."
-        az network vhub connection create -n "vnet${vnet_id}" -g $rg --vhub-name ${vhub_name} --remote-vnet "vnet${vnet_id}" --internet-security true -o none
-    fi
-done
+if [[ "$create_vwan" == "yes" ]]; then
+    az network vwan create -n $vwan_name -g $rg -l $location -o none
+    az network vhub create --vwan $vwan_name -n $vhub_name --address-prefix $vhub_prefix -l $location -g $rg -o none --no-wait
+    # Connect all VNets to virtual hub
+    echo "Connecting VNets to Virtual Hub"
+    for vnet_id in {0..$max_vnet_id}
+    do
+        if [[ "$vnet_id" == "$hub_vnet_id" ]]; then
+            echo "Skipping VNet vnet${vnet_id}, since it is a hub"
+        else
+            echo "Connecting VNet vnet${vnet_id} to Virtual WAN hub ${vhub_name}..."
+            az network vhub connection create -n "vnet${vnet_id}" -g $rg --vhub-name ${vhub_name} --remote-vnet "vnet${vnet_id}" --internet-security true -o none
+        fi
+    done
+fi
 
 # Create Security Admin Config
 sec_config_name="${avnm_config_name}-denyIcmp"

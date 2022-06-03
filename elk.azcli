@@ -7,9 +7,8 @@
 ##################################################
 
 # Variables
-rg=elk
+rg=elk2
 location=westeurope
-elk_vm_size=
 vnet_name=elk
 vnet_prefix=10.99.64.0/22
 elk_subnet_name=elk
@@ -20,20 +19,21 @@ elk_vm_name=elk
 elk_vm_size=Standard_B2ms
 elk_cloudinit_file=/tmp/elk_cloudinit.txt
 nginx_vm_name=nginx
-nginx_vm_size=Standard_B1s
+nginx_vm_size=Standard_B2ms
 nginx_cloudinit_file=/tmp/nginx_cloudinit.txt
 akv_name=erjositoKeyvault
 default_password_secret=defaultPassword
 
 # Get secrets
-akv_rg_found=$(az keyvault list -o tsv --query "[?name=='$akv_name'].resourceGroup" 2>/dev/null)
-if [[ -n ${akv_rg_found} ]]
-then
-    echo "INFO: AKV ${akv_name} found in resource group $akv_rg_found"
-    default_password=$(az keyvault secret show --vault-name $akv_name -n $default_password_secret --query 'value' -o tsv 2>/dev/null)
-else
-    echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
-fi
+# akv_rg_found=$(az keyvault list -o tsv --query "[?name=='$akv_name'].resourceGroup" 2>/dev/null)
+# if [[ -n ${akv_rg_found} ]]
+# then
+#     echo "INFO: AKV ${akv_name} found in resource group $akv_rg_found"
+#     default_password=$(az keyvault secret show --vault-name $akv_name -n $default_password_secret --query 'value' -o tsv 2>/dev/null)
+# else
+#     echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
+# fi
+default_password=Microsoft123!
 
 # Create RG and VNets
 echo "Creating RG and VNet..."
@@ -93,17 +93,17 @@ runcmd:
   - mkdir -p /var/www/elastic-stack-server
   - cp -r Getting-Started-with-Elastic-Stack-8.0/Chapter6/html-webpage/* /var/www/elastic-stack-server
 EOF
-echo "Creating Elastic Stack VM..."
+echo "Creating nginx VM..."
 az vm create -n $nginx_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${nginx_vm_name}-nsg" -o none \
     --custom-data $nginx_cloudinit_file --public-ip-sku Standard --public-ip-address "${nginx_vm_name}-pip" \
     --vnet-name $vnet_name --size $nginx_vm_size --subnet $vm_subnet_name -l $location --no-wait
 
 # Make sure to reset the elastic user's password with elasticsearch-setup-password or elasticsearch-reset-password !!!!
+elk_pip=$(az network public-ip show -n "${elk_vm_name}-pip" -g $rg --query ipAddress -o tsv)
 ssh $elk_pip "sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -i"
 ssh $elk_pip "sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana -i"
 
 # Verify Elastic Search VM
-elk_pip=$(az network public-ip show -n "${elk_vm_name}-pip" -g $rg --query ipAddress -o tsv)
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "systemctl status elasticsearch"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "systemctl status kibana"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u elastic:${default_password} https://localhost:9200"
@@ -118,6 +118,10 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/serv
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.username/c\elasticsearch.username: \"kibana\"' /etc/kibana/kibana.yml"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.password/c\elasticsearch.password: \"$default_password\"' /etc/kibana/kibana.yml"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.hosts/c\elasticsearch.hosts: [\"https://localhost:9200\"]' /etc/kibana/kibana.yml"
+verification_mode=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo grep verificationMode /etc/kibana/kibana.yml")
+if [[ -z "$verification_mode" ]]; then
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/protocol: /a  ssl.verification_mode: none' /etc/kibana/kibana.yml"
+fi
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.ssl.verificationMode/c\elasticsearch.ssl.verificationMode: none' /etc/kibana/kibana.yml"
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i -e '$ axpack.reporting.kibanaServer.hostname: localhost' /etc/kibana/kibana.yml"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart kibana"
@@ -155,6 +159,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat se
 # See https://github.com/elastic/beats/issues/30916
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules nginx --dashboards --pipelines -M \"nginx.access.enabled=true\""
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules nginx --dashboards --pipelines -M \"nginx.error.enabled=true\""
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules system --dashboards --pipelines -M \"system.syslog.enabled=true\""
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
 
 # Install metricbeat if it wasnt installed and configure
@@ -217,9 +222,63 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "echo -n \"$sp_ap
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "echo -n \"$sp_app_secret\" | sudo metricbeat keystore add AZURE_CLIENT_SECRET --stdin"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "echo -n \"$tenant_id\" | sudo metricbeat keystore add AZURE_TENANT_ID --stdin"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "echo -n \"$subscription_id\" | sudo metricbeat keystore add AZURE_SUBSCRIPTION_ID --stdin"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  tenant_id/c\  tenant_id: \x27\${AZURE_TENANT_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  subscription_id/c\  subscription_id: \x27\${AZURE_SUBSCRIPTION_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  client_id/c\  client_id: \x27\${AZURE_CLIENT_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  client_secret/c\  client_secret: \x27\${AZURE_SECRET_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  tenant_id/c\  tenant_id: \x27\${AZURE_TENANT_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  subscription_id/c\  subscription_id: \x27\${AZURE_SUBSCRIPTION_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  client_id/c\  client_id: \x27\${AZURE_CLIENT_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  client_secret/c\  client_secret: \x27\${AZURE_SECRET_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '$ a #\n# Injected from script' /etc/metricbeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '$ a - module: azure\n  metricsets:\n  - compute_vm_scaleset\n  enabled: true\n  period: 30s\n  refresh_list_interval: 600s' /etc/metricbeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '$ a \ \ client_id: \x27\${AZURE_CLIENT_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '$ a \ \ client_secret: \x27\${AZURE_CLIENT_SECRET:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '$ a \ \ subscription_id: \x27\${AZURE_TENANT_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '$ a \ \ tenant_id: \x27\${AZURE_SUBSCRIPTION_ID:\"\"}\x27' /etc/metricbeat/modules.d/azure.yml"
+
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart metricbeat"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo metricbeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\""
+
+
+# Configure filebeat Azure module. We will use the nginx host to collect the logs
+
+# Create storage account and Events Hub
+storage_account_name=$(az storage account list -g $rg -o tsv --query '[0].name')
+storage_container_name=filebeat
+if [[ -z "$storage_account_name" ]]; then
+    storage_account_name=elk$RANDOM
+    echo "No storage account found resource group ${rg}, creating one..."
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location -o none
+    az storage container create -n $storage_container_name --account-name $storage_account_name --auth-mode login -o none
+else
+    echo "Storage account $storage_account_name found in RG $rg"
+fi
+storage_account_key=$(az storage account keys list -n $storage_account_name --query '[0].value' -o tsv)
+eh_ns_name=$(az eventhubs namespace list -g $rg --query '[0].name' -o tsv)
+eh_ns_name=$eh_name
+if [[ -z "$eh_ns_name" ]]; then
+    eh_name=elk$RANDOM
+    eh_ns_name=$eh_name
+    echo "Creating Event Hub ${eh_name}..."
+    az eventhubs namespace create -n $eh_ns_name -g $rg -l $location --sku Standard -o none
+    az eventhubs eventhub create -n $eh_name -g $rg --namespace-name $eh_ns_name -o none
+else
+    echo "Events Hub $eh_name found in RG $rg"
+fi
+eh_ns_cx_string=$(az eventhubs namespace authorization-rule keys list -g $rg --namespace-name $eh_ns_name --name RootManageSharedAccessKey --query primaryConnectionString -o tsv)
+
+# Configure in the portal redirection to this Event Hub (To Do: CLI commands)
+
+# Configure filebeat azure module
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat modules enable azure"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  eventhub:/c\      eventhub: \"$eh_name\"' /etc/filebeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  connection_string:/c\      connection_string: \"$eh_ns_cx_string\"' /etc/filebeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  consumer_group:/c\      consumer_group: \"\$Default\"' /etc/filebeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  storage_account:/c\      storage_account: \"$storage_account_name\"' /etc/filebeat/modules.d/azure.yml"
+#ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  storage_account:/c\      storage_account_container: \"$storage_account_container\"' /etc/filebeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/  storage_account_key:/c\      storage_account_key: \"$storage_account_key\"' /etc/filebeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/activitylogs:/{n;s/.*/    enabled: true/}' /etc/filebeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/auditlogs:/{n;s/.*/    enabled: true\n    var:/}' /etc/filebeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/platformlogs:/{n;s/.*/    enabled: false\n    var:/}' /etc/filebeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/signinlogs:/{n;s/.*/    enabled: false\n    var:/}' /etc/filebeat/modules.d/azure.yml"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules azure --dashboards --pipelines -M \"azure.activitylogs.enabled=true\""
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules azure --dashboards --pipelines -M \"azure.auditlogs.enabled=true\""

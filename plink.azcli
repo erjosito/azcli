@@ -34,26 +34,44 @@ publisher=Canonical
 offer=UbuntuServer
 sku=18.04-LTS
 image_urn=$(az vm image list -p $publisher -f $offer -s $sku -l $location --query '[0].urn' -o tsv)
+
 # Deploy VM
-az vm create -n $vm_name -g $rg -l $location --image $image_urn --size $vm_sku --generate-ssh-keys \
-  --os-disk-name $vm_disk_name --os-disk-size-gb 32 \
-  --vnet-name $vnet_name --subnet $subnet_vm_name \
-  --nsg $vm_nsg_name --nsg-rule SSH --public-ip-address $vm_pip_name
-# Add rule to NSG on port 8080
-az network nsg rule create -n TCP8080 --nsg-name $vm_nsg_name -g $rg \
-  --protocol Tcp --access Allow --priority 105 --direction Inbound \
-  --destination-port-ranges 8080
-# Install app, this will take a while (a bunch of apt updates, installs, etc).
-# You might have to Ctrl-C this, it hangs when executing the app (for some reason i am not able to run it as a background task)
-script_url=https://raw.githubusercontent.com/erjosito/whoami/master/api-vm/cse.sh
-script_command='./cse.sh'
-az vm extension set -n customScript --vm-name $vm_name -g $rg --publisher Microsoft.Azure.Extensions \
-  --protected-settings "{\"fileUris\": [\"${script_url}\"],\"commandToExecute\": \"${script_command}\"}"
-# Set environment variables
-# command="export SQL_SERVER_USERNAME=${sql_username} && export SQL_SERVER_PASSWORD=${sql_password}"
-# az vm run-command invoke -n $vm_name -g $rg --command-id RunShellScript --scripts "${command}"
-# az vm run-command invoke -n $vm_name -g $rg --command-id RunShellScript --scripts 'export SQL_SERVER_USERNAME=$1 && export SQL_SERVER_PASSWORD=$2' \
-#    --parameters $sql_username $sql_password
+deployment_mode=cloudinit
+if [[ "$deployment_mode" == "cloudinit" ]]; then
+    vm_cloudinit_filename=/tmp/cloudinit-whoami.txt
+    cat <<EOF > $vm_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update && apt install -y python3-pip
+  - pip3 install flask
+  - wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
+  - python3 /root/myip.py &
+EOF
+    az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku -l $location1 \
+      --vnet-name $vm_vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
+      --custom-data $vm_cloudinit_filename
+else
+    az vm create -n $vm_name -g $rg -l $location --image $image_urn --size $vm_sku --generate-ssh-keys \
+      --os-disk-name $vm_disk_name --os-disk-size-gb 32 \
+      --vnet-name $vnet_name --subnet $subnet_vm_name \
+      --nsg $vm_nsg_name --nsg-rule SSH --public-ip-address $vm_pip_name
+    # Add rule to NSG on port 8080
+    az network nsg rule create -n TCP8080 --nsg-name $vm_nsg_name -g $rg \
+      --protocol Tcp --access Allow --priority 105 --direction Inbound \
+      --destination-port-ranges 8080
+    # Install app, this will take a while (a bunch of apt updates, installs, etc).
+    # You might have to Ctrl-C this, it hangs when executing the app (for some reason i am not able to run it as a background task)
+    script_url=https://raw.githubusercontent.com/erjosito/whoami/master/api-vm/cse.sh
+    script_command='./cse.sh'
+    az vm extension set -n customScript --vm-name $vm_name -g $rg --publisher Microsoft.Azure.Extensions \
+      --protected-settings "{\"fileUris\": [\"${script_url}\"],\"commandToExecute\": \"${script_command}\"}"
+    # Set environment variables
+    # command="export SQL_SERVER_USERNAME=${sql_username} && export SQL_SERVER_PASSWORD=${sql_password}"
+    # az vm run-command invoke -n $vm_name -g $rg --command-id RunShellScript --scripts "${command}"
+    # az vm run-command invoke -n $vm_name -g $rg --command-id RunShellScript --scripts 'export SQL_SERVER_USERNAME=$1 && export SQL_SERVER_PASSWORD=$2' \
+    #    --parameters $sql_username $sql_password
+fi
+
 # Get private IP
 vm_private_ip=$(az vm list-ip-addresses -n $vm_name -g $rg --query '[0].virtualMachine.network.privateIpAddresses[0]' -o tsv)
 # Get public IP
