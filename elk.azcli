@@ -282,3 +282,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo sed -i '/si
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart filebeat"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules azure --dashboards --pipelines -M \"azure.activitylogs.enabled=true\""
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo filebeat setup -E \"setup.kibana.host=${elk_private_ip}:5601\" -E \"setup.kibana.ssl.verification_mode=none\" --modules azure --dashboards --pipelines -M \"azure.auditlogs.enabled=true\""
+
+# Kubernetes:
+# https://www.elastic.co/guide/en/beats/metricbeat/current/metricbeat-module-kubernetes.html
+# https://www.elastic.co/guide/en/beats/metricbeat/current/running-on-kubernetes.html

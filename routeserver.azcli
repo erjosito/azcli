@@ -9,19 +9,24 @@
 #############################################################################
 
 
+# Control
+nva_type=linux      # can be csr or linux
+redundant_nva=no    # this script only supports the CSR for redundant CSRs
+create_spokes=yes   # can be yes or no
+
 # Variables
 rg=routeserver
 location=westeurope
 vnet_name=hub
-vnet_prefix=10.1.0.0/16
-vnet_prefix_long='10.1.0.0 255.255.0.0'
+vnet_prefix=172.16.0.0/16
+vnet_prefix_long='172.16.0.0 255.255.0.0'
 rs_subnet_name=RouteServerSubnet
-rs_subnet_prefix=10.1.0.0/24
+rs_subnet_prefix=172.16.1.0/24
 rs_name=hubrs
 hub_vm_subnet_name=vm
-hub_vm_subnet_prefix=10.1.3.0/24
+hub_vm_subnet_prefix=172.16.3.0/24
 # GatewaySubnet
-gw_subnet_prefix=10.1.254.0/24
+gw_subnet_prefix=172.16.254.0/24
 # CSR
 publisher=cisco
 offer=cisco-csr-1000v
@@ -29,38 +34,38 @@ sku=16_12-byol
 csr_username=$(whoami)
 csr_password=Microsoft123!
 hub_csrext_subnet_name=csrext
-hub_csrext_subnet_prefix=10.1.1.0/24
-hub_csrext_subnet_prefix_long_reversemask='10.1.1.0 0.0.0.255'
+hub_csrext_subnet_prefix=172.16.11.0/24
+hub_csrext_subnet_prefix_long_reversemask='172.16.11.0 0.0.0.255'
 hub_csrext_nsg_name=hubcsrext-nsg
 hub_csrint_subnet_name=csrint
-hub_csrint_subnet_prefix=10.1.2.0/24
+hub_csrint_subnet_prefix=172.16.12.0/24
 hub_csrint_nsg_name=hubcsrint-nsg
 hub_csr_asn=65001
 hub_csr1_name=csr1
-hub_csr1_bgp_ip=10.1.2.11
+hub_csr1_bgp_ip=172.16.12.11
 hub_csr2_name=csr2
-hub_csr2_bgp_ip=10.1.2.12
+hub_csr2_bgp_ip=172.16.12.12
 # Linux NVA
 hub_linuxnva_asn=65002
 hub_linuxnva_subnet_name=linuxnva
-hub_linuxnva_subnet_prefix=10.1.10.0/24
+hub_linuxnva_subnet_prefix=172.16.10.0/24
 hub_linuxnva_name=ubuntufw
 hub_linuxnva_pip_name="${hub_linuxnva_name}-pip"
 hub_linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
 # Spoke 1
 spoke1_name=spoke1
-spoke1_prefix=10.11.0.0/16
+spoke1_prefix=172.17.0.0/16
 spoke1_vm_subnet_name=vm
-spoke1_vm_subnet_prefix=10.11.0.0/24
+spoke1_vm_subnet_prefix=172.17.0.0/24
 spoke1_csr_subnet_name=csr
-spoke1_csr_subnet_prefix=10.11.1.0/24
+spoke1_csr_subnet_prefix=172.17.1.0/24
 spoke1_csr_name=spoke1csr
 spoke1_csr_asn=65001
 # Spoke 2
 spoke2_name=spoke2
-spoke2_prefix=10.12.0.0/16
+spoke2_prefix=172.18.0.0/16
 spoke2_vm_subnet_name=vm
-spoke2_vm_subnet_prefix=10.12.0.0/24
+spoke2_vm_subnet_prefix=172.18.0.0/24
 # Azure VPN GW
 vpngw_name=vpngw
 vpngw_asn=65515
@@ -148,55 +153,56 @@ hub_vm_private_ip=$(az network nic show --ids $hub_vm_nic_id --query 'ipConfigur
 ####################
 
 # Default gateways
-hub_csrext_default_gw=$(first_ip $hub_csrext_subnet_prefix) && echo $hub_csrext_default_gw
-hub_csrint_default_gw=$(first_ip $hub_csrint_subnet_prefix) && echo $hub_csrint_default_gw
+if [[ "$nva_type" == "csr" ]]; then
+    hub_csrext_default_gw=$(first_ip $hub_csrext_subnet_prefix) && echo $hub_csrext_default_gw
+    hub_csrint_default_gw=$(first_ip $hub_csrint_subnet_prefix) && echo $hub_csrint_default_gw
 
-# Create hub CSR1 as NVA with 2 NICs (easier for NAT)
-version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
-az vm image terms accept --urn ${publisher}:${offer}:${sku}:${version}
-# NSGs (104.21.25.86 and 172.67.133.228 are the addresses of ifconfig.co)
-az network nsg create -n $hub_csrext_nsg_name -g $rg -l $location
-myip=$(curl -s4 ifconfig.co) && echo $myip
-az network nsg rule create -n Internet2VnetInbound --nsg-name $hub_csrext_nsg_name -g $rg \
-  --protocol '*' --access Allow --priority 1010 --direction Inbound \
-  --source-address-prefixes 8.8.8.8/32 104.21.25.86/32 172.67.133.228/32 --source-port-ranges '*' \
-  --destination-address-prefixes VirtualNetwork --destination-port-ranges '*'
-az network nsg rule create -n SSHInbound --nsg-name $hub_csrext_nsg_name -g $rg \
-  --protocol 'TCP' --access Allow --priority 1020 --direction Inbound \
-  --source-address-prefixes "${myip}/32" --source-port-ranges '*' \
-  --destination-address-prefixes VirtualNetwork --destination-port-ranges '22'
-az network nsg create -n $hub_csrint_nsg_name -g $rg -l $location
-az network nsg rule create -n Vnet2InternetInbound --nsg-name $hub_csrint_nsg_name -g $rg \
-  --protocol '*' --access Allow --priority 1010 --direction Inbound \
-  --source-address-prefixes VirtualNetwork --source-port-ranges '*' \
-  --destination-address-prefixes Internet --destination-port-ranges '*'
-az network nsg rule create -n Internet2VnetOutbound --nsg-name $hub_csrint_nsg_name -g $rg \
-  --protocol '*' --access Allow --priority 1010 --direction Outbound \
-  --source-address-prefixes 8.8.8.8/32 104.21.25.86/32 172.67.133.228/32 --source-port-ranges '*' \
-  --destination-address-prefixes VirtualNetwork --destination-port-ranges '*'
-# PIP
-az network public-ip create -g $rg -n "${hub_csr1_name}-pip" --sku basic --allocation-method Static
-# NICs
-az network nic create -n "${hub_csr1_name}-nic0" -g $rg --vnet-name $vnet_name --subnet $hub_csrext_subnet_name --network-security-group "$hub_csrext_nsg_name" --public-ip-address "${hub_csr1_name}-pip" --ip-forwarding
-az network nic create -n "${hub_csr1_name}-nic1" -g $rg --vnet-name $vnet_name --subnet $hub_csrint_subnet_name --network-security-group "$hub_csrint_nsg_name" --private-ip-address $hub_csr1_bgp_ip --ip-forwarding
-# VM
-az vm create -n $hub_csr1_name -g $rg -l $location \
-    --image ${publisher}:${offer}:${sku}:${version} \
-    --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
-    --nics "${hub_csr1_name}-nic0" "${hub_csr1_name}-nic1"
-#hub_csr1_nic_id=$(az vm show -n $hub_csr1_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-#az network nic update --ids $hub_csr1_nic_id --ip-forwarding
+    # Create hub CSR1 as NVA with 2 NICs (easier for NAT)
+    version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+    az vm image terms accept --urn ${publisher}:${offer}:${sku}:${version}
+    # NSGs (104.21.25.86 and 172.67.133.228 are the addresses of ifconfig.co)
+    az network nsg create -n $hub_csrext_nsg_name -g $rg -l $location
+    myip=$(curl -s4 ifconfig.co) && echo $myip
+    az network nsg rule create -n Internet2VnetInbound --nsg-name $hub_csrext_nsg_name -g $rg \
+      --protocol '*' --access Allow --priority 1010 --direction Inbound \
+      --source-address-prefixes 8.8.8.8/32 104.21.25.86/32 172.67.133.228/32 --source-port-ranges '*' \
+      --destination-address-prefixes VirtualNetwork --destination-port-ranges '*'
+    az network nsg rule create -n SSHInbound --nsg-name $hub_csrext_nsg_name -g $rg \
+      --protocol 'TCP' --access Allow --priority 1020 --direction Inbound \
+      --source-address-prefixes "${myip}/32" --source-port-ranges '*' \
+      --destination-address-prefixes VirtualNetwork --destination-port-ranges '22'
+    az network nsg create -n $hub_csrint_nsg_name -g $rg -l $location
+    az network nsg rule create -n Vnet2InternetInbound --nsg-name $hub_csrint_nsg_name -g $rg \
+      --protocol '*' --access Allow --priority 1010 --direction Inbound \
+      --source-address-prefixes VirtualNetwork --source-port-ranges '*' \
+      --destination-address-prefixes Internet --destination-port-ranges '*'
+    az network nsg rule create -n Internet2VnetOutbound --nsg-name $hub_csrint_nsg_name -g $rg \
+      --protocol '*' --access Allow --priority 1010 --direction Outbound \
+      --source-address-prefixes 8.8.8.8/32 104.21.25.86/32 172.67.133.228/32 --source-port-ranges '*' \
+      --destination-address-prefixes VirtualNetwork --destination-port-ranges '*'
+    # PIP
+    az network public-ip create -g $rg -n "${hub_csr1_name}-pip" --sku basic --allocation-method Static
+    # NICs
+    az network nic create -n "${hub_csr1_name}-nic0" -g $rg --vnet-name $vnet_name --subnet $hub_csrext_subnet_name --network-security-group "$hub_csrext_nsg_name" --public-ip-address "${hub_csr1_name}-pip" --ip-forwarding
+    az network nic create -n "${hub_csr1_name}-nic1" -g $rg --vnet-name $vnet_name --subnet $hub_csrint_subnet_name --network-security-group "$hub_csrint_nsg_name" --private-ip-address $hub_csr1_bgp_ip --ip-forwarding
+    # VM
+    az vm create -n $hub_csr1_name -g $rg -l $location \
+        --image ${publisher}:${offer}:${sku}:${version} \
+        --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
+        --nics "${hub_csr1_name}-nic0" "${hub_csr1_name}-nic1"
+    #hub_csr1_nic_id=$(az vm show -n $hub_csr1_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    #az network nic update --ids $hub_csr1_nic_id --ip-forwarding
 
-# Route table without gateway route propagation on the external nic
-az network route-table create -n csrext -g $rg -l $location --disable-bgp-route-propagation
-az network vnet subnet update --name $hub_csrext_subnet_name --route-table csrext --vnet-name $vnet_name --resource-group $rg
+    # Route table without gateway route propagation on the external nic
+    az network route-table create -n csrext -g $rg -l $location --disable-bgp-route-propagation
+    az network vnet subnet update --name $hub_csrext_subnet_name --route-table csrext --vnet-name $vnet_name --resource-group $rg
 
-# Test access over SSH
-hub_csr1_ip=$(az network public-ip show -n "${hub_csr1_name}-pip" --query ipAddress -o tsv -g $rg) && echo $hub_csr1_ip
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" "sh ip int b"
+    # Test access over SSH
+    hub_csr1_ip=$(az network public-ip show -n "${hub_csr1_name}-pip" --query ipAddress -o tsv -g $rg) && echo $hub_csr1_ip
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" "sh ip int b"
 
-# Configure hub CSR1 with BGP
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
+    # Configure hub CSR1 with BGP
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
 config t
     no ip domain lookup
     interface Loopback 0
@@ -221,17 +227,17 @@ end
 wr mem
 EOF
 
-# Route Server is reachable over ICMP :)
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr1_ip "ping $rs_ip1"
-# Create peering
-az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $hub_csr1_bgp_ip --peer-asn $hub_csr_asn -n $hub_csr1_name
+    # Route Server is reachable over ICMP :)
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr1_ip "ping $rs_ip1"
+    # Create peering
+    az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $hub_csr1_bgp_ip --peer-asn $hub_csr_asn -n $hub_csr1_name
 
-# Show peerings and effective routes on the VM nic (at this point only the 1.1.1.1 should be there)
-az network routeserver peering list --routeserver $rs_name -g $rg -o table
-az network nic show-effective-route-table --ids $hub_vm_nic_id -o table
+    # Show peerings and effective routes on the VM nic (at this point only the 1.1.1.1 should be there)
+    az network routeserver peering list --routeserver $rs_name -g $rg -o table
+    az network nic show-effective-route-table --ids $hub_vm_nic_id -o table
 
-# OPTIONAL: Inject default route from CSR1, and configure NAT
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
+    # OPTIONAL: Inject default route from CSR1, and configure NAT
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
 config t
     interface GigabitEthernet1
         ip nat outside
@@ -253,20 +259,20 @@ end
 wr mem
 EOF
 
-# Bypass the NVA for SSH access
-az network route-table create -n hubvmrt -g $rg -l $location
-az network vnet subnet update -g $rg --vnet-name $vnet_name -n $hub_vm_subnet_name --route-table hubvmrt
-myip=$(curl -s4 ifconfig.co) && echo $myip
-az network route-table route create --route-table-name hubvmrt -g $rg --address-prefix "${myip}/32" --name mypc  --next-hop-type Internet
+    # Bypass the NVA for SSH access
+    az network route-table create -n hubvmrt -g $rg -l $location
+    az network vnet subnet update -g $rg --vnet-name $vnet_name -n $hub_vm_subnet_name --route-table hubvmrt
+    myip=$(curl -s4 ifconfig.co) && echo $myip
+    az network route-table route create --route-table-name hubvmrt -g $rg --address-prefix "${myip}/32" --name mypc  --next-hop-type Internet
 
-# Test egress access from the VM
-az network routeserver peering list-learned-routes -n $hub_csr1_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-az network nic show-effective-route-table --ids $hub_vm_nic_id -o table
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_vm_ip" "curl -s4 ifconfig.co"
+    # Test egress access from the VM
+    az network routeserver peering list-learned-routes -n $hub_csr1_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+    az network nic show-effective-route-table --ids $hub_vm_nic_id -o table
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_vm_ip" "curl -s4 ifconfig.co"
 
-# Measure route injection time
-# Create route in CSR
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
+    # Measure route injection time
+    # Create route in CSR
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
 config t
     interface Loopback 10
         ip address 10.10.10.10 255.255.255.255
@@ -274,57 +280,58 @@ config t
         network 10.10.10.10 mask 255.255.255.255
 end
 EOF
-start_time=$(date +%s)
-echo "Interface created in CSR, now waiting for route to appear..."
-route=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
-until [[ -n "$route" ]]
-do
+    start_time=$(date +%s)
+    echo "Interface created in CSR, now waiting for route to appear..."
     route=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
-done
-finish_time=$(date +%s)
-run_time=$(($finish_time - $start_time))
-((minutes=run_time/60))
-((seconds=run_time%60))
-echo "Route appeared in the effective route table of the hub VM after $minutes minutes and $seconds seconds"
-# Result: around 20-45s
+    until [[ -n "$route" ]]
+    do
+        route=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
+    done
+    finish_time=$(date +%s)
+    run_time=$(($finish_time - $start_time))
+    ((minutes=run_time/60))
+    ((seconds=run_time%60))
+    echo "Route appeared in the effective route table of the hub VM after $minutes minutes and $seconds seconds"
+    # Result: around 20-45s
 
-# Measure route removal time
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
+    # Measure route removal time
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
 config t
     no interface Loopback10
     router bgp ${hub_csr_asn}
         no network 10.10.10.10 mask 255.255.255.255
 end
 EOF
-start_time=$(date +%s)
-echo "Interface deleted in CSR, now waiting for route to disappear..."
-route=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
-until [[ -z "$route" ]]
-do
+    start_time=$(date +%s)
+    echo "Interface deleted in CSR, now waiting for route to disappear..."
     route=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
-done
-finish_time=$(date +%s)
-run_time=$(($finish_time - $start_time))
-((minutes=run_time/60))
-((seconds=run_time%60))
-echo "Route disappeared from the effective route table of the hub VM after $minutes minutes and $seconds seconds"
-# Result: around 20-30s
+    until [[ -z "$route" ]]
+    do
+        route=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("10.10.10.10/32"))) | .[]' 2>/dev/null)
+    done
+    finish_time=$(date +%s)
+    run_time=$(($finish_time - $start_time))
+    ((minutes=run_time/60))
+    ((seconds=run_time%60))
+    echo "Route disappeared from the effective route table of the hub VM after $minutes minutes and $seconds seconds"
+    # Result: around 20-30s
 
 # CSR2
-# PIP
-az network public-ip create -g $rg -n "${hub_csr2_name}-pip" --sku basic --allocation-method Static
-# NICs
-az network nic create -n "${hub_csr2_name}-nic0" -g $rg --vnet-name $vnet_name --subnet $hub_csrext_subnet_name --network-security-group "$hub_csrext_nsg_name" --public-ip-address "${hub_csr2_name}-pip" --ip-forwarding
-az network nic create -n "${hub_csr2_name}-nic1" -g $rg --vnet-name $vnet_name --subnet $hub_csrint_subnet_name --network-security-group "$hub_csrint_nsg_name" --private-ip-address $hub_csr2_bgp_ip --ip-forwarding
-# VM
-az vm create -n $hub_csr2_name -g $rg -l $location \
-    --image ${publisher}:${offer}:${sku}:${version} \
-    --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
-    --nics "${hub_csr2_name}-nic0" "${hub_csr2_name}-nic1"
-# Configure hub CSR2 with BGP
-hub_csr2_ip=$(az network public-ip show -n "${hub_csr2_name}-pip" --query ipAddress -o tsv -g $rg) && echo $hub_csr2_ip
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr2_ip" "sh ip int b"
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr2_ip" <<EOF
+    if [[ "$redundant_nva" == "yes" ]]; then
+        # PIP
+        az network public-ip create -g $rg -n "${hub_csr2_name}-pip" --sku basic --allocation-method Static
+        # NICs
+        az network nic create -n "${hub_csr2_name}-nic0" -g $rg --vnet-name $vnet_name --subnet $hub_csrext_subnet_name --network-security-group "$hub_csrext_nsg_name" --public-ip-address "${hub_csr2_name}-pip" --ip-forwarding
+        az network nic create -n "${hub_csr2_name}-nic1" -g $rg --vnet-name $vnet_name --subnet $hub_csrint_subnet_name --network-security-group "$hub_csrint_nsg_name" --private-ip-address $hub_csr2_bgp_ip --ip-forwarding
+        # VM
+        az vm create -n $hub_csr2_name -g $rg -l $location \
+            --image ${publisher}:${offer}:${sku}:${version} \
+            --admin-username "$csr_username" --admin-password $csr_password --authentication-type all --generate-ssh-keys \
+            --nics "${hub_csr2_name}-nic0" "${hub_csr2_name}-nic1"
+        # Configure hub CSR2 with BGP
+        hub_csr2_ip=$(az network public-ip show -n "${hub_csr2_name}-pip" --query ipAddress -o tsv -g $rg) && echo $hub_csr2_ip
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr2_ip" "sh ip int b"
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr2_ip" <<EOF
 config t
     no ip domain lookup
     interface Loopback0
@@ -367,66 +374,68 @@ end
 wr mem
 EOF
 
-# Route Server is reachable over ICMP
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr2_ip "ping $rs_ip1"
-# Create peering
-az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $hub_csr2_bgp_ip --peer-asn $hub_csr_asn -n $hub_csr2_name
-# az network routeserver peering delete --routeserver $rs_name -g $rg -n $hub_csr2_name -y -o none  # In case you need to recreate the BGP peering
+        # Route Server is reachable over ICMP
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr2_ip "ping $rs_ip1"
+        # Create peering
+        az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $hub_csr2_bgp_ip --peer-asn $hub_csr_asn -n $hub_csr2_name
+        # az network routeserver peering delete --routeserver $rs_name -g $rg -n $hub_csr2_name -y -o none  # In case you need to recreate the BGP peering
 
-# Verify that the RS is learning the routes from both CSRs
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr1_ip "sh ip bgp summ"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr2_ip "sh ip bgp summ"
-az network routeserver peering list --routeserver $rs_name -g $rg -o table
-az network routeserver peering list-learned-routes -n $hub_csr1_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-az network routeserver peering list-learned-routes -n $hub_csr2_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-az network nic show-effective-route-table --ids $hub_vm_nic_id -o table
+        # Verify that the RS is learning the routes from both CSRs
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr1_ip "sh ip bgp summ"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_csr2_ip "sh ip bgp summ"
+        az network routeserver peering list --routeserver $rs_name -g $rg -o table
+        az network routeserver peering list-learned-routes -n $hub_csr1_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+        az network routeserver peering list-learned-routes -n $hub_csr2_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+        az network nic show-effective-route-table --ids $hub_vm_nic_id -o table
 
-# Simulate outage of CSR1 and measure time for CSR2 to take over (looking at the effective routes)
-function bring_down_csr1() {
-  ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
-  config t
-    int GigabitEthernet2
-    shutdown
-EOF
-  start_time=$(date +%s)
-  echo "Internal interface shutdown in CSR1, now waiting for the effective route to switch to CSR2 ($hub_csr2_bgp_ip)..."
-  nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]')  && echo $nexthop
-  until [[ "$nexthop" == "$hub_csr2_bgp_ip" ]]
-  do
-    nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
-    echo "Next hop for 0.0.0.0/0 is $nexthop"
-  done
-  finish_time=$(date +%s)
-  run_time=$(($finish_time - $start_time))
-  ((minutes=run_time/60))
-  ((seconds=run_time%60))
-  echo "Effective route pointing now to $nexthop after $minutes minutes and $seconds seconds"
-}
+        # Simulate outage of CSR1 and measure time for CSR2 to take over (looking at the effective routes)
+        function bring_down_csr1() {
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
+          config t
+            int GigabitEthernet2
+            shutdown
+        EOF
+          start_time=$(date +%s)
+          echo "Internal interface shutdown in CSR1, now waiting for the effective route to switch to CSR2 ($hub_csr2_bgp_ip)..."
+          nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]')  && echo $nexthop
+          until [[ "$nexthop" == "$hub_csr2_bgp_ip" ]]
+          do
+            nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
+            echo "Next hop for 0.0.0.0/0 is $nexthop"
+          done
+          finish_time=$(date +%s)
+          run_time=$(($finish_time - $start_time))
+          ((minutes=run_time/60))
+          ((seconds=run_time%60))
+          echo "Effective route pointing now to $nexthop after $minutes minutes and $seconds seconds"
+        }
 
-# Restore CSR1 connectivity
-function bring_up_csr1() {
-  ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
-  config t
-    int GigabitEthernet2
-    no shutdown
-EOF
-  start_time=$(date +%s)
-  echo "Internal interface restored in CSR1, now waiting for the effective route to switch back to CSR1 ($hub_csr1_bgp_ip)..."
-  nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
-  until [[ "$nexthop" == "$hub_csr1_bgp_ip" ]]
-  do
-    nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
-    echo "Next hop for 0.0.0.0/0 is $nexthop"
-  done
-  finish_time=$(date +%s)
-  run_time=$(($finish_time - $start_time))
-  ((minutes=run_time/60))
-  ((seconds=run_time%60))
-  echo "Effective route pointing now to $nexthop after $minutes minutes and $seconds seconds"
-}
+        # Restore CSR1 connectivity
+        function bring_up_csr1() {
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$hub_csr1_ip" <<EOF
+          config t
+            int GigabitEthernet2
+            no shutdown
+        EOF
+          start_time=$(date +%s)
+          echo "Internal interface restored in CSR1, now waiting for the effective route to switch back to CSR1 ($hub_csr1_bgp_ip)..."
+          nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
+          until [[ "$nexthop" == "$hub_csr1_bgp_ip" ]]
+          do
+            nexthop=$(az network nic show-effective-route-table --ids $hub_vm_nic_id -o json | jq -r '.value | map(select(.addressPrefix[0] | contains("0.0.0.0/0"))) | .[].nextHopIpAddress[]' 2>/dev/null)
+            echo "Next hop for 0.0.0.0/0 is $nexthop"
+          done
+          finish_time=$(date +%s)
+          run_time=$(($finish_time - $start_time))
+          ((minutes=run_time/60))
+          ((seconds=run_time%60))
+          echo "Effective route pointing now to $nexthop after $minutes minutes and $seconds seconds"
+        }
 
-bring_down_csr1
-bring_up_csr1
+        bring_down_csr1
+        bring_up_csr1
+    fi
+fi
 
 ################
 #    Spokes    #
@@ -920,7 +929,7 @@ az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --a
 az network public-ip create -g $rg -n "${vpngw_pip}-a" --allocation-method Dynamic --sku Basic
 az network public-ip create -g $rg -n "${vpngw_pip}-b" --allocation-method Dynamic --sku Basic
 az network vnet-gateway create -g "$rg" --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased \
-            --vnet "$vnet_name" -n $vpngw_name --asn "$vpngw_asn" --public-ip-addresses "${vpngw_pip}-a" "${vpngw_pip}-b"
+            --vnet "$vnet_name" -n $vpngw_name --asn "$vpngw_asn" --public-ip-addresses "${vpngw_pip}-a" "${vpngw_pip}-b" --no-wait
 az network vnet-gateway list -g $rg -o table
 
 # Inspect learnt routes

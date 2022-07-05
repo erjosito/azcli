@@ -1,0 +1,1146 @@
+###############################################
+# Scripts to test AVS networking connectivity
+# It doesnt include setting up AVS
+#
+# Jose Moreno, May 2022
+###############################################
+
+
+# Control
+simulate_onprem=no
+create_2nd_region=no
+fw_type=ubuntu          # Possible values: ubuntu/azfw
+create_aux_vnet=yes     # Create auxiliary VNet for AVS to onprem
+create_spoke=yes        # Create one spoke VNet in Azure
+create_vwan=yes         # If using a VWAN to connect to onprem
+
+#############
+# Variables #
+#############
+rg=avstest
+er_circuit_sku=Standard
+er_provider=Megaport
+linux_vm_size=Standard_B1s
+windows_vm_size=Standard_B2s
+azfw_policy_name=azfw-policy
+# Location 1
+location1=germanywestcentral
+er1_location=germanywestcentral
+er1_pop=Frankfurt
+er1_circuit_name="er-${er1_pop}"
+ergw1_name="ergw-${er1_pop}"
+ergw1_pip="${ergw1_name}-pip"
+vnet1_name="ervnet-${er1_pop}"
+vnet1_prefix=192.168.11.0/24
+gw_subnet1_prefix=192.168.11.0/27
+rs_subnet1_prefix=192.168.11.32/27
+vm_subnet1_name=vm
+vm_subnet1_prefix=192.168.11.64/27
+bgpvmss_subnet1_prefix=192.168.11.96/27
+fw_subnet1_prefix=192.168.11.128/26
+nva_subnet1_name=nva
+nva_subnet1_prefix=192.168.11.192/27
+bgpvmss_subnet1_name=bgpvmss
+linvm1_name="linvm-${er1_pop}"
+linvm1_pip_name="${linvm1_name}-pip"
+winvm1_name="winvm-${er1_pop}"
+winvm1_pip_name="${winvm1_name}-pip"
+winvm1_username=$(whoami)
+mcr1_asn=65001
+azfw1_name=azfw1
+azfw1_pip_name="${azfw1_name}-pip"
+vnet1aux_name="ervnet-${er1_pop}-aux"
+vnet1aux_prefix=192.168.111.0/24
+gw_subnet1aux_prefix=192.168.111.0/27
+rs_subnet1aux_prefix=192.168.111.32/27
+nva_subnet1aux_name=nva
+nva_subnet1aux_prefix=192.168.111.128/26
+ergw1aux_name="ergw-${er1_pop}-aux"
+ergw1aux_pip="${ergw1aux_name}-pip"
+spoke1_vnet_name="spoke-${er1_pop}"
+spoke1_vnet_prefix=192.168.2.0/24
+spoke1_subnet_name=vm
+spoke1_subnet_prefix=192.168.2.0/26
+vwan1_hub_space=192.168.0.0/24
+# Location 2
+# location2=southcentralus
+# er2_location=southcentralus
+# er2_pop=Dallas
+# er2_circuit_name="er-${er2_pop}"
+location2=germanywestcentral
+er2_location=germanywestcentral
+er2_pop=Frankfurt
+er2_circuit_name="er-avs"
+ergw2_name="ergw-${er2_pop}"
+ergw2_pip="${ergw2_name}-pip"
+vnet2_name="ervnet-${er2_pop}"
+vnet2_prefix=192.168.12.0/24
+vm_subnet2_name=vm
+vm_subnet2_prefix=192.168.12.64/27
+gw_subnet2_prefix=192.168.12.0/27
+rs_subnet2_prefix=192.168.12.32/27
+fw_subnet2_prefix=192.168.12.128/26
+bgpvmss_subnet2_prefix=192.168.12.96/27
+bgpvmss_subnet2_name=bgpvmss
+linvm2_name="linvm-${er2_pop}"
+linvm2_pip_name="${linvm2_name}-pip"
+mcr2_asn=65004
+# Secrets
+akv_name=erjositoKeyvault
+vcenter_username_secret=vcenterUsername
+vcenter_password_secret=vcenterPassword
+nsxmgr_username_secret=vcenterUsername
+nsxmgr_password_secret=vcenterPassword
+avs_er_key_secret=avsExpressRouteKey
+avs_er_circuit_id_secret=avsExpressRouteCircuitId
+default_password_secret=defaultPassword
+# BGP VMSS
+bgpvmss_name=bgpvmss
+bgpvmss_size=Standard_B1s
+bgpvmss_publisher=Canonical
+bgpvmss_offer=UbuntuServer
+bgpvmss_sku=18.04-LTS
+bgpvmss_version=latest
+bgpvmss_asn=65011
+bgpvmss_cloudinit_file=/tmp/bgpvmss_cloudinit.txt
+# AVS details
+vcenter_ip=10.2.252.2
+nsxmgr_ip=10.2.252.3
+avs_vm_ip=192.168.5.4
+# gcloud variables
+project_name=onprem
+project_id="${project_name}${RANDOM}"
+machine_type=e2-micro
+gcp_asn=16550
+# gcp region 1
+region1=europe-west3
+zone1=europe-west3-b
+gcp_vm1_name=vm1
+gcp_vpc1_name=vpc1
+gcp_subnet1_name=vm1
+gcp_subnet1_prefix='192.168.12.0/24'
+attachment1_name=attachment1
+router1_name=router1
+# gcp region 2
+# region2=us-west2
+# zone2=us-west2-b
+region2=europe-west3
+zone2=europe-west3-b
+gcp_vm2_name=vm2
+gcp_vpc2_name=vpc2
+gcp_subnet2_name=vm2
+gcp_subnet2_prefix='192.168.22.0/24'
+attachment2_name=attachment2
+router2_name=router2
+
+#############
+# Functions #
+#############
+
+# Wait for resource to be created
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
+# Wait until GCP attachment is ready
+function wait_for_gcp_attachment_ready () {
+    wait_interval=15
+    attachment_name=$1
+    region_name=$2
+    echo "Waiting for attachment $attachment_name to become ready..."
+    start_time=`date +%s`
+    state=$(gcloud compute interconnects attachments describe $attachment_name --region $region_name --format json | jq -r '.state')
+    until [[ "$state" == "ACTIVE" ]] || [[ -z "$state" ]]
+    do
+        sleep $wait_interval
+        state=$(gcloud compute interconnects attachments describe $attachment_name --region $region_name --format json | jq -r '.state')
+    done
+    if [[ -z "$state" ]]; then
+        echo "Something really bad happened..."
+    else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Attachment $attachment_name state is $state, wait time $minutes minutes and $seconds seconds"
+    fi
+}
+
+# Get the first IP of a subnet (default gateway)
+function first_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
+
+############
+#   Code   #
+############
+
+# Get secrets
+akv_rg_found=$(az keyvault list -o tsv --query "[?name=='$akv_name'].resourceGroup" 2>/dev/null)
+if [[ -n ${akv_rg_found} ]]
+then
+    echo "INFO: AKV ${akv_name} found in resource group $akv_rg_found"
+    akv_rg="$akv_rg_found"
+    vcenter_username=$(az keyvault secret show --vault-name $akv_name -n $vcenter_username_secret --query 'value' -o tsv 2>/dev/null)
+    vcenter_password=$(az keyvault secret show --vault-name $akv_name -n $vcenter_password_secret --query 'value' -o tsv 2>/dev/null)
+    nsxmgr_username=$(az keyvault secret show --vault-name $akv_name -n $nsxmgr_username_secret --query 'value' -o tsv 2>/dev/null)
+    nsxmgr_password=$(az keyvault secret show --vault-name $akv_name -n $nsxmgr_password_secret --query 'value' -o tsv 2>/dev/null)
+    avs_er_key=$(az keyvault secret show --vault-name $akv_name -n $avs_er_key_secret --query 'value' -o tsv 2>/dev/null)
+    avs_er_circuit_id=$(az keyvault secret show --vault-name $akv_name -n $avs_er_circuit_id_secret --query 'value' -o tsv 2>/dev/null)
+    default_password=$(az keyvault secret show --vault-name $akv_name -n $default_password_secret --query 'value' -o tsv 2>/dev/null)
+else
+    echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
+fi
+
+# Create RG
+echo "Creating resource group..."
+az group create -n $rg -l $location1 -o none
+
+# Create ER circuit (we need the service key to create the MCR)
+az network express-route create -n $er1_circuit_name --peering-location $er1_pop -g $rg -o none \
+    --bandwidth 50 Mbps --provider $er_provider -l $er1_location --sku-family MeteredData --sku-tier $er_circuit_sku
+service_key1=$(az network express-route show -n $er1_circuit_name -g $rg --query serviceKey -o tsv)
+
+# Start creating MCR router (takes a while)
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+if [[ -e "$megaport_script_path" ]]
+then
+    echo "Creating Megaport Cloud Router..."
+    $megaport_script_path -s=jomore-${er1_pop} -a=create_mcr --asn=$mcr1_asn -k=$service_key1
+else
+    echo "Sorry, I cannot seem to find the script $megaport_script_path to interact with the Megaport API"
+fi
+
+# Create VNet with subnets, and kick off the creation of the ER GW
+echo "Creating VNet and VMs (linux/win)..."
+az network vnet create -g $rg -n $vnet1_name --address-prefix $vnet1_prefix --subnet-name $vm_subnet1_name --subnet-prefix $vm_subnet1_prefix -l $location1 -o none
+az network vnet subnet create -g $rg --vnet-name $vnet1_name -n GatewaySubnet --address-prefix $gw_subnet1_prefix -o none
+az network vnet subnet create -g $rg --vnet-name $vnet1_name -n RouteServerSubnet --address-prefix $rs_subnet1_prefix -o none
+az network vnet subnet create -g $rg --vnet-name $vnet1_name -n AzureFirewallSubnet --address-prefix $fw_subnet1_prefix -o none
+az network vnet subnet create -g $rg --vnet-name $vnet1_name -n $bgpvmss_subnet1_name --address-prefix $bgpvmss_subnet1_prefix -o none
+az network vnet subnet create -g $rg --vnet-name $vnet1_name -n $nva_subnet1_name --address-prefix $nva_subnet1_prefix -o none
+az network public-ip create -g $rg -n $ergw1_pip --allocation-method Dynamic --sku Basic -l $location1 -o none
+if [[ "$create_vwan" == "no" ]]; then
+    az network vnet-gateway create -g $rg -n $ergw1_name --gateway-type ExpressRoute --sku Standard -l $location1 --vnet $vnet1_name --public-ip-addresses $ergw1_pip --no-wait -o none
+else
+    az network vwan create -n vwan -l $location1 -g $rg
+    az network vhub create --vwan vwan -n vhub --address-prefix $vwan1_hub_space -l $location1 -g $rg -o none
+    az network express-route gateway create -g $rg -n $ergw1_name --virtual-hub vhub -o none
+    az network vhub connection create -n $vnet1_name -g $rg --vhub-name vhub --remote-vnet $vnet1_name --internet-security true -o none
+fi
+az vm create -n $linvm1_name -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys --nsg "${linvm1_name}-nsg" -o none --public-ip-sku Standard \
+    --public-ip-address $linvm1_pip_name --vnet-name $vnet1_name --size $linux_vm_size --subnet $vm_subnet1_name -l $location1 --no-wait
+az vm create -n $winvm1_name -g $rg --image win2019datacenter --admin-username $winvm1_username --admin-password $default_password --size $windows_vm_size \
+   --vnet-name $vnet1_name --subnet $vm_subnet1_name --public-ip-address $winvm1_pip_name --public-ip-sku Standard --nsg "${winvm1_name}-nsg" --no-wait
+
+# Create an NSG for NVAs
+echo "Creating NSG for NVAs..."
+az network nsg create -n nva-nsg -g $rg -o none
+az network nsg rule create -n SSHin --nsg-name nva-nsg -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+az network nsg rule create -n ICMPin --nsg-name nva-nsg -g $rg --priority 1010 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp -o none
+az network nsg rule create -n WEBin --nsg-name nva-nsg -g $rg --priority 1020  --source-address-prefixes 'VirtualNetwork' --destination-port-ranges 80 443 --access Allow --protocol Tcp -o none
+az network nsg rule create -n ICMPout --nsg-name nva-nsg -g $rg --priority 1130 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp  --direction Outbound -o none
+
+# Optionally, create a spoke VNet
+if [[ "$create_spoke" == "yes" ]]; then
+    echo "Creating spoke VNet..."
+    az network vnet create -g $rg -n $spoke1_vnet_name --address-prefix $spoke1_vnet_prefix --subnet-name $spoke1_subnet_name --subnet-prefix $spoke1_subnet_prefix -l $location1 -o none
+    az vm create -n spoke1vm -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys --nsg "spoke1vm-nsg" -o none --public-ip-sku Standard \
+        --public-ip-address spoke1vm-pip --vnet-name $spoke1_vnet_name --size $linux_vm_size --subnet $spoke1_subnet_name -l $location1 --no-wait -o none
+    az network vnet peering create -n spoke1tohub -g $rg --vnet-name $spoke1_vnet_name --remote-vnet $vnet1_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n hubtospoke1 -g $rg --vnet-name $vnet1_name --remote-vnet $spoke1_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+fi
+
+# If simulate onprem, create VPC and VM in gcloud
+if [[ "$simulate_onprem" == "yes" ]]; then
+    # Get environment info
+    account=$(gcloud info --format json | jq -r '.config.account')
+    billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
+    billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
+    # Create project
+    gcloud projects create $project_id --name $project_name
+    gcloud config set project $project_id
+    gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
+    gcloud services enable compute.googleapis.com
+    # VPC and instance
+    gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+    gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1
+    gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
+    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+    gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="ip a"
+    # Create interconnect
+    gcloud compute routers create $router1_name --project=$project_id --network=$gcp_vpc1_name --asn=$gcp_asn --region=$region1
+    gcloud compute interconnects attachments partner create $attachment1_name --region $region1 --router $router1_name --edge-availability-domain availability-domain-1
+    pairing_key1=$(gcloud compute interconnects attachments describe $attachment1_name --region $region1 --format json | jq -r '.pairingKey')
+    # Create VXC in Megaport
+    $megaport_script_path -g -s=jomore-${er1_pop} -a=create_vxc -k=$pairing_key1
+    # Activate attachment
+    # wait_for_gcp_attachment_ready $attachment1_name $region1
+    sleep 120
+    gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --admin-enabled
+    # gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --no-enable-admin
+fi
+
+# If auxiliary VNet is created, AVS will be connected to that second VNet
+if [[ "$create_aux_vnet" = "yes" ]]; then
+    echo "Creating auxiliary VNet and VMs (linux/win)..."
+    az network vnet create -g $rg -n $vnet1aux_name --address-prefix $vnet1aux_prefix --subnet-name GatewaySubnet --subnet-prefix $gw_subnet1aux_prefix -l $location1 -o none
+    az network vnet subnet create -g $rg --vnet-name $vnet1aux_name -n RouteServerSubnet --address-prefix $rs_subnet1aux_prefix -o none
+    az network vnet subnet create -g $rg --vnet-name $vnet1aux_name -n $nva_subnet1aux_name --address-prefix $nva_subnet1aux_prefix -o none
+    az network public-ip create -g $rg -n $ergw1aux_pip --allocation-method Dynamic --sku Basic -l $location1 -o none
+    az network vnet-gateway create -g $rg -n $ergw1aux_name --gateway-type ExpressRoute --sku Standard -l $location1 --vnet $vnet1aux_name --public-ip-addresses $ergw1aux_pip --no-wait -o none
+    az network vnet peering create -n auxtohub -g $rg --vnet-name $vnet1aux_name --remote-vnet $vnet1_name --allow-vnet-access --allow-forwarded-traffic
+    az network vnet peering create -n hubtoaux -g $rg --vnet-name $vnet1_name --remote-vnet $vnet1aux_name --allow-vnet-access --allow-forwarded-traffic
+    # Deploy two Linux NVAs with ILB in NVA subnet
+    nva_vm_size=Standard_B1s
+    linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
+    cat <<EOF > $linuxnva_cloudinit_file
+#cloud-config
+runcmd:
+- apt update && apt install -y bird strongswan
+- sysctl -w net.ipv4.ip_forward=1
+- sysctl -w net.ipv4.conf.all.accept_redirects=0 
+- sysctl -w net.ipv4.conf.all.send_redirects=0
+EOF
+    az vm create -n nvaaux1 -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys \
+        --public-ip-address nvaaux1-pip --public-ip-sku Standard --vnet-name $vnet1aux_name --size $nva_vm_size --subnet $nva_subnet1aux_name \
+        --custom-data $linuxnva_cloudinit_file --nsg nva-nsg -o none
+    nvaaux1_nic_id=$(az vm show -n nvaaux1 -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    nvaaux1_ipconfig_name=$(az network nic show --ids $nvaaux1_nic_id --query 'ipConfigurations[0].name' -o tsv)
+    az network nic update --ids $nvaaux1_nic_id --ip-forwarding -o none
+    az vm create -n nvaaux2 -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys \
+        --public-ip-address nvaaux2-pip --public-ip-sku Standard --vnet-name $vnet1aux_name --size $nva_vm_size --subnet $nva_subnet1aux_name \
+        --custom-data $linuxnva_cloudinit_file --nsg nva-nsg -o none
+    nvaaux2_nic_id=$(az vm show -n nvaaux2 -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    nvaaux2_ipconfig_name=$(az network nic show --ids $nvaaux2_nic_id --query 'ipConfigurations[0].name' -o tsv)
+    az network nic update --ids $nvaaux2_nic_id --ip-forwarding -o none
+    echo "Creating Azure LB..."
+    az network lb create -n nvaaux-lb -g $rg -o table --backend-pool-name nvas --frontend-ip-name nvalbfrontend --vnet-name $vnet1aux_name --subnet $nva_subnet1aux_name --sku Standard -o none
+    az network lb probe create -n nvaprobe --lb-name nvaaux-lb -g $rg --protocol tcp --port 22 --interval 5 --threshold 2 -o none
+    az network lb rule create -n nvahaports --lb-name nvaaux-lb -g $rg --protocol All --frontend-port 0 --backend-port 0 --frontend-ip-name nvalbfrontend --backend-pool-name nvas --probe-name nvaprobe -o none
+    nvaaux1_nic_name=$(echo $nvaaux1_nic_id | cut -d/ -f 9)
+    nvaaux2_nic_name=$(echo $nvaaux2_nic_id | cut -d/ -f 9)
+    az network nic ip-config address-pool add --nic-name $nvaaux1_nic_name -g $rg --ip-config-name $nvaaux1_ipconfig_name --lb-name nvaaux-lb --address-pool nvas -o none
+    az network nic ip-config address-pool add --nic-name $nvaaux2_nic_name -g $rg --ip-config-name $nvaaux2_ipconfig_name --lb-name nvaaux-lb --address-pool nvas -o none
+    nvaaux1_pip_ip=$(az network public-ip show -n nvaaux1-pip -g $rg --query ipAddress -o tsv) && echo $nvaaux1_pip_ip
+    nvaaux2_pip_ip=$(az network public-ip show -n nvaaux2-pip -g $rg --query ipAddress -o tsv) && echo $nvaaux2_pip_ip
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nvaaux1_pip_ip" "ip a"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nvaaux2_pip_ip" "ip a"
+    # Connect AVS with Azure Aux VNet
+    ergw1aux_id=$(az network vnet-gateway show -n $ergw1aux_name -g $rg --query id -o tsv)
+    wait_until_finished $ergw1_id
+    az network vpn-connection create -n avs2vnet -g $rg --authorization-key $avs_er_key --vnet-gateway1 $ergw1aux_id --express-route-circuit2 $avs_er_circuit_id -o none
+else
+    # Connect AVS with Azure VNet
+    ergw1_id=$(az network vnet-gateway show -n $ergw1_name -g $rg --query id -o tsv)
+    wait_until_finished $ergw1_id
+    az network vpn-connection create -n avs2vnet -g $rg --authorization-key $avs_er_key --vnet-gateway1 $ergw1_id --express-route-circuit2 $avs_er_circuit_id -o none
+fi
+
+# Test connectivity thru Linux VM to AVS VM
+linvm1_pip=$(az network public-ip show -n $linvm1_pip_name -g $rg --query ipAddress -o tsv)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip "ping $avs_vm_ip -c 5"
+
+# Get NSX T0 name
+nsx_auth_string="${nsxmgr_username}:${nsxmgr_password}"
+nsx_auth_base64=$(echo $nsx_auth_string | base64)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip "sudo apt install -y jq"
+cmd="curl -ks -X GET -H \"Accept: application/json\" -u '${nsxmgr_username}:${nsxmgr_password}' https://$nsxmgr_ip/policy/api/v1/infra/tier-0s/"
+t0_id=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip $cmd | jq -r '.results[0].id')
+# Get BGP Routes
+cmd="curl -ks -X GET -H \"Accept: application/json\" -u '${nsxmgr_username}:${nsxmgr_password}' https://${nsxmgr_ip}/policy/api/v1/infra/tier-0s/${t0_id}/locale-services/${t0_id}-LOCALE-SERVICES/bgp/neighbors/${t0_id}-A/routes"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip $cmd | jq -r '.results[0].egde_node_routes[0].routes[] | {network,next_hop,local_pref,weight,med,as_path} | join("\t")'   # Note the "egde" typo!!!
+# Get BGP neighbors
+cmd="curl -ks -X GET -H \"Accept: application/json\" -u '${nsxmgr_username}:${nsxmgr_password}' https://${nsxmgr_ip}/policy/api/v1/infra/tier-0s/${t0_id}/locale-services/${t0_id}-LOCALE-SERVICES/bgp/neighbors/status"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $linvm1_pip $cmd | jq -r '.results[] | {neighbor_address,remote_as_number,connection_state,keep_alive_interval,hold_time_interval,source_address}|join("\t")'   # Note the "egde" typo!!!
+
+# Create Log Analytics workspace
+# logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
+# if [[ -z "$logws_name" ]]
+# then
+#     logws_name=log$RANDOM
+#     echo "Creating Log Analytics workspace ${logws_name}..."
+#     az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+# else
+#     echo "Log Analytics workspace ${logws_name} found in the subscription"
+# fi
+# logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+# logws_customer_id=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+# logws_key=$(az monitor log-analytics workspace get-shared-keys -g $rg -n $logws_name --query primarySharedKey -o tsv)
+
+# Deploy AzFW
+if [[ "$fw_type" == "azfw" ]]; then
+    echo "Creating Azure Firewall..."
+    az network firewall policy create -n $azfw_policy_name -g $rg --sku Standard -o none
+    az network public-ip create -n $azfw1_pip_name -g $rg --sku Standard --allocation-method Static -o none
+    az network firewall create -n $azfw1_name -g $rg -l $location1 --policy $azfw_policy_name -o none
+    azfw1_id=$(az network firewall show -n $azfw1_name -g $rg -o tsv --query id)
+    az network firewall ip-config create -f $azfw1_name -n azfw1-ipconfig -g $rg --public-ip-address $azfw1_pip_name --vnet-name $vnet1_name -o none
+    az network firewall update -n $azfw1_name -g $rg -o none
+    azfw1_private_ip=$(az network firewall show -n $azfw1_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+    echo "Azure Firewall created with private IP $azfw1_private_ip"
+
+    # Enable firewall logs
+    azfw1_id=$(az network firewall show -n $azfw1_name -g $rg -o tsv --query id)
+    az monitor diagnostic-settings create -n mydiag --resource $azfw1_id --workspace $logws_id -o none \
+        --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+        --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+                {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+
+    # Allow-all rule
+    echo "Creating firewall rules..."
+    az network firewall policy rule-collection-group create -n myrcg --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
+    az network firewall policy rule-collection-group collection add-filter-collection --rule-type NetworkRule -g $rg --rcg-name myrcg --policy-name $azfw_policy_name \
+        --action Allow --collection-priority 1010 --name allowany --rule-name allowany --source-addresses '*' --destination-addresses '*' \
+        --ip-protocols Any --destination-ports '*' -o none
+else
+    # Deploy two Linux NVAs with ILB in NVA subnet
+    nva_vm_size=Standard_B1s
+    linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
+    cat <<EOF > $linuxnva_cloudinit_file
+#cloud-config
+runcmd:
+- apt update && apt install -y bird strongswan
+- sysctl -w net.ipv4.ip_forward=1
+- sysctl -w net.ipv4.conf.all.accept_redirects=0 
+- sysctl -w net.ipv4.conf.all.send_redirects=0
+EOF
+    az vm create -n nva1 -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys \
+        --public-ip-address nva1-pip --public-ip-sku Standard --vnet-name $vnet1_name --size $nva_vm_size --subnet $nva_subnet1_name \
+        --custom-data $linuxnva_cloudinit_file --nsg nva-nsg -o none
+    nva1_nic_id=$(az vm show -n nva1 -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    nva1_ipconfig_name=$(az network nic show --ids $nva1_nic_id --query 'ipConfigurations[0].name' -o tsv)
+    az network nic update --ids $nva1_nic_id --ip-forwarding -o none
+    az vm create -n nva2 -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys \
+        --public-ip-address nva2-pip --public-ip-sku Standard --vnet-name $vnet1_name --size $nva_vm_size --subnet $nva_subnet1_name \
+        --custom-data $linuxnva_cloudinit_file --nsg nva-nsg -o none
+    nva2_nic_id=$(az vm show -n nva2 -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    nva2_ipconfig_name=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].name' -o tsv)
+    az network nic update --ids $nva2_nic_id --ip-forwarding -o none
+    echo "Creating internal Azure LB..."
+    az network lb create -n nva-lb-internal -g $rg -o table --backend-pool-name nvas --frontend-ip-name nvalbfrontend --vnet-name $vnet1_name --subnet $nva_subnet1_name --sku Standard -o none
+    az network lb probe create -n nvaprobe --lb-name nva-lb-internal -g $rg --protocol tcp --port 22 --interval 5 --threshold 2 -o none
+    az network lb rule create -n nvahaports --lb-name nva-lb-internal -g $rg --protocol All --frontend-port 0 --backend-port 0 --frontend-ip-name nvalbfrontend --backend-pool-name nvas --probe-name nvaprobe -o none
+    nva1_nic_name=$(echo $nva1_nic_id | cut -d/ -f 9)
+    nva2_nic_name=$(echo $nva2_nic_id | cut -d/ -f 9)
+    az network nic ip-config address-pool add --nic-name $nva1_nic_name -g $rg --ip-config-name $nva1_ipconfig_name --lb-name nva-lb-internal --address-pool nvas -o none
+    az network nic ip-config address-pool add --nic-name $nva2_nic_name -g $rg --ip-config-name $nva2_ipconfig_name --lb-name nva-lb-internal --address-pool nvas -o none
+    echo "Creating public Azure LB..."
+    az network lb create -n nva-lb-external -g $rg -o table --backend-pool-name nvas --frontend-ip-name nvalbfrontend --public-ip-address nva-lb-external-pip --sku Standard -o none
+    az network lb probe create -n nvaprobe --lb-name nva-lb-external -g $rg --protocol tcp --port 22 --interval 5 --threshold 2 -o none
+    az network lb rule create -n nvaport80 --lb-name nva-lb-external -g $rg --protocol Tcp --frontend-port 80 --backend-port 80 --frontend-ip-name nvalbfrontend --backend-pool-name nvas --probe-name nvaprobe -o none
+    nva1_nic_name=$(echo $nva1_nic_id | cut -d/ -f 9)
+    nva2_nic_name=$(echo $nva2_nic_id | cut -d/ -f 9)
+    az network nic ip-config address-pool add --nic-name $nva1_nic_name -g $rg --ip-config-name $nva1_ipconfig_name --lb-name nva-lb-external --address-pool nvas -o none
+    az network nic ip-config address-pool add --nic-name $nva2_nic_name -g $rg --ip-config-name $nva2_ipconfig_name --lb-name nva-lb-external --address-pool nvas -o none
+    echo "Testing connectivity to NVAs..."
+    nva1_pip_ip=$(az network public-ip show -n nva1-pip -g $rg --query ipAddress -o tsv) && echo $nva1_pip_ip
+    nva2_pip_ip=$(az network public-ip show -n nva2-pip -g $rg --query ipAddress -o tsv) && echo $nva2_pip_ip
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva1_pip_ip" "ip a"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva2_pip_ip" "ip a"
+fi
+
+# Deploy Azure Route Server
+if [[ "$create_vwan" == "yes" ]]; then
+    echo "Getting VWAN information..."
+    rs1_asn=$(az network vhub show -n vhub -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs1_asn
+    rs1_ip1=$(az network vhub show -n vhub -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs1_ip1
+    rs1_ip2=$(az network vhub show -n vhub -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs1_ip2
+else
+    echo "Creating Route Server..."
+    rs_subnet_id=$(az network vnet subnet show -n RouteServerSubnet --vnet-name $vnet1_name -g $rg --query id -o tsv)
+    az network public-ip create -n rs1-pip -g $rg --sku Standard --allocation-method Static -o none
+    az network routeserver create -n rs1 -g $rg --hosted-subnet $rs_subnet_id -l $location1 --public-ip-address rs1-pip -o none
+    rs1_asn=$(az network routeserver show -n rs1 -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs1_asn
+    rs1_ip1=$(az network routeserver show -n rs1 -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs1_ip1
+    rs1_ip2=$(az network routeserver show -n rs1 -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs1_ip2
+    # az network routeserver update -n rs1 -g $rg --allow-b2b-traffic -o none # Required??
+fi
+if [[ "$create_aux_vnet" == "yes" ]]; then
+    rs_subnet_id=$(az network vnet subnet show -n RouteServerSubnet --vnet-name $vnet1aux_name -g $rg --query id -o tsv)
+    az network public-ip create -n rsaux1-pip -g $rg --sku Standard --allocation-method Static -o none
+    az network routeserver create -n rsaux1 -g $rg --hosted-subnet $rs_subnet_id -l $location1 --public-ip-address rsaux1-pip -o none
+    rsaux1_asn=$(az network routeserver show -n rsaux1 -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rsaux1_asn
+    rsaux1_ip1=$(az network routeserver show -n rsaux1 -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rsaux1_ip1
+    rsaux1_ip2=$(az network routeserver show -n rsaux1 -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rsaux1_ip2
+    # az network routeserver update -n rsaux1 -g $rg --allow-b2b-traffic -o none # Required??
+fi
+
+if [[ "$fw_type" == "azfw" ]]; then
+
+    # Create Identity for BGP VMSS
+    bgp_id_name="$bgpvmss_name"
+    bgp_id_id=$(az identity show -n $bgp_id_name -g $rg --query id -o tsv)
+    if [[ -z "$bgp_id_id" ]]; then
+        echo "Creating managed identity and assigning contributor role to RG..."
+        az identity create -n $bgp_id_name -g $rg -o none
+        bgp_id_id=$(az identity show -n $bgp_id_name -g $rg --query id -o tsv)
+        bgp_id_principal_id=$(az identity show -n $bgp_id_name -g $rg --query principalId -o tsv)
+        rg_id=$(az group show -n $rg --query id -o tsv)
+        az role assignment create --scope $rg_id --assignee $bgp_id_principal_id --role 'Contributor' -o none
+    else
+        echo "Found managed identity $bgp_id_id"
+    fi
+
+    # Create cloudinit file for BGP VMSS
+    echo "Creating cloudinit file for VMSS..."
+    bgpvmss_default_gw=$(first_ip "$bgpvmss_subnet_prefix")
+    cat <<EOF > $bgpvmss_cloudinit_file
+#cloud-config
+packages:
+  - bird
+  - python3-pip
+  - jq
+runcmd:
+  - [ pip3, install, flask ]
+  - [ wget, "$healthcheck_script_url", "-P", "/root/" ]
+  - [ wget, "$housekeeping_script_url", "-P", "/root/" ]
+  - [ chmod, "755", "/root/routeserver-vmss-selfcontained-config.sh" ]
+  - [ wget, "https://aka.ms/InstallAzureCLIDeb", "-O", "/root/install_azcli.sh" ]
+  - bash /root/install_azcli.sh
+  - /root/routeserver-vmss-selfcontained-config.sh
+  - [ systemctl, restart, bird ]
+  - python3 /root/routeserver-vmss-selfcontained-healthcheck.py &
+write_files:
+- path: /etc/crontab
+  append: true
+  content: |
+    */5 * * * * root /root/routeserver-vmss-selfcontained-config.sh
+- content: |
+    $routes_url
+  path: /root/routes_url
+- content: |
+    log syslog all;
+    protocol device {
+            scan time 10;
+    }
+    protocol direct {
+        disabled;
+    }
+    protocol kernel {
+        preference 254;
+        learn;
+        merge paths on;
+        import filter {
+            reject;
+        };
+        export filter {
+            reject;
+        };
+    }
+    protocol static {
+        import all;
+        # Example: 
+        # route 0.0.0.0/0 via $nva_default_gw;
+        # Routes advertised --DONT CHANGE THIS LINE--
+    }
+    filter TO_RS {
+        bgp_next_hop = $azfw1_private_ip;
+        accept;
+    }
+    protocol bgp rs0 {
+        description "RouteServer instance 0";
+        multihop;
+        local as $bgpvmss_asn;
+        neighbor $rs_ip1 as $rs_asn;
+        import filter {accept;};
+        export filter TO_RS;
+    }
+    protocol bgp rs1 {
+        description "Route Server instance 1";
+        multihop;
+        local as $bgpvmss_asn;
+        neighbor $rs_ip2 as $rs_asn;
+        import filter {accept;};
+        export filter TO_RS;
+    }
+  path: /etc/bird/bird.conf.template
+EOF
+
+    # Create NSG for BGM VMSS
+    echo "Creating NSG for BGP VMSS..."
+    az network nsg create -n "${bgpvmss_name}-nsg" -g $rg -o none
+    az network nsg rule create -n SSH --nsg-name "${bgpvmss_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+    az network nsg rule create -n ICMP --nsg-name "${bgpvmss_name}-nsg" -g $rg --priority 1030 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp -o none
+    az network nsg rule create -n Webin --nsg-name "${bgpvmss_name}-nsg" -g $rg --priority 1040 --source-address-prefixes 'VirtualNetwork' --destination-port-ranges 8080 --access Allow --protocol Tcp -o none  # To troubleshoot the HTTP healthchecks
+    az network nsg rule create -n ICMPout --nsg-name "${bgpvmss_name}-nsg" -g $rg --priority 1130 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp  --direction Outbound -o none
+
+    # Create BGP VMSS and configure the autorepair extension
+    echo "Creating VMSS..."
+    az vmss create -n $bgpvmss_name -g $rg -l $location1 --image "${bgpvmss_publisher}:${bgpvmss_offer}:${bgpvmss_sku}:${bgpvmss_version}" --generate-ssh-keys \
+        --vnet-name $vnet1_name --subnet $bgpvmss_subnet1_name --assign-identity $bgp_id_id -z 1 2 3 \
+        --vm-sku ${bgpvmss_size} --custom-data "$bgpvmss_cloudinit_file" --nsg "${bgpvmss_name}-nsg" --instance-count 1 -o none
+    # Configure App Health Extension
+    echo "Enabling Application Health Extension in the VMSS..."
+    cat <<EOF > /tmp/health_extension.json
+{
+    "protocol": "http",
+    "port": 8080,
+    "requestPath": "/api/healthcheck",
+    "intervalInSeconds": 30,
+    "numberOfProbes": 1
+}
+EOF
+    az vmss extension set -n ApplicationHealthLinux --publisher Microsoft.ManagedServices --version 1.0 -g $rg --vmss-name $bgpvmss_name --settings /tmp/health_extension.json -o none
+    az vmss update-instances -n $bgpvmss_name -g $rg --instance-ids '*' -o none
+    # Scale NVA VMSS in and out
+    az vmss scale -n $bgpvmss_name -g $rg --new-capacity 2 -o none
+
+    # Create RT and attach it to the VM subnet
+    az network route-table create -n vm1rt -g $rg --disable-bgp-route-propagation -o none
+    az network vnet subnet update -n $vm_subnet1_name --vnet-name $vnet1_name -g $rg --route-table vm1rt -o none
+
+    # Create RT and attach it to the Gateway subnet
+    az network route-table create -n vng1rt -g $rg -o none
+    az network vnet subnet update -n GatewaySubnet --vnet-name $vnet1_name -g $rg --route-table vng1rt -o none
+    az network route-table route create -g $rg --route-table-name vng1rt -n summary -o none \
+        --next-hop-type VirtualAppliance --address-prefix 192.168.0.0/16 --next-hop-ip-address $azfw1_private_ip
+    # az network route-table route delete -g $rg --route-table-name vng1rt -n summary -o none
+
+
+# If not using AzFW but NVAs, connect the NVAs to the Route Server
+else
+
+    # Configure BIRD on NVA1
+    nva1_pip_ip=$(az network public-ip show -n nva1-pip -g $rg --query ipAddress -o tsv) && echo $nva1_pip_ip
+    nva1_private_ip=$(az network nic show --ids $nva1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nva1_private_ip
+    nva_default_gw=$(first_ip "$nva_subnet1_prefix") && echo $nva_default_gw
+    nva_asn=65003
+    nva_lb_ip=$(az network lb frontend-ip list --lb-name nva-lb-internal -g $rg --query '[0].privateIpAddress' -o tsv) && echo $nva_lb_ip
+    bird_config_file=/tmp/bird.conf
+    cat <<EOF > $bird_config_file
+log syslog all;
+router id $nva1_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      disabled;
+}
+protocol static {
+      import all;
+      route $rs1_ip1/32 via $nva_default_gw;
+      route $rs1_ip2/32 via $nva_default_gw;
+      #route $spoke1_vnet_prefix via $nva_default_gw;
+      #route $vnet1_prefix via $nva_default_gw;
+      route 1.1.1.1/32 via $nva_default_gw;  # Test route to test propagation
+}
+filter TO_RS {
+      #bgp_next_hop = $nva_lb_ip;
+      accept;
+}
+protocol bgp rs0 {
+      description "RouteServer instance 0";
+      multihop;
+      local $nva1_private_ip as $nva_asn;
+      neighbor $rs1_ip1 as $rs1_asn;
+      import filter {accept;};
+      export filter TO_RS;
+}
+protocol bgp rs1 {
+      description "Route Server instance 1";
+      multihop;
+      local $nva1_private_ip as $nva_asn;
+      neighbor $rs1_ip2 as $rs1_asn;
+      import filter {accept;};
+      export filter TO_RS;
+}
+EOF
+    username=$(whoami)
+    scp $bird_config_file "${nva1_pip_ip}:/home/${username}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip_ip "sudo systemctl restart bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip_ip "systemctl status bird"
+    # Configure BIRD on NVA2
+    nva2_pip_ip=$(az network public-ip show -n nva2-pip -g $rg --query ipAddress -o tsv) && echo $nva2_pip_ip
+    nva2_private_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nva2_private_ip
+    bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+log syslog all;
+router id $nva2_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      disabled;
+}
+protocol static {
+      import all;
+      route $rs1_ip1/32 via $nva_default_gw;
+      route $rs1_ip2/32 via $nva_default_gw;
+      #route $spoke1_vnet_prefix via $nva_default_gw;
+      #route $vnet1_prefix via $nva_default_gw;
+      route 2.2.2.2/32 via $nva_default_gw;  # Test route to test propagation
+}
+filter TO_RS {
+      # Test next-hop feature with control route
+      if ( net ~ [ 2.2.2.2/32 ] ) then {
+            bgp_next_hop = $nva_lb_ip;
+            accept; 
+      }
+      else {
+            accept;
+      }
+}
+protocol bgp rs0 {
+      description "RouteServer instance 0";
+      multihop;
+      local $nva2_private_ip as $nva_asn;
+      neighbor $rs1_ip1 as $rs1_asn;
+      import filter {accept;};
+      export filter TO_RS;
+}
+protocol bgp rs1 {
+      description "Route Server instance 1";
+      multihop;
+      local $nva2_private_ip as $nva_asn;
+      neighbor $rs1_ip2 as $rs1_asn;
+      import filter {accept;};
+      export filter TO_RS;
+}
+EOF
+    username=$(whoami)
+    scp $bird_config_file "${nva2_pip_ip}:/home/${username}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip_ip "sudo systemctl restart bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip_ip "systemctl status bird"
+
+    # If using VWAN, connect with BGP to VWAN, otherwise connect with BGP to RS
+    if [[ "$create_vwan" == "yes" ]]; then
+        vhub_connection_id=$(az network vhub connection show -n $vnet1_name --vhub-name vhub -g $rg --query id -o tsv) && echo $vhub_connection_id
+        # az network vhub bgpconnection delete -n nva1 -g $rg --vhub-name vhub -y -o none
+        # az network vhub bgpconnection delete -n nva2 -g $rg --vhub-name vhub -y -o none
+        az network vhub bgpconnection create -n nva1 -g $rg --vhub-name vhub --peer-asn $nva_asn --peer-ip $nva1_private_ip --vhub-conn $vhub_connection_id -o none
+        az network vhub bgpconnection create -n nva2 -g $rg --vhub-name vhub --peer-asn $nva_asn --peer-ip $nva2_private_ip --vhub-conn $vhub_connection_id -o none
+        echo "Adding default route to defaultRouteTable in Virtual WAN..."
+        vnet1_cx_id=$(az network vhub connection show --vhub-name vhub -g $rg -n $vnet1_name --query id -o tsv) && echo $vnet1_cx_id
+        az network vhub route-table route add -n defaultRouteTable -g $rg --vhub-name vhub --destination-type CIDR --destinations $spoke1_vnet_prefix --next-hop-type ResourceId --next-hop $vnet1_cx_id --route-name spoke1 -o none
+        # Delete all previously existing routes in the VNet connection
+        vnet_route_name=$(az network vhub connection show --ids $vnet1_cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+        while [[ -n "$vnet_route_name" ]]
+        do
+            echo "Previous route $vnet_route_name detected in connection, deleting first..."
+            az network vhub connection update --ids $vnet1_cx_id --remove "routingConfiguration.vnetRoutes.staticRoutes" "0" -o none
+            vnet_route_name=$(az network vhub connection show --ids $vnet1_cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+        done
+        echo "Creating static route in connection $vnet1_cx_id with next hop ${nva_lb_ip}..."
+            vnet_route="{
+                \"name\": \"spoke1\",
+                \"nextHopIpAddress\": \"${nva_lb_ip}\",
+                \"addressPrefixes\": [ \"${spoke1_vnet_prefix}\" ]}"
+        az network vhub connection update --ids $vnet1_cx_id --add "routingConfiguration.vnetRoutes.staticRoutes" $vnet_route -o none
+
+    else
+        az network routeserver peering create --routeserver rs1 -g $rg --peer-ip $nva1_private_ip --peer-asn $nva_asn -n nva1
+        az network routeserver peering create --routeserver rs1 -g $rg --peer-ip $nva2_private_ip --peer-asn $nva_asn -n nva2
+    fi
+
+    if [[ "$create_aux_vnet" == "yes" ]]; then
+
+        # Configure BIRD on NVA AUX 1
+        nvaaux1_pip_ip=$(az network public-ip show -n nvaaux1-pip -g $rg --query ipAddress -o tsv) && echo $nvaaux1_pip_ip
+        nvaaux1_private_ip=$(az network nic show --ids $nvaaux1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nvaaux1_private_ip
+        nvaaux_default_gw=$(first_ip "$nva_subnet1aux_prefix") && echo $nvaaux_default_gw
+        nvaaux_asn=65002
+        bird_config_file=/tmp/bird.conf
+        cat <<EOF > $bird_config_file
+log syslog all;
+router id $nvaaux1_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      disabled;
+}
+protocol static {
+      import all;
+      route $rsaux1_ip1/32 via $nvaaux_default_gw;
+      route $rsaux1_ip2/32 via $nvaaux_default_gw;
+      route $spoke1_vnet_prefix via $nvaaux_default_gw;
+      route $gcp_subnet1_prefix via $nvaaux_default_gw;
+      route $vnet1_prefix via $nvaaux_default_gw;
+      route 11.11.11.11/32 via $nvaaux_default_gw;  # Test route to test propagation
+}
+protocol bgp rs0 {
+      description "RouteServer instance 0";
+      multihop;
+      local $nvaaux1_private_ip as $nvaaux_asn;
+      neighbor $rsaux1_ip1 as $rsaux1_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+protocol bgp rs1 {
+      description "Route Server instance 1";
+      multihop;
+      local $nvaaux1_private_ip as $nvaaux_asn;
+      neighbor $rsaux1_ip2 as $rsaux1_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+EOF
+        username=$(whoami)
+        scp $bird_config_file "${nvaaux1_pip_ip}:/home/${username}/bird.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nvaaux1_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nvaaux1_pip_ip "sudo systemctl restart bird"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nvaaux1_pip_ip "systemctl status bird"
+        # Configure BIRD on NVA AUX 2
+        nvaaux2_pip_ip=$(az network public-ip show -n nvaaux2-pip -g $rg --query ipAddress -o tsv) && echo $nvaaux2_pip_ip
+        nvaaux2_private_ip=$(az network nic show --ids $nvaaux2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nvaaux2_private_ip
+        bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+log syslog all;
+router id $nvaaux2_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      disabled;
+}
+protocol static {
+      import all;
+      route $rsaux1_ip1/32 via $nvaaux_default_gw;
+      route $rsaux1_ip2/32 via $nvaaux_default_gw;
+      route $spoke1_vnet_prefix via $nvaaux_default_gw;
+      route $gcp_subnet1_prefix via $nvaaux_default_gw;
+      route $vnet1_prefix via $nvaaux_default_gw;
+      route 12.12.12.12/32 via $nvaaux_default_gw;  # Test route to test propagation
+}
+protocol bgp rs0 {
+      description "RouteServer instance 0";
+      multihop;
+      local $nvaaux2_private_ip as $nvaaux_asn;
+      neighbor $rsaux1_ip1 as $rsaux1_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+protocol bgp rs1 {
+      description "Route Server instance 1";
+      multihop;
+      local $nvaaux2_private_ip as $nvaaux_asn;
+      neighbor $rsaux1_ip2 as $rsaux1_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+EOF
+        username=$(whoami)
+        scp $bird_config_file "${nvaaux2_pip_ip}:/home/${username}/bird.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nvaaux2_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nvaaux2_pip_ip "sudo systemctl restart bird"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nvaaux2_pip_ip "systemctl status bird"
+
+        # Configure RS peerings
+        az network routeserver peering create --routeserver rsaux1 -g $rg --peer-ip $nvaaux1_private_ip --peer-asn $nvaaux_asn -n nvaaux1
+        az network routeserver peering create --routeserver rsaux1 -g $rg --peer-ip $nvaaux2_private_ip --peer-asn $nvaaux_asn -n nvaaux2
+
+        # Configure route tables in NVA subnets pointing to each other's load balancers
+        echo "Creating routing tables..."
+        az network route-table create -n nva -g $rg -l $location1 -o none
+        az network vnet subnet update -g $rg --vnet-name $vnet1_name -n $nva_subnet1_name --route-table nva -o none
+        az network route-table create -n nvaaux -g $rg -l $location1 -o none
+        az network vnet subnet update -g $rg --vnet-name $vnet1aux_name -n $nva_subnet1aux_name --route-table nvaaux -o none
+        nva_lb_ip=$(az network lb frontend-ip list --lb-name nva-lb-internal -g $rg --query '[0].privateIpAddress' -o tsv) && echo $nva_lb_ip
+        nvaaux_lb_ip=$(az network lb frontend-ip list --lb-name nvaaux-lb -g $rg --query '[0].privateIpAddress' -o tsv) && echo $nvaaux_lb_ip
+        # Route in main hub for AVS with next hop NVA AUX
+        az network route-table route create --route-table-name nva -g $rg --address-prefix '192.168.5.0/24' -n avs --next-hop-type VirtualAppliance --next-hop-ip-address $nvaaux_lb_ip -o none
+        # Route in aux hub for onprem and spokes, with next hop NVA
+        az network route-table route create --route-table-name nvaaux -g $rg --address-prefix $gcp_subnet1_prefix -n onprem --next-hop-type VirtualAppliance --next-hop-ip-address $nva_lb_ip -o none
+        az network route-table route create --route-table-name nvaaux -g $rg --address-prefix $vm_subnet1_prefix -n hubvm --next-hop-type VirtualAppliance --next-hop-ip-address $nva_lb_ip -o none
+        az network route-table route create --route-table-name nvaaux -g $rg --address-prefix $spoke1_vnet_prefix -n spoke1 --next-hop-type VirtualAppliance --next-hop-ip-address $nva_lb_ip -o none
+        # Configure route tables in aux VNet GatewaySubnet pointing to nvaaux-lb-ip
+        az network route-table create -n vngaux -g $rg -l $location1 -o none
+        az network vnet subnet update -g $rg --vnet-name $vnet1aux_name -n GatewaySubnet --route-table vngaux -o none
+        az network route-table route create --route-table-name vngaux -g $rg --address-prefix $gcp_subnet1_prefix -n onprem --next-hop-type VirtualAppliance --next-hop-ip-address $nvaaux_lb_ip -o none
+        az network route-table route create --route-table-name vngaux -g $rg --address-prefix $vm_subnet1_prefix -n hubvm --next-hop-type VirtualAppliance --next-hop-ip-address $nvaaux_lb_ip -o none
+        az network route-table route create --route-table-name vngaux -g $rg --address-prefix $spoke1_vnet_prefix -n spoke1 --next-hop-type VirtualAppliance --next-hop-ip-address $nvaaux_lb_ip -o none        
+        # Route table in spoke
+        if [[ "$create_spoke" == "yes" ]]; then
+            az network route-table create -n spoke1 -g $rg -l $location1 -o none
+            az network vnet subnet update -g $rg --vnet-name $spoke1_vnet_name -n $spoke1_subnet_name --route-table spoke1 -o none
+            az network route-table route create --route-table-name spoke1 -g $rg --address-prefix '0.0.0.0/0' -n default --next-hop-type VirtualAppliance --next-hop-ip-address $nva_lb_ip -o none
+            myip=$(curl -s4 ifconfig.co)
+            az network route-table route create -n mypc -g $rg --route-table-name spoke1 --address-prefix "${myip}/32" --next-hop-type Internet -o none
+        fi
+    fi
+fi
+
+# Connect the onprem ER circuit to MCR and to the VNet/VWAN
+$megaport_script_path -s=jomore-${er1_pop} -a=create_vxc -k=$service_key1
+circuit1_id=$(az network express-route show -n $er1_circuit_name -g $rg -o tsv --query id) && echo $circuit1_id
+provisioning_state=$(az network express-route show -n $er1_circuit_name -g $rg --query serviceProviderProvisioningState -o tsv) && echo "ER provider provisioning state is ${provisioning_state}"
+while [[ "$provisioning_state" == "NotProvisioned" ]]; do
+    echo "Waiting..."
+    sleep 30 # Wait for ER provisioning...
+    az network express-route update -n "$er1_circuit_name" -g $rg -o none
+    provisioning_state=$(az network express-route show -n $er1_circuit_name -g $rg --query serviceProviderProvisioningState -o tsv) && echo "ER provider provisioning state is ${provisioning_state}"
+done
+if [[ "$create_vwan" == "yes" ]]; then
+    echo "Connecting ER circuit to VWAN..."
+    er1_peering_id=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name $er1_circuit_name -g $rg -o tsv --query id) && echo $er1_peering_id
+    vhub_default_rt_id=$(az network vhub route-table show -n defaultRouteTable --vhub-name vhub -g $rg --query id -o tsv)
+    az network express-route gateway connection create --gateway-name $ergw1_name -n "${ergw1_name}-${er_pop}" -g $rg --peering $er_peering_id \
+        --associated-route-table $vhub_default_rt_id --propagated-route-tables $vhub_default_rt_id --labels default -o none
+else
+    echo "Connecting ER circuit to ER GW..."
+    az network vpn-connection create -n "$ergw1_name" -g $rg -l $location1 --vnet-gateway1 $ergw1_name --express-route-circuit2 $circuit1_id -o none
+fi
+
+
+# To Do: 2nd region
+if [[ "$create_2nd_region" == "yes" ]]; then
+    echo "This script only supports one region at this time..."cluster/api-service
+    # Create circuit
+    az network express-route create -n $er2_circuit_name --peering-location $er2_pop -g $rg -o none \
+    --bandwidth 50 Mbps --provider $er_provider -l $er2_location --sku-family MeteredData --sku-tier $er_circuit_sku
+    service_key2=$(az network express-route show -n $er2_circuit_name -g $rg --query serviceKey -o tsv)
+    # Create MCR
+    megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+    if [[ -e "$megaport_script_path" ]]
+    then
+        echo "Creating Megaport Cloud Router..."
+        # $megaport_script_path -s=jomore-${er1_pop} -a=create_mcr --asn=$mcr1_asn -k=$service_key1
+        $megaport_script_path -s=jomore-avs -a=create_mcr --asn=$mcr2_asn -k=$service_key2
+    else
+        echo "Sorry, I cannot seem to find the script $megaport_script_path to interact with the Megaport API"
+    fi
+    # Create Google infra and connect to circuit
+    if [[ "$simulate_onprem" == "yes" ]]; then
+        # VPC and instance
+        gcloud compute networks create "$gcp_vpc2_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+        gcloud compute networks subnets create "$gcp_subnet2_name" --network "$gcp_vpc2_name" --range "$gcp_subnet2_prefix" --region=$region2
+        gcloud compute instances create "$gcp_vm2_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc2_name" --subnet "$gcp_subnet2_name" --zone "$zone2"
+        gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-icmp" --network "$gcp_vpc2_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-ssh" --network "$gcp_vpc2_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-web" --network "$gcp_vpc2_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+        gcloud compute ssh $gcp_vm2_name --zone=$zone2 --command="ip a"
+        # Create interconnect
+        gcloud compute routers create $router2_name --project=$project_id --network=$gcp_vpc2_name --asn=$gcp_asn --region=$region2
+        gcloud compute interconnects attachments partner create $attachment2_name --region $region2 --router $router2_name --edge-availability-domain availability-domain-1
+        pairing_key2=$(gcloud compute interconnects attachments describe $attachment2_name --region $region2 --format json | jq -r '.pairingKey')
+        # Create VXC in Megaport
+        $megaport_script_path -g -s=jomore-avs -a=create_vxc -k=$pairing_key2
+        # Activate attachment
+        # wait_for_gcp_attachment_ready $attachment1_name $region1
+        sleep 120
+        gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --admin-enabled
+        # gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --no-enable-admin
+    fi
+    # Attach MCR to circuit
+    $megaport_script_path -s=jomore-avs -a=create_vxc -k=$service_key2
+    circuit2_id=$(az network express-route show -n $er2_circuit_name -g $rg -o tsv --query id) && echo $circuit2_id
+    provisioning_state=$(az network express-route show -n $er2_circuit_name -g $rg --query serviceProviderProvisioningState -o tsv) && echo "ER provider provisioning state is ${provisioning_state}"
+    while [[ "$provisioning_state" == "NotProvisioned" ]]; do
+        echo "Waiting..."
+        sleep 30 # Wait for ER provisioning...
+        az network express-route update -n "$er2_circuit_name" -g $rg -o none
+        provisioning_state=$(az network express-route show -n $er2_circuit_name -g $rg --query serviceProviderProvisioningState -o tsv) && echo "ER provider provisioning state is ${provisioning_state}"
+    done
+
+fi
+
+###############
+# Diagnostics #
+###############
+
+# NICs
+linvm1_nic_id=$(az vm show -n $linvm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke1_nic_id=$(az vm show -n spoke1vm -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $spoke1_nic_id -o table
+
+# Route server
+az network routeserver peering list --routeserver rs -g $rg -o table
+az network routeserver peering list-learned-routes --routeserver rs -n bgpvmss_1 -g $rg -o table --query 'RouteServiceRole_IN_0'
+az network routeserver peering list-advertised-routes --routeserver rs -n bgpvmss_1 -g $rg -o table --query 'RouteServiceRole_IN_0'
+
+# ExpressRoute GW 
+az network vnet-gateway list-bgp-peer-status -n $ergw1_name -g $rg -o table
+az network vnet-gateway list-advertised-routes -n $ergw1_name -g $rg --peer 192.168.1.4
+az network vnet-gateway list-learned-routes -n $ergw1_name -g $rg --query 'value[].{LocalAddress:localAddress, Peer:sourcePeer, Network:network, NextHop:nextHop, ASPath: asPath, Origin:origin, Weight:weight}' -o table
+
+# ExpressRoute circuit
+az network express-route list-route-tables-summary -g $rg -n $er1_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables-summary -g $rg -n $er1_circuit_name --path secondary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $er1_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $er1_circuit_name --path secondary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables-summary -g $rg -n $er2_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables-summary -g $rg -n $er2_circuit_name --path secondary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $er2_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $er2_circuit_name --path secondary --peering-name AzurePrivatePeering --query value -o table
+
+# Virtual WAN
+az network vhub connection list --vhub-name vhub -g $rg -o table
+az network express-route gateway list -g $rg -o table
+az network express-route gateway connection list --gateway-name $ergw1_name -g $rg -o table
+az network vhub get-effective-routes --resource-type RouteTable --resource-id $default_rt_id -g $rg -n vhub -o table
+az network vhub get-effective-routes --resource-type HubVirtualNetworkConnection --resource-id $vnet1_cx_id -g $rg -n vhub -o table
+ergw1_vwan_id=$(az network vhub show -n vhub -g $rg --query expressRouteGateway.id -o tsv) && echo $ergw1_vwan_id
+er1_vwan_cx_id=$(az network express-route gateway connection list --gateway-name $ergw1_name -g $rg --query 'value[0].id' -o tsv)
+az network vhub get-effective-routes --resource-type ExpressRouteConnection --resource-id $er1_vwan_cx_id -g $rg -n vhub -o table
+
+# Megaport Cloud Router
+$megaport_script_path -q -s=jomore-${er1_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,as_path} | join("\t")'
+
+# GCP onprem simulation
+gcloud compute instances describe $gcp_vm1_name
+gcloud compute routers get-status $router1_name --region=$region1 --format=json | jq -r '.result.bestRoutesForRouter[]|{destRange,routeType,nextHopIp} | join("\t")'
+gcloud compute instances describe $gcp_vm2_name
+gcloud compute routers get-status $router2_name --region=$region1 --format=json | jq -r '.result.bestRoutesForRouter[]|{destRange,routeType,nextHopIp} | join("\t")'
+
+# SSH to first BGP VMSS instance (if using BGP VMSS)
+vm1=$(az vmss list-instance-connection-info -n $bgpvmss_name -g $rg | grep ':' | head -1)
+vm=$(echo $vm1 | cut -d\" -f 4)
+vm_ip=$(echo $vm | cut -d: -f 1)
+vm_port=$(echo $vm | cut -d: -f 2)
+echo "Connecting to VM $vm on IP $vm_ip and port $vm_port..."
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $vm_ip -p $vm_port
+
+# BIRD on NVA
+nva_pip=$nvaaux1_pip_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip "sudo birdc show route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip "sudo birdc show protocols"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip "sudo birdc show protocols all rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip "sudo birdc show route protocol rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip "sudo birdc show route protocol hub1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip "sudo birdc show route export rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip "sudo birdc show route export rs0 all"
+
+
+# NSX T0 routes (from a VM with access to the NSX Mgr IP)
+curl -ks -X GET -H "Accept: application/json" -u 'admin:9h*usJT^v512' https://10.2.252.3/policy/api/v1/infra/tier-0s/TNT34-T0/locale-services/TNT34-T0-LOCALE-SERVICES/bgp/neighbors/TNT34-T0-A/routes | jq -r '.results[0].egde_node_routes[0].routes[] | {network,next_hop,as_path} | join("\t")'
+
+########
+# Logs #
+########
+
+# Firewall Network Rules
+fw_net_logs_query='AzureDiagnostics
+| where Category == "AzureFirewallNetworkRule"
+| where TimeGenerated >= ago(5m) 
+| parse msg_s with Protocol " request from " SourceIP ":" SourcePortInt:int " to " TargetIP ":" TargetPortInt:int *
+| parse msg_s with * ". Action: " Action1a
+| parse msg_s with * " was " Action1b " to " NatDestination
+| parse msg_s with Protocol2 " request from " SourceIP2 " to " TargetIP2 ". Action: " Action2
+| extend SourcePort = tostring(SourcePortInt),TargetPort = tostring(TargetPortInt)
+| extend Action = case(Action1a == "", case(Action1b == "",Action2,Action1b), Action1a),Protocol = case(Protocol == "", Protocol2, Protocol),SourceIP = case(SourceIP == "", SourceIP2, SourceIP),TargetIP = case(TargetIP == "", TargetIP2, TargetIP),SourcePort = case(SourcePort == "", "N/A", SourcePort),TargetPort = case(TargetPort == "", "N/A", TargetPort),NatDestination = case(NatDestination == "", "N/A", NatDestination)
+//| where Action == "Deny" 
+//| project TimeGenerated, msg_s, Protocol, SourceIP,SourcePort,TargetIP,TargetPort,Action, NatDestination  // with msg_s
+| project TimeGenerated, Protocol, SourceIP,SourcePort,TargetIP,TargetPort,Action, Resource  // without msg_s
+| take 20 '
+
+fw_logs_query='AzureDiagnostics
+| where TimeGenerated >= ago(5m) 
+| where Category == "AzureFirewallNetworkRule" or Category == "AzureFirewallApplicationRule"
+//optionally apply filters to only look at a certain type of log data
+//| where OperationName == "AzureFirewallNetworkRuleLog"
+//| where OperationName == "AzureFirewallNatRuleLog"
+//| where OperationName == "AzureFirewallApplicationRuleLog"
+//| where OperationName == "AzureFirewallIDSLog"
+//| where OperationName == "AzureFirewallThreatIntelLog"
+| extend msg_original = msg_s
+| extend msg_s = replace(@". Action: Deny. Reason: SNI TLS extension was missing.", @" to no_data:no_data. Action: Deny. Rule Collection: default behavior. Rule: SNI TLS extension missing', msg_s)
+| extend msg_s = replace(@"No rule matched. Proceeding with default action", @"Rule Collection: default behavior. Rule: no rule matched", msg_s)
+| parse msg_s with * " Web Category: " WebCategory
+| extend msg_s = replace(@\"(. Web Category:).*","", msg_s)
+| parse msg_s with * ". Rule Collection: " RuleCollection ". Rule: " Rule
+| extend msg_s = replace(@\"(. Rule Collection:).*","", msg_s)
+| parse msg_s with * ". Rule Collection Group: " RuleCollectionGroup
+| extend msg_s = replace(@"(. Rule Collection Group:).*","", msg_s)
+| parse msg_s with * ". Policy: " Policy
+| extend msg_s = replace(@"(. Policy:).*","", msg_s)
+| parse msg_s with * ". Signature: " IDSSignatureIDInt ". IDS: " IDSSignatureDescription ". Priority: " IDSPriorityInt ". Classification: " IDSClassification
+| extend msg_s = replace(@"(. Signature:).*","", msg_s)
+| parse msg_s with * " was DNATed to " NatDestination
+| extend msg_s = replace(@"( was DNATed to ).*",". Action: DNAT", msg_s)
+| parse msg_s with * ". ThreatIntel: " ThreatIntel
+| extend msg_s = replace(@"(. ThreatIntel:).*","", msg_s)
+| extend URL = extract(@"(Url: )(.*)(\. Action)",2,msg_s)
+| extend msg_s=replace(@"(Url: .*)(Action)",@"\2",msg_s)
+| parse msg_s with Protocol " request from " SourceIP " to " Target ". Action: " Action
+| extend 
+    SourceIP = iif(SourceIP contains ":",strcat_array(split(SourceIP,":",0),""),SourceIP),
+    SourcePort = iif(SourceIP contains ":",strcat_array(split(SourceIP,":",1),""),""),
+    Target = iif(Target contains ":",strcat_array(split(Target,":",0),""),Target),
+    TargetPort = iif(SourceIP contains ":",strcat_array(split(Target,":",1),""),""),
+    Action = iif(Action contains ".",strcat_array(split(Action,".",0),""),Action),
+    Policy = case(RuleCollection contains ":", split(RuleCollection, ":")[0] ,Policy),
+    RuleCollectionGroup = case(RuleCollection contains ":", split(RuleCollection, ":")[1], RuleCollectionGroup),
+    RuleCollection = case(RuleCollection contains ":", split(RuleCollection, ":")[2], RuleCollection),
+    IDSSignatureID = tostring(IDSSignatureIDInt),
+    IDSPriority = tostring(IDSPriorityInt)
+| project msg_original,TimeGenerated,Protocol,SourceIP,SourcePort,Target,TargetPort,URL,Action, NatDestination, OperationName,ThreatIntel,IDSSignatureID,IDSSignatureDescription,IDSPriority,IDSClassification,Policy,RuleCollectionGroup,RuleCollection,Rule,WebCategory
+| order by TimeGenerated
+| limit 50'
+
+
+az monitor log-analytics query -w $logws_customer_id --analytics-query $fw_net_logs_query -o tsv
+
+
+############
+# Stop VMs #
+############
+
+az vm deallocate -n $linvm1_name -g $rg --no-wait -o none
+az vm deallocate -n $winvm1_name -g $rg --no-wait -o none
+
+#############
+# Start VMs #
+#############
+
+az vm start -n $linvm1_name -g $rg --no-wait -o none
+az vm start -n $winvm1_name -g $rg --no-wait -o none
+
+#######################
+#  Cleanup - Danger!  #
+#######################
+
+# Remove MCR from Megaport
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+$megaport_script_path -q -s=jomore -a=delete_mcr
+
+# Deleter ER 
+az network express-route delete -n $er1_circuit_name -g $rg --no-wait
+az network vnet-gateway delete -g $rg -n $ergw1_name --no-wait 
+
+# Delete RG
+az group delete -n $rg -y --no-wait
+
+# Delete GCP project
+if [[ "$simulate_onprem" == "yes" ]]; then
+    gcloud projects delete "$project_id" --quiet
+fi

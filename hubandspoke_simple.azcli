@@ -1,0 +1,67 @@
+# Create a simple hub and spoke environment
+# Used for FTA Live sessions
+
+# Variables
+rg=ftalive
+location=westeurope
+hub_vnet_name=hubvnet
+hub_vnet_prefix=192.168.0.0/24
+hub_subnet_name=vm
+hub_subnet_prefix=192.168.0.0/26
+spoke_vnet_name=spokevnet
+spoke_vnet_prefix=192.168.1.0/24
+spoke_subnet_name=vm
+spoke_subnet_prefix=192.168.1.0/26
+vm_size=Standard_B1s
+hub_vm_name=hubvm
+spoke_vm_name=spokevm
+spoke_rt_name=spokert
+
+# Create environment
+echo "Creating RG and VNets..."
+az group create -n $rg -l $location -o none
+az network vnet create -g $rg -n $hub_vnet_name --address-prefix $hub_vnet_prefix --subnet-name $hub_subnet_name --subnet-prefix $hub_subnet_prefix -l $location -o none
+az network vnet create -g $rg -n $spoke_vnet_name --address-prefix $spoke_vnet_prefix --subnet-name $spoke_subnet_name --subnet-prefix $spoke_subnet_prefix -l $location -o none
+echo "Creating Virtual machines..."
+az vm create -n $hub_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard \
+    --public-ip-address "${hub_vm_name}-pip" --vnet-name $hub_vnet_name --size $vm_size --subnet $hub_subnet_name -l $location --no-wait
+az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard \
+    --public-ip-address "${spoke_vm_name}-pip" --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -l $location --no-wait
+echo "Peering VNets..."
+az network vnet peering create -n hub2spoke -g $rg --vnet-name $hub_vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none 
+az network vnet peering create -n spoke2hub -g $rg --vnet-name $spoke_vnet_name --remote-vnet $hub_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+echo "Configuring VMs..."
+hub_nic_id=$(az vm show -n $hub_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $hub_nic_id --ip-forwarding -o none
+hub_private_ip=$(az network nic show --ids $hub_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+az network route-table create -n $spoke_rt_name -g $rg -l $location -o none
+az network route-table route create --route-table-name $spoke_rt_name -g $rg --address-prefix '0.0.0.0/0' -n default --next-hop-type VirtualAppliance --next-hop-ip-address $hub_private_ip -o none
+myip=$(curl -s4 ifconfig.co)
+az network route-table route create -n mypc -g $rg --route-table-name $spoke_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none
+az network vnet subnet update -g $rg --vnet-name $spoke_vnet_name -n $spoke_subnet_name --route-table $spoke_rt_name -o none
+hub_pip=$(az network public-ip show -n "${hub_vm_name}-pip" -g $rg --query 'ipAddress' -o tsv)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_pip "sudo sysctl -w net.ipv4.ip_forward=1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_pip "sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+
+# Update route table with new IP (might be necessary if the local PIP changed)
+myip=$(curl -s4 ifconfig.co)
+az network route-table route update -n mypc -g $rg --route-table-name $spoke_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none
+
+# Diagnostics
+hub_nic_id=$(az vm show -n $hub_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+hub_pip=$(az network public-ip show -n "${hub_vm_name}-pip" -g $rg --query 'ipAddress' -o tsv)
+spoke_pip=$(az network public-ip show -n "${spoke_vm_name}-pip" -g $rg --query 'ipAddress' -o tsv)
+az vm list-ip-addresses -o table -g $rg
+az network route-table list -g $rg -o table
+az network route-table route list --route-table-name $spoke_rt_name -g $rg -o table
+az network nic show-effective-route-table --ids $hub_nic_id -o table
+az network nic show-effective-route-table --ids $spoke_nic_id -o table
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_pip "curl -s4 ifconfig.co"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_pip "sysctl net.ipv4.ip_forward"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_pip "sudo iptables -L -t nat"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke_pip "curl -s4 ifconfig.co"
+az network vnet subnet show -n $spoke_subnet_name -g $rg --vnet-name $spoke_vnet_name --query routeTable -o tsv
+
+# Cleanup
+# az group delete -y -n $rg --no-wait

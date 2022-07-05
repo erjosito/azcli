@@ -189,6 +189,10 @@ else
     echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
 fi
 
+# Create RG
+echo "Creating resource group..."
+az group create -n $rg -l $location1 -o none
+
 # Create ER circuit (we need the service key to create the MCR)
 az network express-route create -n $er1_circuit_name --peering-location $er1_pop -g $rg -o none \
     --bandwidth 50 Mbps --provider $er_provider -l $er1_location --sku-family MeteredData --sku-tier $er_circuit_sku
@@ -205,8 +209,6 @@ else
 fi
 
 # Create VNet with subnets, and kick off the creation of the ER GW
-echo "Creating resource group..."
-az group create -n $rg -l $location1 -o none
 echo "Creating VNet and VMs (linux/win)..."
 az network vnet create -g $rg -n $vnet1_name --address-prefix $vnet1_prefix --subnet-name $vm_subnet1_name --subnet-prefix $vm_subnet1_prefix -l $location1 -o none
 az network vnet subnet create -g $rg --vnet-name $vnet1_name -n GatewaySubnet --address-prefix $gw_subnet1_prefix -o none
