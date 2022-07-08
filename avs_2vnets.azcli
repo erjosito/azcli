@@ -1012,6 +1012,8 @@ az network vhub get-effective-routes --resource-type HubVirtualNetworkConnection
 ergw1_vwan_id=$(az network vhub show -n vhub -g $rg --query expressRouteGateway.id -o tsv) && echo $ergw1_vwan_id
 er1_vwan_cx_id=$(az network express-route gateway connection list --gateway-name $ergw1_name -g $rg --query 'value[0].id' -o tsv)
 az network vhub get-effective-routes --resource-type ExpressRouteConnection --resource-id $er1_vwan_cx_id -g $rg -n vhub -o table
+subscription_id=$(az account show -o tsv --query id)
+az network vhub get-effective-routes --resource-type RouteTable --resource-id $hub1_default_rt_id -g $rg -n hub1 --query 'value[].{Prefix:addressPrefixes[0],ASPath:asPath,NextHopType:nextHopType,NextHop:nextHops[0],Origin:routeOrigin}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft.Network\//,""); print }'
 
 # Megaport Cloud Router
 $megaport_script_path -q -s=jomore-${er1_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,as_path} | join("\t")'
@@ -1139,8 +1141,11 @@ az network vnet-gateway delete -g $rg -n $ergw1_name --no-wait
 
 # Delete RG
 az group delete -n $rg -y --no-wait
+az group show -n $rg --query properties.provisioningState -o tsv
+az resource list -g $rg -o table
 
 # Delete GCP project
 if [[ "$simulate_onprem" == "yes" ]]; then
     gcloud projects delete "$project_id" --quiet
+    gcloud projects list
 fi

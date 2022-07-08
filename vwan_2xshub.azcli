@@ -18,7 +18,7 @@
 ###############
 
 # Control
-no_of_hubs=1         # 1 or 2 hubs
+no_of_hubs=2         # 1 or 2 hubs
 no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=no        # Whether firewalls are provisioned in the hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
@@ -28,15 +28,16 @@ vnet_ass=default     # Route table to associate VNet connections. Can be 'defaul
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
 nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
-deploy_vpngw=yes     # Whether VPN GWs should be deployed
-deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
+deploy_vpngw=no      # Whether VPN GWs should be deployed
+deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
 route_thru_nva=no    # Whether a static pointing to the NVA in the last spoke is configured
+er_bow_tie=yes       # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 
 # Generic variables
 rg=vwaneastus
 vwan=vwan
-location1=eastus
-location2=westus
+location1=germanywestcentral
+location2=westcentralus
 password=Microsoft123!
 vwan_hub1_prefix=192.168.0.0/23
 vwan_hub2_prefix=192.168.2.0/23
@@ -79,18 +80,35 @@ branch4_asn=65504
 branch4_test_route=4.4.4.0/24
 # ER (optional)
 er_provider=Megaport
-er_circuit_sku=Standard
+er_circuit_sku=Premium
 megaport_script_location="/home/jose/repos/azcli/megaport.sh"
-hub1_er_pop=Dallas
-hub1_er_circuit_name="hub1er-$er_pop"
+hub1_er_pop=Frankfurt
+hub1_er_circuit_name="er1-$hub1_er_pop"
 hub2_er_pop=Dallas
-hub2_er_circuit_name="hub2er-$er_pop"
-branch5_prefix=10.225.0.0/24
-branch5_vm_subnet_name=vm
-branch5_vm_subnet_prefix=10.225.0.64/26
-branch5_gw_subnet_prefix=10.225.0.0/26
-branch5_gw_name=branch5ergw
-branch5_location=$location1
+hub2_er_circuit_name="er2-$hub2_er_pop"
+# gcloud variables to simulate onprem via ER
+project_name=onprem
+project_id="${project_name}${RANDOM}"
+machine_type=e2-micro
+gcp_asn=16550
+# gcp region 1
+region1=europe-west3
+zone1=europe-west3-b
+gcp_vm1_name=vm1
+gcp_vpc1_name=vpc1
+gcp_subnet1_name=vm1
+gcp_subnet1_prefix='10.225.0.0/24'
+attachment1_name=attachment1
+router1_name=router1
+# gcp region 2
+region2=us-west2
+zone2=us-west2-b
+gcp_vm2_name=vm2
+gcp_vpc2_name=vpc2
+gcp_subnet2_name=vm2
+gcp_subnet2_prefix='10.226.0.0/24'
+attachment2_name=attachment2
+router2_name=router2
 
 #############
 # Functions #
@@ -186,7 +204,7 @@ function create_spoke() {
     fi
     echo "Creating VM spoke${spoke_id}-vm in VNet spoke${spoke_id}-$location..."
     az vm create -n spoke${spoke_id}-vm -g $rg -l $location --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-        --public-ip-address spoke${spoke_id}-pip --vnet-name spoke${spoke_id}-$location --nsg $nsg_name --size $vm_size \
+        --public-ip-address spoke${spoke_id}-pip --public-ip-sku Standard --vnet-name spoke${spoke_id}-$location --nsg $nsg_name --size $vm_size \
         --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file -o none
     echo "Installing Network Watcher extension in VM spoke${spoke_id}-vm..."
     az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4 -o none
@@ -265,7 +283,7 @@ EOF
     # VM for onprem NVA
     echo "Creating VM $onprem_linuxnva_name..."
     az vm create -n $onprem_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
-        --public-ip-address $onprem_linuxnva_pip --vnet-name $onprem_vnet_name --size $vm_size --subnet $onprem_nva_subnet_name \
+        --public-ip-address $onprem_linuxnva_pip --public-ip-sku Standard --vnet-name $onprem_vnet_name --size $vm_size --subnet $onprem_nva_subnet_name \
         --custom-data $linuxnva_cloudinit_file --private-ip-address "$onprem_linuxnva_ip" --nsg "${onprem_linuxnva_name}-nsg" -o none
     onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
     az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding -o none
@@ -918,7 +936,7 @@ then
     echo "Creating NVAs..."
     az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} \
         --generate-ssh-keys --admin-username $username --nsg $nsg1_name --size $nva_size \
-        --public-ip-address branch1-pip --public-ip-address-allocation static --private-ip-address $branch1_bgp_ip \
+        --public-ip-address branch1-pip --public-ip-address-allocation static --public-ip-sku Standard --private-ip-address $branch1_bgp_ip \
         --vnet-name branch1 --vnet-address-prefix $branch1_prefix --subnet nva --subnet-address-prefix $branch1_subnet -o none
     branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv)
     # az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan \
@@ -938,7 +956,7 @@ then
         # Create CSR to simulate branch2
         az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} \
             --generate-ssh-keys --admin-username $username --nsg $nsg2_name --size $nva_size \
-            --public-ip-address branch2-pip --public-ip-address-allocation static --private-ip-address $branch2_bgp_ip \
+            --public-ip-address branch2-pip --public-ip-address-allocation static --public-ip-sku Standard --private-ip-address $branch2_bgp_ip \
             --vnet-name branch2 --vnet-address-prefix $branch2_prefix --subnet nva --subnet-address-prefix $branch2_subnet -o none
         branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)
         az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan --with-link --device-vendor cisco --device-model csr --link-speed 100 \
@@ -1133,10 +1151,10 @@ then
         --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
         --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols TCP --destination-ports 9 22 80 -o none
     # Allow ICMP
-    # echo "Creating rule to allow ICMP..."
-    # az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-    #     --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
-    #     --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
+    echo "Creating rule to allow ICMP..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
     # Allow NTP
     echo "Creating rule to allow NTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -1181,7 +1199,6 @@ then
             --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
             --next-hop-type ResourceId --next-hop $azfw2_id -o none
     fi
-
 
     # Azure Firewalls
     echo "Configuring Azure Firewalls..."
@@ -1363,8 +1380,8 @@ then
     echo "Creating VNet peerings to indirect spokes..."
     az network vnet peering create -n 1${indirect_spoke_id}1to1${indirect_spoke_id} -g $rg --vnet-name spoke1${indirect_spoke_id}1-${location1} --remote-vnet spoke1${indirect_spoke_id}-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
     az network vnet peering create -n 1${indirect_spoke_id}2to1${indirect_spoke_id} -g $rg --vnet-name spoke1${indirect_spoke_id}2-${location1} --remote-vnet spoke1${indirect_spoke_id}-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet peering create -n 14to1${indirect_spoke_id}1 -g $rg --vnet-name spoke1${indirect_spoke_id}-${location1} --remote-vnet spoke1${indirect_spoke_id}1-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet peering create -n 14to1${indirect_spoke_id}2 -g $rg --vnet-name spoke1${indirect_spoke_id}-${location1} --remote-vnet spoke1${indirect_spoke_id}2-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n 1${indirect_spoke_id}to1${indirect_spoke_id}1 -g $rg --vnet-name spoke1${indirect_spoke_id}-${location1} --remote-vnet spoke1${indirect_spoke_id}1-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n 1${indirect_spoke_id}to1${indirect_spoke_id}2 -g $rg --vnet-name spoke1${indirect_spoke_id}-${location1} --remote-vnet spoke1${indirect_spoke_id}2-${location1} --allow-vnet-access --allow-forwarded-traffic -o none
     if [[ "$no_of_hubs" == "2" ]]
     then
         az network vnet peering create -n 2${indirect_spoke_id}1to2${indirect_spoke_id} -g $rg --vnet-name spoke2${indirect_spoke_id}1-${location2} --remote-vnet spoke2${indirect_spoke_id}-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
@@ -1374,13 +1391,13 @@ then
     fi
     # Configure IP forwarding in the NVA NICs
     echo "Configuring IP forwarding in NVA NICs..."
-    vm_names=("spoke${indirect_spoke_id}4-vm" "spoke2${indirect_spoke_id}-vm")
+    vm_names=("spoke1${indirect_spoke_id}-vm" "spoke2${indirect_spoke_id}-vm")
     for vm_name in ${vm_names[@]}; do
         echo "Enabling IP forwarding for $vm_name..."
         vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
         az network nic update --ids $vm_nic_id --ip-forwarding -o none
     done
-    # RT for indirect spokes 1${indirect_spoke_id}1/1${indirect_spoke_id}2
+    # Route table for indirect spokes 1${indirect_spoke_id}1/1${indirect_spoke_id}2
     echo "Creating route tables for indirect spokes with default route pointing to the NVA..."
     myip=$(curl -s4 ifconfig.co)
     nva1_nic_id=$(az vm show -n spoke1${indirect_spoke_id}-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -1439,7 +1456,7 @@ if [[ "$deploy_vpngw" == "yes" ]]
 then
     # VM in branch1
     az vm create -n branch1-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-        --public-ip-address branch1-vm-pip --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
+        --public-ip-address branch1-vm-pip --public-ip-sku Standard --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
         --subnet vm --subnet-address-prefix $branch1_vm_subnet --custom-data $cloudinit_file
     az vm extension set --vm-name branch1-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
     az network route-table create -n branch1vm-$location1 -g $rg -l $location1
@@ -1453,7 +1470,7 @@ then
     if [[ "$no_of_hubs" == "2" ]]
     then
         az vm create -n branch2-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-            --public-ip-address branch2-vm-pip --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
+            --public-ip-address branch2-vm-pip --public-ip-sku Standard --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
             --subnet vm --subnet-address-prefix $branch2_vm_subnet --custom-data $cloudinit_file
         az vm extension set --vm-name branch2-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
         az network route-table create -n branch2vm-$location2 -g $rg -l $location2
@@ -1558,6 +1575,19 @@ EOF
 
     if [[ "$no_of_hubs" == "2" ]]
     then
+        # Get information
+        nva2_nic_id=$(az vm show -n "spoke2${indirect_spoke_id}-vm" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo "$nva2_ip"
+        nva2_pip=$(az network public-ip show -n "spoke2${indirect_spoke_id}-pip" -g $rg --query ipAddress -o tsv) && echo "$nva2_pip"
+        nva2_default_gw="10.2.${indirect_spoke_id}.1"
+        nva2_asn="6501${indirect_spoke_id}"
+        echo "Getting information about the Route Service in hub2..."
+        hub2_rs_ip1=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $hub2_rs_ip1
+        hub2_rs_ip2=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $hub2_rs_ip2
+        hub2_rs_asn=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterAsn' -o tsv) && echo $hub2_rs_asn
+        echo "Configuring static route in NVA1 for the hub address space $vwan_hub2_prefix"
+        ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$nva2_pip" "sudo ip route add $vwan_hub2_prefix via $nva2_default_gw"
+
         # NVA in spoke24-vm config
         bird_config_file=/tmp/bird2${indirect_spoke_id}.conf
         cat <<EOF > $bird_config_file
@@ -1606,12 +1636,12 @@ EOF
         ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo systemctl restart bird"
     fi
     # Now configure the VWAN side
-    nva1_cx_id=$( az network vhub connection show -n "spoke1${indirect_spoke_id}" --vhub-name hub1 -g $rg -o tsv --query id)
+    nva1_cx_id=$(az network vhub connection show -n "spoke1${indirect_spoke_id}" --vhub-name hub1 -g $rg -o tsv --query id)
     echo "Creating BGP peering to hub1..."
     az network vhub bgpconnection create -n spoke1${indirect_spoke_id} -g $rg --vhub-name hub1 --peer-asn "$nva1_asn" --peer-ip "$nva1_ip" --vhub-conn "$nva1_cx_id" -o none
     if [[ "$no_of_hubs" == "2" ]]
     then
-        nva2_cx_id=$( az network vhub connection show -n spoke2${indirect_spoke_id} --vhub-name hub2 -g $rg -o tsv --query id)
+        nva2_cx_id=$(az network vhub connection show -n spoke2${indirect_spoke_id} --vhub-name hub2 -g $rg -o tsv --query id)
         echo "Creating BGP peering to hub2..."
         az network vhub bgpconnection create -n spoke2${indirect_spoke_id} -g $rg --vhub-name hub2 --peer-asn "$nva2_asn" --peer-ip "$nva2_ip" --vhub-conn "$nva2_cx_id" -o none
     fi
@@ -1682,7 +1712,7 @@ then
     vm_name=branch1-vm2
     az network vnet update -n branch1 -g $rg --address-prefixes $branch1_prefix $new_subnet
     az vm create -n $vm_name -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-        --public-ip-address ${vm_name}-pip --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
+        --public-ip-address ${vm_name}-pip --public-ip-sku Standard --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
         --subnet $new_subnet_name --subnet-address-prefix $new_subnet --custom-data $cloudinit_file
     az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
     az network vnet subnet update -n $new_subnet_name --vnet-name branch1 -g $rg --route-table branch1vm-$location1
@@ -1703,7 +1733,7 @@ EOF
     vm_name=branch2-vm2
     az network vnet update -n branch2 -g $rg --address-prefixes $branch2_prefix $new_subnet
     az vm create -n $vm_name -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
-        --public-ip-address ${vm_name}-pip --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
+        --public-ip-address ${vm_name}-pip --public-ip-sku Standard --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
         --subnet $new_subnet_name --subnet-address-prefix $new_subnet --custom-data $cloudinit_file
     az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
     az network vnet subnet update -n $new_subnet_name --vnet-name branch2 -g $rg --route-table branch2vm-$location2
@@ -1732,104 +1762,159 @@ then
     create_hub_nva_branch 2     # Takes care as well of the BGP config to the RS
 fi
 
-# Optional: ExpressRoute (WORK IN PROGRESS!!)
+# Optional: ExpressRoute
 if [[ "$deploy_er" == "yes" ]]
 then
-    # Create onprem ER branch
-    onprem_vnet_name=branch5
-    echo "Creating VNet branch5 to simulate an ER branch..."
-    az network vnet create -n $onprem_vnet_name -g $rg --address-prefix $branch5_prefix -o none
-    az network vnet subnet create -g $rg -n $branch5_vm_subnet_name --vnet-name $onprem_vnet_name --address-prefix $branch5_vm_subnet_prefix -o none
-    az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name $onprem_vnet_name --address-prefix $branch5_gw_subnet_prefix -o none
-    echo "Creating ER gateway in branch5 (--no-wait)..."
-    az network public-ip create -g $rg -n ${branch5_gw_name}-pip --allocation-method Dynamic --sku Basic -o none
-    az network vnet-gateway create -g $rg -n ${branch5_gw_name} --gateway-type ExpressRoute --sku Standard -l $branch5_location --vnet $onprem_vnet_name --public-ip-addresses "${branch5_gw_name}-pip" --no-wait -o none
     # Create VWAN ER and circuits
     echo "Creating ER gateway in hub1..."
     az network express-route gateway create -g $rg -n hub1ergw --virtual-hub hub1 -l $location1 -o none
     echo "Creating ER circuit in $hub1_er_pop"
-    az network express-route create -n hub1er --peering-location $hub1_er_pop -g $rg \
+    az network express-route create -n $hub1_er_circuit_name --peering-location $hub1_er_pop -g $rg \
         --bandwidth 50 Mbps --provider $er_provider -l $location1 --sku-family MeteredData --sku-tier $er_circuit_sku -o none
-    service_key_1=$(az network express-route show -n hub1er -g $rg --query serviceKey -o tsv) && echo "Service Key is $service_key_1"
+    service_key_1=$(az network express-route show -n $hub1_er_circuit_name -g $rg --query serviceKey -o tsv) && echo "Service Key is $service_key_1"
     if [[ "$no_of_hubs" == "2" ]]
     then
         echo "Creating ER gateway in hub2..."
         az network express-route gateway create -g $rg -n hub2ergw --virtual-hub hub2 -l $location2 -o none
         echo "Creating ER circuit in $hub2_er_pop"
-        az network express-route create -n hub2er --peering-location $hub2_er_pop -g $rg \
+        az network express-route create -n $hub2_er_circuit_name --peering-location $hub2_er_pop -g $rg \
             --bandwidth 50 Mbps --provider $er_provider -l $location2 --sku-family MeteredData --sku-tier $er_circuit_sku -o none
-        service_key_2=$(az network express-route show -n hub2er -g $rg --query serviceKey -o tsv) && echo "Service Key is $service_key_2"
+        service_key_2=$(az network express-route show -n $hub2_er_circuit_name -g $rg --query serviceKey -o tsv) && echo "Service Key is $service_key_2"
     fi
     # Provision Megaport MCR in locations for hub1/hub2 (it could be the same)
     if [[ -e "$megaport_script_location" ]]
     then
         echo "Creating MCR in $hub1_er_pop..."
-        $megaport_script_location -q -s=jomore-${hub1_er_pop} -a=create_mcr -k=$service_key_1
-        sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+        $megaport_script_location -s=jomore-${hub1_er_pop} -a=create_mcr -k=$service_key_1
+        sleep 120  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
         echo "Connecting MCR in $hub1_er_pop with ER circuit in hub1..."
-        $megaport_script_location -q -s=jomore-${hub1_er_pop} -a=create_vxc -k=$service_key_1
+        $megaport_script_location -s=jomore-${hub1_er_pop} -a=create_vxc -k=$service_key_1
         if [[ "$no_of_hubs" == "2" ]]
         then
             if [[ "$hub1_er_pop" != "$hub2_er_pop" ]]
             then
                 echo "Creating MCR in $hub2_er_pop..."
-                $megaport_script_location -q -s=jomore-${hub2_er_pop} -a=create_mcr -k=$service_key_2
-                sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+                $megaport_script_location -s=jomore-${hub2_er_pop} -a=create_mcr -k=$service_key_2
+                sleep 120  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
             fi
             echo "Connecting MCR in $hub2_er_pop with ER circuit in hub2..."
-            $megaport_script_location -q -s=jomore-${hub2_er_pop} -a=create_vxc -k=$service_key_2
+            $megaport_script_location -s=jomore-${hub2_er_pop} -a=create_vxc -k=$service_key_2
         fi
     else
         echo "Sorry, I cannot seem to find the script $megaport_script_location to interact with the Megaport API"
     fi
     # Wait until circuits are provisioned
-    circuit1_id=$(az network express-route show -n hub1er -g $rg -o tsv --query id) && echo "Circuit ID is $circuit1_id"
-    circuit1_state=$(az network express-route show -n hub1er -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit1_state"
+    az network express-route update -n $hub1_er_circuit_name -g $rg -o none
+    circuit1_id=$(az network express-route show -n $hub1_er_circuit_name -g $rg -o tsv --query id) && echo "Circuit ID is $circuit1_id"
+    circuit1_state=$(az network express-route show -n $hub1_er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit1_state"
     echo "Waiting until ER circuit in hub1 is provisioned..."
     until [[ "$circuit1_state" == "Provisioned" ]]
     do
         sleep 15
-        circuit1_state=$(az network express-route show -n hub1er -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit1_state_1"
+        az network express-route update -n $hub1_er_circuit_name -g $rg -o none
+        circuit1_state=$(az network express-route show -n $hub1_er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit1_state"
     done
     if [[ "$no_of_hubs" == "2" ]]
     then
-        circuit2_id=$(az network express-route show -n hub2er -g $rg -o tsv --query id) && echo "Circuit ID is $circuit2_id"
-        circuit2_state=$(az network express-route show -n hub2er -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit2_state"
+        az network express-route update -n $hub2_er_circuit_name -g $rg -o none
+        circuit2_id=$(az network express-route show -n $hub2_er_circuit_name -g $rg -o tsv --query id) && echo "Circuit ID is $circuit2_id"
+        circuit2_state=$(az network express-route show -n $hub2_er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit2_state"
         echo "Waiting until ER circuit in hub2 is provisioned..."
         until [[ "$circuit2_state" == "Provisioned" ]]
         do
             sleep 15
-            circuit2_state=$(az network express-route show -n hub2er -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit_state"
+            az network express-route update -n $hub2_er_circuit_name -g $rg -o none
+            circuit2_state=$(az network express-route show -n $hub2_er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit2_state"
         done
     fi
-    # Create connections
-    peering_id_1=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name hub1er -g $rg -o tsv --query id) && echo "Private peering ID is $peering_id_1"
+    # Create connections to Virtual WAN
+    peering_id_1=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name $hub1_er_circuit_name -g $rg -o tsv --query id) && echo "Private peering ID is $peering_id_1"
     if [[ -z "$peering_id_1" ]]
     then
         echo "Could not find private peering for ER circuit 1, you might have to refresh in the portal?"
     else
         hub1_default_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n defaultRouteTable --query id -o tsv) && echo $hub1_default_rt_id
-        echo "Connecting branch5 to ER circuit 1..."
-        az network vpn-connection create -n "${branch5_gw_name}-${er_pop}-$RANDOM" -g $rg -l $branch5_location --vnet-gateway1 $branch5_gw_name --express-route-circuit2 $circuit1_id -o none
         echo "Connecting VWAN hub1 to ER circuit 1..."
         az network express-route gateway connection create --gateway-name hub1ergw -n "hub1ergw-${hub1_er_pop}" -g $rg --peering $peering_id_1 \
             --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default -o none
     fi
     if [[ "$no_of_hubs" == "2" ]]
     then
-        peering_id_2=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name hub2er -g $rg -o tsv --query id) && echo "Private peering ID is $peering_id_2"
+        peering_id_2=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name $hub2_er_circuit_name -g $rg -o tsv --query id) && echo "Private peering ID is $peering_id_2"
         if [[ -z "$peering_id_2" ]]
         then
             echo "Could not find private peering for ER circuit 2, you might have to refresh in the portal?"
         else
             hub2_default_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n defaultRouteTable --query id -o tsv) && echo $hub1_default_rt_id
-            echo "Connecting branch5 to ER circuit 2..."
-            az network vpn-connection create -n "${branch5_gw_name}-${er_pop}-$RANDOM" -g $rg -l $branch5_location --vnet-gateway1 $branch5_gw_name --express-route-circuit2 $circuit2_id -o none
             echo "Connecting VWAN hub2 to ER circuit 2..."
             az network express-route gateway connection create --gateway-name hub2ergw -n "hub2ergw-${hub2_er_pop}" -g $rg --peering $peering_id_2 \
                 --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id --labels default -o none
+            # Optionally, cross-connect the ER circuits
+            if [[ "$er_bow_tie" == "yes" ]]; then
+                echo "Connecting VWAN hub2 to ER circuit 1..."
+                az network express-route gateway connection create --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg --peering $peering_id_1 \
+                    --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id --labels default -o none
+                echo "Connecting VWAN hub1 to ER circuit 2..."
+                az network express-route gateway connection create --gateway-name hub1ergw -n "hub1ergw-${hub2_er_pop}" -g $rg --peering $peering_id_2 \
+                    --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default -o none
+                # Optionally, change the routing preference of the vhubs
+                az network vhub update -n hub1 -g $rg --hub-routing-preference ASPath -o none
+                az network vhub update -n hub2 -g $rg --hub-routing-preference ASPath -o none
+            fi
         fi
     fi
+
+    # Simulate onprem with Google Cloud
+    # Get environment info
+    account=$(gcloud info --format json | jq -r '.config.account')
+    billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
+    billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
+    # Create project
+    gcloud projects create $project_id --name $project_name
+    gcloud config set project $project_id
+    gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
+    gcloud services enable compute.googleapis.com
+    # VPC and instance
+    gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+    gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1
+    gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
+    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+    gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="ip a"
+    # Create interconnect
+    gcloud compute routers create $router1_name --project=$project_id --network=$gcp_vpc1_name --asn=$gcp_asn --region=$region1
+    gcloud compute interconnects attachments partner create $attachment1_name --region $region1 --router $router1_name --edge-availability-domain availability-domain-1
+    pairing_key1=$(gcloud compute interconnects attachments describe $attachment1_name --region $region1 --format json | jq -r '.pairingKey')
+    # Create VXC in Megaport
+    $megaport_script_path -g -s=jomore-${hub1_er_pop} -a=create_vxc -k=$pairing_key1
+    # Activate attachment
+    # wait_for_gcp_attachment_ready $attachment1_name $region1
+    sleep 120
+    gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --admin-enabled
+    # gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --no-enable-admin
+    if [[ "$no_of_hubs" == "2" ]]; then
+        # VPC and instance
+        gcloud compute networks create "$gcp_vpc2_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+        gcloud compute networks subnets create "$gcp_subnet2_name" --network "$gcp_vpc2_name" --range "$gcp_subnet2_prefix" --region=$region2
+        gcloud compute instances create "$gcp_vm2_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc2_name" --subnet "$gcp_subnet2_name" --zone "$zone2"
+        gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-icmp" --network "$gcp_vpc2_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-ssh" --network "$gcp_vpc2_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-web" --network "$gcp_vpc2_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+        gcloud compute ssh $gcp_vm2_name --zone=$zone2 --command="ip a"
+        # Create interconnect
+        gcloud compute routers create $router2_name --project=$project_id --network=$gcp_vpc2_name --asn=$gcp_asn --region=$region2
+        gcloud compute interconnects attachments partner create $attachment2_name --region $region2 --router $router2_name --edge-availability-domain availability-domain-1
+        pairing_key2=$(gcloud compute interconnects attachments describe $attachment2_name --region $region2 --format json | jq -r '.pairingKey')
+        # Create VXC in Megaport
+        $megaport_script_path -g -s=jomore-${hub2_er_pop} -a=create_vxc -k=$pairing_key2
+        # Activate attachment
+        # wait_for_gcp_attachment_ready $attachment1_name $region1
+        sleep 120
+        gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --admin-enabled
+        # gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --no-enable-admin
+    fi
+
 fi
 
 ##############################
@@ -1853,20 +1938,104 @@ function change_prop() {
         fi
         cx_id_list=$(az network vhub connection list -g $rg --vhub-name $hub --query '[].id' -o tsv)
         while IFS= read -r cx_id; do
-            echo "Modifying VNet connection ID $cx_id to propagate to ${rt_id}/${label}..."
-            az network vhub connection update --ids $cx_id --propagated-route-tables $rt_id --labels $label -o none
+            cx_name=$(echo $cx_id | cut -d/ -f 11)
+            if [[ "$cx_name" == "spoke1${indirect_spoke_id}" ]] || [[ "$cx_name" == "spoke1${indirect_spoke_id}" ]]; then
+                echo "${cxname} seems to have indirect spokes connected: not doing anything..."
+            else
+                echo "Modifying VNet connection $cx_name ($cx_id) to propagate to ${rt_id} - ${label}..."
+                az network vhub connection update --ids $cx_id --propagated-route-tables $rt_id --labels $label -o none --only-show-errors
+            fi
         done <<< "$cx_id_list"
         # Get the VPN GW ID and name
         vpngw_id=$(az network vhub show -n $hub -g $rg --query vpnGateway.id -o tsv)
-        vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
-        # Change propagation in VPN connections
-        vpn_cx_id_list=$(az network vpn-gateway connection list --gateway-name $vpngw_name -g $rg --query '[].id' -o tsv)
-        while IFS= read -r cx_id; do
-            echo "Modifying VPN connection ID $cx_id to propagate to ${rt_id}/${label}..."
-            az network vpn-gateway connection update --ids $cx_id --propagated-route-tables $rt_id --labels $label -o none
-        done <<< "$vpn_cx_id_list"
+        if [[ -n "$vpngw_id" ]]; then
+            vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
+            # Change propagation in VPN connections
+            echo "Getting existing S2S connections for gateway ${vpngw_name}..."
+            vpn_cx_id_list=$(az network vpn-gateway connection list --gateway-name $vpngw_name -g $rg --query '[].id' -o tsv)
+            while IFS= read -r cx_id; do
+                echo "Modifying VPN connection ID $cx_id to propagate to ${rt_id} - ${label}..."
+                az network vpn-gateway connection update --ids $cx_id --propagated-route-tables $rt_id --labels $label -o none --only-show-errors
+            done <<< "$vpn_cx_id_list"
+        fi
+        # Get the ER GW ID and name
+        ergw_id=$(az network vhub show -n $hub -g $rg --query expressRouteGateway.id -o tsv)
+        if [[ -n "$ergw_id" ]]; then
+            ergw_name=$(echo $ergw_id | cut -d/ -f 9)
+            # Change propagation in ER connections
+            echo "Getting existing ER connections for gateway ${ergw_name}..."
+            er_cx_id_list=$(az network express-route gateway connection list --gateway-name $ergw_name -g $rg --query 'value[].id' -o tsv)
+            while IFS= read -r cx_id; do
+                echo "Modifying ExpressRoute connection ID $cx_id to propagate to ${rt_id} - ${label}..."
+                az network express-route gateway connection update --ids $cx_id --propagated-route-tables $rt_id --labels $label -o none --only-show-errors
+            done <<< "$er_cx_id_list"
+        fi
     done
 }
+
+# Removes all static routes from a RT in a vhub
+# Example:
+#   remove_vhub_routes hub1 defaultRouteTable
+function remove_vhub_routes() {
+    vhub_name=$1
+    rt_name=$2
+    first_route_name=$(az network vhub route-table route list -n $rt_name --vhub-name $vhub_name -g $rg --query '[0].name' -o tsv)
+    while [[ -n '$first_route_name' ]]; do
+        echo "Removing route $first_route_name from $rt_name..."
+        az network vhub route-table route remove -n $rt_name --vhub-name $vhub_name -g $rg --index 0 -o none
+        first_route_name=$(az network vhub route-table route list -n $rt_name --vhub-name $vhub_name -g $rg --query '[0].name' -o tsv)
+    done
+}
+
+# Removes static routes from RTv3 in the vhub with next hop the azfw
+function remove_static_routes() {
+    remove_vhub_routes hub1 defaultRouteTable
+    remove_vhub_routes hub1 hub1Vnet
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        remove_vhub_routes hub2 defaultRouteTable
+        remove_vhub_routes hub2 hub1Vnet
+    fi
+}
+
+# Adds static routes to RTv3 in the vhub with next hop the azfw
+function add_static_routes() {
+    azfw1_id=$(az network vhub show -n hub1 -g $rg --query azureFirewall.id -o tsv)
+    if [[ -n "$azfw1_id" ]]; then
+        az network vhub route-table route add -n defaultRouteTable --vhub-name hub1 -g $rg \
+            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
+            --next-hop-type ResourceId --next-hop $azfw1_id -o none
+        az network vhub route-table route add -n hub1Vnet --vhub-name hub1 -g $rg \
+            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
+            --next-hop-type ResourceId --next-hop $azfw1_id -o none
+        if [[ "$no_of_hubs" == "2" ]]
+        then
+            azfw2_id=$(az network vhub show -n hub2 -g $rg --query azureFirewall.id -o tsv)
+            if [[ -n "$azfw2_id" ]]; then
+                az network vhub route-table route add -n defaultRouteTable --vhub-name hub2 -g $rg \
+                    --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
+                    --next-hop-type ResourceId --next-hop $azfw2_id -o none
+                az network vhub route-table route add -n hub2Vnet --vhub-name hub2 -g $rg \
+                    --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
+                    --next-hop-type ResourceId --next-hop $azfw2_id -o none
+            fi
+        fi
+    fi
+}
+
+
+#############################
+#   Modify bow-tie design   #
+#############################
+
+# Remove the bow-tie connections
+az network express-route gateway connection delete --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg -o none
+az network express-route gateway connection delete --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg -o none
+
+# Change routing preference
+routing_preference=ASPath  # Can be ASPath, ExpressRoute or VpnGateway
+az network vhub update -n hub1 -g $rg --hub-routing-preference $routing_preference -o none
+az network vhub update -n hub2 -g $rg --hub-routing-preference $routing_preference -o none
 
 ##############################
 # Connectivity test examples #
@@ -2085,6 +2254,68 @@ function monitor_results() {
 }
 monitor_results
 
+##########################
+#      Diagnostics       #
+##########################
+
+# ExpressRoute circuit
+az network express-route list-route-tables-summary -g $rg -n $hub1_er_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables-summary -g $rg -n $hub1_er_circuit_name --path secondary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $hub1_er_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $hub1_er_circuit_name --path secondary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables-summary -g $rg -n $hub2_er_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables-summary -g $rg -n $hub2_er_circuit_name --path secondary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $hub2_er_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $hub2_er_circuit_name --path secondary --peering-name AzurePrivatePeering --query value -o table
+
+# ExpressRoute gateways
+az network express-route gateway connection list --gateway-name hub2ergw -g $rg --query value -o table
+
+# Virtual WAN
+az network vhub list -g $rg -o table
+az network vhub connection list --vhub-name vhub -g $rg -o table
+az network express-route gateway list -g $rg -o table
+az network express-route gateway connection list --gateway-name $ergw1_name -g $rg -o table
+az network vhub get-effective-routes --resource-type RouteTable --resource-id $hub1_default_rt_id -g $rg -n hub1 -o table
+az network vhub get-effective-routes --resource-type RouteTable --resource-id $hub2_default_rt_id -g $rg -n hub2 -o table
+az network vhub get-effective-routes --resource-type HubVirtualNetworkConnection --resource-id $vnet1_cx_id -g $rg -n vhub -o table
+hub1_ergw_id=$(az network vhub show -n hub1 -g $rg --query expressRouteGateway.id -o tsv) && echo $hub1_ergw_id
+hub1_ergw_cx0_id=$(az network express-route gateway connection list --gateway-name hub1ergw -g $rg --query 'value[0].id' -o tsv) && echo $hub1_ergw_cx0_id
+hub1_ergw_cx1_id=$(az network express-route gateway connection list --gateway-name hub1ergw -g $rg --query 'value[1].id' -o tsv) && echo $hub1_ergw_cx1_id
+az network vhub get-effective-routes --resource-type ExpressRouteConnection --resource-id $hub1_ergw_cx0_id -g $rg -n hub1 -o table
+az network vhub get-effective-routes --resource-type ExpressRouteConnection --resource-id $hub1_ergw_cx1_id -g $rg -n hub1 -o table
+# with some bash fanciness:
+subscription_id=$(az account show -o tsv --query id)
+az network vhub get-effective-routes --resource-type RouteTable --resource-id $hub1_default_rt_id -g $rg -n hub1 --query 'value[].{Prefix:addressPrefixes[0],ASPath:asPath,NextHopType:nextHopType,NextHop:nextHops[0],Origin:routeOrigin}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft.Network\//,""); print }'
+az network vhub get-effective-routes --resource-type ExpressRouteConnection --resource-id $hub1_ergw_cx0_id -g $rg -n hub1 -o table --query 'value[].{Prefix:addressPrefixes[0],ASPath:asPath,NextHopType:nextHopType,NextHop:nextHops[0],Origin:routeOrigin}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft.Network\//,""); print }'
+
+# Virtual WAN BGP peerings
+az network vhub bgpconnection list --vhub-name hub1 -g $rg -o table
+az network vhub bgpconnection list --vhub-name hub2 -g $rg -o table
+
+# MCR
+$megaport_script_path -q -s=jomore-${hub1_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,as_path} | join("\t")'
+$megaport_script_path -q -s=jomore-${hub2_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,as_path} | join("\t")'
+
+# Effective routes in NICs
+az network nic list -g $rg -o table
+az network nic show-effective-route-table -o table -g $rg -n spoke11-vmVMNic
+
+# GCP onprem simulation
+gcloud compute instances describe $gcp_vm1_name
+gcloud compute routers get-status $router1_name --region=$region1 --format=json | jq -r '.result.bestRoutesForRouter[]|{destRange,routeType,nextHopIp} | join("\t")'
+gcloud compute instances describe $gcp_vm2_name
+gcloud compute routers get-status $router2_name --region=$region1 --format=json | jq -r '.result.bestRoutesForRouter[]|{destRange,routeType,nextHopIp} | join("\t")'
+
+# Spoke NVAs
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "systemctl status bird"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo birdc show prot"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo birdc show route export rs0"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "systemctl status bird"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo birdc show prot"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo birdc show route export rs0"
+
+
 ####################################
 # Firewall Logs from Azure Monitor #
 ####################################
@@ -2125,7 +2356,7 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_lo
 if [[ "$deploy_er" == "yes" ]]
 then
     # Remove MCR from Megaport
-    $megaport_script_location -q -s=jomore -a=delete_mcr
+    $megaport_script_location -s=jomore -a=delete_mcr
 fi
 # locations=($location1 $location2)
 # for location in ${locations[@]}; do
