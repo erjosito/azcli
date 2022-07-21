@@ -1,0 +1,63 @@
+#####################################################
+# Sample CLI commands to test Azure Container Apps,
+#   especially to investigate its networking
+#   components.
+#
+# Jose Moreno, July 2022
+#####################################################
+
+# Variables
+rg=aca
+location=eastus
+vnet_name=aca
+vnet_prefix=10.10.0.0/22
+aca_subnet_prefix=10.10.0.0/26
+aca_subnet_name=aca
+acainfra_subnet_prefix=10.10.2.0/23
+acainfra_subnet_name=aca-infra
+vm_subnet_prefix=10.10.0.64/26
+vm_subnet_name=vm
+aca_env_name=env1
+image_name='erjosito/sqlapi:1.0'
+sql_server_name=sqlserver$RANDOM
+sql_db_name=mydb
+sql_username=azure
+sql_password='Microsoft123!'
+
+# Create RG and VNet
+echo "Creating resource group and VNet..."
+az group create -n $rg -l $location -o none
+az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $aca_subnet_name --subnet-prefixes $aca_subnet_prefix -o none
+az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix -o none
+az network vnet subnet create -n $acainfra_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $acainfra_subnet_prefix -o none
+acainfra_subnet_id=$(az network vnet subnet show -n $acainfra_subnet_name -g $rg --vnet-name $vnet_name --query id -o tsv)
+
+# Create ACA environment
+echo "Creating ACA environment..."
+az containerapp env create -n $aca_env_name -g $rg -l $location --infrastructure-subnet-resource-id $acainfra_subnet_id -o none
+
+# Private DNS
+aca_env_domain=$(az containerapp env show -n $aca_env_name -g $rg --query defaultDomain -o tsv)
+aca_env_static_ip=$(az containerapp env show -n $aca_env_name -g $rg --query staticIp -o tsv)
+vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id --out tsv)
+echo "Creating private DNS zone for ${aca_env_domain}..."
+az network private-dns zone create -n aca_env_domain -g $rg -o none
+az network private-dns link vnet create -n $vnet_name -g $rg --virtual-network $vnet_id --zone-name $aca_env_domain --registration-enabled true -o none
+az network private-dns record-set a add-record --record-set-name "*" -g $rg --ipv4-address $aca_env_static_ip --zone-name $aca_env_domain -o none
+
+# Create backend database
+echo "Creating test database..."
+az sql server create -n $sql_server_name -g $rg -l $location --admin-user "$sql_username" --admin-password "$sql_password" -o none
+az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait -o none
+sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName) && echo $sql_server_fqdn
+
+# Deploy apps (2 of them)
+echo "Deploying apps..."
+az containerapp create --image $image_name -n app1 -g $rg --environment $aca_env_name -o none \
+    --env-vars "SQL_SERVER_USERNAME=${sql_username}" "SQL_SERVER_PASSWORD=${sql_password}" "SQL_SERVER_FQDN=${sql_server_fqdn}"
+az containerapp create --image $image_name -n app2 -g $rg --environment $aca_env_name -o none \
+    --env-vars "SQL_SERVER_USERNAME=${sql_username}" "SQL_SERVER_PASSWORD=${sql_password}" "SQL_SERVER_FQDN=${sql_server_fqdn}"
+
+# Query app insights logs
+logws_client_id=$(az containerapp env show -n $aca_env_name -g $rg --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
+az monitor log-analytics query --workspace $logws_client_id --analytics-query "ContainerAppConsoleLogs_CL | where ContainerAppName_s == 'my-container-app' | project ContainerAppName_s, Log_s, TimeGenerated" -o table

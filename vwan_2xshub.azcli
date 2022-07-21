@@ -18,23 +18,23 @@
 ###############
 
 # Control
-no_of_hubs=2         # 1 or 2 hubs
+no_of_hubs=1         # 1 or 2 hubs
 no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=no        # Whether firewalls are provisioned in the hubs
-public_ip=no         # Whether extra VMs are created with public IP addressing
 indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
 nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
 nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
-deploy_vpngw=no      # Whether VPN GWs should be deployed
+deploy_vpngw=yes     # Whether VPN GWs should be deployed
 deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
 route_thru_nva=no    # Whether a static pointing to the NVA in the last spoke is configured
 er_bow_tie=yes       # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
+public_ip=no         # Whether extra VMs are created with public IP addressing
 
 # Generic variables
-rg=vwaneastus
+rg=vwan
 vwan=vwan
 location1=germanywestcentral
 location2=westcentralus
@@ -1881,7 +1881,7 @@ then
     gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
     gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
     gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
-    gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="ip a"
+    # gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="ip a"    # This command will pause the script if the key file is password-protected
     # Create interconnect
     gcloud compute routers create $router1_name --project=$project_id --network=$gcp_vpc1_name --asn=$gcp_asn --region=$region1
     gcloud compute interconnects attachments partner create $attachment1_name --region $region1 --router $router1_name --edge-availability-domain availability-domain-1
@@ -1901,7 +1901,7 @@ then
         gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-icmp" --network "$gcp_vpc2_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
         gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-ssh" --network "$gcp_vpc2_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
         gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-web" --network "$gcp_vpc2_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
-        gcloud compute ssh $gcp_vm2_name --zone=$zone2 --command="ip a"
+        # gcloud compute ssh $gcp_vm2_name --zone=$zone2 --command="ip a"    # This command will pause the script if the key file is password-protected
         # Create interconnect
         gcloud compute routers create $router2_name --project=$project_id --network=$gcp_vpc2_name --asn=$gcp_asn --region=$region2
         gcloud compute interconnects attachments partner create $attachment2_name --region $region2 --router $router2_name --edge-availability-domain availability-domain-1
@@ -2294,8 +2294,8 @@ az network vhub bgpconnection list --vhub-name hub1 -g $rg -o table
 az network vhub bgpconnection list --vhub-name hub2 -g $rg -o table
 
 # MCR
-$megaport_script_path -q -s=jomore-${hub1_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,as_path} | join("\t")'
-$megaport_script_path -q -s=jomore-${hub2_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,as_path} | join("\t")'
+$megaport_script_path -q -s=jomore-${hub1_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,asPath} | join("\t")'
+$megaport_script_path -q -s=jomore-${hub2_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,asPath} | join("\t")'
 
 # Effective routes in NICs
 az network nic list -g $rg -o table
@@ -2314,6 +2314,11 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo birdc show r
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "systemctl status bird"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo birdc show prot"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo birdc show route export rs0"
+# Danger
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo systemctl stop bird"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo systemctl stop bird"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo systemctl start bird"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo systemctl start bird"
 
 
 ####################################
@@ -2352,10 +2357,9 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_lo
 #    Cleanup    #
 #################
 
-# az group delete -n $rg -y --no-wait
+# Delete Megaport components
 if [[ "$deploy_er" == "yes" ]]
 then
-    # Remove MCR from Megaport
     $megaport_script_location -s=jomore -a=delete_mcr
 fi
 # locations=($location1 $location2)
@@ -2366,3 +2370,12 @@ fi
 #         az network watcher connection-monitor delete -n $monitor_name -l $location -o none
 #     done <<< "$monitor_list"
 # done
+
+# Delete GCP project
+if [[ "$deploy_er" == "yes" ]]; then
+    gcloud projects delete "$project_id"
+    gcloud projects list
+fi
+
+# Delete Azure infrastructure
+az group delete -n $rg -y --no-wait

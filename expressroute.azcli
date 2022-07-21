@@ -38,6 +38,7 @@ vm_name="vm-${er_pop}"
 vm_pip_name="${vm_name}-pip"
 vm_size=Standard_B1s
 mcr_asn=65001
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
 
 # Create RG
 echo "Creating resource group..."

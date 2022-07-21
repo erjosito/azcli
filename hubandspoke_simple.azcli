@@ -47,6 +47,13 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_pip "sudo iptables -t n
 myip=$(curl -s4 ifconfig.co)
 az network route-table route update -n mypc -g $rg --route-table-name $spoke_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none
 
+# Update hub VM NSG
+hub_nsg_id=$(az network nic show --ids $hub_nic_id --query 'networkSecurityGroup.id' -o tsv)
+hub_nsg_name=$(echo $hub_nsg_id | cut -d/ -f 9)
+az network nsg rule create --nsg-name $hub_nsg_name -g $rg -n Allow_Inbound_From_RFC1918 --priority 1010 \
+    --access Allow --protocol '*' --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges '*' -o none
+
 # Diagnostics
 hub_nic_id=$(az vm show -n $hub_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 spoke_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
