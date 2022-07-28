@@ -28,6 +28,9 @@ pod_subnet_name=pods
 pod_subnet_prefix=10.13.80.0/24
 vm_subnet_name=vm
 vm_subnet_prefix=10.13.1.0/24
+bastion_subnet_name=AzureBastionSubnet 
+bastion_subnet_prefix=10.13.15.0/24
+bastion_name=aksbastion
 appgw_subnet_name=AppGateway
 appgw_subnet_prefix=10.13.10.0/24
 azfw_subnet_prefix=10.13.11.0/24
@@ -188,7 +191,8 @@ az aks create -g $rg -n $aks_name -l $location \
     --network-plugin $network_plugin --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
     --network-policy 'calico' --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
-    --dns-name-prefix cloudtrooper
+    --enable-private-cluster --private-dns-zone none \
+    --dns-name-prefix cloudtrooper --no-wait
 
 # Other options you can use in the previous command
     # --enable-private-cluster --private-dns-zone none --disable-public-fqdn \
@@ -257,6 +261,19 @@ az aks update -g $rg -n $aks_name --enable-managed-identity -y
 # Update to new version
 new_aks_version=1.21.2
 az aks upgrade -n $aks_name -g $rg -k $new_aks_version -y
+
+#####################
+# Create Az Bastion #
+#####################
+
+echo "Creating Azure Bastion..."
+bastion_pip_name="${bastion_name}-pip"
+az network vnet subnet create -g $rg -n $bastion_subnet_name --vnet-name $vnet_name --address-prefix $bastion_subnet_prefix -o none
+az network public-ip create -g $rg -n $bastion_pip_name --sku Standard -l $location -o none
+az network bastion create -n $bastion_name --public-ip-address $bastion_pip_name -g $rg --vnet-name $vnet_name -l $location -o none
+vm_id=$(az vm show -n $vm_name -g $rg --query id -o tsv)
+az vm user update -u azureuser -p 'Microsoft123!' -n $vm_name -g $rg -o none
+az network bastion tunnel -n $bastion_name -g $rg --target-resource-id $vm_id --resource-port 22 --port 2022
 
 #####################
 #  IP restrictions  #
@@ -555,6 +572,10 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
 node_ip=$(kubectl get node -o json | jq -r '.items[0].status.addresses[] | select(.type=="InternalIP") | .address') && echo $node_ip
 # Connect to an AKS node over the jump VM
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -m hmac-sha2-512 -J $vm_pip_address $node_ip "ip a"
+# Install Azure CLI and kubectl on the jump VM
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo apt update"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo az aks install-cli"
 
 #######################
 # OpenVPN Server test #

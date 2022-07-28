@@ -6,6 +6,9 @@
 # Jose Moreno, July 2022
 #####################################################
 
+# Control
+internal=yes
+
 # Variables
 rg=aca
 location=eastus
@@ -15,11 +18,14 @@ aca_subnet_prefix=10.10.0.0/26
 aca_subnet_name=aca
 acainfra_subnet_prefix=10.10.2.0/23
 acainfra_subnet_name=aca-infra
+sql_subnet_name=sql
+sql_subnet_prefix=10.10.0.128/27
 vm_subnet_prefix=10.10.0.64/26
 vm_subnet_name=vm
+vm_name=testvm
+vm_sku=Standard_B2ms
 aca_env_name=env1
 image_name='erjosito/sqlapi:1.0'
-sql_server_name=sqlserver$RANDOM
 sql_db_name=mydb
 sql_username=azure
 sql_password='Microsoft123!'
@@ -29,35 +35,156 @@ echo "Creating resource group and VNet..."
 az group create -n $rg -l $location -o none
 az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $aca_subnet_name --subnet-prefixes $aca_subnet_prefix -o none
 az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix -o none
+az network vnet subnet create -n $sql_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $sql_subnet_prefix -o none
 az network vnet subnet create -n $acainfra_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $acainfra_subnet_prefix -o none
 acainfra_subnet_id=$(az network vnet subnet show -n $acainfra_subnet_name -g $rg --vnet-name $vnet_name --query id -o tsv)
 
+# If internal cluster, create VM to test
+if [[ "$internal" == "yes" ]]; then
+    az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku -l $location \
+      --vnet-name $vnet_name --subnet $vm_subnet_name --nsg "${vm_name}-nsg" --public-ip-address "${vm_name}-pip"
+    vm_pip=$(az network public-ip show -n "${vm_name}-pip" -g $rg --query ipAddress -o tsv)
+    # Install Azure CLI
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash"
+
+fi
+
 # Create ACA environment
 echo "Creating ACA environment..."
-az containerapp env create -n $aca_env_name -g $rg -l $location --infrastructure-subnet-resource-id $acainfra_subnet_id -o none
+if [[ "$internal" == "yes" ]]; then
+        az containerapp env create -n $aca_env_name -g $rg -l $location --infrastructure-subnet-resource-id $acainfra_subnet_id --internal-only true \
+            --docker-bridge-cidr 172.28.0.1/16 --platform-reserved-cidr 172.29.0.0/16 --platform-reserved-dns-ip 172.29.0.10 -o none
+else
+    az containerapp env create -n $aca_env_name -g $rg -l $location --infrastructure-subnet-resource-id $acainfra_subnet_id -o none
+fi
 
-# Private DNS
-aca_env_domain=$(az containerapp env show -n $aca_env_name -g $rg --query defaultDomain -o tsv)
-aca_env_static_ip=$(az containerapp env show -n $aca_env_name -g $rg --query staticIp -o tsv)
+# Private DNS for ACA
+aca_env_domain=$(az containerapp env show -n $aca_env_name -g $rg --query properties.defaultDomain -o tsv)
+aca_env_static_ip=$(az containerapp env show -n $aca_env_name -g $rg --query properties.staticIp -o tsv)
 vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id --out tsv)
 echo "Creating private DNS zone for ${aca_env_domain}..."
-az network private-dns zone create -n aca_env_domain -g $rg -o none
-az network private-dns link vnet create -n $vnet_name -g $rg --virtual-network $vnet_id --zone-name $aca_env_domain --registration-enabled true -o none
+az network private-dns zone create -n $aca_env_domain -g $rg -o none
+az network private-dns link vnet create -n $vnet_name -g $rg --virtual-network $vnet_id --zone-name $aca_env_domain --registration-enabled false -o none
 az network private-dns record-set a add-record --record-set-name "*" -g $rg --ipv4-address $aca_env_static_ip --zone-name $aca_env_domain -o none
 
-# Create backend database
-echo "Creating test database..."
-az sql server create -n $sql_server_name -g $rg -l $location --admin-user "$sql_username" --admin-password "$sql_password" -o none
-az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait -o none
+# Get the node RG from the default domain
+aca_domain_name=$(echo $aca_env_domain | cut -d. -f 1)
+aca_domain_region=$(echo $aca_env_domain | cut -d. -f 2)
+node_rg="MC_${aca_domain_name}-rg_${aca_domain_name}_${aca_domain_region}"
+az resource list -g $node_rg -o table
+
+# Create backend database to test private link
+sql_server_name=$(az sql server list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$sql_server_name" ]]; then
+    sql_server_name=sqlserver$RANDOM
+    echo "Creating SQL server ${sql_server_name}..."
+    az sql server create -n $sql_server_name -g $rg -l $location --admin-user "$sql_username" --admin-password "$sql_password" -o none
+    az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait -o none
+else
+    echo "SQL Server $sql_server_name found in resource group $rg"
+fi
 sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName) && echo $sql_server_fqdn
+
+# Create private link for SQL Server
+sql_endpoint_name=sqlep
+sql_server_id=$(az sql server show -n $sql_server_name -g $rg -o tsv --query id)
+az network vnet subnet update -n $subnet_sql_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true -o none
+az network private-endpoint create -n $sql_endpoint_name -g $rg --vnet-name $vnet_name --subnet $subnet_sql_name --private-connection-resource-id $sql_server_id --group-id sqlServer --connection-name sqlConnection -o none
+sql_nic_id=$(az network private-endpoint show -n $sql_endpoint_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
+sql_endpoint_ip=$(az network nic show --ids $sql_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+echo "Private IP address for SQL server ${sql_server_name}: ${sql_endpoint_ip}"
+# nslookup ${sql_server_fqdn}
+# nslookup ${sql_server_name}.privatelink.database.windows.net
+
+# Create private DNS zone for private link
+echo "Creating private DNS zone for private link..."
+dns_zone_name=privatelink.database.windows.net
+az network private-dns zone create -n $dns_zone_name -g $rg -o none
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n myDnsLink --virtual-network $vnet_name --registration-enabled false -o none
+# az network private-dns record-set a create -n $sql_server_name -z $dns_zone_name -g $rg -o none
+# az network private-dns record-set a add-record --record-set-name $sql_server_name -z $dns_zone_name -g $rg -a $sql_endpoint_ip -o none
+az network private-endpoint dns-zone-group create --endpoint-name $sql_endpoint_name -g $rg -n plinkzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none
 
 # Deploy apps (2 of them)
 echo "Deploying apps..."
+if [[ "$internal" == "yes" ]]; then
+    ingress=internal
+else
+    ingress=external
+fi
 az containerapp create --image $image_name -n app1 -g $rg --environment $aca_env_name -o none \
-    --env-vars "SQL_SERVER_USERNAME=${sql_username}" "SQL_SERVER_PASSWORD=${sql_password}" "SQL_SERVER_FQDN=${sql_server_fqdn}"
+    --env-vars "SQL_SERVER_USERNAME=${sql_username}" "SQL_SERVER_FQDN=${sql_server_fqdn}" "SQL_SERVER_PASSWORD=${sql_password}" \
+    --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 --ingress $ingress --target-port 8080
 az containerapp create --image $image_name -n app2 -g $rg --environment $aca_env_name -o none \
-    --env-vars "SQL_SERVER_USERNAME=${sql_username}" "SQL_SERVER_PASSWORD=${sql_password}" "SQL_SERVER_FQDN=${sql_server_fqdn}"
+    --env-vars "SQL_SERVER_USERNAME=${sql_username}" "SQL_SERVER_FQDN=${sql_server_fqdn}" "SQL_SERVER_PASSWORD=${sql_password}" \
+    --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 --ingress $ingress --target-port 8080
+
+# Publish/unpublish apps
+# az containerapp ingress enable -n app1 -g $rg --type external --allow-insecure --target-port 8080 -o none
+app1_fqdn=$(az containerapp show -n app1 -g $rg --query properties.configuration.ingress.fqdn -o tsv)
+if [[ "$internal" == "yes" ]]; then
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "nslookup $app1_fqdn"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -sk https://${app1_fqdn}/api/ip"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -sk https://${app1_fqdn}/api/sqlsrcip"
+else
+    curl -k "https://${app1_fqdn}/api/ip"
+    curl -k "https://${app1_fqdn}/api/sqlsrcip"
+fi
+# az containerapp ingress disable -n app1 -g $rg -o none
+# az containerapp ingress enable -n app2 -g $rg --type internal --allow-insecure --target-port 8080 -o none
+app2_fqdn=$(az containerapp show -n app2 -g $rg --query properties.configuration.ingress.fqdn -o tsv)
+if [[ "$internal" == "yes" ]]; then
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "nslookup $app2_fqdn"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -sk https://${app2_fqdn}/api/ip"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -sk https://${app2_fqdn}/api/sqlsrcip"
+else
+    curl -k "https://${app2_fqdn}/api/ip"
+    curl -k "https://${app2_fqdn}/api/sqlsrcip"
+fi
+# az containerapp ingress disable -n app2 -g $rg -o none
+
+# Modify resource allocation
+az containerapp update -n app1 -g $rg --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 -o none
+az containerapp update -n app2 -g $rg --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 -o none
+
+# Exec into app
+app1_replica0_name=$(az containerapp replica list -n app1 -g $rg --query '[0].name' -o tsv)
+az containerapp exec -n app1 -g $rg --command bash
+az containerapp exec -n app1 -g $rg --command 'for i in {0..255}; do for j in {0..255}; do dig -x 10.0.$i.$j | grep -e cluster.local ; done ; done'
+
+###############
+# Diagnostics #
+###############
+
+# ACA env
+az containerapp env list -g $rg -o table
+az containerapp env show -n $aca_env_name -g $rg
+
+# ACA apps
+az containerapp list -g $rg -o table
+az containerapp show -n app1 -g $rg
+az containerapp replica list -n app1 -g $rg -o table
+az containerapp logs show -n app1 -g $rg -o table
+
+# LB
+az network lb frontend-ip list --lb-name kubernetes -g $node_rg -o table
+az network lb outbound-rule list --lb-name kubernetes -g $node_rg -o table
+az network lb rule list --lb-name kubernetes -g $node_rg -o table
+az network lb frontend-ip list --lb-name kubernetes-internal -g $node_rg -o table
+az network lb outbound-rule list --lb-name kubernetes-internal -g $node_rg -o table
+az network lb rule list --lb-name kubernetes-internal -g $node_rg -o table
 
 # Query app insights logs
 logws_client_id=$(az containerapp env show -n $aca_env_name -g $rg --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
 az monitor log-analytics query --workspace $logws_client_id --analytics-query "ContainerAppConsoleLogs_CL | where ContainerAppName_s == 'my-container-app' | project ContainerAppName_s, Log_s, TimeGenerated" -o table
+
+###############
+#   Cleanup   #
+###############
+
+az containerapp delete -n app1 -g $rg -y
+az containerapp delete -n app2 -g $rg -y
+
+az containerapp env delete -n $aca_env_name -g $rg -y
+
+az group delete -n $rg -y --no-wait

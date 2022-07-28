@@ -115,7 +115,7 @@ else
         --target-fqdns '*.opinsights.azure.com' '*.azure-automation.net' --source-addresses '*' --protocols Https=443 -o none
     # Create Azure Firewalls in the virtual hubs and configure static routes to firewall in the VWAN hub route tables
     echo "Creating Azure Firewall..."
-    az network firewall create -n azfw1 -g $rg --vhub hub1 --policy $azfw_policy_name -l $location1 --sku AZFW_Hub --public-ip-count 1 -o none
+    az network firewall create -n $azfw_name -g $rg --policy $azfw_policy_name -l $location -o none
 fi
 # Configuring IP
 echo "Configuring firewall logs and private IP..."
