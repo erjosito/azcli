@@ -18,25 +18,26 @@
 ###############
 
 # Control
-no_of_hubs=1         # 1 or 2 hubs
+no_of_hubs=2         # 1 or 2 hubs
 no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
-secure_hub=no        # Whether firewalls are provisioned in the hubs
-indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
-nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
+secure_hub=yes       # Whether firewalls are provisioned in the hubs
+indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
+nva_bgp=yes          # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
-nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
-nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub2=yes      # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
 deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
 route_thru_nva=no    # Whether a static pointing to the NVA in the last spoke is configured
-er_bow_tie=yes       # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
+er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 
 # Generic variables
 rg=vwan
 vwan=vwan
-location1=germanywestcentral
+location1=australiaeast
+# location1=germanywestcentral
 location2=westcentralus
 password=Microsoft123!
 vwan_hub1_prefix=192.168.0.0/23
@@ -49,40 +50,41 @@ publisher=cisco
 offer=cisco-csr-1000v
 sku=16_12-byol
 version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
-branch1_prefix=10.201.0.0/24
-branch1_prefix_long="10.201.0.0 255.255.255.0"
-branch1_subnet=10.201.0.0/26
-branch1_vm_subnet=10.201.0.64/26
-branch1_gateway=10.201.0.1
-branch1_bgp_ip=10.201.0.10
+branch1_prefix=10.4.1.0/24
+branch1_prefix_long="10.4.1.0 255.255.255.0"
+branch1_subnet=10.4.1.0/26
+branch1_vm_subnet=10.4.1.64/26
+branch1_gateway=10.4.1.1
+branch1_bgp_ip=10.4.1.10
 branch1_asn=65501
-branch2_prefix=10.202.0.0/24
-branch2_prefix_long="10.202.0.0 255.255.255.0"
-branch2_vm_subnet=10.202.0.64/26
-branch2_subnet=10.202.0.0/26
-branch2_gateway=10.202.0.1
-branch2_bgp_ip=10.202.0.10
-branch2_2ary_bgp_ip=10.202.0.20
+branch2_prefix=10.5.1.0/24
+branch2_prefix_long="10.5.1.0 255.255.255.0"
+branch2_vm_subnet=10.5.1.64/26
+branch2_subnet=10.5.1.0/26
+branch2_gateway=10.5.1.1
+branch2_bgp_ip=10.5.1.10
+branch2_2ary_bgp_ip=10.5.1.20
 branch2_asn=65502
-branch3_prefix=10.213.0.0/24
-branch3_subnet=10.213.0.0/26
-branch3_vm_subnet=10.213.0.64/26
-branch3_gateway=10.213.0.1
-branch3_bgp_ip=10.213.0.75
+branch3_prefix=10.4.3.0/24
+branch3_subnet=10.4.3.0/26
+branch3_vm_subnet=10.4.3.64/26
+branch3_gateway=10.4.3.1
+branch3_bgp_ip=10.4.3.75
 branch3_asn=65503
 branch3_test_route=3.3.3.0/24
-branch4_prefix=10.214.0.0/24
-branch4_vm_subnet=10.214.0.64/26
-branch4_subnet=10.214.0.0/26
-branch4_gateway=10.214.0.1
-branch4_bgp_ip=10.214.0.75
+branch4_prefix=10.5.3.0/24
+branch4_vm_subnet=10.5.3.64/26
+branch4_subnet=10.5.3.0/26
+branch4_gateway=10.5.3.1
+branch4_bgp_ip=10.5.3.75
 branch4_asn=65504
 branch4_test_route=4.4.4.0/24
 # ER (optional)
 er_provider=Megaport
 er_circuit_sku=Premium
 megaport_script_location="/home/jose/repos/azcli/megaport.sh"
-hub1_er_pop=Frankfurt
+hub1_er_pop=Sydney
+# hub1_er_pop=Frankfurt
 hub1_er_circuit_name="er1-$hub1_er_pop"
 hub2_er_pop=Dallas
 hub2_er_circuit_name="er2-$hub2_er_pop"
@@ -92,12 +94,14 @@ project_id="${project_name}${RANDOM}"
 machine_type=e2-micro
 gcp_asn=16550
 # gcp region 1
-region1=europe-west3
-zone1=europe-west3-b
+region1=australia-southeast1
+zone1=australia-southeast1-b
+# region1=europe-west3
+# zone1=europe-west3-b
 gcp_vm1_name=vm1
 gcp_vpc1_name=vpc1
 gcp_subnet1_name=vm1
-gcp_subnet1_prefix='10.225.0.0/24'
+gcp_subnet1_prefix='10.4.2.0/24'
 attachment1_name=attachment1
 router1_name=router1
 # gcp region 2
@@ -106,7 +110,7 @@ zone2=us-west2-b
 gcp_vm2_name=vm2
 gcp_vpc2_name=vpc2
 gcp_subnet2_name=vm2
-gcp_subnet2_prefix='10.226.0.0/24'
+gcp_subnet2_prefix='10.5.2.0/24'
 attachment2_name=attachment2
 router2_name=router2
 
@@ -1143,8 +1147,8 @@ if [[ "$secure_hub" == "yes" ]]
 then
     # Create Azure Firewall policy with sample policies
     azfw_policy_name=vwanfwpolicy
-    az network firewall policy create -n $azfw_policy_name -g $rg
-    az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 100
+    az network firewall policy create -n $azfw_policy_name -g $rg -o none
+    az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 100 -o none
     # Allow SSH and HTTP for connection monitor (uses TCP9 too)
     echo "Creating rule to allow SSH and HTTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -1154,7 +1158,7 @@ then
     echo "Creating rule to allow ICMP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols ICMP --destination-ports "1-65535" -o none
     # Allow NTP
     echo "Creating rule to allow NTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \

@@ -8,6 +8,8 @@
 
 # Control
 internal=yes
+create_azfw=yes
+custom_dns=yes
 
 # Variables
 rg=aca
@@ -24,6 +26,11 @@ vm_subnet_prefix=10.10.0.64/26
 vm_subnet_name=vm
 vm_name=testvm
 vm_sku=Standard_B2ms
+azfw_subnet_name=AzureFirewallSubnet
+azfw_subnet_prefix=10.10.0.192/26
+azfw_name=azfw
+azfw_pip_name=azfw-pip
+azfw_policy_name=azfw-policy
 aca_env_name=env1
 image_name='erjosito/sqlapi:1.0'
 sql_db_name=mydb
@@ -37,25 +44,109 @@ az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --su
 az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix -o none
 az network vnet subnet create -n $sql_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $sql_subnet_prefix -o none
 az network vnet subnet create -n $acainfra_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $acainfra_subnet_prefix -o none
+az network vnet subnet create -n $azfw_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $azfw_subnet_prefix -o none
 acainfra_subnet_id=$(az network vnet subnet show -n $acainfra_subnet_name -g $rg --vnet-name $vnet_name --query id -o tsv)
+
+# If create AzFW
+if [[ "$create_azfw" == "yes" ]]; then
+    # Create Log Analytics Workspace
+    logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+    if [[ -z "$logws_name" ]]
+    then
+        echo "Creating new Log Analytics workspace"
+        logws_name=log$RANDOM
+        az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+    else
+        echo "Log Analytics workspace $logws_name found"
+    fi
+    logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+    logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+    # Create PIP
+    az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location -o none
+    azfw_ip=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
+    # Create policy
+    azfw_policy_name="${azfw_name}-policy"
+    az network firewall policy create -n $azfw_policy_name -g $rg -o none
+    az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
+    echo "Creating rule to allow SSH and HTTP..."       # Allows internal connectivity
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name allowall --collection-priority 101 --action Allow --rule-name allowrfc1918 --rule-type NetworkRule --description "Internal connectivity" \
+        --destination-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --ip-protocols Any --destination-ports "1-65535" -o none
+    echo "Creating rule to allow ICMP..."               # Allow ICMP
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols ICMP --destination-ports "1-65535" -o none
+    echo "Creating rule to allow NTP..."                # Allow NTP
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --ip-protocols UDP --destination-ports "123" -o none
+    echo "Creating rule to allow Outbound Web..."       # Allow outbound web
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name outboundweb --collection-priority 104 --action Allow --rule-name allowWeb --rule-type NetworkRule --description "Egress web traffic" \
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --ip-protocols TCP --destination-ports "443" -o none
+    echo "Creating rule to allow *.ubuntu.com..."       # Example application collection with wildcards (*.ubuntu.com)
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name allowallweb --collection-priority 20000 --action Allow --rule-name allowall --rule-type ApplicationRule --description "allowAllWeb" \
+        --target-fqdns '*' --source-addresses '*' --protocols Http=80 Https=443 -o none
+    # Create AzFW
+    echo "Creating Azure Firewall..."
+    az network firewall create -n $azfw_name -g $rg --policy $azfw_policy_name -l $location -o none
+    # Configuring IP
+    echo "Configuring firewall logs and private IP..."
+    azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+    az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+        --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+        --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+                {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+    azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo "$azfw_private_ip"
+    # Configure UDR and default route in ACA infra subnet
+    az network route-table create -n aca -g $rg -l $location -o none
+    az network route-table route create -n defaultRoute --route-table-name aca -g $rg --next-hop-type VirtualAppliance --address-prefix "0.0.0.0/0" --next-hop-ip-address $azfw_private_ip -o none
+    aca_rt_id=$(az network route-table show -n aca -g $rg --query id -o tsv)
+    az network vnet subnet update -g $rg --vnet-name $vnet_name -n $acainfra_subnet_name --route-table $aca_rt_id -o none
+    # az network vnet subnet update -g $rg --vnet-name $vnet_name -n $acainfra_subnet_name --route-table '' -o none     # Remove RT
+fi
+
+# Functions to start/stop the firewall
+function stop_firewall() {
+    az network firewall ip-config delete -f $azfw_name -n azfw-ipconfig -g $rg -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+function start_firewall() {
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
 
 # If internal cluster, create VM to test
 if [[ "$internal" == "yes" ]]; then
     az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku -l $location \
       --vnet-name $vnet_name --subnet $vm_subnet_name --nsg "${vm_name}-nsg" --public-ip-address "${vm_name}-pip"
     vm_pip=$(az network public-ip show -n "${vm_name}-pip" -g $rg --query ipAddress -o tsv)
+    vm_nic_id=$(az vm show -n $vm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv) && echo $vm_nic_id
+    vm_private_ip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $vm_private_ip
     # Install Azure CLI
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash"
+    # Install dnsmasq (to act as DNS server) and add a random name to /etc/hosts
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip" "sudo apt install -y dnsmasq"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip" "sudo sed -i \"\$ a 1.2.3.4 test.contoso.corp\" /etc/hosts"
+fi
 
+# If custom DNS
+if [[ "$custom_dns" == "yes" ]]; then
+    echo "Updating VNet custom DNS servers to $vm_private_ip..."
+    az network vnet update -n $vnet_name -g $rg --dns-servers $vm_private_ip -o none
 fi
 
 # Create ACA environment
 echo "Creating ACA environment..."
 if [[ "$internal" == "yes" ]]; then
-        az containerapp env create -n $aca_env_name -g $rg -l $location --infrastructure-subnet-resource-id $acainfra_subnet_id --internal-only true \
-            --docker-bridge-cidr 172.28.0.1/16 --platform-reserved-cidr 172.29.0.0/16 --platform-reserved-dns-ip 172.29.0.10 -o none
+    az containerapp env create -n $aca_env_name -g $rg -l $location --infrastructure-subnet-resource-id $acainfra_subnet_id --internal-only true \
+        --docker-bridge-cidr 172.28.0.1/16 --platform-reserved-cidr 172.29.0.0/16 --platform-reserved-dns-ip 172.29.0.10 -o none
 else
-    az containerapp env create -n $aca_env_name -g $rg -l $location --infrastructure-subnet-resource-id $acainfra_subnet_id -o none
+    az containerapp env create -n $aca_env_name -g $rg -l $location --infrastructure-subnet-resource-id $acainfra_subnet_id --internal-only false \
+        --docker-bridge-cidr 172.28.0.1/16 --platform-reserved-cidr 172.29.0.0/16 --platform-reserved-dns-ip 172.29.0.10 -o none
 fi
 
 # Private DNS for ACA
@@ -107,17 +198,12 @@ az network private-endpoint dns-zone-group create --endpoint-name $sql_endpoint_
 
 # Deploy apps (2 of them)
 echo "Deploying apps..."
-if [[ "$internal" == "yes" ]]; then
-    ingress=internal
-else
-    ingress=external
-fi
 az containerapp create --image $image_name -n app1 -g $rg --environment $aca_env_name -o none \
     --env-vars "SQL_SERVER_USERNAME=${sql_username}" "SQL_SERVER_FQDN=${sql_server_fqdn}" "SQL_SERVER_PASSWORD=${sql_password}" \
-    --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 --ingress $ingress --target-port 8080
+    --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 --ingress external --target-port 8080
 az containerapp create --image $image_name -n app2 -g $rg --environment $aca_env_name -o none \
     --env-vars "SQL_SERVER_USERNAME=${sql_username}" "SQL_SERVER_FQDN=${sql_server_fqdn}" "SQL_SERVER_PASSWORD=${sql_password}" \
-    --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 --ingress $ingress --target-port 8080
+    --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 --ingress internal --target-port 8080
 
 # Publish/unpublish apps
 # az containerapp ingress enable -n app1 -g $rg --type external --allow-insecure --target-port 8080 -o none
@@ -178,13 +264,78 @@ az network lb rule list --lb-name kubernetes-internal -g $node_rg -o table
 logws_client_id=$(az containerapp env show -n $aca_env_name -g $rg --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
 az monitor log-analytics query --workspace $logws_client_id --analytics-query "ContainerAppConsoleLogs_CL | where ContainerAppName_s == 'my-container-app' | project ContainerAppName_s, Log_s, TimeGenerated" -o table
 
+# Query firewall logs
+# Firewall Network Rules
+fw_net_logs_query='AzureDiagnostics
+| where Category == "AzureFirewallNetworkRule"
+| where TimeGenerated >= ago(5m) 
+| parse msg_s with Protocol " request from " SourceIP ":" SourcePortInt:int " to " TargetIP ":" TargetPortInt:int *
+| parse msg_s with * ". Action: " Action1a
+| parse msg_s with * " was " Action1b " to " NatDestination
+| parse msg_s with Protocol2 " request from " SourceIP2 " to " TargetIP2 ". Action: " Action2
+| extend SourcePort = tostring(SourcePortInt),TargetPort = tostring(TargetPortInt)
+| extend Action = case(Action1a == "", case(Action1b == "",Action2,Action1b), Action1a),Protocol = case(Protocol == "", Protocol2, Protocol),SourceIP = case(SourceIP == "", SourceIP2, SourceIP),TargetIP = case(TargetIP == "", TargetIP2, TargetIP),SourcePort = case(SourcePort == "", "N/A", SourcePort),TargetPort = case(TargetPort == "", "N/A", TargetPort),NatDestination = case(NatDestination == "", "N/A", NatDestination)
+//| where Action == "Deny" 
+//| project TimeGenerated, msg_s, Protocol, SourceIP,SourcePort,TargetIP,TargetPort,Action, NatDestination  // with msg_s
+| project TimeGenerated, Protocol, SourceIP,SourcePort,TargetIP,TargetPort,Action, NatDestination, Resource  // without msg_s
+| take 20 '
+az monitor log-analytics query -w $logws_customerid --analytics-query $fw_net_logs_query -o tsv
+# Firewall App Rules
+fw_app_logs_query='AzureDiagnostics 
+| where ResourceType == "AZUREFIREWALLS" 
+| where Category == "AzureFirewallApplicationRule" 
+| where TimeGenerated >= ago(5m) 
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12]), msg_s 
+| where Rule_Collection != "AzureInternalTraffic" 
+//| where Action == "Deny" 
+| take 20'
+az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_logs_query -o tsv
+# Firewall logs (all) WORK IN PROGRESS
+fw_logs_query='AzureDiagnostics
+| where Category == "AzureFirewallNetworkRule" or Category == "AzureFirewallApplicationRule"
+| extend msg_original = msg_s
+| extend msg_s = replace(@". Action: Deny. Reason: SNI TLS extension was missing.", @" to no_data:no_data. Action: Deny. Rule Collection: default behavior. Rule: SNI TLS extension missing", msg_s)
+| extend msg_s = replace(@"No rule matched. Proceeding with default action", @"Rule Collection: default behavior. Rule: no rule matched", msg_s)
+| parse msg_s with * " Web Category: " WebCategory
+| extend msg_s = replace(@"(. Web Category:).*","", msg_s)
+| parse msg_s with * ". Rule Collection: " RuleCollection ". Rule: " Rule
+| extend msg_s = replace(@"(. Rule Collection:).*","", msg_s)
+| parse msg_s with * ". Rule Collection Group: " RuleCollectionGroup
+| extend msg_s = replace(@"(. Rule Collection Group:).*","", msg_s)
+| parse msg_s with * ". Policy: " Policy
+| extend msg_s = replace(@"(. Policy:).*","", msg_s)
+| parse msg_s with * ". Signature: " IDSSignatureIDInt ". IDS: " IDSSignatureDescription ". Priority: " IDSPriorityInt ". Classification: " IDSClassification
+| extend msg_s = replace(@"(. Signature:).*","", msg_s)
+| parse msg_s with * " was DNAT"ed to " NatDestination
+| extend msg_s = replace(@"( was DNAT"ed to ).*",". Action: DNAT", msg_s)
+| parse msg_s with * ". ThreatIntel: " ThreatIntel
+| extend msg_s = replace(@"(. ThreatIntel:).*","", msg_s)
+| extend URL = extract(@"(Url: )(.*)(\. Action)",2,msg_s)
+| extend msg_s=replace(@"(Url: .*)(Action)",@"\2",msg_s)
+| parse msg_s with Protocol " request from " SourceIP " to " Target ". Action: " Action
+| extend 
+    SourceIP = iif(SourceIP contains ":",strcat_array(split(SourceIP,":",0),""),SourceIP),
+    SourcePort = iif(SourceIP contains ":",strcat_array(split(SourceIP,":",1),""),""),
+    Target = iif(Target contains ":",strcat_array(split(Target,":",0),""),Target),
+    TargetPort = iif(SourceIP contains ":",strcat_array(split(Target,":",1),""),""),
+    Action = iif(Action contains ".",strcat_array(split(Action,".",0),""),Action),
+    Policy = case(RuleCollection contains ":", split(RuleCollection, ":")[0] ,Policy),
+    RuleCollectionGroup = case(RuleCollection contains ":", split(RuleCollection, ":")[1], RuleCollectionGroup),
+    RuleCollection = case(RuleCollection contains ":", split(RuleCollection, ":")[2], RuleCollection),
+    IDSSignatureID = tostring(IDSSignatureIDInt),
+    IDSPriority = tostring(IDSPriorityInt)
+| project msg_original,TimeGenerated,Protocol,SourceIP,SourcePort,Target,TargetPort,URL,Action, NatDestination, OperationName,ThreatIntel,IDSSignatureID,IDSSignatureDescription,IDSPriority,IDSClassification,Policy,RuleCollectionGroup,RuleCollection,Rule,WebCategory
+| order by TimeGenerated
+| limit 100'
+az monitor log-analytics query -w $logws_customerid --analytics-query $fw_logs_query -o tsv
+
+
 ###############
 #   Cleanup   #
 ###############
 
 az containerapp delete -n app1 -g $rg -y
 az containerapp delete -n app2 -g $rg -y
-
 az containerapp env delete -n $aca_env_name -g $rg -y
 
 az group delete -n $rg -y --no-wait
