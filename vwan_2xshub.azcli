@@ -21,20 +21,23 @@
 no_of_hubs=2         # 1 or 2 hubs
 no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
+create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
 indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
 nva_bgp=yes          # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
-nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=yes      # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
 deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
 route_thru_nva=no    # Whether a static pointing to the NVA in the last spoke is configured
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
+global_reach=yes     # If 2 hubs and ER, connect both circuits via GR
+
 
 # Generic variables
-rg=vwan
+rg=vwan2hubs
 vwan=vwan
 location1=australiaeast
 # location1=germanywestcentral
@@ -82,12 +85,15 @@ branch4_test_route=4.4.4.0/24
 # ER (optional)
 er_provider=Megaport
 er_circuit_sku=Premium
-megaport_script_location="/home/jose/repos/azcli/megaport.sh"
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
 hub1_er_pop=Sydney
+mcr1_asn=65001
+gr_ip_range=172.16.31.0/29
 # hub1_er_pop=Frankfurt
 hub1_er_circuit_name="er1-$hub1_er_pop"
 hub2_er_pop=Dallas
 hub2_er_circuit_name="er2-$hub2_er_pop"
+mcr2_asn=65002
 # gcloud variables to simulate onprem via ER
 project_name=onprem
 project_id="${project_name}${RANDOM}"
@@ -264,7 +270,7 @@ function create_hub_nva_branch() {
     rs_asn=$(az network vhub show -n $hub_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
     # Create VNet
     echo "Creating VNet $onprem_vnet_name with $onprem_vnet_prefix..."
-    az network vnet create -n $onprem_vnet_name -g $rg --address-prefixes $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefixes $onprem_nva_subnet_prefix -o none
+    az network vnet create -n $onprem_vnet_name -g $rg -l $location --address-prefixes $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefixes $onprem_nva_subnet_prefix -o none
     # Cloudinit file for onprem NVA
     linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
     cat <<EOF > $linuxnva_cloudinit_file
@@ -272,18 +278,18 @@ function create_hub_nva_branch() {
 runcmd:
   - apt update && apt install -y bird strongswan
   - sysctl -w net.ipv4.ip_forward=1
-  - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
-  - sysctl -w net.ipv4.conf.all.send_redirects = 0
+  - sysctl -w net.ipv4.conf.all.accept_redirects=0 
+  - sysctl -w net.ipv4.conf.all.send_redirects=0
 EOF
     # NSG for onprem NVA
     echo "Creating NSG ${onprem_linuxnva_name}-nsg..."
-    az network nsg create -n "${onprem_linuxnva_name}-nsg" -g $rg -o none
+    az network nsg create -n "${onprem_linuxnva_name}-nsg" -g $rg -l $location -o none
     az network nsg rule create -n SSH --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
     az network nsg rule create -n IKE --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp -o none
     az network nsg rule create -n IPsec --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp -o none
     az network nsg rule create -n ICMP --nsg-name "${onprem_linuxnva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp -o none
-    az network watcher flow-log create -l $location -n ${onprem_linuxnva_name}-nsg -g $rg \
-        --nsg ${onprem_linuxnva_name}-nsg --storage-account $storage_account_name --log-version 2 --retention 7 -o none
+    # az network watcher flow-log create -l $location -n ${onprem_linuxnva_name}-nsg -g $rg \
+    #     --nsg ${onprem_linuxnva_name}-nsg --storage-account $storage_account_name --log-version 2 --retention 7 -o none
     # VM for onprem NVA
     echo "Creating VM $onprem_linuxnva_name..."
     az vm create -n $onprem_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
@@ -673,12 +679,14 @@ EOF
         }
     }'
     uri="/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/NetworkVirtualAppliances/${nva_name}?api-version=2021-02-01"
+    # Deploy NVA
     echo "Sending REST request to $uri..."
     az rest --method PUT --uri $uri --body "$json_payload" -o none
+    # az network virtual-appliance create -n $nva_name -g $rg --scale-unit 2 --vendor $vendor --version $version --vhub $hub_arm_id --asn $nva_asn --init-config $cloudinit_string --tags tagExample="xyz"
     nva_id=$(az network virtual-appliance show -n $nva_name -g $rg --query id -o tsv)
     wait_until_finished $nva_id
     # Diagnostics
-    echo "Interfaces in the NVA instances..."
+    echo "Getting IP addresses for the NVA instances in the hub..."
     nva_pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip1" "ip a"
     nva_pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
@@ -928,7 +936,6 @@ then
         --nsg $nsg2_name --storage-account $storage_account2_name --log-version 2 --retention 7 -o none
 fi
 
-
 # Create CSRs only if there are VPN Gateways
 
 # Create CSR to simulate branch1
@@ -948,7 +955,9 @@ then
     # az network vpn-gateway connection create -n branch1 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch1 \
     #     --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
     #     --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default --internet-security true -o none
-    az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100 --ip-address $branch1_ip  \
+    # az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan --address-prefixes ${branch1_ip}/32 --device-vendor cisco --device-model csr --link-speed 100 --ip-address $branch1_ip  \
+    #     --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --with-link -o none
+    az network vpn-site create -n branch1 -g $rg -l $location1 --virtual-wan $vwan --device-vendor cisco --device-model csr --link-speed 100 --ip-address $branch1_ip  \
         --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --with-link -o none
     # az network vpn-site link add -n branch1 -g $rg --ip-address $branch1_ip --asn $branch1_asn --bgp-peering-address $branch1_bgp_ip --site-name branch1 --link-speed-in-mbps 100 --link-provider-name msft -o none
     branch1_link_id=$(az network vpn-site link list --site-name branch1 -g $rg --query '[0].id' -o tsv)
@@ -963,9 +972,11 @@ then
             --public-ip-address branch2-pip --public-ip-address-allocation static --public-ip-sku Standard --private-ip-address $branch2_bgp_ip \
             --vnet-name branch2 --vnet-address-prefix $branch2_prefix --subnet nva --subnet-address-prefix $branch2_subnet -o none
         branch2_ip=$(az network public-ip show -n branch2-pip -g $rg --query ipAddress -o tsv)
+        # az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan --with-link --device-vendor cisco --device-model csr --link-speed 100 \
+        #     --asn $branch2_asn --bgp-peering-address $branch2_bgp_ip --ip-address $branch2_ip --address-prefixes ${branch2_ip}/32 -o none
         az network vpn-site create -n branch2 -g $rg -l $location2 --virtual-wan $vwan --with-link --device-vendor cisco --device-model csr --link-speed 100 \
-            --asn $branch2_asn --bgp-peering-address $branch2_bgp_ip --ip-address $branch2_ip --address-prefixes ${branch2_ip}/32 -o none
-        branch2_link_id=$(az network vpn-site link list --site-name branch1 -g $rg --query '[0].id' -o tsv)
+            --asn $branch2_asn --bgp-peering-address $branch2_bgp_ip --ip-address $branch2_ip -o none
+        branch2_link_id=$(az network vpn-site link list --site-name branch2 -g $rg --query '[0].id' -o tsv)
         az network vpn-gateway connection create -n branch2 --gateway-name hubvpn2 -g $rg --remote-vpn-site branch2 --with-link true --vpn-site-link $branch2_link_id \
             --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
             --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id  --labels default --internet-security true -o none
@@ -1041,7 +1052,6 @@ config t
     interface Loopback0
         ip address ${loopback_ip} 255.255.255.255
     router bgp ${branch1_asn}
-        redistribute connected
         redistribute static route-map S2B
     route-map S2B
         match ip address prefix-list S2B
@@ -1100,7 +1110,6 @@ config t
     interface Loopback0
         ip address ${loopback_ip} 255.255.255.255
     router bgp ${branch2_asn}
-        redistribute connected
         redistribute static route-map S2B
     route-map S2B
         match ip address prefix-list S2B
@@ -1185,23 +1194,29 @@ then
     echo "Creating Azure Firewall in hub1..."
     az network firewall create -n azfw1 -g $rg --vhub hub1 --policy $azfw_policy_name -l $location1 --sku AZFW_Hub --public-ip-count 1 -o none
     azfw1_id=$(az network firewall show -n azfw1 -g $rg --query id -o tsv)
-    az network vhub route-table route add -n defaultRouteTable --vhub-name hub1 -g $rg \
-        --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
-        --next-hop-type ResourceId --next-hop $azfw1_id -o none
-    az network vhub route-table route add -n hub1Vnet --vhub-name hub1 -g $rg \
-        --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
-        --next-hop-type ResourceId --next-hop $azfw1_id -o none
+    if [[ "$create_routes" == "yes" ]]; then
+        echo "Creating static routes in hub 1..."
+        az network vhub route-table route add -n defaultRouteTable --vhub-name hub1 -g $rg \
+            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
+            --next-hop-type ResourceId --next-hop $azfw1_id -o none
+        az network vhub route-table route add -n hub1Vnet --vhub-name hub1 -g $rg \
+            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
+            --next-hop-type ResourceId --next-hop $azfw1_id -o none
+    fi
     if [[ "$no_of_hubs" == "2" ]]
     then
         echo "Creating Azure Firewall in hub2..."
         az network firewall create -n azfw2 -g $rg --vhub hub2 --policy $azfw_policy_name -l $location2 --sku AZFW_Hub --public-ip-count 1 -o none
         azfw2_id=$(az network firewall show -n azfw2 -g $rg --query id -o tsv)
-        az network vhub route-table route add -n defaultRouteTable --vhub-name hub2 -g $rg \
-            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
-            --next-hop-type ResourceId --next-hop $azfw2_id -o none
-        az network vhub route-table route add -n hub2Vnet --vhub-name hub2 -g $rg \
-            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
-            --next-hop-type ResourceId --next-hop $azfw2_id -o none
+        if [[ "$create_routes" == "yes" ]]; then
+            echo "Creating static routes in hub 2..."
+            az network vhub route-table route add -n defaultRouteTable --vhub-name hub2 -g $rg \
+                --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
+                --next-hop-type ResourceId --next-hop $azfw2_id -o none
+            az network vhub route-table route add -n hub2Vnet --vhub-name hub2 -g $rg \
+                --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
+                --next-hop-type ResourceId --next-hop $azfw2_id -o none
+        fi
     fi
 
     # Azure Firewalls
@@ -1267,101 +1282,103 @@ then
 fi
 
 # Optional: route through NVA (convert VM  to NVA and add static route in defaultRT)
-if [[ "$route_thru_nva" == "yes" ]]
-then
-    nva_spoke_id=$no_of_spokes
-    # Hub 1: Configure IP fwding for the NVAs
-    vm_name="spoke1${nva_spoke_id}-vm"
-    echo "Enabling IP Forwarding for ${vm_name}..."
-    vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    az network nic update --ids $vm_nic_id --ip-forwarding -o none
-    # Hub 2: Configure IP fwding for the NVAs
-    if [[ "$no_of_hubs" == "2" ]]
-    then
-        vm_name="spoke2${nva_spoke_id}-vm"
-        echo "Enabling IP Forwarding for ${vm_name}..."
-        vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-        az network nic update --ids $vm_nic_id --ip-forwarding -o none
-    fi
-    # Hub 1: Configure NVA VNet connection to not learn the default route, and add route to route-table
-    cx_name="spoke1${nva_spoke_id}"
-    cx_id=$(az network vhub connection show --vhub-name hub1 -g $rg -n $cx_name --query id -o tsv)
-    echo "Adding default route to defaultRouteTable in hub1..."
-    az network vhub route-table route add -n defaultRouteTable -g $rg --vhub-name hub1 --destination-type CIDR --destinations "0.0.0.0/0" --next-hop-type ResourceId --next-hop $cx_id --route-name default -o none
-    az network vhub connection update --ids $cx_id --set "enableInternetSecurity=false" -o none
-    # Hub 1: Adding route to Vnet connection
-    vm_name="spoke1${nva_spoke_id}-vm"
-    echo "Finding out IP address for NVA ${vm_name}..."
-    vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    nva_ip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-    echo "Private IP address for ${vm_name} is ${nva_ip}"
-    vnet_route="{
-        \"name\": \"default\",
-        \"nextHopIpAddress\": \"${nva_ip}\",
-        \"addressPrefixes\": [ \"0.0.0.0/0\" ]}"
-    # Delete all existing routes in the VNet connection
-    vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
-    while [[ -n "$vnet_route_name" ]]
-    do
-        # If there was a route, delete it first
-        echo "Previous route $vnet_route_name detected, deleting first..."
-        az network vhub connection update --ids $cx_id --remove "routingConfiguration.vnetRoutes.staticRoutes" "0" -o none
-        vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
-    done
-    echo "Creating static route in connection $cx_id with next hop ${nva_ip}..."
-    az network vhub connection update --ids $cx_id --add "routingConfiguration.vnetRoutes.staticRoutes" $vnet_route -o none
-    # Hub 2: Configure NVA VNet connection to not learn the default route, and add route to route-table
-    if [[ "$no_of_hubs" == "2" ]]
-    then
-        cx_name="spoke2${nva_spoke_id}"
-        cx_id=$(az network vhub connection show --vhub-name hub2 -g $rg -n $cx_name --query id -o tsv)
-        echo "Adding default route to defaultRouteTable in hub2..."
-        az network vhub route-table route add -n defaultRouteTable -g $rg --vhub-name hub2 --destination-type CIDR --destinations "0.0.0.0/0" --next-hop-type ResourceId --next-hop $cx_id --route-name default -o none
-        az network vhub connection update --ids $cx_id --set "enableInternetSecurity=false" -o none
-        # Hub 2: Adding route to Vnet connection
-        vm_name="spoke2${nva_spoke_id}-vm"
-        echo "Finding out IP address for NVA ${vm_name}..."
-        vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-        nva_ip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-        echo "Private IP address for ${vm_name} is ${nva_ip}"
-        vnet_route="{
-            \"name\": \"default\",
-            \"nextHopIpAddress\": \"${nva_ip}\",
-            \"addressPrefixes\": [ \"0.0.0.0/0\" ]}"
-        # Delete all existing routes in the VNet connection
-        vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
-        while [[ -n "$vnet_route_name" ]]
-        do
-            # If there was a route, delete it first
-            echo "Previous route $vnet_route_name detected, deleting first..."
-            az network vhub connection update --ids $cx_id --remove "routingConfiguration.vnetRoutes.staticRoutes" "0" -o none
-            vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
-        done
-        echo "Creating static route in connection $cx_id with next hop ${nva_ip}..."
-        az network vhub connection update --ids $cx_id --add "routingConfiguration.vnetRoutes.staticRoutes" $vnet_route -o none
-    fi
-    # Hub 1: configure IP fwding and NAT on NVAs
-    vm_name="spoke1${nva_spoke_id}-vm"
-    echo "Finding out public IP address for NVA ${vm_name}..."
-    vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    nva_pip_id=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
-    nva_pip=$(az network public-ip show --ids $nva_pip_id --query 'ipAddress' -o tsv)
-    echo "Public IP address for ${vm_name} is ${nva_pip}. Configuring IP forwarding and SNAT at OS level..."
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo sysctl -w net.ipv4.ip_forward=1"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo iptables -t nat -A POSTROUTING ! -d 10.0.0.0/8 -o eth0 -j MASQUERADE"
-    # Hub 2: configure IP fwding and NAT on NVAs
-    if [[ "$no_of_hubs" == "2" ]]
-    then
-        vm_name="spoke2${nva_spoke_id}-vm"
-        echo "Finding out public IP address for NVA ${vm_name}..."
-        vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-        nva_pip_id=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
-        nva_pip=$(az network public-ip show --ids $nva_pip_id --query 'ipAddress' -o tsv)
-        echo "Public IP address for ${vm_name} is ${nva_pip}. Configuring IP forwarding and SNAT at OS level..."
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo sysctl -w net.ipv4.ip_forward=1"
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo iptables -t nat -A POSTROUTING ! -d 10.0.0.0/8 -o eth0 -j MASQUERADE"
-    fi
-fi
+# I think this is redundant? Commenting out for the time being...
+# if [[ "$route_thru_nva" == "yes" ]]
+# then
+#     nva_spoke_id=$no_of_spokes
+#     # Hub 1: Configure IP fwding for the NVAs
+#     vm_name="spoke1${nva_spoke_id}-vm"
+#     echo "Enabling IP Forwarding for ${vm_name}..."
+#     vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+#     az network nic update --ids $vm_nic_id --ip-forwarding -o none
+#     # Hub 2: Configure IP fwding for the NVAs
+#     if [[ "$no_of_hubs" == "2" ]]
+#     then
+#         vm_name="spoke2${nva_spoke_id}-vm"
+#         echo "Enabling IP Forwarding for ${vm_name}..."
+#         vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+#         echo "Enabling IP forwarding for VM $vm and NIC $vm_nic_id..."
+#         az network nic update --ids $vm_nic_id --ip-forwarding -o none
+#     fi
+#     # Hub 1: Configure NVA VNet connection to not learn the default route, and add route to route-table
+#     cx_name="spoke1${nva_spoke_id}"
+#     cx_id=$(az network vhub connection show --vhub-name hub1 -g $rg -n $cx_name --query id -o tsv)
+#     echo "Adding default route to defaultRouteTable in hub1..."
+#     az network vhub route-table route add -n defaultRouteTable -g $rg --vhub-name hub1 --destination-type CIDR --destinations "0.0.0.0/0" --next-hop-type ResourceId --next-hop $cx_id --route-name default -o none
+#     az network vhub connection update --ids $cx_id --set "enableInternetSecurity=false" -o none
+#     # Hub 1: Adding route to Vnet connection
+#     vm_name="spoke1${nva_spoke_id}-vm"
+#     echo "Finding out IP address for NVA ${vm_name}..."
+#     vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+#     nva_ip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+#     echo "Private IP address for ${vm_name} is ${nva_ip}"
+#     vnet_route="{
+#         \"name\": \"default\",
+#         \"nextHopIpAddress\": \"${nva_ip}\",
+#         \"addressPrefixes\": [ \"0.0.0.0/0\" ]}"
+#     # Delete all existing routes in the VNet connection
+#     vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+#     while [[ -n "$vnet_route_name" ]]
+#     do
+#         # If there was a route, delete it first
+#         echo "Previous route $vnet_route_name detected, deleting first..."
+#         az network vhub connection update --ids $cx_id --remove "routingConfiguration.vnetRoutes.staticRoutes" "0" -o none
+#         vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+#     done
+#     echo "Creating static route in connection $cx_id with next hop ${nva_ip}..."
+#     az network vhub connection update --ids $cx_id --add "routingConfiguration.vnetRoutes.staticRoutes" $vnet_route -o none
+#     # Hub 2: Configure NVA VNet connection to not learn the default route, and add route to route-table
+#     if [[ "$no_of_hubs" == "2" ]]
+#     then
+#         cx_name="spoke2${nva_spoke_id}"
+#         cx_id=$(az network vhub connection show --vhub-name hub2 -g $rg -n $cx_name --query id -o tsv)
+#         echo "Adding default route to defaultRouteTable in hub2..."
+#         az network vhub route-table route add -n defaultRouteTable -g $rg --vhub-name hub2 --destination-type CIDR --destinations "0.0.0.0/0" --next-hop-type ResourceId --next-hop $cx_id --route-name default -o none
+#         az network vhub connection update --ids $cx_id --set "enableInternetSecurity=false" -o none
+#         # Hub 2: Adding route to Vnet connection
+#         vm_name="spoke2${nva_spoke_id}-vm"
+#         echo "Finding out IP address for NVA ${vm_name}..."
+#         vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+#         nva_ip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+#         echo "Private IP address for ${vm_name} is ${nva_ip}"
+#         vnet_route="{
+#             \"name\": \"default\",
+#             \"nextHopIpAddress\": \"${nva_ip}\",
+#             \"addressPrefixes\": [ \"0.0.0.0/0\" ]}"
+#         # Delete all existing routes in the VNet connection
+#         vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+#         while [[ -n "$vnet_route_name" ]]
+#         do
+#             # If there was a route, delete it first
+#             echo "Previous route $vnet_route_name detected, deleting first..."
+#             az network vhub connection update --ids $cx_id --remove "routingConfiguration.vnetRoutes.staticRoutes" "0" -o none
+#             vnet_route_name=$(az network vhub connection show --ids $cx_id --query 'routingConfiguration.vnetRoutes.staticRoutes[0].name' -o tsv)
+#         done
+#         echo "Creating static route in connection $cx_id with next hop ${nva_ip}..."
+#         az network vhub connection update --ids $cx_id --add "routingConfiguration.vnetRoutes.staticRoutes" $vnet_route -o none
+#     fi
+#     # Hub 1: configure IP fwding and NAT on NVAs
+#     vm_name="spoke1${nva_spoke_id}-vm"
+#     echo "Finding out public IP address for NVA ${vm_name}..."
+#     vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+#     nva_pip_id=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+#     nva_pip=$(az network public-ip show --ids $nva_pip_id --query 'ipAddress' -o tsv)
+#     echo "Public IP address for ${vm_name} is ${nva_pip}. Configuring IP forwarding and SNAT at OS level..."
+#     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo sysctl -w net.ipv4.ip_forward=1"
+#     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo iptables -t nat -A POSTROUTING ! -d 10.0.0.0/8 -o eth0 -j MASQUERADE"
+#     # Hub 2: configure IP fwding and NAT on NVAs
+#     if [[ "$no_of_hubs" == "2" ]]
+#     then
+#         vm_name="spoke2${nva_spoke_id}-vm"
+#         echo "Finding out public IP address for NVA ${vm_name}..."
+#         vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+#         nva_pip_id=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+#         nva_pip=$(az network public-ip show --ids $nva_pip_id --query 'ipAddress' -o tsv)
+#         echo "Public IP address for ${vm_name} is ${nva_pip}. Configuring IP forwarding and SNAT at OS level..."
+#         ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo sysctl -w net.ipv4.ip_forward=1"
+#         ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo iptables -t nat -A POSTROUTING ! -d 10.0.0.0/8 -o eth0 -j MASQUERADE"
+#     fi
+# fi
 
 # Optional: additional spokes with NVA and 2 indirect spokes attached to them
 if [[ "$indirect_spokes" == "yes" ]]
@@ -1515,7 +1532,8 @@ then
     hub1_rs_asn=$(az network vhub show -n hub1 -g $rg --query 'virtualRouterAsn' -o tsv) && echo $hub1_rs_asn
     echo "Configuring static route in NVA1 for the hub address space $vwan_hub1_prefix"
     ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$nva1_pip" "sudo ip route add $vwan_hub1_prefix via $nva1_default_gw"
-    if [[ "$nva_in_hub2" == "yes" ]] && [[ "$no_of_hubs" == "2" ]]
+    # if [[ "$nva_in_hub2" == "yes" ]] && [[ "$no_of_hubs" == "2" ]]
+    if [[ "$no_of_hubs" == "2" ]]
     then
         echo "Getting information about NVA in spoke 2${indirect_spoke_id}..."
         nva2_nic_id=$(az vm show -n "spoke2${indirect_spoke_id}-vm" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -1551,7 +1569,7 @@ protocol kernel {
     #disabled;
 }
 protocol static {
-    route 1${indirect_spoke_id}.1${indirect_spoke_id}.1${indirect_spoke_id}.1${indirect_spoke_id}/32 via $nva1_default_gw;   # Test route
+    # route 1${indirect_spoke_id}.1${indirect_spoke_id}.1${indirect_spoke_id}.1${indirect_spoke_id}/32 via $nva1_default_gw;   # Test route
     route 10.1.${indirect_spoke_id}1.0/24 via $nva1_default_gw; # Route to spoke1${spoke}1
     route 10.1.${indirect_spoke_id}2.0/24 via $nva1_default_gw; # Route to spoke1${spoke}2
 }
@@ -1613,7 +1631,7 @@ protocol kernel {
     #disabled;
 }
 protocol static {
-    route 2${indirect_spoke_id}.2${indirect_spoke_id}.2${indirect_spoke_id}.2${indirect_spoke_id}/32 via $nva2_default_gw;   # Test route
+    # route 2${indirect_spoke_id}.2${indirect_spoke_id}.2${indirect_spoke_id}.2${indirect_spoke_id}/32 via $nva2_default_gw;   # Test route
     route 10.2.${indirect_spoke_id}1.0/24 via $nva2_default_gw; # Route to spoke2${spoke}1
     route 10.2.${indirect_spoke_id}2.0/24 via $nva2_default_gw; # Route to spoke2${spoke}2
 }
@@ -1658,8 +1676,9 @@ EOF
     # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo birdc show route protocol rs0"
     # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "sudo birdc show route export rs0"
     az network nic show-effective-route-table --ids $nva1_nic_id -o table
-    # Diagnostics for NVA in hub2
-    if [[ "$nva_in_hub2" == "yes" ]] && [[ "$no_of_hubs" == "2" ]]
+    # Diagnostics for NVA attached to hub2
+    # if [[ "$nva_in_hub2" == "yes" ]] && [[ "$no_of_hubs" == "2" ]]
+    if [[ "$no_of_hubs" == "2" ]]
     then
         echo "Performing some checks on NVA in spoke2${indirect_spoke_id}..."
         ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo birdc show protocols"
@@ -1753,17 +1772,19 @@ EOF
 fi
 
 # Optional: deploy NVA in the hubs
-if [[ "$deploy_nva_hub1" == "yes" ]]
+if [[ "$nva_in_hub1" == "yes" ]]
 then
+    "Deploying NVA in hub 1..."
     create_hub_nva 1
     #configure_hub_nva_bgp 1    # If no branches (only configures BGP to RS)
-    create_hub_nva_branch 1     # Takes care as well of the BGP config to the RS
+    create_hub_nva_branch 1     # Takes care as well of the BGP config to the RS, so previous command is redundant
 fi
-if [[ "$deploy_nva_hub2" == "yes" ]] && [[ "$no_of_hubs" == "2" ]]
+if [[ "$nva_in_hub2" == "yes" ]] && [[ "$no_of_hubs" == "2" ]]
 then
+    "Deploying NVA in hub 2..."
     create_hub_nva 2
     #configure_hub_nva_bgp 2    # If no branches (only configures BGP to RS)
-    create_hub_nva_branch 2     # Takes care as well of the BGP config to the RS
+    create_hub_nva_branch 2     # Takes care as well of the BGP config to the RS, so previous command is redundant
 fi
 
 # Optional: ExpressRoute
@@ -1786,26 +1807,26 @@ then
         service_key_2=$(az network express-route show -n $hub2_er_circuit_name -g $rg --query serviceKey -o tsv) && echo "Service Key is $service_key_2"
     fi
     # Provision Megaport MCR in locations for hub1/hub2 (it could be the same)
-    if [[ -e "$megaport_script_location" ]]
+    if [[ -e "$megaport_script_path" ]]
     then
         echo "Creating MCR in $hub1_er_pop..."
-        $megaport_script_location -s=jomore-${hub1_er_pop} -a=create_mcr -k=$service_key_1
+        $megaport_script_path -s=jomore-${hub1_er_pop} -a=create_mcr -k=$service_key_1 --mcr_asn=$mcr1_asn
         sleep 120  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
         echo "Connecting MCR in $hub1_er_pop with ER circuit in hub1..."
-        $megaport_script_location -s=jomore-${hub1_er_pop} -a=create_vxc -k=$service_key_1
+        $megaport_script_path -s=jomore-${hub1_er_pop} -a=create_vxc -k=$service_key_1
         if [[ "$no_of_hubs" == "2" ]]
         then
             if [[ "$hub1_er_pop" != "$hub2_er_pop" ]]
             then
                 echo "Creating MCR in $hub2_er_pop..."
-                $megaport_script_location -s=jomore-${hub2_er_pop} -a=create_mcr -k=$service_key_2
+                $megaport_script_path -s=jomore-${hub2_er_pop} -a=create_mcr -k=$service_key_2 --mcr_asn=$mcr2_asn
                 sleep 120  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
             fi
             echo "Connecting MCR in $hub2_er_pop with ER circuit in hub2..."
-            $megaport_script_location -s=jomore-${hub2_er_pop} -a=create_vxc -k=$service_key_2
+            $megaport_script_path -s=jomore-${hub2_er_pop} -a=create_vxc -k=$service_key_2
         fi
     else
-        echo "Sorry, I cannot seem to find the script $megaport_script_location to interact with the Megaport API"
+        echo "Sorry, I cannot seem to find the script $megaport_script_path to interact with the Megaport API"
     fi
     # Wait until circuits are provisioned
     az network express-route update -n $hub1_er_circuit_name -g $rg -o none
@@ -1866,6 +1887,13 @@ then
                 az network vhub update -n hub2 -g $rg --hub-routing-preference ASPath -o none
             fi
         fi
+    fi
+    # Configure Global Reach
+    if [[ "$global_reach" == "yes" ]]; then
+        echo "Creating Global Reach connection..."
+        hub2_er_circuit_id=$(az network express-route show -n $hub2_er_circuit_name -g $rg -o tsv --query id)
+        az network express-route peering connection create -g $rg --circuit-name $hub1_er_circuit_name --peering-name AzurePrivatePeering \
+            -n "${hub1_er_pop}-to-${hub2_er_pop}" --peer-circuit $hub2_er_circuit_id --address-prefix $gr_ip_range -o none
     fi
 
     # Simulate onprem with Google Cloud
@@ -2028,18 +2056,34 @@ function add_static_routes() {
 }
 
 
-#############################
-#   Modify bow-tie design   #
-#############################
+################################
+#   Modify ER bow-tie design   #
+################################
+
+# Add the bow-tie connections (WIP)
+function add_bow_tie() {
+    echo "Connecting VWAN hub2 to ER circuit 1..."
+    az network express-route gateway connection create --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg --peering $peering_id_1 \
+        --associated-route-table $hub2_default_rt_id --propagated-route-tables $hub2_default_rt_id --labels default -o none
+    echo "Connecting VWAN hub1 to ER circuit 2..."
+    az network express-route gateway connection create --gateway-name hub1ergw -n "hub1ergw-${hub2_er_pop}" -g $rg --peering $peering_id_2 \
+        --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default -o none
+}
 
 # Remove the bow-tie connections
-az network express-route gateway connection delete --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg -o none
-az network express-route gateway connection delete --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg -o none
+function remove_bow_tie() {
+    az network express-route gateway connection delete --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg -o none
+    az network express-route gateway connection delete --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg -o none
+}
 
 # Change routing preference
-routing_preference=ASPath  # Can be ASPath, ExpressRoute or VpnGateway
-az network vhub update -n hub1 -g $rg --hub-routing-preference $routing_preference -o none
-az network vhub update -n hub2 -g $rg --hub-routing-preference $routing_preference -o none
+# Takes the routing preference as first parameter (Can be ASPath, ExpressRoute or VpnGateway)
+function set_routing_preference() {
+    # routing_preference=ASPath  # Can be ASPath, ExpressRoute or VpnGateway
+    routing_preference=$1
+    az network vhub update -n hub1 -g $rg --hub-routing-preference $routing_preference -o none
+    az network vhub update -n hub2 -g $rg --hub-routing-preference $routing_preference -o none
+}
 
 ##############################
 # Connectivity test examples #
@@ -2308,8 +2352,10 @@ az network nic show-effective-route-table -o table -g $rg -n spoke11-vmVMNic
 # GCP onprem simulation
 gcloud compute instances describe $gcp_vm1_name
 gcloud compute routers get-status $router1_name --region=$region1 --format=json | jq -r '.result.bestRoutesForRouter[]|{destRange,routeType,nextHopIp} | join("\t")'
+gcloud compute interconnects attachments describe $attachment1_name --region=$region1
 gcloud compute instances describe $gcp_vm2_name
-gcloud compute routers get-status $router2_name --region=$region1 --format=json | jq -r '.result.bestRoutesForRouter[]|{destRange,routeType,nextHopIp} | join("\t")'
+gcloud compute routers get-status $router2_name --region=$region2 --format=json | jq -r '.result.bestRoutesForRouter[]|{destRange,routeType,nextHopIp} | join("\t")'
+gcloud compute interconnects attachments describe $attachment2_name --region=$region2
 
 # Spoke NVAs
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva1_pip "systemctl status bird"
@@ -2364,7 +2410,7 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_lo
 # Delete Megaport components
 if [[ "$deploy_er" == "yes" ]]
 then
-    $megaport_script_location -s=jomore -a=delete_mcr
+    $megaport_script_path -s=jomore -a=delete_mcr
 fi
 # locations=($location1 $location2)
 # for location in ${locations[@]}; do

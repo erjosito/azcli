@@ -334,7 +334,7 @@ case $action in
         mcr_ids=($mcr_ids)
         if [[ -z "$mcr_ids" ]]
         then
-            log_msg "INFO: No MCR found matching that string"
+            log_msg "INFO: No MCR found matching string '${product_string}'"
         else
             for mcr_id in "${mcr_ids[@]}"
             do
