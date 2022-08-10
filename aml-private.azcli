@@ -26,6 +26,23 @@ aml_ep_name=wsep
 azfw_name=amlfw
 test_vm_size=Standard_B1s
 
+# Functions to start/stop the firewall
+function stop_firewall() {
+    az network firewall ip-config delete -f $azfw_name -n azfw-ipconfig -g $rg -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+function start_firewall() {
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+
+# Function to update UDR back to testing PC
+function update_myip() {
+    myip=$(curl -s4 ifconfig.co)
+    echo "Updating IP to $myip..."
+    az network route-table route update --route-table-name aml -g $rg --address-prefix "${myip}/32" --name clientIP -o none
+}
+
 # RG and VNet
 echo "Creating RG and VNets..."
 az group create -n $rg -l $location -o none
@@ -73,6 +90,23 @@ dns_zone_name=privatelink.file.core.windows.net
 az network private-dns zone create -n $dns_zone_name -g $rg -o none
 az network private-dns link vnet create -g $rg -z $dns_zone_name -n fileLink --virtual-network $vnet_name --registration-enabled false -o none
 az network private-endpoint dns-zone-group create --endpoint-name $storage_file_ep_name -g $rg -n filezonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none
+# Diagnostic settings
+storage_account_id=$(az storage account show -n $storage_account_name -g $rg -o tsv --query id)
+storage_blob_id="${storage_account_id}/blobServices/default"
+storage_file_id="${storage_account_id}/fileServices/default"
+az monitor diagnostic-settings create -n blobdiag --storage-account $storage_account_name --resource $storage_blob_id --workspace $logws_id \
+    --metrics '[{"category": "Transaction", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "StorageRead", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "StorageWrite", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "StorageDelete", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+az monitor diagnostic-settings create -n filediag --storage-account $storage_account_name --resource $storage_file_id --workspace $logws_id \
+    --metrics '[{"category": "Transaction", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "StorageRead", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "StorageWrite", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "StorageDelete", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+# Disable public access
+echo "Disabling public network access in storage account $storage_account_name..."
+az storage account update -n $storage_account_name -g $rg --public-network-access Disabled -o none
 
 # Azure Key Vault
 akv_name=$(az keyvault list -g $rg --query '[0].name' -o tsv)
@@ -90,6 +124,10 @@ dns_zone_name=privatelink.file.vaultcore.azure.net
 az network private-dns zone create -n $dns_zone_name -g $rg -o none
 az network private-dns link vnet create -g $rg -z $dns_zone_name -n akvLink --virtual-network $vnet_name --registration-enabled false -o none
 az network private-endpoint dns-zone-group create --endpoint-name $akv_ep_name -g $rg -n akvzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none
+# Logs
+az monitor diagnostic-settings create -n akvdiag --resource $akv_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "AuditEvent", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
 
 # Azure Container Registry
 acr_name=$(az acr list -g $rg --query '[0].name' -o tsv)
@@ -107,6 +145,15 @@ dns_zone_name="privatelink.azurecr.io"
 az network private-dns zone create -n $dns_zone_name -g $rg -o none
 az network private-dns link vnet create -g $rg -z $dns_zone_name -n acrLink --virtual-network $vnet_name --registration-enabled false -o none
 az network private-endpoint dns-zone-group create --endpoint-name $acr_ep_name -g $rg -n acrzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none
+# Logs
+az monitor diagnostic-settings create -n acrdiag --resource $acr_id --workspace $logws_id \
+    --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+    --logs '[{"category": "ContainerRegistryRepositoryEvents", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "ContainerRegistryLoginEvents", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+# Enable admin user
+az acr update --admin-enabled -n $acr_name -g $rg -o none
+acr_usr=$(az acr credential show -n "$acr_name" -g "$rg" --query 'username' -o tsv)
+acr_pwd=$(az acr credential show -n "$acr_name" -g "$rg" --query 'passwords[0].value' -o tsv)
 
 # AML workspace
 aml_ws_name=$(az ml workspace list -g $rg --query '[0].name' -o tsv)
@@ -139,6 +186,8 @@ dns_zone_name=privatelink.api.azureml.ms
 az network private-dns zone create -n $dns_zone_name -g $rg -o none
 az network private-dns link vnet create -g $rg -z $dns_zone_name -n amlLink --virtual-network $vnet_name --registration-enabled false -o none
 az network private-endpoint dns-zone-group create --endpoint-name $aml_ep_name -g $rg -n amlzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none
+echo "Disabling public access to the workspace..."
+az ml workspace update -n $aml_ws_name -g $rg --public-network-access Disabled -o none
 
 # Enabling AML Studio (??)
 storage_blob_ep_id=$(az network private-endpoint show -n $storage_blob_ep_name -g $rg --query id -o tsv)
@@ -151,7 +200,7 @@ az role assignment create --assignee $aml_ws_appid --role "Reader" --scope $stor
 
 # Granting access to ACR
 echo "Granting pull access on ACR $acr_name to AML workspace $aml_ws_name..."
-az role assignment create --assignee $aml_ws_appid --scope $acr_id --role acrpull -o none
+az role assignment create --assignee $aml_ws_appid --scope $acr_id --role acrpush -o none
 echo "Enabling access to trusted services on ACR $acr_name..."
 az acr update -n $acr_name --allow-trusted-services true -o none
 
@@ -164,6 +213,12 @@ az network firewall policy rule-collection-group create -n amlruleset --policy-n
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name amlruleset -g $rg \
     --name allowall --collection-priority 200 --action Allow --rule-name allowall --rule-type ApplicationRule --description "AllowAll" \
     --target-fqdns '*' --source-addresses '*' --protocols Http=80 Https=443 -o none
+az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name amlruleset -g $rg \
+    --name ntp --collection-priority 110 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
+    --destination-addresses '*' --source-addresses "$vnet_prefix" --ip-protocols UDP --destination-ports "123" -o none
+# az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name amlruleset -g $rg \
+#     --name allowallnet --collection-priority 150 --action Allow --rule-name AllowAll --rule-type NetworkRule --description "Allow All" \
+#     --destination-addresses '*' --source-addresses '*' --ip-protocols All --destination-ports '*' -o none
 echo "Creating Azure Firewall..."
 az network firewall create -n $azfw_name -g $rg --policy $azfw_policy_name -l $location -o none
 echo "Configuring firewall logs and private IP..."
@@ -180,17 +235,22 @@ az network firewall update -n $azfw_name -g $rg -o none
 azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo "$azfw_private_ip"
 
 # UDRs to send all traffic through the Azure Firewall
+# See https://docs.microsoft.com/en-us/azure/machine-learning/how-to-secure-training-vnet
 echo "Creating route table..."
 az network route-table create -n aml -g $rg -l $location -o none
 my_ip=$(curl -s4 ifconfig.co)
 az network route-table route create -n clientIP --route-table-name aml -g $rg --next-hop-type Internet --address-prefix "$my_ip/32" -o none
 az network route-table route create -n defaultRoute --route-table-name aml -g $rg --next-hop-type VirtualAppliance --address-prefix "0.0.0.0/0" --next-hop-ip-address $azfw_private_ip -o none
-az network route-table route create -n vnetTraffic --route-table-name aml -g $rg --next-hop-type VirtualAppliance --address-prefix $vnet_prefix --next-hop-ip-address $azfw_private_ip -o none
+# az network route-table route create -n vnetTraffic --route-table-name aml -g $rg --next-hop-type VirtualAppliance --address-prefix $vnet_prefix --next-hop-ip-address $azfw_private_ip -o none
+# az network route-table route delete -n vnetTraffic --route-table-name aml -g $rg -o none
+az network route-table route create -n azureBatch --route-table-name aml -g $rg --next-hop-type VirtualAppliance --address-prefix BatchNodeManagement --next-hop-ip-address $azfw_private_ip -o none
+az network route-table route create -n AML --route-table-name aml -g $rg --next-hop-type VirtualAppliance --address-prefix AzureMachineLearning --next-hop-ip-address $azfw_private_ip -o none
+
 rt_id=$(az network route-table show -n aml -g $rg --query id -o tsv)
 az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table $rt_id -o none
 az network vnet subnet update -g $rg --vnet-name $vnet_name -n $test_subnet_name --route-table $rt_id -o none
 
-# Test VM
+# Test VM (linux)
 az vm create -n testvm -g $rg --image ubuntuLTS --generate-ssh-keys --public-ip-address testvm-pip --size $test_vm_size \
     --vnet-name $vnet_name --subnet $test_subnet_name --public-ip-sku Standard -o none
 testvm_pip=$(az network public-ip show -n testvm-pip -g $rg --query ipAddress -o tsv)
@@ -202,65 +262,99 @@ subscription_id=$(az account show --query id -o tsv)
 echo "Setting subscription to $subscription_id..."
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az account set -n $subscription_id"
 
-# Create compute instance
-compute_name=cpucompute$RANDOM
-compute_vm_size=STANDARD_DS3_v2
-# az ml compute delete -w $aml_ws_name -g $rg -n $compute_name -y   # If you need to delete it
-echo "Creating Compute Instance $compute_name..."
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml compute create -w $aml_ws_name -g $rg -n $compute_name -t AmlCompute --size $compute_vm_size --vnet-name $vnet_name --subnet $vm_subnet_name --min-instances 0 --max-instances 1 -o none"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml compute create -w $aml_ws_name -g $rg -n $compute_name -t ComputeInstance --size $compute_vm_size --vnet-name $vnet_name --subnet $vm_subnet_name -o none"
-az ml compute create -w $aml_ws_name -g $rg -n $compute_name -t ComputeInstance --size $compute_vm_size --vnet-name $vnet_name --subnet $vm_subnet_name -o none
-echo "Updating cluster to use compute instance $compute_name to build images..."
-az ml workspace update -n $aml_ws_name -g $rg --image-build-compute $compute_name -o none
+# Test VM (Windows
+win_user=$(whoami)
+win_password='Microsoft123!'
+win_vm_name=testvmwin
+win_vm_sku=Standard_B2ms
+win_pip_name=testvmwin-pip
+az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $win_user --admin-password $win_password --size $win_vm_sku \
+   --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $win_pip_name -o none
+
+# Create compute
+compute_type=AmlCompute        # Can be 'ComputeInstance' or 'AmlCompute'
+compute_name=$(az ml compute list -w $aml_ws_name -g $rg --query '[0].name' -o tsv)
+if [[ -z "$compute_name" ]]; then
+    compute_name=cpucompute$RANDOM
+    # compute_vm_size=STANDARD_DS3_v2  # $0.23/h
+    compute_vm_size=STANDARD_DS11_v2 # $0.15/h
+    echo "Disabling private link policies in subnet $subnet_name..."
+    az network vnet subnet update -n $vm_subnet_name --vnet-name $vnet_name -g $rg --disable-private-link-service-network-policies -o none      # Required for clusters without PIP
+    az network vnet subnet update -n $vm_subnet_name --vnet-name $vnet_name -g $rg --disable-private-endpoint-network-policies -o none          # Required for clusters without PIP
+    echo "Creating new compute target $compute_name of type $compute_type..."
+    # az ml compute delete -w $aml_ws_name -g $rg -n $compute_name -y   # If you need to delete it
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml compute create -w $aml_ws_name -g $rg -n $compute_name -t AmlCompute --size $compute_vm_size --vnet-name $vnet_name --subnet $vm_subnet_name --min-instances 0 --max-instances 1 -o none"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml compute create -w $aml_ws_name -g $rg -n $compute_name -t ComputeInstance --size $compute_vm_size --vnet-name $vnet_name --subnet $vm_subnet_name -o none"
+    if [[ "$compute_type" == "ComputeInstance" ]]; then
+        az ml compute create -w $aml_ws_name -g $rg -n $compute_name -t ComputeInstance --size $compute_vm_size --vnet-name $vnet_name --subnet $vm_subnet_name -o none
+    elif [[ "$compute_type" == "AmlCompute" ]]; then
+        az ml compute create -w $aml_ws_name -g $rg -n $compute_name -t AmlCompute --size $compute_vm_size --vnet-name $vnet_name --subnet $vm_subnet_name --min-instances 0 --max-instances 1 -o none
+    else
+        echo "Compute type $compute_type not recognized"
+    fi
+    echo "Updating cluster to use compute instance $compute_name to build images..."
+    az ml workspace update -n $aml_ws_name -g $rg --image-build-compute $compute_name -o none
+else
+    echo "Compute target $compute_name found in AML workspace $aml_ws_name"
+fi
 
 # Training
-training_file=/tmp/hello.py
-cat <<EOF > ${training_file}
-print("Hello world!")
-EOF
-control_file=/tmp/run_hello.py
-cat <<EOF > ${control_file}
-from azure.ai.ml import MLClient, command, Input
-from azure.identity import DefaultAzureCredential
-from azureml.core import Workspace
-ws = Workspace.from_config()
-default_azure_credential = DefaultAzureCredential()
-subscription_id = ws.subscription_id
-resource_group = ws.resource_group
-workspace = ws.name
-ml_client = MLClient(
-   default_azure_credential,
-   subscription_id,
-   resource_group,
-   workspace)
-computeName="$compute_name"
-job = command(
-    code="./src",
-    command="python hello.py",
-    environment="AzureML-sklearn-0.24-ubuntu18.04-py37-cpu@latest",
-    compute=computeName,
-    display_name="hello-world-example",
-)
-returned_job = ml_client.create_or_update(job)
-aml_url = returned_job.studio_url
-print("Monitor your job at", aml_url)
-EOF
+# Potentially look at https://github.com/MicrosoftLearning/mslearn-aml-cli/tree/master/Allfiles/Labs/02/basic-job
+# training_file=/tmp/hello.py
+# cat <<EOF > ${training_file}
+# print("Hello world!")
+# EOF
+# control_file=/tmp/run_hello.py
+# cat <<EOF > ${control_file}
+# from azure.ai.ml import MLClient, command, Input
+# from azure.identity import DefaultAzureCredential
+# from azureml.core import Workspace
+# ws = Workspace.from_config()
+# default_azure_credential = DefaultAzureCredential()
+# subscription_id = ws.subscription_id
+# resource_group = ws.resource_group
+# workspace = ws.name
+# ml_client = MLClient(
+#    default_azure_credential,
+#    subscription_id,
+#    resource_group,
+#    workspace)
+# computeName="$compute_name"
+# job = command(
+#     code="./src",
+#     command="python hello.py",
+#     environment="AzureML-sklearn-0.24-ubuntu18.04-py37-cpu@latest",
+#     compute=computeName,
+#     display_name="hello-world-example",
+# )
+# returned_job = ml_client.create_or_update(job)
+# aml_url = returned_job.studio_url
+# print("Monitor your job at", aml_url)
+# EOF
 job_file=/tmp/job_hello.yml
 cat <<EOF > ${job_file}
-/$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+\$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 command: echo "hello world"
-display_name: hello-world-example
+display_name: hello-world-$compute_name
 experiment_name: hello-world-example
 environment:
   image: library/python:latest
 compute: azureml:$compute_name
 EOF
-run_output=$(az ml job create -w $aml_ws_name -g $rg -f $job_file --web)
+run_output=$(az ml job create -w $aml_ws_name -g $rg -f $job_file)
 run_id=$(echo $run_output | jq -r '.name') && echo "Running job $run_id..."
 
 #################
 #  Diagnostics  #
 #################
+
+# Jump host
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "ip a"
+
+# Routing
+az network route-table route list --route-table aml -g $rg -o table
+testvm_nic_id=$(az vm show -n testvm -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $testvm_nic_id
 
 # Test DNS resolution
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "nslookup ${storage_account_name}.blob.core.windows.net"
@@ -269,17 +363,56 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "nslookup ${acr_
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "nslookup ${akv_name}.file.vaultcore.azure.net"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "nslookup ${ml_ws_name}.api.azureml.ms"
 
-# Compute
+# AML Compute
 az ml compute list -w $aml_ws_name -g $rg -o table
+az ml job list -w $aml_ws_name -g $rg -o table
+
+# ACR
+az acr repository list -n $acr_name -g $rg -u $acr_usr -p $acr_pwd -o table
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az acr repository list -n $acr_name -g $rg -u $acr_usr -p $acr_pwd"
+
+# Storage
+az storage container list --account-name $storage_account_name --auth-mode login -o table
+
+# Logs
+logs_query='AzureDiagnostics 
+| distinct ResourceType'
+logs_query='AzureDiagnostics 
+| distinct Category'
+az monitor log-analytics query -w $logws_customerid --analytics-query $logs_query -o tsv
+
+# AKV logs
+akv_logs_query='AzureDiagnostics 
+| where ResourceType == "VAULTS" and Category == "AuditEvent"
+| where TimeGenerated >= ago(2h) 
+| project TimeGenerated, ResultType, OperationName, CallerIPAddress, msg_s, Message
+| take 20'
+az monitor log-analytics query -w $logws_customerid --analytics-query $akv_logs_query -o tsv
+
+# Firewall net rule logs
+fw_net_logs_query='AzureDiagnostics
+| where Category == "AzureFirewallNetworkRule"
+| where TimeGenerated >= ago(1h) 
+| project TimeGenerated, msg_s
+| take 20 '
+az monitor log-analytics query -w $logws_customerid --analytics-query $fw_net_logs_query -o tsv
 
 # Firewall App Rule Logs
 fw_app_logs_query='AzureDiagnostics 
 | where ResourceType == "AZUREFIREWALLS" 
 | where Category == "AzureFirewallApplicationRule" 
-| where TimeGenerated >= ago(5m) 
+| where TimeGenerated >= ago(1h) 
 | project TimeGenerated, msg_s
 | take 20'
 az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_logs_query -o tsv
+
+####################
+#    Start/Stop    #
+####################
+
+stop_firewall
+az vm deallocate -n testvm -g $rg -y --no-wait
+az vm deallocate -n testvmwin -g $rg -y --no-wait
 
 ####################
 # Cleanup !DANGER! #
