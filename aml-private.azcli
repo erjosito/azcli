@@ -43,6 +43,11 @@ function update_myip() {
     az network route-table route update --route-table-name aml -g $rg --address-prefix "${myip}/32" --name clientIP -o none
 }
 
+# Function to update the SSH key of the Linux VM
+function update_ssh_key() {
+    az vm user update -g $rg -u jose -n testvm --ssh-key-value "$(< ~/.ssh/id_rsa.pub)" -o none
+}
+
 # RG and VNet
 echo "Creating RG and VNets..."
 az group create -n $rg -l $location -o none
@@ -113,7 +118,7 @@ akv_name=$(az keyvault list -g $rg --query '[0].name' -o tsv)
 if [[ -z "$akv_name" ]]; then
     akv_name=aml$RANDOM
     echo "Creating new Azure Key Vault $akv_name..."
-    az keyvault create -n $akv_name -g $rg -l $location -o none
+    az keyvault create -n $akv_name -g $rg -l $location --public-network-access disabled -o none
 else
     echo "Azure Key Vault $akv_name found in resource group"
 fi
@@ -128,6 +133,8 @@ az network private-endpoint dns-zone-group create --endpoint-name $akv_ep_name -
 az monitor diagnostic-settings create -n akvdiag --resource $akv_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
     --logs '[{"category": "AuditEvent", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+# Disable network access (if not done at creation time)
+# az keyvault update -n $akv_name -g $rg --public-network-access disabled -o none
 
 # Azure Container Registry
 acr_name=$(az acr list -g $rg --query '[0].name' -o tsv)
@@ -198,11 +205,15 @@ az role assignment create --assignee $aml_ws_appid --role "Reader" --scope $stor
 echo "Creating Reader assignment for AML workspace's MSI $aml_ws_appid to the file endpoint $storage_file_ep_name..."
 az role assignment create --assignee $aml_ws_appid --role "Reader" --scope $storage_file_ep_id -o none
 
-# Granting access to ACR
+# Grant access to ACR
 echo "Granting pull access on ACR $acr_name to AML workspace $aml_ws_name..."
 az role assignment create --assignee $aml_ws_appid --scope $acr_id --role acrpush -o none
 echo "Enabling access to trusted services on ACR $acr_name..."
 az acr update -n $acr_name --allow-trusted-services true -o none
+
+# Grant access to AKV
+# az keyvault set-policy -n $akv_name --object-id $aml_ws_appid -o none \
+#     --secret-permissions all --key-permissions all --certificate-permissions all
 
 # Azure Firewall
 azfw_policy_name="${azfw_name}-policy"
@@ -216,6 +227,9 @@ az network firewall policy rule-collection-group collection add-filter-collectio
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name amlruleset -g $rg \
     --name ntp --collection-priority 110 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
     --destination-addresses '*' --source-addresses "$vnet_prefix" --ip-protocols UDP --destination-ports "123" -o none
+az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name amlruleset -g $rg \
+    --name winactivation --collection-priority 115 --action Allow --rule-name allowWinActivation --rule-type NetworkRule --description "Egress Windows Activation" \
+    --destination-addresses '20.118.99.224' '40.83.235.53' '23.102.135.246' --source-addresses "$vnet_prefix" --ip-protocols Tcp --destination-ports "1688" -o none
 # az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name amlruleset -g $rg \
 #     --name allowallnet --collection-priority 150 --action Allow --rule-name AllowAll --rule-type NetworkRule --description "Allow All" \
 #     --destination-addresses '*' --source-addresses '*' --ip-protocols All --destination-ports '*' -o none
@@ -298,6 +312,42 @@ else
     echo "Compute target $compute_name found in AML workspace $aml_ws_name"
 fi
 
+# Dataset
+function load_dataset() {
+    dataset_name=$1
+    dataset_local_file="/tmp/${dataset_name}.csv"
+    wget "https://azuremlexamples.blob.core.windows.net/datasets/${dataset_name}.csv" -O $dataset_local_file
+    dataset_yaml=/tmp/dataset.yml
+    cat <<EOF > ${dataset_yaml}
+\$schema: https://azuremlschemas.azureedge.net/latest/asset.schema.json
+name: ${dataset_name}
+version: 1
+path: $dataset_local_file
+type: uri_file
+description: ${dataset_name} dataset.
+EOF
+    scp "${dataset_local_file}" "${testvm_pip}:${dataset_local_file}"
+    scp "${dataset_yaml}" "${testvm_pip}:${dataset_yaml}"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml data create -w $aml_ws_name -g $rg -f $dataset_yaml -o none"
+}
+load_dataset iris
+load_dataset diabetes
+
+# Environment
+conda_env_url='https://raw.githubusercontent.com/MicrosoftLearning/mslearn-aml-cli/master/Allfiles/Labs/01/conda-envs/basic-env-cpu.yml'
+env_yaml=/tmp/environment.yml
+conda_yaml=/tmp/basic-env-cpu.yml
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "wget $conda_env_url -O $conda_yaml"
+cat <<EOF > ${env_yaml}
+\$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+name: basic-env-scikit
+image: mcr.microsoft.com/azureml/openmpi3.1.2-ubuntu18.04
+conda_file: $conda_yaml
+description: Environment created from a Docker image plus Conda environment.
+EOF
+scp "${env_yaml}" "${testvm_pip}:${env_yaml}"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml environment create -w $aml_ws_name -g $rg -f $env_yaml -o none"
+
 # Training
 # Potentially look at https://github.com/MicrosoftLearning/mslearn-aml-cli/tree/master/Allfiles/Labs/02/basic-job
 # training_file=/tmp/hello.py
@@ -331,6 +381,7 @@ fi
 # aml_url = returned_job.studio_url
 # print("Monitor your job at", aml_url)
 # EOF
+# Hello world
 job_file=/tmp/job_hello.yml
 cat <<EOF > ${job_file}
 \$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
@@ -343,6 +394,34 @@ compute: azureml:$compute_name
 EOF
 run_output=$(az ml job create -w $aml_ws_name -g $rg -f $job_file)
 run_id=$(echo $run_output | jq -r '.name') && echo "Running job $run_id..."
+# Diabetes
+job_file=/tmp/job_diabetes.yml
+cat <<EOF > ${job_file}
+\$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+code: src
+command: >-
+  python main.py 
+  --diabetes-csv \${{inputs.diabetes}}
+inputs:
+  diabetes:
+    path: azureml:diabetes:1
+    mode: ro_mount
+environment: azureml:basic-env-scikit@latest
+compute: azureml:$compute_name
+experiment_name: diabetes-data-example
+description: Train a classification model on diabetes data using a registered dataset as input.
+display_name: diabetes-$compute_name
+EOF
+training_script_local_file="/tmp/main.py"
+training_script_url="https://raw.githubusercontent.com/MicrosoftLearning/mslearn-aml-cli/master/Allfiles/Labs/02/input-data-job/src/main.py"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "mkdir src"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "wget $training_script_url -O ./src/main.py"
+scp "${job_file}" "${testvm_pip}:${job_file}"
+job_file_basename=$(basename "$job_file")
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "cp $job_file ./$job_file_basename"
+run_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml job create -w $aml_ws_name -g $rg -f $job_file_basename")
+run_id=$(echo $run_output | jq -r '.name') && echo "Running job $run_id..."
+
 
 #################
 #  Diagnostics  #
@@ -366,10 +445,14 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "nslookup ${ml_w
 # AML Compute
 az ml compute list -w $aml_ws_name -g $rg -o table
 az ml job list -w $aml_ws_name -g $rg -o table
+az ml data list -w $aml_ws_name -g $rg -o table
+az ml environment list -w $aml_ws_name -g $rg -o table
+az ml model list -w $aml_ws_name -g $rg -o table
 
 # ACR
-az acr repository list -n $acr_name -g $rg -u $acr_usr -p $acr_pwd -o table
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az acr repository list -n $acr_name -g $rg -u $acr_usr -p $acr_pwd"
+# az acr repository list -n $acr_name -g $rg -u $acr_usr -p $acr_pwd -o table
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az acr repository list -n $acr_name -u $acr_usr -p $acr_pwd -o table"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az acr repository list -n $acr_name -o table"
 
 # Storage
 az storage container list --account-name $storage_account_name --auth-mode login -o table
@@ -392,8 +475,10 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $akv_logs_
 # Firewall net rule logs
 fw_net_logs_query='AzureDiagnostics
 | where Category == "AzureFirewallNetworkRule"
-| where TimeGenerated >= ago(1h) 
-| project TimeGenerated, msg_s
+| where TimeGenerated >= ago(12h) 
+| parse msg_s with * "Action: " Action "." *
+| where Action == "Deny"
+| project TimeGenerated, msg_s, Action
 | take 20 '
 az monitor log-analytics query -w $logws_customerid --analytics-query $fw_net_logs_query -o tsv
 
