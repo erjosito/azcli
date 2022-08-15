@@ -128,7 +128,7 @@ if [[ -z "$logws_name" ]]
 then
     logws_name=log$RANDOM
     echo "INFO: Creating log analytics workspace ${logws_name}..."
-    az monitor log-analytics workspace create -n $logws_name -g $rg
+    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
 else
     echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
 fi
@@ -165,7 +165,7 @@ then
 else
     # User identity
     id_name=aksid
-    id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
+    id_id=$(az identity show -n $id_name -g $rg --query id -o tsv 2>/dev/null)
     if [[ -z "$id_id" ]]
     then
         echo "Identity $id_name not found, creating a new one..."
@@ -191,13 +191,12 @@ az aks create -g $rg -n $aks_name -l $location \
     --network-plugin $network_plugin --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
     --network-policy 'calico' --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
-    --enable-private-cluster --private-dns-zone none \
     --dns-name-prefix cloudtrooper --no-wait
 
 # Other options you can use in the previous command
     # --enable-private-cluster --private-dns-zone none --disable-public-fqdn \
     # --pod-subnet-id $pod_subnet_id \
-    # --enable-pod-security-policy \
+    # --enable-pod-security-policy \  # Deprecated
     # --enable-cluster-autoscaler --min-count 1 --max-count 3 \
     # --cluster-autoscaler-profile scan-interval=30s \
     # --dns-name-prefix cloudtrooper \
@@ -307,19 +306,20 @@ kubectl create deployment sqlapi --image=erjosito/sqlapi:1.0 --port=8080 --repli
 kubectl expose deploy sqlapi --port=80 --target-port=8080
 
 # Service
+app_name=sqlapi
 yaml_file=/tmp/svc.yaml
 cat <<EOF > $yaml_file
 apiVersion: v1
 kind: Service
 metadata:
   annotations:
-  name: kuard
+  name: $app_name
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   ports:
   - port: 8080
   selector:
-    app: kuard
+    app: $app_name
 EOF
 kubectl apply -f $yaml_file
 
@@ -423,6 +423,44 @@ node1_disk_count=$(kubectl get CSINode $node1_name -o jsonpath="{.spec.drivers[1
 svc_ip=$(kubectl get svc/sqlapi -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null) && echo $svc_ip
 curl "http://${svc_ip}/api/healthcheck"
 curl "http://${svc_ip}/api/healthcheck/api/ioperf?file=%2Fmnt%2Fazure%2Fiotest"
+
+###########################
+#          AGIC           #
+###########################
+
+# Create AGIC addon
+echo "Creating subnet for AppGW..."
+az network vnet subnet create -n $appgw_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $appgw_subnet_prefix -o none
+appgw_subnet_id=$(az network vnet subnet show -n $appgw_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+echo "Enabling AGIC..."
+az aks enable-addons -a ingress-appgw -n $aks_name -g $rg --appgw-subnet-id $appgw_subnet_id -o none
+
+# Create ingress rule
+node_rg=$(az aks show -n $aks_name -g $rg --query nodeResourceGroup -o tsv)
+appgw_name=$(az network application-gateway list -g $node_rg --query '[0].name' -o tsv)
+appgw_pip_id=$(az network application-gateway frontend-ip list --gateway-name $appgw_name -g $node_rg --query '[0].publicIpAddress.id' -o tsv)
+appgw_pip=$(az network public-ip show --ids $appgw_pip_id --query 'ipAddress' -o tsv)
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sqlapi
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+    appgw.ingress.kubernetes.io/health-probe-path: "/api/healthcheck"
+spec:
+  rules:
+  - host: sqlapi.${appgw_pip}.nip.io
+    http:
+      paths:
+      - path: /api/
+        pathType: Prefix
+        backend:
+          service:
+            name: sqlapi
+            port:
+              number: 8080
+EOF
 
 ##############################
 # Daemonset to install stuff #
@@ -566,7 +604,7 @@ echo "Creating subnet..."
 az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name --address-prefix $vm_subnet_prefix -o none
 echo "Creating VM..."
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku -l $location \
-   --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $vm_pip_name -o none
+   --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $vm_pip_name --public-ip-sku Standard -o none
 vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
 node_ip=$(kubectl get node -o json | jq -r '.items[0].status.addresses[] | select(.type=="InternalIP") | .address') && echo $node_ip

@@ -18,6 +18,8 @@ ep_subnet_name=ep
 ep_subnet_prefix=10.13.77.0/27
 test_subnet_name=test
 test_subnet_prefix=10.13.77.32/27
+aks_subnet_name=aks
+aks_subnet_prefix=10.13.77.128/25
 storage_blob_ep_name=blobep
 storage_file_ep_name=fileep
 acr_ep_name=acrep
@@ -25,16 +27,6 @@ akv_ep_name=akvep
 aml_ep_name=wsep
 azfw_name=amlfw
 test_vm_size=Standard_B1s
-
-# Functions to start/stop the firewall
-function stop_firewall() {
-    az network firewall ip-config delete -f $azfw_name -n azfw-ipconfig -g $rg -o none
-    az network firewall update -n $azfw_name -g $rg -o none
-}
-function start_firewall() {
-    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
-    az network firewall update -n $azfw_name -g $rg -o none
-}
 
 # Function to update UDR back to testing PC
 function update_myip() {
@@ -45,7 +37,10 @@ function update_myip() {
 
 # Function to update the SSH key of the Linux VM
 function update_ssh_key() {
-    az vm user update -g $rg -u jose -n testvm --ssh-key-value "$(< ~/.ssh/id_rsa.pub)" -o none
+    vm_name=testvm
+    user=$(whoami)
+    echo "Updating SSH key for VM $vm_name and user $user..."
+    az vm user update -g $rg -u $user -n $vm_name --ssh-key-value "$(< ~/.ssh/id_rsa.pub)" -o none
 }
 
 # RG and VNet
@@ -56,7 +51,8 @@ az network vnet subnet create -g $rg --vnet-name $vnet_name -n $ep_subnet_name -
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n $ep_subnet_name --address-prefix $ep_subnet_prefix -o none
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n $azfw_subnet_name --address-prefix $azfw_subnet_prefix -o none
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n $test_subnet_name --address-prefix $test_subnet_prefix -o none
-# az network vnet subnet update -n $subnet_sql_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $aks_subnet_name --address-prefix $aks_subnet_prefix -o none
+# az network vnet subnet update -n $compute_subnet_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
 
 # Log Analytics Workspace
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
@@ -271,7 +267,7 @@ testvm_pip=$(az network public-ip show -n testvm-pip -g $rg --query ipAddress -o
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "sudo apt update"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az extension add -n ml"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az login --use-device-code"        # !!!!! Interactive, dont run as a script !!!!!
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az login --use-device-code"        # !!!!! Interactive, don't run as a script !!!!!
 subscription_id=$(az account show --query id -o tsv)
 echo "Setting subscription to $subscription_id..."
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az account set -n $subscription_id"
@@ -285,7 +281,7 @@ win_pip_name=testvmwin-pip
 az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $win_user --admin-password $win_password --size $win_vm_sku \
    --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $win_pip_name -o none
 
-# Create compute
+# Create compute cluster
 compute_type=AmlCompute        # Can be 'ComputeInstance' or 'AmlCompute'
 compute_name=$(az ml compute list -w $aml_ws_name -g $rg --query '[0].name' -o tsv)
 if [[ -z "$compute_name" ]]; then
@@ -340,7 +336,7 @@ conda_yaml=/tmp/basic-env-cpu.yml
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "wget $conda_env_url -O $conda_yaml"
 cat <<EOF > ${env_yaml}
 \$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
-name: basic-env-scikit
+name: basic-env-scikit2
 image: mcr.microsoft.com/azureml/openmpi3.1.2-ubuntu18.04
 conda_file: $conda_yaml
 description: Environment created from a Docker image plus Conda environment.
@@ -348,53 +344,25 @@ EOF
 scp "${env_yaml}" "${testvm_pip}:${env_yaml}"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml environment create -w $aml_ws_name -g $rg -f $env_yaml -o none"
 
-# Training
-# Potentially look at https://github.com/MicrosoftLearning/mslearn-aml-cli/tree/master/Allfiles/Labs/02/basic-job
-# training_file=/tmp/hello.py
-# cat <<EOF > ${training_file}
-# print("Hello world!")
-# EOF
-# control_file=/tmp/run_hello.py
-# cat <<EOF > ${control_file}
-# from azure.ai.ml import MLClient, command, Input
-# from azure.identity import DefaultAzureCredential
-# from azureml.core import Workspace
-# ws = Workspace.from_config()
-# default_azure_credential = DefaultAzureCredential()
-# subscription_id = ws.subscription_id
-# resource_group = ws.resource_group
-# workspace = ws.name
-# ml_client = MLClient(
-#    default_azure_credential,
-#    subscription_id,
-#    resource_group,
-#    workspace)
-# computeName="$compute_name"
-# job = command(
-#     code="./src",
-#     command="python hello.py",
-#     environment="AzureML-sklearn-0.24-ubuntu18.04-py37-cpu@latest",
-#     compute=computeName,
-#     display_name="hello-world-example",
-# )
-# returned_job = ml_client.create_or_update(job)
-# aml_url = returned_job.studio_url
-# print("Monitor your job at", aml_url)
-# EOF
-# Hello world
+# Hello world job
 job_file=/tmp/job_hello.yml
 cat <<EOF > ${job_file}
 \$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 command: echo "hello world"
 display_name: hello-world-$compute_name
-experiment_name: hello-world-example
+experiment_name: hello-world-$compute_name
 environment:
   image: library/python:latest
 compute: azureml:$compute_name
+display_name: hello-world-$compute_name
 EOF
 run_output=$(az ml job create -w $aml_ws_name -g $rg -f $job_file)
 run_id=$(echo $run_output | jq -r '.name') && echo "Running job $run_id..."
-# Diabetes
+
+# Training
+# Potentially look at https://github.com/MicrosoftLearning/mslearn-aml-cli/tree/master/Allfiles/Labs/02/basic-job
+
+# Training with AML dataset...
 job_file=/tmp/job_diabetes.yml
 cat <<EOF > ${job_file}
 \$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
@@ -422,6 +390,216 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "cp $job_file ./
 run_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml job create -w $aml_ws_name -g $rg -f $job_file_basename")
 run_id=$(echo $run_output | jq -r '.name') && echo "Running job $run_id..."
 
+# Training with local data file
+training_script=/tmp/diabetes_experiment.py
+training_script_basename=$(basename "$training_script")
+cat <<EOF > ${training_script}
+# Import libraries
+from azureml.core import Run
+import pandas as pd
+import numpy as np
+import joblib
+import os
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_curve
+# Get the experiment run context
+run = Run.get_context()
+# load the diabetes dataset
+print("Loading Data...")
+diabetes = pd.read_csv('diabetes.csv')
+# Separate features and labels
+X, y = diabetes[['Pregnancies','PlasmaGlucose','DiastolicBloodPressure','TricepsThickness','SerumInsulin','BMI','DiabetesPedigree','Age']].values, diabetes['Diabetic'].values
+# Split data into training set and test set
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.30, random_state=0)
+# Set regularization hyperparameter
+reg = 0.01
+# Train a logistic regression model
+print('Training a logistic regression model with regularization rate of', reg)
+run.log('Regularization Rate',  np.float(reg))
+model = LogisticRegression(C=1/reg, solver="liblinear").fit(X_train, y_train)
+# calculate accuracy
+y_hat = model.predict(X_test)
+acc = np.average(y_hat == y_test)
+print('Accuracy:', acc)
+run.log('Accuracy', np.float(acc))
+# calculate AUC
+y_scores = model.predict_proba(X_test)
+auc = roc_auc_score(y_test,y_scores[:,1])
+print('AUC: ' + str(auc))
+run.log('AUC', np.float(auc))
+# Save the trained model in the outputs folder
+os.makedirs('outputs', exist_ok=True)
+joblib.dump(value=model, filename='outputs/diabetes_model.pkl')
+run.complete()
+EOF
+# Job file:
+job_file=/tmp/job_diabetes.yml
+cat <<EOF > ${job_file}
+\$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+code: src
+command: >-
+  python ${training_script_basename}
+environment: azureml:basic-env-scikit@latest
+compute: azureml:$compute_name
+experiment_name: diabetes-data-example
+description: Train a classification model on diabetes data using a data file uploaded along the script.
+display_name: diabetes-localfile-$compute_name
+EOF
+# Create src folder in local VM, in case it doesnt exist
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "mkdir src"
+# Option 1: get training script from the Web
+# training_script_url="https://raw.githubusercontent.com/MicrosoftLearning/mslearn-aml-cli/master/Allfiles/Labs/02/basic-job/src/main.py"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "wget $training_script_url -O ./src/main.py"
+# Option 2: copy from local file system
+scp "${training_script}" "${testvm_pip}:/home/$(whoami)/src/${training_script_basename}"
+# Get data from the web
+diabetes_data_url='https://github.com/MicrosoftLearning/mslearn-dp100/raw/main/data/diabetes.csv'
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "wget $diabetes_data_url -O ./src/diabetes.csv"
+# Copy job file from local file system
+job_file_basename=$(basename "$job_file")
+scp "${job_file}" "${testvm_pip}:/home/$(whoami)/${job_file_basename}"
+# Run job
+run_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml job create -w $aml_ws_name -g $rg -f $job_file_basename")
+run_id=$(echo $run_output | jq -r '.name') && echo "Running job $run_id..."
+
+# Register model
+model_name=diabetesmodel
+# az ml model create -n $model_name -w $aml_ws_name -g $rg --version 1 --path "azureml://jobs/${run_id}/outputs/artifacts/paths/model/"
+az ml model create -n $model_name -w $aml_ws_name -g $rg --version 1 --path "azureml://jobs/${run_id}/outputs/diabetes_model.pkl"
+
+# Deploy to a managed endpoint
+# 1. Endpoint
+endpoint_name=diabetes$RANDOM
+endpoint_file=/tmp/endpoint_diabetes.yml
+cat <<EOF > ${endpoint_file}
+\$schema: https://azuremlschemas.azureedge.net/exp/managedOnlineEndpoint.schema.json
+name: diabetes-endpoint
+auth_mode: key
+public_network_access: disabled     # This is ingress
+# egress_public_network_access: disabled  # Note that egress access is a deployment property, not an endpoint property
+EOF
+scp "${endpoint_file}" "${testvm_pip}:${endpoint_file}"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml online-endpoint create -n $endpoint_name -w $aml_ws_name -g $rg -f $endpoint_file -o none"
+# 2. Deployment
+scoring_script_url=https://raw.githubusercontent.com/MicrosoftDocs/pipelines-azureml/master/models/diabetes/score.py
+deployment_file=/tmp/deployment_diabetes.yml
+cat <<EOF > ${deployment_file}
+\$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineDeployment.schema.json
+name: diabetes-deployment
+endpoint_name: ${endpoint_name}
+model: azureml:${model_name}:1
+instance_type: Standard_F2s_v2
+instance_count: 1
+environment: azureml:basic-env-scikit:1
+egress_public_network_access: disabled
+code_configuration:
+  code: /home/$(whoami)/score/
+  scoring_script: score.py
+EOF
+scoring_script=/tmp/score.py
+cat <<EOF > ${scoring_script}
+import json
+import numpy as np
+import pickle
+from sklearn.linear_model import Ridge
+from azureml.core.model import Model
+from inference_schema.schema_decorators import input_schema, output_schema
+from inference_schema.parameter_types.numpy_parameter_type import NumpyParameterType
+def init():
+    global model
+    model_path = Model.get_model_path('$model_name')
+
+    with open(model_path, 'rb') as file:
+        model = pickle.load(file)
+input_sample = np.array([[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]])
+output_sample = np.array([3726.995])
+@input_schema('data', NumpyParameterType(input_sample))
+@output_schema(NumpyParameterType(output_sample))
+def run(data):
+    try:
+        result = model.predict(data)
+        return result.tolist()
+    except Exception as e:
+        error = str(e)
+        return error
+EOF
+scp "${deployment_file}" "${testvm_pip}:${deployment_file}"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "mkdir score"
+# Option 1: download score.py from Internet
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "wget $scoring_script_url -O ./score/score.py"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "sudo sed -i \"s/diabetes-model/$model_name/\" ./score/score.py"  # Fix the scoring script (that version is hardwired to a specific model name)
+# Option 2: copy from local file
+scp "${scoring_script}" "${testvm_pip}:/home/$(whoami)/score/score.py"
+# Create deployment
+deployment_name=diabetes$RANDOM
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml online-deployment create -n $deployment_name -w $aml_ws_name -g $rg -f $deployment_file --all-traffic -o none"
+# This error happens when using public outbound for the endpoint and the WS is private:
+# Your online endpoint deployment failed because your workspace enables a private link feature and it blocks 
+#   your online managed endpoint to get data from your workspace. Please enable workspace public network access to avoid this issue
+# Unidentified error:
+# Creating/updating online deployment diabetes23941 ERROR: (None) ResourceNotReady: User container has crashed or terminated.
+#   Please see troubleshooting guide, available here: https://aka.ms/oe-tsg#error-resourcenotready
+
+# Create inference cluster
+# https://docs.microsoft.com/en-us/azure/machine-learning/how-to-attach-kubernetes-anywhere?tabs=deploy-extension-with-cli%2Ccli
+# 1. Create AKS cluster
+aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+rt_id=$(az network route-table show -n aml -g $rg --query id -o tsv)
+az network vnet subnet update --ids $aks_subnet_id --route-table $rt_id -o none   # kubenet/BYO-RT not supported with MSI
+aks_node_size=Standard_B2ms    # Some possible values: Standard_B2ms, Standard_D2_v3
+network_plugin=azure           # Since BYO-RT not supported with MSI, but AML requires MSI at this point, using Azure CNI
+k8s_versions=$(az aks get-versions -l $location -o json)
+k8s_version=$(echo $k8s_versions | jq '.orchestrators[]' | jq -rsc 'sort_by(.orchestratorVersion) | reverse[0] | .orchestratorVersion')
+echo "Latest supported k8s version in $rg_location is $k8s_version (in preview)"
+aks_service_cidr=10.0.0.0/16
+aks_name=$(az aks list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$aks_name" ]]; then
+    echo "Creating AKS cluster..."
+    aks_name=amlaks$RANDOM
+    az aks create -g $rg -n $aks_name -l $location -o none \
+        -c 1 -s $aks_node_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
+        --enable-managed-identity \
+        --network-plugin $network_plugin --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
+        --network-policy 'calico' --load-balancer-sku Standard --outbound-type userDefinedRouting \
+        --node-resource-group "$aks_name"-iaas-"$RANDOM" \
+        --enable-private-cluster --disable-public-fqdn
+else
+    echo "AKS cluster $aks_name found in resource group"
+fi
+az aks enable-addons --addons azure-policy -n $aks_name -g $rg -o none
+# 2. Deploy AzureML extension
+az k8s-extension create --name amlextension --extension-type Microsoft.AzureML.Kubernetes -o none \
+    --config enableTraining=True enableInference=True inferenceRouterServiceType=LoadBalancer internalLoadBalancerProvider=azure allowInsecureConnections=True inferenceLoadBalancerHA=False \
+    --cluster-type managedClusters --cluster-name $aks_name --resource-group $rg --scope cluster
+# 3. Attach cluster to AML workspace
+aks_id=$(az aks show -n $aks_name -g $rg --query id -o tsv) && echo "AKS cluster ID is $aks_id"
+aks_ns=aml
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml compute attach -w $aml_ws_name -g $rg --type Kubernetes -n $aks_name --resource-id $aks_id --identity-type SystemAssigned --namespace $aks_ns -o none"
+
+# Deploy model to AKS inferencing cluster
+endpoint_name=aksendpoint
+endpoint_file=/tmp/aksendpoint_diabetes.yml
+scoring_script_url=https://raw.githubusercontent.com/MicrosoftDocs/pipelines-azureml/master/models/diabetes/score.py
+cat <<EOF > ${endpoint_file}
+name: blue
+app_insights_enabled: false
+endpoint_name: $endpoint_name
+model: 
+  path: /home/$(whoami)/${model_name}/model/model.pkl
+code_configuration:
+  code: /home/$(whoami)/score/
+  scoring_script: score.py
+environment: 
+  conda_file: file:/home/$(whoami)/${model_name}/model/conda.yml
+  image: mcr.microsoft.com/azureml/openmpi3.1.2-ubuntu18.04:20210727.v1
+EOF
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az ml model download -n $model_name -w $aml_ws_name -g $rg -v 1 -p ./" # This will create the folder $model_name in ~/
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "mkdir score"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "wget $scoring_script_url -O ./score/score.py"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "sudo sed -i \"s/diabetes-model/$model_name/\" ./score/score.py"
+scp "${endpoint_file}" "${testvm_pip}:${endpoint_file}"
 
 #################
 #  Diagnostics  #
@@ -442,20 +620,36 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "nslookup ${acr_
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "nslookup ${akv_name}.file.vaultcore.azure.net"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "nslookup ${ml_ws_name}.api.azureml.ms"
 
-# AML Compute
+# AML
 az ml compute list -w $aml_ws_name -g $rg -o table
 az ml job list -w $aml_ws_name -g $rg -o table
 az ml data list -w $aml_ws_name -g $rg -o table
 az ml environment list -w $aml_ws_name -g $rg -o table
 az ml model list -w $aml_ws_name -g $rg -o table
+az ml online-endpoint list -w $aml_ws_name -g $rg -o table
+az ml online-deployment list -w $aml_ws_name -g $rg -e $endpoint_name -o table
+az ml online-deployment get-logs -n diabetes23941 -w $aml_ws_name -g $rg -e $endpoint_name -o table
 
 # ACR
 # az acr repository list -n $acr_name -g $rg -u $acr_usr -p $acr_pwd -o table
 # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az acr repository list -n $acr_name -u $acr_usr -p $acr_pwd -o table"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az acr repository list -n $acr_name -o table"
+acr_repo_name=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az acr repository list -n $acr_name -o tsv --query '[0]'")
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az acr repository show-tags --repository $acr_repo_name -n $acr_name -o table"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az acr repository show --repository $acr_repo_name -n $acr_name"
+
 
 # Storage
 az storage container list --account-name $storage_account_name --auth-mode login -o table
+
+# AKS
+az aks list -g $rg -o table
+az k8s-extension show --name amlextension --cluster-type managedClusters --cluster-name $aks_name --resource-group $rg
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "sudo az aks install-cli"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "az aks get-credentials -n $aks_name -g $rg --overwrite --admin"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "kubectl get ns"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "kubectl get svc -A"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $testvm_pip "kubectl get svc -n azureml"
 
 # Logs
 logs_query='AzureDiagnostics 
@@ -495,14 +689,61 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_lo
 #    Start/Stop    #
 ####################
 
-stop_firewall
-az vm deallocate -n testvm -g $rg -y --no-wait
-az vm deallocate -n testvmwin -g $rg -y --no-wait
+# Stop all
+function stop_lab() {
+    aks_name=$(az aks list -g $rg --query '[0].name' -o tsv)
+    az aks stop -n $aks_name -g $rg --no-wait
+    stop_vms
+    stop_firewall
+}
+
+# Stop VMs
+function stop_vms() {
+    # vm_list=$(az vm list -o tsv -g "$rg" --query "[?contains(name,'testvm')].name")
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        az vm deallocate -g $rg -n "$vm_name" -y --no-wait
+    done <<< "$vm_list"
+}
+
+# Start
+function start_lab() {
+    aks_name=$(az aks list -g $rg --query '[0].name' -o tsv)
+    az aks start -n $aks_name -g $rg --no-wait
+    start_vms
+    start_firewall
+}
+
+# Start VMs
+function start_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        az vm start -g $rg -n "$vm_name" --no-wait
+    done <<< "$vm_list"
+}
+
+# Functions to start/stop the firewall
+function stop_firewall() {
+    azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
+    azfw_ipconfig_name=$(az network firewall show -n $azfw_name -g $rg --query 'ipConfigurations[0].name' -o tsv)
+    az network firewall ip-config delete -f $azfw_name -n $azfw_ipconfig_name -g $rg -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+function start_firewall() {
+    azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
+    azfw_ipconfig_name="${azfw_name}-ipconfig"
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+
+# stop_lab
+# start_lab
 
 ####################
 # Cleanup !DANGER! #
 ####################
 
-az ml compute stop -n $compute_name -g $rg -w $aml_ws_name
-
-# az group delete -n $rg -y
+function cleanup_all() {
+    az group delete -n $rg -y
+}
+# cleanup_all
