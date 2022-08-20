@@ -17,7 +17,9 @@ function create_gw {
     vnet_name=vnet${id}
     vnet_prefix=10.${id}.0.0/16
     subnet_prefix=10.${id}.0.0/24
+    vm_subnet_prefix=10.${id}.1.0/24
     az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name GatewaySubnet --subnet-prefix $subnet_prefix
+    az network vnet subnet create -g $rg -n vm --vnet-name $vnet_name --address-prefix $vm_subnet_prefix
     az network public-ip create -g $rg -n pip0
     if [[ $no_of_gws == "1" ]]
     then
@@ -44,7 +46,9 @@ function connect_gws {
 az group create -n $rg -l $location
 
 # Create VPN GW in one vnet
-create_gw 1 1
+create_gw 1 1   # active/passive
+# create_gw 1 2   # active/active
+
 
 # Create test VM
 azurevm_name=testvm
@@ -52,7 +56,7 @@ azurevm_pip_name="${azurevm_name}-pip"
 vm_size=Standard_B1s
 az network nsg create -n "${azurevm_name}-nsg" -g $rg
 az vm create -n $azurevm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
-    --public-ip-address $azurevm_pip_name --vnet-name vnet1 --size $vm_size --subnet vm --subnet-address-prefix 10.1.1.0/24
+    --public-ip-address $azurevm_pip_name --vnet-name vnet1 --size $vm_size --subnet vm
 
 # Connection between Azure VNGs
 # az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n 0to11 --vnet-gateway1 vng0 --vnet-gateway2 vng11
@@ -101,7 +105,7 @@ vpngw_pip_1=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettin
 vpngw_private_ip_1=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_1
 vpngw_asn=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.asn' -o tsv) && echo $vpngw_asn
 
-# Configure CSR
+# Configure CSR (active/active VNG)
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
 config t
     crypto ikev2 proposal azure-proposal
@@ -171,13 +175,75 @@ config t
         neighbor $vpngw_private_ip_1 ebgp-multihop 5
         neighbor $vpngw_private_ip_1 update-source GigabitEthernet1
     !
-    ip route vpngw_private_ip_0 255.255.255.255 Tunnel0
-    ip route vpngw_private_ip_1 255.255.255.255 Tunnel1
+    ip route $vpngw_private_ip_0 255.255.255.255 Tunnel0
+    ip route $vpngw_private_ip_1 255.255.255.255 Tunnel1
 !
 end
 !
 wr mem
 EOF
+
+# Configure CSR (active/active VNG)
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
+config t
+    crypto ikev2 proposal azure-proposal
+        encryption aes-cbc-256 aes-cbc-128 3des
+        integrity sha1
+        group 2
+        exit
+    !
+    crypto ikev2 policy azure-policy
+        proposal azure-proposal
+        exit
+    !
+    crypto ikev2 keyring azure-keyring
+    peer $vpngw_pip_0
+        address $vpngw_pip_0
+        pre-shared-key $psk
+        exit
+    exit
+    !
+    crypto ikev2 profile azure-profile
+        match address local interface GigabitEthernet1
+        match identity remote address $vpngw_pip_0 255.255.255.255
+        authentication remote pre-share
+        authentication local pre-share
+        keyring local azure-keyring
+    exit
+    !
+    crypto ipsec transform-set azure-ipsec-proposal-set esp-aes 256 esp-sha-hmac
+        mode tunnel
+    exit
+    crypto ipsec profile azure-vti
+        set transform-set azure-ipsec-proposal-set
+        set ikev2-profile azure-profile
+        set security-association lifetime kilobytes 102400000
+        set security-association lifetime seconds 3600 
+    exit
+    !
+    interface Tunnel0
+        ip unnumbered GigabitEthernet1 
+        ip tcp adjust-mss 1350
+        tunnel source GigabitEthernet1
+        tunnel mode ipsec ipv4
+        tunnel destination $vpngw_pip_0
+        tunnel protection ipsec profile azure-vti
+    exit
+    !
+    router bgp $branch_asn
+        bgp router-id interface GigabitEthernet1
+        bgp log-neighbor-changes
+        neighbor $vpngw_private_ip_0 remote-as $vpngw_asn
+        neighbor $vpngw_private_ip_0 ebgp-multihop 5
+        neighbor $vpngw_private_ip_0 update-source GigabitEthernet1
+    !
+    ip route $vpngw_private_ip_0 255.255.255.255 Tunnel0
+!
+end
+!
+wr mem
+EOF
+
 
 # Diagnostics
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip int b"
