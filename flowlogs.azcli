@@ -7,13 +7,18 @@
 # May 2021
 ########################################################
 
+# Control
+create_azfw=yes
+
 # Variables
 rg=flowlogs
 location=westeurope
 vnet_name=flowlogs
 vnet_prefix=192.168.0.0/16
-subnet_name=vm
-subnet_prefix=192.168.1.0/24
+subnet0_name=vm0
+subnet0_prefix=192.168.0.0/24
+subnet1_name=vm1
+subnet1_prefix=192.168.1.0/24
 nsg_name=flowlogs
 cloudinit_file="/tmp/cloudinit.txt"
 vm_size=Standard_B1s
@@ -69,17 +74,20 @@ function configure_flowlogs () {
 }
 
 # Create RG, Vnet, NSG
-az group create -n $rg -l $location
-az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $subnet_name --subnet-prefix $subnet_prefix -l $location
-az network nsg create -n $nsg_name -g $rg -l $location
-az network nsg rule create -n allowSSHin --nsg-name $nsg_name -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp
+az group create -n $rg -l $location -o none
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $subnet1_name --subnet-prefix $subnet1_prefix -l $location -o none
+az network vnet subnet create --vnet-name $vnet_name --name $subnet0_name -g $rg --address-prefixes $subnet0_prefix -o none
+az network nsg create -n $nsg_name -g $rg -l $location -o none
+az network nsg rule create -n allowSSHin --nsg-name $nsg_name -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+az network vnet subnet update -n $subnet1_name --vnet-name $vnet_name -g $rg --nsg $nsg_name -o none
+az network vnet subnet update -n $subnet0_name --vnet-name $vnet_name -g $rg --nsg $nsg_name -o none
 
 # Create Log Analytics workspace
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
 if [[ -z "$logws_name" ]]
 then
     logws_name=log$RANDOM
-    az monitor log-analytics workspace create -n $logws_name -g $rg
+    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
 fi
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
@@ -89,13 +97,13 @@ storage_account_name=$(az storage account list -g $rg --query '[].name' -o tsv 2
 if [[ -z "$storage_account_name" ]]
 then
     storage_account_name=log$RANDOM
-    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location -o none
 fi
 
 # Enable flow logs
 az network watcher flow-log create -l $location -n "flowlog-$location" -g $rg \
     --nsg $nsg_name --storage-account $storage_account_name --log-version 2 --retention 7 \
-    --workspace $logws_id --interval 10 --traffic-analytics true
+    --workspace $logws_id --interval 10 --traffic-analytics true -o none
 
 # Generate cloudinit file to create VMs
 cat <<EOF > $cloudinit_file
@@ -105,13 +113,14 @@ packages:
   - pv
 EOF
 
-# Create VMs
+# Create VMs spread over two subnets
 for i in {1..$no_of_vms}
 do
     vm_name="vm$(printf "%02d" i)"
+    subnet_index=$(expr $i % 2)
     az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_size \
-    --vnet-name $vnet_name --subnet $subnet_name --public-ip-address "${vm_name}-pip" --nsg $nsg_name \
-    --custom-data $cloudinit_file -l $location --no-wait
+    --vnet-name $vnet_name --subnet "vm${subnet_index}" --public-ip-address "${vm_name}-pip" --nsg $nsg_name \
+    --custom-data $cloudinit_file -l $location --public-ip-sku Standard --no-wait
 done
 
 # Wait some seconds and create JSON with required IPs
@@ -127,6 +136,74 @@ function get_private_ip () {
 function get_public_ip () {
     echo $1 | jq -r '.[] | select(.virtualMachine.name == "'$2'") | .virtualMachine.network.publicIpAddresses[0].ipAddress'
 }
+
+# Azure Firewall
+if [[ "$create_azfw" == "yes" ]]; then
+    # Variables
+    azfw_subnet_prefix=192.168.10.0/24
+    azfw_name=myazfw
+    azfw_policy_name=myazfwpolicy
+    azfw_pip_name=myazfw-pip
+    # Start
+    az network vnet subnet create --vnet-name $vnet_name --name AzureFirewallSubnet -g $rg --address-prefixes $azfw_subnet_prefix -o none
+    az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location -o none
+    azfw_ip=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
+    az network firewall policy create -n $azfw_policy_name -g $rg
+    az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000
+    # Allow SSH and HTTP for connection monitor (uses TCP9 too)
+    echo "Creating rule to allow SSH and HTTP..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols TCP --destination-ports 9 22 80 -o none
+    # Allow ICMP
+    echo "Creating rule to allow ICMP..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
+    # Allow NTP
+    echo "Creating rule to allow NTP..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "20.0.0.0/6" --ip-protocols UDP --destination-ports "123" -o none
+    # Example application collection with 2 rules (ipconfig.co, api.ipify.org)
+    echo "Creating rule to allow ifconfig.co and api.ipify.org..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
+        --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 -o none
+    az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
+        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 --rule-type ApplicationRule -o none
+    # Example application collection with wildcards (*.ubuntu.com)
+    echo "Creating rule to allow *.ubuntu.com..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ubuntu --collection-priority 202 --action Allow --rule-name repos --rule-type ApplicationRule --description "ubuntucom" \
+        --target-fqdns 'ubuntu.com' '*.ubuntu.com' --source-addresses '*' --protocols Http=80 Https=443 -o none
+    # Mgmt traffic to Azure
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name azure --collection-priority 203 --action Allow --rule-name azmonitor --rule-type ApplicationRule --description "Azure Monitor" \
+        --target-fqdns '*.opinsights.azure.com' '*.azure-automation.net' --source-addresses '*' --protocols Https=443 -o none
+    # Create Azure Firewall
+    echo "Creating Azure Firewall..."
+    az network firewall create -n $azfw_name -g $rg --policy $azfw_policy_name -l $location -o none
+    # Configuring IP
+    echo "Configuring firewall logs and private IP..."
+    azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+    az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+        --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+        --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+                {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+    azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo "$azfw_private_ip"
+    # Create route tables
+    az network route-table create --name subnet0 --resource-group "$rg" --location "$location" -o none
+    az network route-table route create --route-table-name subnet0 -g $rg --address-prefix $subnet1_prefix --name subnet1 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+    az network vnet subnet update --name $subnet0_name --route-table subnet0 --vnet-name $vnet_name --resource-group $rg -o none
+    az network route-table create --name subnet1 --resource-group "$rg" --location "$location" -o none
+    az network route-table route create  --route-table-name subnet1 -g $rg --address-prefix $subnet0_prefix --name subnet0 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+    az network vnet subnet update --name $subnet1_name --route-table subnet1 --vnet-name $vnet_name --resource-group $rg -o none
+
+
+fi
 
 # Start traffic generation
 flows_array=($(convert_string_to_array $flows ','))

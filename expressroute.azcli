@@ -39,6 +39,19 @@ vm_pip_name="${vm_name}-pip"
 vm_size=Standard_B1s
 mcr_asn=65001
 megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+# gcloud (to simulate onprem ER)
+project_name=onprem
+project_id="${project_name}${RANDOM}"
+machine_type=e2-micro
+gcp_asn=16550
+region=europe-west3  # other values: europe-west3, australia-southeast1
+zone=europe-west3-b  # other values: europe-west3-b, australia-southeast1-b
+gcp_vm_name=vm
+gcp_vpc_name=vpc
+gcp_subnet_name=vm
+gcp_subnet_prefix='10.4.2.0/24'
+attachment_name=attachment
+router_name=router
 
 # Create RG
 echo "Creating resource group..."
@@ -54,9 +67,9 @@ megaport_script_path="/home/jose/repos/azcli/megaport.sh"
 if [[ -e "$megaport_script_path" ]]
 then
     echo "Creating Megaport Cloud Router and configuring circuit..."
-    $megaport_script_path -q -s=jomore-${er_pop} -a=create_mcr -k=$service_key --asn=$mcr_asn
+    $megaport_script_path -s=jomore-${er_pop} -a=create_mcr -k=$service_key --asn=$mcr_asn
     sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
-    $megaport_script_path -q -s=jomore-${er_pop} -a=create_vxc -k=$service_key
+    $megaport_script_path -s=jomore-${er_pop} -a=create_vxc -k=$service_key
 else
     echo "Sorry, I cannot seem to find the script $megaport_script_path to interact with the Megaport API"
 fi

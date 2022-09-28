@@ -143,7 +143,7 @@ az network firewall policy create -n "$azfw_policy_name" -g $rg --sku Premium --
 az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location
 azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
 azfw_policy_id=$(az network firewall policy show -n $azfw_policy_name -g $rg --query id -o tsv)
-az network firewall create -n $azfw_name -g $rg -l $location --tier Premium --policy $azfw_policy_id # Not working yet (Feb 11 2022)...
+az network firewall create -n $azfw_name -g $rg -l $location --tier Premium --policy $azfw_policy_id
 azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id) && echo $azfw_id
 az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
@@ -297,7 +297,7 @@ az network private-dns link vnet create -g $rg -z $public_domain -n myDnsLink --
 az network public-ip create -g $rg -n $appgw_pip_name --sku standard --allocation-method static -l $location
 appgw_pip_address=$(az network public-ip show -g $rg -n $appgw_pip_name --query ipAddress -o tsv)
 az network application-gateway create -g $rg -n $appgw_name --capacity 2 --sku $appgw_sku \
-    --frontend-port 8080 --routing-rule-type basic \
+    --frontend-port 8080 --routing-rule-type basic --priority 100 \
     --servers $vm_fqdn --http-settings-port 8080 --http-settings-protocol Http \
     --sku Standard_v2 --min-capacity 1 --max-capacity 2 \
     --public-ip-address $appgw_pip_name --vnet-name $vnet_name --subnet $appgw_subnet_name
@@ -360,7 +360,7 @@ frontend_name=$(az network application-gateway frontend-ip list -g "$rg" --gatew
 az network application-gateway frontend-port create -n testvmport -g "$rg" --gateway-name "$appgw_name" --port 443 -o none
 az network application-gateway http-listener create -n testvmlistener -g "$rg" --gateway-name "$appgw_name" \
 --frontend-port testvmport --frontend-ip "$frontend_name" --ssl-cert "$cert_name" -o none
-az network application-gateway rule create -g "$rg" --gateway-name "$appgw_name" -n testvmrule \
+az network application-gateway rule create -g "$rg" --gateway-name "$appgw_name" -n testvmrule --priority 110 \
 --http-listener testvmlistener --rule-type Basic --address-pool testvmpool --http-settings testvmsettings -o none
 
 # Connect app gw to Azure Monitor

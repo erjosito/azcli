@@ -10,14 +10,17 @@
 
 
 # Control
-nva_type=csr            # can be csr or linux
+nva_type=linux          # can be csr or linux
 redundant_nva=no        # this script only supports the CSR for redundant CSRs
 create_spokes=no        # can be yes or no
-create_remote_spoke=yes # create a spoke in a remote region
+create_remote_spoke=no  # create a spoke in a remote region
+vpn_branch=no           # whether simulating a VPN branch
+onprem_nva_type=linux   # for the onprem NVA, whether Linux or CSR
+er_branch=yes           # whether simulating an ER branch
 
 # Variables
 rg=routeserver
-location=eastus
+location=northeurope
 remote_location=westeurope
 vnet_name=hub
 vnet_prefix=172.16.0.0/16
@@ -85,7 +88,9 @@ er_location=germanywestcentral
 er_pop=Frankfurt
 er_provider=Megaport
 er_circuit_name=tester
-# Onprem (simulated with Linux NVA)
+mcr_asn=65001
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+# VPN onprem (simulated with Linux NVA)
 onprem_vnet_name=onprem
 onprem_vnet_prefix=192.168.0.0/16
 onprem_nva_subnet_name=onprem
@@ -96,6 +101,19 @@ onprem_linuxnva_asn=65102
 onprem_linuxnva_name=onpremnva
 onprem_linuxnva_pip=${onprem_linuxnva_name}-pip
 onprem_linuxnva_ip=192.168.0.20
+# gcloud (to simulate onprem ER)
+project_name=onprem
+project_id="${project_name}${RANDOM}"
+machine_type=e2-micro
+gcp_asn=16550
+region=europe-west3  # other values: europe-west3, australia-southeast1
+zone=europe-west3-b  # other values: europe-west3-b, australia-southeast1-b
+gcp_vm_name=vm
+gcp_vpc_name=vpc
+gcp_subnet_name=vm
+gcp_subnet_prefix='10.4.2.0/24'
+attachment_name=attachment
+router_name=router
 
 ####################
 # Helper functions #
@@ -139,7 +157,7 @@ az network vnet subnet create -n GatewaySubnet --address-prefix $gw_subnet_prefi
 
 # Create Route Server
 echo "Creating Route Server..."
-rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv) -o none
+rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 rs_pip_name="${rs_name}-pip"
 az network public-ip create -g $rg -n $rs_pip_name --allocation-method Static --sku Standard -o none
 az network routeserver create -n $rs_name -g $rg --hosted-subnet $rs_subnet_id -l $location --public-ip-address $rs_pip_name -o none
@@ -558,39 +576,42 @@ EOF
 
 fi
 
-#############
-# Linux NVA #
-#############
+####################
+# Linux NVA in hub #
+####################
 
-# Cloud init file to install StrongSwan (not used in this lab) and BIRD 1.6
-cat <<EOF > $hub_linuxnva_cloudinit_file
+if [[ "$nva_type" == "linux" ]]; then
+    # Cloud init file to install StrongSwan (not used in this lab) and BIRD 1.6
+    cat <<EOF > $hub_linuxnva_cloudinit_file
 #cloud-config
 runcmd:
   - apt update && apt install -y bird strongswan libcharon-extra-plugins strongswan-pki
   - sysctl -w net.ipv4.ip_forward=1
   - sudo iptables -t nat -A POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE
 EOF
-az network vnet subnet create --vnet-name $vnet_name --name $hub_linuxnva_subnet_name -g $rg --address-prefixes $hub_linuxnva_subnet_prefix
-az network route-table create -n hublinuxnva -g $rg -l $location --disable-bgp-route-propagation
-az network vnet subnet update -g $rg --vnet-name $vnet_name -n $hub_linuxnva_subnet_name --route-table hublinuxnva
-az vm create -n $hub_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
-    --public-ip-address $hub_linuxnva_pip_name --vnet-name $vnet_name --size Standard_B1s --subnet $hub_linuxnva_subnet_name \
-    --custom-data $hub_linuxnva_cloudinit_file 
-hub_linuxnva_nic_id=$(az vm show -n $hub_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-az network nic update --ids $hub_linuxnva_nic_id --ip-forwarding
-hub_linuxnva_pip_ip=$(az network public-ip show -n $hub_linuxnva_pip_name -g $rg --query ipAddress -o tsv) && echo $hub_linuxnva_pip_ip
-hub_linuxnva_private_ip=$(az network nic show --ids $hub_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub_linuxnva_private_ip
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "ip a"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
-hub_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $hub_linuxnva_default_gw
+    echo "Creating Linux NVA..."
+    az network vnet subnet create --vnet-name $vnet_name --name $hub_linuxnva_subnet_name -g $rg --address-prefixes $hub_linuxnva_subnet_prefix -o none
+    az network route-table create -n hublinuxnva -g $rg -l $location --disable-bgp-route-propagation -o none
+    az network vnet subnet update -g $rg --vnet-name $vnet_name -n $hub_linuxnva_subnet_name --route-table hublinuxnva -o none
+    az vm create -n $hub_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+        --public-ip-address $hub_linuxnva_pip_name --vnet-name $vnet_name --size Standard_B1s --subnet $hub_linuxnva_subnet_name \
+        --custom-data $hub_linuxnva_cloudinit_file -o none
+    hub_linuxnva_nic_id=$(az vm show -n $hub_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $hub_linuxnva_nic_id --ip-forwarding -o none
+    hub_linuxnva_pip_ip=$(az network public-ip show -n $hub_linuxnva_pip_name -g $rg --query ipAddress -o tsv) && echo $hub_linuxnva_pip_ip
+    hub_linuxnva_private_ip=$(az network nic show --ids $hub_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub_linuxnva_private_ip
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "ip a"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
+    hub_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $hub_linuxnva_default_gw
 
-# RS adjacency
-az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $hub_linuxnva_private_ip --peer-asn $hub_linuxnva_asn -n $hub_linuxnva_name
+    # RS adjacency
+    echo "Connecting Linux NVA to ARS..."
+    az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $hub_linuxnva_private_ip --peer-asn $hub_linuxnva_asn -n $hub_linuxnva_name -o none
 
-# Bird config file
-bird_config_file=/tmp/bird.conf
-cat <<EOF > $bird_config_file
+    # Bird config file
+    bird_config_file=/tmp/bird.conf
+    cat <<EOF > $bird_config_file
 log syslog all;
 router id $hub_linuxnva_private_ip;
 protocol device {
@@ -630,53 +651,81 @@ protocol bgp rs1 {
           export filter {accept;};
 }
 EOF
-hub_linuxnva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "whoami") && echo $hub_linuxnva_user
-scp $bird_config_file "${hub_linuxnva_pip_ip}:/home/${hub_linuxnva_user}/bird.conf"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo mv /home/${hub_linuxnva_user}/bird.conf /etc/bird/bird.conf"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo systemctl restart bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols all"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs0"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs1"
+    hub_linuxnva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "whoami") && echo $hub_linuxnva_user
+    scp $bird_config_file "${hub_linuxnva_pip_ip}:/home/${hub_linuxnva_user}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo mv /home/${hub_linuxnva_user}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo systemctl restart bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show status"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols all"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs1"
 
-# Effective routes in a spoke (5.5.5.5/32 should be there)
-az network nic show-effective-route-table --ids $spoke1_nic_id -o table
-
-# Routes advertised to ARS
-az network routeserver peering list-learned-routes -n $hub_linuxnva_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-
+    # Routes advertised to ARS
+    az network routeserver peering list-learned-routes -n $hub_linuxnva_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+fi
 
 #################################
 # Onprem simulation with VPN/ER #
 #################################
 
-# Initialization
-az network vnet create -n $onprem_vnet_name -g $rg --address-prefixes $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefixes $onprem_nva_subnet_prefix
-az network vnet subnet create -g $rg --vnet-name $onprem_vnet_name -n GatewaySubnet --address-prefix $onprem_gw_subnet_prefix
-az network route-table create -n onpremnva -g $rg -l $location --disable-bgp-route-propagation
-az network vnet subnet update -g $rg --vnet-name $onprem_vnet_name -n $onprem_nva_subnet_name --route-table onpremnva
+if [[ "$er_branch" == "yes" ]]; then
+    # Create ER and ER Gateway to simulate onprem
+    az network public-ip create -g $rg -n $ergw_pip --allocation-method Dynamic --sku Basic -o none
+    az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location \
+        --vnet $vnet_name --public-ip-addresses $ergw_pip -o none
+    az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg \
+        --bandwidth 50 Mbps --provider $er_provider -l $er_location --sku-family MeteredData --sku-tier Standard -o none
+    # After provisioning circuit in Megaport portal continue
+    echo "Creating Megaport Cloud Router and configuring circuit..."
+    service_key=$(az network express-route show -n $er_circuit_name -g $rg --query serviceKey -o tsv)
+    $megaport_script_path -s=jomore-${er_pop} -a=create_mcr -k=$service_key --asn=$mcr_asn
+    sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+    $megaport_script_path -s=jomore-${er_pop} -a=create_vxc -k=$service_key
+    # Connect circuit to VNet
+    circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id
+    az network vpn-connection create -n erconnection -g $rg --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
+    # Create GCP environment to simulate onprem
+    # Get environment info
+    account=$(gcloud info --format json | jq -r '.config.account')
+    billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
+    billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
+    # Create project
+    gcloud projects create $project_id --name $project_name
+    gcloud config set project $project_id
+    gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
+    gcloud services enable compute.googleapis.com
+    # VPC and instance
+    gcloud compute networks create "$gcp_vpc_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+    gcloud compute networks subnets create "$gcp_subnet_name" --network "$gcp_vpc_name" --range "$gcp_subnet_prefix" --region=$region1
+    gcloud compute instances create "$gcp_vm_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc_name" --subnet "$gcp_subnet_name" --zone "$zone"
+    gcloud compute firewall-rules create "${gcp_vpc_name}-allow-icmp" --network "$gcp_vpc_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute firewall-rules create "${gcp_vpc_name}-allow-ssh" --network "$gcp_vpc_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute firewall-rules create "${gcp_vpc_name}-allow-web" --network "$gcp_vpc_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+    # gcloud compute ssh $gcp_vm_name --zone=$zone --command="ip a"    # This command will pause the script if the key file is password-protected
+    # Create interconnect
+    gcloud compute routers create $router_name --project=$project_id --network=$gcp_vpc_name --asn=$gcp_asn --region=$region
+    gcloud compute interconnects attachments partner create $attachment_name --region $region --router $router_name --edge-availability-domain availability-domain-1
+    pairing_key=$(gcloud compute interconnects attachments describe $attachment_name --region $region --format json | jq -r '.pairingKey')
+    # Create VXC in Megaport
+    $megaport_script_path -g -s=jomore-${er_pop} -a=create_vxc -k=$pairing_key
+    # Activate attachment
+    # wait_for_gcp_attachment_ready $attachment_name $region1
+    sleep 120
+    gcloud compute interconnects attachments partner update $attachment_name --region $region --admin-enabled
+fi
 
-# OPTIONAL: Create ER and ER Gateway to simulate onprem
-ergw_name=onpremergw
-ergw_pip="${ergw_name}-pip"
-er_location=germanywestcentral
-er_pop=Frankfurt
-er_provider=Megaport
-er_circuit_name=onpremer
-az network public-ip create -g $rg -n $ergw_pip --allocation-method Dynamic --sku Basic
-az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location \
-    --vnet $onprem_vnet_name --public-ip-addresses $ergw_pip --no-wait
-az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg \
-    --bandwidth 50 --provider $er_provider -l $er_location --sku-family MeteredData --sku-tier Standard
-# After provisioning circuit in Megaport portal continue
-circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id
-az network vpn-connection create -n erconnection -g $rg --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
+if [[ "$vpn_branch" == "yes" ]] && [[ "$onprem_nva_type" == "linux" ]]; then
+    # Initialization
+    az network vnet create -n $onprem_vnet_name -g $rg --address-prefixes $onprem_vnet_prefix --subnet-name $onprem_nva_subnet_name --subnet-prefixes $onprem_nva_subnet_prefix
+    az network vnet subnet create -g $rg --vnet-name $onprem_vnet_name -n GatewaySubnet --address-prefix $onprem_gw_subnet_prefix
+    az network route-table create -n onpremnva -g $rg -l $location --disable-bgp-route-propagation
+    az network vnet subnet update -g $rg --vnet-name $onprem_vnet_name -n $onprem_nva_subnet_name --route-table onpremnva
 
-# Create onprem Linux NVA
-onprem_linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
-cat <<EOF > $onprem_linuxnva_cloudinit_file
+    # Create onprem Linux NVA
+    onprem_linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
+    cat <<EOF > $onprem_linuxnva_cloudinit_file
 #cloud-config
 runcmd:
   - apt update && apt install -y bird strongswan
@@ -684,45 +733,45 @@ runcmd:
   - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
   - sysctl -w net.ipv4.conf.all.send_redirects = 0
 EOF
-az vm create -n $onprem_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
-    --public-ip-address $onprem_linuxnva_pip --vnet-name $onprem_vnet_name --size Standard_B1s --subnet $onprem_nva_subnet_name \
-    --custom-data $onprem_linuxnva_cloudinit_file --private-ip-address "$onprem_linuxnva_ip"
-onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding
-onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $onprem_linuxnva_pip_ip
-onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $onprem_linuxnva_private_ip
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ip a"
-onprem_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $onprem_linuxnva_default_gw
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show route"
+    az vm create -n $onprem_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+        --public-ip-address $onprem_linuxnva_pip --vnet-name $onprem_vnet_name --size Standard_B1s --subnet $onprem_nva_subnet_name \
+        --custom-data $onprem_linuxnva_cloudinit_file --private-ip-address "$onprem_linuxnva_ip"
+    onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding
+    onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $onprem_linuxnva_pip_ip
+    onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $onprem_linuxnva_private_ip
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ip a"
+    onprem_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $onprem_linuxnva_default_gw
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show route"
 
-# Configure StrongSwan VPN to the hub Linux NVA
-# See https://blog.sys4.de/routing-based-vpn-with-strongswan-de.html
-# See https://wiki.strongswan.org/projects/strongswan/wiki/RouteBasedVPN
-echo "Configuring VPN between A:${linuxnva_pip_ip}/${linuxnva_private_ip} and B:${onprem_linuxnva_pip_ip}/${onprem_linuxnva_private_ip}"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo ip tunnel add vti0 local $hub_linuxnva_private_ip remote $onprem_linuxnva_pip_ip mode vti key 12"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo ip link set up dev vti0"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo ip route add $onprem_linuxnva_private_ip/32 dev vti0"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti0 local $onprem_linuxnva_private_ip remote $hub_linuxnva_pip_ip mode vti key 12"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip link set up dev vti0"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route add $hub_linuxnva_private_ip/32 dev vti0"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
-vpn_psk=$(openssl rand -base64 64)
-vpn_psk=${vpn_psk//$'\n'/}  # Remove line breaks
-psk_file_a=/tmp/ipsec.secrets.a
-psk_file_b=/tmp/ipsec.secrets.b
-cat <<EOF > $psk_file_a
+    # Configure StrongSwan VPN to the hub Linux NVA
+    # See https://blog.sys4.de/routing-based-vpn-with-strongswan-de.html
+    # See https://wiki.strongswan.org/projects/strongswan/wiki/RouteBasedVPN
+    echo "Configuring VPN between A:${linuxnva_pip_ip}/${linuxnva_private_ip} and B:${onprem_linuxnva_pip_ip}/${onprem_linuxnva_private_ip}"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo ip tunnel add vti0 local $hub_linuxnva_private_ip remote $onprem_linuxnva_pip_ip mode vti key 12"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo ip link set up dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo ip route add $onprem_linuxnva_private_ip/32 dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip tunnel add vti0 local $onprem_linuxnva_private_ip remote $hub_linuxnva_pip_ip mode vti key 12"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip link set up dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ip route add $hub_linuxnva_private_ip/32 dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
+    vpn_psk=$(openssl rand -base64 64)
+    vpn_psk=${vpn_psk//$'\n'/}  # Remove line breaks
+    psk_file_a=/tmp/ipsec.secrets.a
+    psk_file_b=/tmp/ipsec.secrets.b
+    cat <<EOF > $psk_file_a
 $hub_linuxnva_pip_ip $onprem_linuxnva_pip_ip : PSK "$vpn_psk"
 EOF
-cat <<EOF > $psk_file_b
+    cat <<EOF > $psk_file_b
 $onprem_linuxnva_pip_ip $hub_linuxnva_pip_ip : PSK "$vpn_psk"
 EOF
-ipsec_file_a=/tmp/ipsec.conf.a
-ipsec_file_b=/tmp/ipsec.conf.b
-cat <<EOF > $ipsec_file_a
+    ipsec_file_a=/tmp/ipsec.conf.a
+    ipsec_file_b=/tmp/ipsec.conf.b
+    cat <<EOF > $ipsec_file_a
 config setup
         charondebug="all"
         uniqueids=yes
@@ -744,7 +793,7 @@ conn to-onprem
   auto=start
   mark=12
 EOF
-cat <<EOF > $ipsec_file_b
+    cat <<EOF > $ipsec_file_b
 config setup
         charondebug="all"
         uniqueids=yes
@@ -766,25 +815,25 @@ conn to-azure
   auto=start
   mark=12
 EOF
-username=$(whoami)
-scp $psk_file_a $hub_linuxnva_pip_ip:/home/$username/ipsec.secrets
-scp $psk_file_b $onprem_linuxnva_pip_ip:/home/$username/ipsec.secrets
-scp $ipsec_file_a $hub_linuxnva_pip_ip:/home/$username/ipsec.conf
-scp $ipsec_file_b $onprem_linuxnva_pip_ip:/home/$username/ipsec.conf
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo mv ./ipsec.* /etc/"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo systemctl restart ipsec"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo mv ./ipsec.* /etc/"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart ipsec"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status ipsec"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status ipsec"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo ipsec status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ipsec status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "ping $onprem_linuxnva_private_ip -c 5"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping $hub_linuxnva_private_ip -c 5"
+    username=$(whoami)
+    scp $psk_file_a $hub_linuxnva_pip_ip:/home/$username/ipsec.secrets
+    scp $psk_file_b $onprem_linuxnva_pip_ip:/home/$username/ipsec.secrets
+    scp $ipsec_file_a $hub_linuxnva_pip_ip:/home/$username/ipsec.conf
+    scp $ipsec_file_b $onprem_linuxnva_pip_ip:/home/$username/ipsec.conf
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo mv ./ipsec.* /etc/"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo systemctl restart ipsec"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo mv ./ipsec.* /etc/"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart ipsec"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status ipsec"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status ipsec"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo ipsec status"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ipsec status"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "ping $onprem_linuxnva_private_ip -c 5"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ping $hub_linuxnva_private_ip -c 5"
 
-# Configure BGP onprem with Bird
-bird_config_file=/tmp/bird.conf
-cat <<EOF > $bird_config_file
+    # Configure BGP onprem with Bird
+    bird_config_file=/tmp/bird.conf
+    cat <<EOF > $bird_config_file
 log syslog all;
 router id $onprem_linuxnva_private_ip;
 protocol device {
@@ -810,17 +859,17 @@ protocol bgp azurenva {
           export filter {accept;};
 }
 EOF
-scp $bird_config_file "${onprem_linuxnva_pip_ip}:/home/${hub_linuxnva_user}/bird.conf"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo mv /home/${hub_linuxnva_user}/bird.conf /etc/bird/bird.conf"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show route"
+    scp $bird_config_file "${onprem_linuxnva_pip_ip}:/home/${hub_linuxnva_user}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo mv /home/${hub_linuxnva_user}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo systemctl restart bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show status"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show route"
 
-# Configure BGP on Azure
-bird_config_file=/tmp/bird.conf
-cat <<EOF > $bird_config_file
+    # Configure BGP on Azure
+    bird_config_file=/tmp/bird.conf
+    cat <<EOF > $bird_config_file
 protocol bgp onprem {
       description "BGP to Onprem";
       multihop;
@@ -830,44 +879,46 @@ protocol bgp onprem {
           export filter {accept;};
 }
 EOF
-scp $bird_config_file "${hub_linuxnva_pip_ip}:/home/${username}/bird.conf.new"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "cat /home/${hub_linuxnva_user}/bird.conf.new"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo cat /etc/bird/bird.conf /home/${hub_linuxnva_user}/bird.conf.new >/home/${hub_linuxnva_user}/bird.conf"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo mv /home/${hub_linuxnva_user}/bird.conf /etc/bird/bird.conf"
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo more /etc/bird/bird.conf"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo systemctl restart bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show status"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
+    scp $bird_config_file "${hub_linuxnva_pip_ip}:/home/${username}/bird.conf.new"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "cat /home/${hub_linuxnva_user}/bird.conf.new"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo cat /etc/bird/bird.conf /home/${hub_linuxnva_user}/bird.conf.new >/home/${hub_linuxnva_user}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo mv /home/${hub_linuxnva_user}/bird.conf /etc/bird/bird.conf"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo more /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo systemctl restart bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show status"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
 
-# Check effective routes (6.6.6.6 should be there)
-az network nic show-effective-route-table --ids $hub_vm_nic_id -o table
-az network nic show-effective-route-table --ids $spoke1_vm_nic_id -o table
-$spoke1_
+    # Check effective routes (6.6.6.6 should be there)
+    az network nic show-effective-route-table --ids $hub_vm_nic_id -o table
+    az network nic show-effective-route-table --ids $spoke1_vm_nic_id -o table
+    $spoke1_
 
-# Ping onprem's IP
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_ip "ping $onprem_linuxnva_private_ip -c 5"
+    # Ping onprem's IP
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_ip "ping $onprem_linuxnva_private_ip -c 5"
+fi
 
 # Create onprem CSR (WORK IN PROGRESS)
-nva_size=Standard_B2ms
-onprem_csr_ip=192.168.0.10
-publisher=cisco
-offer=cisco-csr-1000v
-sku=16_12-byol
-version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
-az vm create -n onprem-csr -g "$rg" -l "$location" --image "${publisher}:${offer}:${sku}:${version}" --size "$nva_size" \
-    --generate-ssh-keys --public-ip-address "onprem-csr-pip" --public-ip-address-allocation static --public-ip-sku Standard \
-    --vnet-name "$onprem_vnet_name" --subnet "$onprem_nva_subnet_name" \
-    --private-ip-address "$onprem_csr_ip"
+if [[ "$vpn_branch" == "yes" ]] && [[ "$onprem_nva_type" == "csr" ]]; then
+    nva_size=Standard_B2ms
+    onprem_csr_ip=192.168.0.10
+    publisher=cisco
+    offer=cisco-csr-1000v
+    sku=16_12-byol
+    version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
+    az vm create -n onprem-csr -g "$rg" -l "$location" --image "${publisher}:${offer}:${sku}:${version}" --size "$nva_size" \
+        --generate-ssh-keys --public-ip-address "onprem-csr-pip" --public-ip-address-allocation static --public-ip-sku Standard \
+        --vnet-name "$onprem_vnet_name" --subnet "$onprem_nva_subnet_name" \
+        --private-ip-address "$onprem_csr_ip"
 
-# Configure onprem CSR for VPN
-onprem_default_gw=192.168.0.1
-vpngw_pip_ip=$(az network public-ip show -n $vpngw_pip -g $rg --query ipAddress -o tsv) && echo $vpngw_pip_ip
-vpngw_bgp_ip=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]) && echo $vpngw_bgp_ip
-vpngw_bgp_asn=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.asn) && echo $vpngw_bgp_asn
-onprem_asn=65200
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$onprem_csr_ip"
+    # Configure onprem CSR for VPN
+    onprem_default_gw=192.168.0.1
+    vpngw_pip_ip=$(az network public-ip show -n $vpngw_pip -g $rg --query ipAddress -o tsv) && echo $vpngw_pip_ip
+    vpngw_bgp_ip=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]) && echo $vpngw_bgp_ip
+    vpngw_bgp_asn=$(az network vnet-gateway show -n $vpngw_name -g $rg --query bgpSettings.asn) && echo $vpngw_bgp_asn
+    onprem_asn=65200
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 "$onprem_csr_ip"
     config t
       crypto ikev2 proposal azure-proposal
         encryption aes-cbc-256 aes-cbc-128 3des
@@ -920,47 +971,30 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellma
     end
     wr mem
 EOF
-# Create LNG, connection
-az network local-gateway create -g $rg -n onprem --gateway-ip-address $onprem_csr_ip --local-address-prefixes "$onprem_csr_ip\32" \
-  --bgp-peering-address $onprem_csr_ip --asn ${onprem_asn}
-az network vpn-connection create -g $rg --shared-key $psk -n onprem --vnet-gateway1 $vpngw_name --local-gateway2 onprem 
-
-################
-# ExpressRoute #
-################
-
-# Create ER and ER Gateway
-az network public-ip create -g $rg -n $ergw_pip --allocation-method Dynamic --sku Basic
-az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix
-az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $vnet_name --public-ip-addresses $ergw_pip --no-wait
-az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg \
-    --bandwidth 50 --provider $er_provider -l $er_location --sku-family MeteredData --sku-tier Standard
-# After provisioning circuit in Megaport portal continue
-circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id
-az network vpn-connection create -n erconnection2 -g $rg --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
-
-# Configure Route Server to exchange routes with Vnet Gateways
-az network routeserver update -n $rs_name -g $rg --set allowBranchToBranchTraffic=true -o none
-
-# BGP neighbors of ER gateway should show the two Route Server instances
-az network vnet-gateway list-bgp-peer-status -n $ergw_name -g $rg -o table
+    # Create LNG, connection
+    az network local-gateway create -g $rg -n onprem --gateway-ip-address $onprem_csr_ip --local-address-prefixes "$onprem_csr_ip\32" \
+      --bgp-peering-address $onprem_csr_ip --asn ${onprem_asn}
+    az network vpn-connection create -g $rg --shared-key $psk -n onprem --vnet-gateway1 $vpngw_name --local-gateway2 onprem 
+fi
 
 #######
 # VPN #
 #######
 
-# Azure VPN Gateway gets created in Failed state if deployed AFTER the ARS (this might be fixed now)
+# NOTE: Azure VPN Gateway gets created in Failed state if deployed AFTER the ARS (this might be fixed now)
 
 # Create VPN Gateway
-az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix
-az network public-ip create -g $rg -n "${vpngw_pip}-a" --allocation-method Dynamic --sku Basic
-az network public-ip create -g $rg -n "${vpngw_pip}-b" --allocation-method Dynamic --sku Basic
-az network vnet-gateway create -g "$rg" --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased \
-            --vnet "$vnet_name" -n $vpngw_name --asn "$vpngw_asn" --public-ip-addresses "${vpngw_pip}-a" "${vpngw_pip}-b" --no-wait
-az network vnet-gateway list -g $rg -o table
+if [[ "$vpn_branch" == "yes" ]]; then
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix
+    az network public-ip create -g $rg -n "${vpngw_pip}-a" --allocation-method Dynamic --sku Basic
+    az network public-ip create -g $rg -n "${vpngw_pip}-b" --allocation-method Dynamic --sku Basic
+    az network vnet-gateway create -g "$rg" --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased \
+                --vnet "$vnet_name" -n $vpngw_name --asn "$vpngw_asn" --public-ip-addresses "${vpngw_pip}-a" "${vpngw_pip}-b" --no-wait
+    az network vnet-gateway list -g $rg -o table
 
-# Inspect learnt routes
-az network vnet-gateway list-learned-routes -n $vpngw_name -g $rg --query 'value[].{LocalAddress:localAddress, Peer:sourcePeer, Network:network, NextHop:nextHop, ASPath: asPath, Origin:origin, Weight:weight}' -o tsv
+    # Inspect learnt routes
+    az network vnet-gateway list-learned-routes -n $vpngw_name -g $rg --query 'value[].{LocalAddress:localAddress, Peer:sourcePeer, Network:network, NextHop:nextHop, ASPath: asPath, Origin:origin, Weight:weight}' -o tsv
+fi
 
 ###############
 # Diagnostics #
@@ -970,20 +1004,25 @@ az network routeserver list -g $rg -o table
 az network routeserver show -n $rs_name -g $rg
 az network routeserver peering list --routeserver $rs_name -g $rg -o table
 az network routeserver peering show -n csr --routeserver $rs_name -g $rg
+az network routeserver peering list-learned-routes -n ubuntufw --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
 
-##########################
-# REST: WORK IN PROGRESS #
-##########################
+az network vnet-gateway list-bgp-peer-status -n $ergw_name -g $rg -o table
+az network vnet-gateway list-learned-routes -n $ergw_name -g $rg --query 'value[].{LocalAddress:localAddress, Peer:sourcePeer, Network:network, NextHop:nextHop, ASPath: asPath, Origin:origin, Weight:weight}' -o table
+❯ az network vnet-gateway list-advertised-routes -n $ergw_name -g $rg -o table --peer $rs_ip1
 
-# REST: routeserver
-subscription=$(az account show --query id -o tsv)
-version=2020-07-01
-url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualRouters/${rs_name}?api-version=${version}"
-url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualHubs/${rs_name}?api-version=${version}"
-az rest --method get --url $url
+$megaport_script_path -s=jomore -a=list_live
 
-# REST: peering
-subscription=$(az account show --query id -o tsv)
-version=2020-07-01
-url="https://management.azure.com/subscriptions/${subscription}/resourceGroups/${rg}/providers/Microsoft.Network/virtualRouters/${rs_name}/peerings/csr?api-version=${version}"
-az rest --method get --url $rl
+###########
+# Cleanup #
+###########
+
+function cleanup_all() {
+  # Remove MCR from Megaport
+  megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+  $megaport_script_path -q -s=jomore -a=delete_mcr
+  # Delete RG
+  az group delete -n $rg -y --no-wait
+  # Delete Google infra
+  gcloud projects delete "$project_id"
+  gcloud projects list
+}
