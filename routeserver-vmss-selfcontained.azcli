@@ -189,7 +189,7 @@ if [[ -z "$id_id" ]]; then
     az identity create -n $id_name -g $rg -o none
     id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
     rg_id=$(az group show -n $rg --query id -o tsv)
-    az role assignment create --scope $rg_id --assignee $id_principal_id --role 'Contributor' -o none
+    az role assignment create --scope $rg_id --assignee $id_id --role 'Contributor' -o none
 else
     echo "Found managed identity $id_id"
 fi
