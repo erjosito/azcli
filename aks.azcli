@@ -271,7 +271,8 @@ echo "Creating Azure Bastion..."
 bastion_pip_name="${bastion_name}-pip"
 az network vnet subnet create -g $rg -n $bastion_subnet_name --vnet-name $vnet_name --address-prefix $bastion_subnet_prefix -o none
 az network public-ip create -g $rg -n $bastion_pip_name --sku Standard -l $location -o none
-az network bastion create -n $bastion_name --public-ip-address $bastion_pip_name -g $rg --vnet-name $vnet_name -l $location -o none
+az network bastion create -n $bastion_name --public-ip-address $bastion_pip_name -g $rg --vnet-name $vnet_name -l $location \
+    --enable-ip-connect true --enable-tunneling true  -o none
 vm_id=$(az vm show -n $vm_name -g $rg --query id -o tsv)
 az vm user update -u azureuser -p 'Microsoft123!' -n $vm_name -g $rg -o none
 az network bastion tunnel -n $bastion_name -g $rg --target-resource-id $vm_id --resource-port 22 --port 2022

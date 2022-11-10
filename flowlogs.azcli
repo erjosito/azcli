@@ -250,7 +250,7 @@ ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "sudo netstat -tu
 # Simulate port scan
 src_vm_name=vm01
 port=22
-src_pip=$(get_public_ip $ip_json "$src_vm_name") && echo $pip
+src_pip=$(get_public_ip $ip_json "$src_vm_name") && echo $src_pip
 for i in {1..$no_of_vms}
 do
     dst_vm_name="vm$(printf "%02d" i)"
@@ -258,5 +258,44 @@ do
     ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "nc -vz $dst_ip $port"
 done
 
-# Cleanup
+##############
+# Stop/Start #
+##############
+
+function stop_firewall() {
+    echo "Stoping Azure Firewall ${azfw_name}..."
+    az network firewall ip-config delete -f $azfw_name -n azfw-ipconfig -g $rg -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+function start_firewall() {
+    echo "Starting Azure Firewall ${azfw_name}..."
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+function stop_lab() {
+    stop_vms
+    stop_firewall
+}
+function stop_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        echo "Deallocating Virtual Machine ${vm_name}..."
+        az vm deallocate -g $rg -n "$vm_name" --no-wait -o none
+    done <<< "$vm_list"
+}
+function start_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        echo "Starting Virtual Machine ${vm_name}..."
+        az vm start -g $rg -n "$vm_name" --no-wait -o none
+    done <<< "$vm_list"
+}
+function start_lab() {
+    start_vms
+    start_firewall
+}
+
+###########
+# Cleanup #
+###########
 az network watcher flow-log delete -l $location -n 

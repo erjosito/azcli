@@ -20,7 +20,7 @@
 healthcheck_script_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-healthcheck.py'
 housekeeping_script_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-config.sh'
 routes_url='https://raw.githubusercontent.com/erjosito/azcli/master/routeserver-vmss-selfcontained-routes.txt'
-autorecovery=extension # can be 'extension' or 'probe'
+autorepair=extension # can be 'extension' or 'probe'
 custom_lb=no
 
 # Variables
@@ -87,25 +87,25 @@ function wait_until_finished {
      fi
 }
 
+# Create Vnets and subnets
+echo "Creating RG and VNet..."
+az group create -n $rg -l $location -o none
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix -l $location -o none
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $gw_subnet_name --address-prefix $gw_subnet_prefix -o none
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $rs_subnet_name --address-prefix $rs_subnet_prefix -o none
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $nva_subnet_name --address-prefix $nva_subnet_prefix -o none
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $azfw_subnet_name --address-prefix $azfw_subnet_prefix -o none
+
 # Create Log Analytics workspace
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
 if [[ -z "$logws_name" ]]
 then
     logws_name=log$RANDOM
-    az monitor log-analytics workspace create -n $logws_name -g $rg
+    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
 fi
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customer_id=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 logws_key=$(az monitor log-analytics workspace get-shared-keys -g $rg -n $logws_name --query primarySharedKey -o tsv)
-
-# Create Vnets and subnets
-echo "Creating RG and VNet..."
-az group create -n $rg -l $location -o none
-az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix -o none
-az network vnet subnet create --vnet-name $vnet_name -g $rg -n $gw_subnet_name --address-prefix $gw_subnet_prefix -o none
-az network vnet subnet create --vnet-name $vnet_name -g $rg -n $rs_subnet_name --address-prefix $rs_subnet_prefix -o none
-az network vnet subnet create --vnet-name $vnet_name -g $rg -n $nva_subnet_name --address-prefix $nva_subnet_prefix -o none
-az network vnet subnet create --vnet-name $vnet_name -g $rg -n $azfw_subnet_name --address-prefix $azfw_subnet_prefix -o none
 
 # Configure a RT in the NVA subnet so that it doesnt learn its own routes
 nva_rt_name=nva
@@ -302,7 +302,7 @@ fi
 az vmss list-instance-connection-info -n $nva_name -g $rg -o table
 
 # Configure Autorepair
-if [[ "$autorepair" == "extension" ]]
+if [[ "$autorepair" == "extension" ]]; then
     # Configure App Health Extension
     echo "Enabling Application Health Extension in the VMSS..."
     cat <<EOF > /tmp/health_extension.json
