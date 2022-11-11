@@ -9,13 +9,14 @@
 ############################################################################
 
 # Control variables
-create_azfw=no          # Whether an AzFW is created in the hub with DNS configured
+create_azfw=yes         # Whether an AzFW is created in the hub with DNS configured
 create_onpremdns=no     # Whether a dnsmasq server is configured to simulate an onprem server
 create_spokes=yes       # Create spokes
+create_onprem=yes       # Create VPN GW and simulate onprem
 
 # Variables
 # Note: '10.0.1.0/24;10.0.2.0/24;10.0.3.0/24' are reserved IPs!!!!!
-rg=dns
+rg=dnsresolver
 location=westeurope
 vnet_name=hub
 vnet_prefix=192.168.0.0/16
@@ -29,6 +30,7 @@ client_vm_name=clientvm
 client_vm_pip_name="${client_vm_name}-pip"
 client_subnet_name=vm
 client_subnet_prefix=192.168.10.0/24
+gw_subnet_prefix=192.168.0.0/24
 dns_vm_name=dnsserver
 dns_vm_pip_name="${dns_vm_name}-pip"
 dns_subnet_name=dns-vm
@@ -80,14 +82,14 @@ then
     az network vnet create -n $spoke1_vnet_name -g $rg --address-prefixes $spoke1_vnet_prefix --subnet-name $spoke1_subnet_name --subnet-prefixes $spoke1_subnet_prefix -o none
     az network vnet peering create -n hubtospoke1 -g $rg --vnet-name $vnet_name --remote-vnet $spoke1_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
     az network vnet peering create -n spoke1tohub -g $rg --vnet-name $spoke1_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet subnet create -n $spoke1_resolver_in_subnet_name --vnet-name $spoke1_vnet_name -g $rg --address-prefixes $spoke1_resolver_in_subnet_prefix -o none
-    az network vnet subnet create -n $spoke1_resolver_out_subnet_name --vnet-name $spoke1_vnet_name -g $rg --address-prefixes $spoke1_resolver_out_subnet_prefix -o none
+    # az network vnet subnet create -n $spoke1_resolver_in_subnet_name --vnet-name $spoke1_vnet_name -g $rg --address-prefixes $spoke1_resolver_in_subnet_prefix -o none
+    # az network vnet subnet create -n $spoke1_resolver_out_subnet_name --vnet-name $spoke1_vnet_name -g $rg --address-prefixes $spoke1_resolver_out_subnet_prefix -o none
     # Spoke 2
     az network vnet create -n $spoke2_vnet_name -g $rg --address-prefixes $spoke2_vnet_prefix --subnet-name $spoke2_subnet_name --subnet-prefixes $spoke2_subnet_prefix -o none
     az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $vnet_name --remote-vnet $spoke2_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
     az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke2_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
-    az network vnet subnet create -n $spoke2_resolver_in_subnet_name --vnet-name $spoke2_vnet_name -g $rg --address-prefixes $spoke2_resolver_in_subnet_prefix -o none
-    az network vnet subnet create -n $spoke2_resolver_out_subnet_name --vnet-name $spoke2_vnet_name -g $rg --address-prefixes $spoke2_resolver_out_subnet_prefix -o none
+    # az network vnet subnet create -n $spoke2_resolver_in_subnet_name --vnet-name $spoke2_vnet_name -g $rg --address-prefixes $spoke2_resolver_in_subnet_prefix -o none
+    # az network vnet subnet create -n $spoke2_resolver_out_subnet_name --vnet-name $spoke2_vnet_name -g $rg --address-prefixes $spoke2_resolver_out_subnet_prefix -o none
 fi
 
 # Private DNS Zone
@@ -135,6 +137,9 @@ then
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl status dnsmasq"
     echo "Adding sample DNS name $sample_fqdn with IP $sample_ip..."
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$dns_vm_pip" "sudo sed -i \"\$ a $sample_ip $sample_fqdn\" /etc/hosts"
+    dns_vm_nic_id=$(az vm show -n $dns_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    dns_vm_privateip=$(az network nic show --ids $dns_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+
 fi
 
 # Client VM (hub)
@@ -286,6 +291,198 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup $
 echo "Resolving on spoke VM public DNS name 'microsoft.com'"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup microsoft.com"
 
+# Create DNS resolver
+resolver_name=hubresolver
+in_ep_name=hubin
+out_ep_name=hubout
+fwd_ruleset_name=hubfwdruleset
+fwd_rule_name=contosocorp
+subscription_id=$(az account show --query id -o tsv)
+in_ep_subnet_id=$(az network vnet subnet show --vnet-name $vnet_name -n $resolver_in_subnet_name -g $rg --query id -o tsv)
+in_ep_config="[{private-ip-address:'',private-ip-allocation-method:'Dynamic',id:'${in_ep_subnet_id}'}]"
+out_ep_subnet_id=$(az network vnet subnet show --vnet-name $vnet_name -n $resolver_out_subnet_name -g $rg --query id -o tsv)
+out_ep_config="[{private-ip-address:'',private-ip-allocation-method:'Dynamic',id:'${out_ep_subnet_id}'}]"
+echo "Creating DNS Private Resolver..."
+vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+az dns-resolver create -n $resolver_name  --id $vnet_id -g $rg -o none
+az dns-resolver inbound-endpoint create --dns-resolver-name $resolver_name --name $in_ep_name \
+        --ip-configurations $in_ep_config -g $rg -o none
+az dns-resolver outbound-endpoint create --dns-resolver-name $resolver_name --name $out_ep_name \
+        --id $out_ep_subnet_id -g $rg -o none
+in_ep_id=$(az dns-resolver inbound-endpoint show --dns-resolver-name $resolver_name --name $in_ep_name -g $rg --query id -o tsv)
+out_ep_id=$(az dns-resolver outbound-endpoint show --dns-resolver-name $resolver_name --name $out_ep_name -g $rg --query id -o tsv)
+az dns-resolver forwarding-ruleset create -n $fwd_ruleset_name -g $rg \
+        --outbound-endpoints "[{'id': '$out_ep_id'}]"
+az dns-resolver forwarding-rule create --ruleset-name $fwd_ruleset_name -n $fwd_rule_name \
+        --domain-name "${sample_domain}." --forwarding-rule-state "Enabled" \
+        --target-dns-servers "[{ip-address:'$dns_vm_privateip',port:53}]" -g $rg -o none
+spoke1_vnet_id=$(az network vnet show -n $spoke1_vnet_name -g $rg --query id -o tsv)
+az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name \
+        --id "$spoke1_vnet_id" -g $rg --name $spoke1_vnet_name -o none
+spoke2_vnet_id=$(az network vnet show -n $spoke2_vnet_name -g $rg --query id -o tsv)
+az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name \
+        --id "$spoke2_vnet_id" -g $rg --name $spoke2_vnet_name -o none
+hub_vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name \
+        --id "$hub_vnet_id" -g $rg --name $vnet_name -o none
+
+# Simulate onprem
+if [[ "$create_onprem" == "yes" ]]; then
+    echo "Creating VPN Gateway..."
+    az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name $vnet_name --address-prefix $gw_subnet_prefix -o none
+    az network public-ip create -g $rg -n vngpip0 --sku Standard --allocation-method Static -o none
+    az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn \
+        --vpn-type RouteBased --vnet $vnet_name -n vpnvng --asn 65000 --public-ip-address vngpip0 -o none
+    # Variables for NVA
+    onprem_vnet_name=nva
+    onprem_vnet_prefix=172.16.0.0/16
+    nva_subnet_name=nva
+    nva_subnet_prefix=172.16.0.0/24
+    nva_name=mynva
+    nva_pip_name="${nva_name}-pip"
+    nva_vm_size=Standard_B1s
+    nva_asn=65001
+    # Function to get the first IP (default gateway) of a subnet. Example: first_ip 192.168.0.64/27
+    function first_ip(){
+        subnet=$1
+        IP=$(echo $subnet | cut -d/ -f 1)
+        IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+        NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+        NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+        echo "$NEXT_IP"
+    }
+    # Create VNet
+    echo "Creating onprem VNet..."
+    az network vnet create -n $onprem_vnet_name -g $rg --address-prefixes $onprem_vnet_prefix --subnet-name $nva_subnet_name --subnet-prefixes $nva_subnet_prefix -o none
+    # NSG for NVA
+    echo "Creating NSG ${nva_name}-nsg..."
+    az network nsg create -n "${nva_name}-nsg" -g $rg -o none
+    az network nsg rule create -n SSH --nsg-name "${nva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+    az network nsg rule create -n IKE --nsg-name "${nva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp -o none
+    az network nsg rule create -n IPsec --nsg-name "${nva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp -o none
+    az network nsg rule create -n ICMP --nsg-name "${nva_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp -o none
+    # Cloudinit file for NVA
+    linuxnva_cloudinit_file=/tmp/linuxnva_cloudinit.txt
+    cat <<EOF > $linuxnva_cloudinit_file
+#cloud-config
+runcmd:
+- apt update && apt install -y bird strongswan
+- sysctl -w net.ipv4.ip_forward=1
+- sysctl -w net.ipv4.conf.all.accept_redirects=0 
+- sysctl -w net.ipv4.conf.all.send_redirects=0
+EOF
+    # VM for NVA
+    echo "Creating VM $nva_name..."
+    az vm create -n $nva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+        --public-ip-address $nva_pip_name --public-ip-sku Standard --vnet-name $onprem_vnet_name --size $nva_vm_size --subnet $nva_subnet_name \
+        --custom-data $linuxnva_cloudinit_file --nsg "${nva_name}-nsg" -o none
+    nva_nic_id=$(az vm show -n $nva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $nva_nic_id --ip-forwarding -o none
+    echo "Getting information about the created VM..."
+    nva_pip_ip=$(az network public-ip show -n $nva_pip_name -g $rg --query ipAddress -o tsv) && echo $nva_pip_ip
+    nva_private_ip=$(az network nic show --ids $nva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nva_private_ip
+    nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
+    # Get VPN GW information from standalone VPN Gateway (active/active)
+    vpngw_name=vpnvng
+    vpn_psk='Microsoft123!'
+    vpngw_bgp_asn=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.asn' -o tsv) && echo $vpnwg_bgp_asn
+    vpngw_gw0_pip=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_gw0_pip
+    vpngw_gw0_bgp_ip=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_gw0_bgp_ip
+    echo "Extracted info for vpn gateway: Gateway0 $vpngw_gw0_pip, $vpngw_gw0_bgp_ip. ASN $vpngw_bgp_asn"
+    # VTI interfaces and static routes
+    # Note these changes are not reboot-persistent!!!
+    echo "Configuring VPN between Azure:${vpngw_gw0_pip}/${vpngw_gw0_bgp_ip} and B:${nva_pip_ip}/${nva_private_ip}..."
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo ip tunnel add vti0 local $nva_private_ip remote $vpngw_gw0_pip mode vti key 12"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo sysctl -w net.ipv4.conf.vti0.disable_policy=1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo ip link set up dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo ip route add ${vpngw_gw0_bgp_ip}/32 dev vti0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo sed -i 's/# install_routes = yes/install_routes = no/' /etc/strongswan.d/charon.conf"
+    myip=$(curl -s4 ifconfig.co) && echo $myip
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo ip route add ${vpngw_gw0_pip}/32 via $nva_default_gw"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo ip route add ${myip}/32 via $nva_default_gw" # To not lose SSH connectivity
+    # IPsec config files
+    vpn_psk_file=/tmp/ipsec.secrets
+    cat <<EOF > $vpn_psk_file
+$nva_pip_ip  $vpngw_gw0_pip : PSK "$vpn_psk"
+EOF
+    ipsec_file=/tmp/ipsec.conf
+    cat <<EOF > $ipsec_file
+config setup
+        charondebug="all"
+        uniqueids=yes
+        strictcrlpolicy=no
+conn vng0
+  authby=secret
+  leftid=$nva_pip_ip
+  leftsubnet=0.0.0.0/0
+  right= $vpngw_gw0_pip
+  rightsubnet=0.0.0.0/0
+  keyexchange=ikev2
+  ikelifetime=28800s
+  keylife=3600s
+  keyingtries=3
+  compress=no
+  auto=start
+  ike=aes256-sha1-modp1024
+  esp=aes256-sha1
+  mark=12
+EOF
+    # Copy files to NVA and restart ipsec daemon
+    username=$(whoami)
+    scp $vpn_psk_file $nva_pip_ip:/home/$username/ipsec.secrets
+    scp $ipsec_file $nva_pip_ip:/home/$username/ipsec.conf
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo mv ./ipsec.* /etc/"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo systemctl restart ipsec"
+    # Configure BGP with Bird (NVA to VPNGW)
+    bird_config_file=/tmp/bird.conf
+    cat <<EOF > $bird_config_file
+log syslog all;
+router id $nva_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      preference 254;
+      learn;
+      merge paths on;
+      import filter {
+          if net ~ ${vpngw_gw0_bgp_ip}/32 then accept;
+          else reject;
+      };
+      export filter {
+          if net ~ ${vpngw_gw0_bgp_ip}/32 then reject;
+          else accept;
+      };
+}
+protocol static {
+      import all;
+      # Test route
+      route 1.1.1.1/32 via $nva_default_gw;
+      route $vnet_prefix via $nva_default_gw;
+}
+protocol bgp vpngw0 {
+      description "VPN Gateway instance 0";
+      multihop;
+      local $nva_private_ip as $nva_asn;
+      neighbor $vpngw_gw0_bgp_ip as $vpngw_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+EOF
+    username=$(whoami)
+    scp $bird_config_file "${nva_pip_ip}:/home/${username}/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo systemctl restart bird"
+    # Connect Azure to onprem
+    az network local-gateway create -g $rg -n onprem --gateway-ip-address $nva_pip_ip --asn $nva_asn --bgp-peering-address $nva_private_ip -o none
+    az network vpn-connection create -g $rg --shared-key $vpn_psk --enable-bgp -n onprem --vnet-gateway1 vpnvng --local-gateway2 onprem -l $location -o none
+
+fi
+
+
 ###############
 # Diagnostics #
 ###############
@@ -343,110 +540,110 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $fw_dns_lo
 # dnsmasq logs
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "cat /var/log/syslog | grep dnsmasq | grep contoso | tail -10"
 
-######################
-# PowerShell (begin) #
-######################
+# ######################
+# # PowerShell (begin) #
+# ######################
 
-# Variables
-$ResourceGroupName = "dns"
-$VNetName = "hub"
-$SpokeVNetName = "spoke1"
-$ResolverName = "hubresolver"
-$Location = "westeurope"
-$SubnetInName = "resolverin"
-$SubnetOutName = "resolverout"
-$EndpointInName = "inboundendpoint"
-$EndpointOutName = "outboundendpoint"
-$RulesetName = "myruleset"
-$TargetDNSIP = "192.168.53.4"
-$TargetDomain = "contoso.com."
-# Install module
-Register-PSRepository -Name LocalPSRepo -SourceLocation 'C:\Users\jomore\Downloads' -ScriptSourceLocation 'C:\Users\jomore\Downloads' -InstallationPolicy Trusted
-Install-Module Az.DnsResolver -RequiredVersion 0.1.5
-# Update-Module -Name Az.DnsResolver -RequiredVersion 0.1.5
-Get-InstalledModule -Name Az.DnsResolver
-Connect-AzAccount -Environment AzureCloud
-Select-AzSubscription -SubscriptionObject (Get-AzSubscription -SubscriptionId $SubscriptionId)
-Register-AzResourceProvider -Feature ManagedResolver -ProviderNamespace Microsoft.Network
-# Register-AzResourceProvider -ProviderNamespace Microsoft.Network
+# # Variables
+# $ResourceGroupName = "dns"
+# $VNetName = "hub"
+# $SpokeVNetName = "spoke1"
+# $ResolverName = "hubresolver"
+# $Location = "westeurope"
+# $SubnetInName = "resolverin"
+# $SubnetOutName = "resolverout"
+# $EndpointInName = "inboundendpoint"
+# $EndpointOutName = "outboundendpoint"
+# $RulesetName = "myruleset"
+# $TargetDNSIP = "192.168.53.4"
+# $TargetDomain = "contoso.com."
+# # Install module
+# Register-PSRepository -Name LocalPSRepo -SourceLocation 'C:\Users\jomore\Downloads' -ScriptSourceLocation 'C:\Users\jomore\Downloads' -InstallationPolicy Trusted
+# Install-Module Az.DnsResolver -RequiredVersion 0.1.5
+# # Update-Module -Name Az.DnsResolver -RequiredVersion 0.1.5
+# Get-InstalledModule -Name Az.DnsResolver
+# Connect-AzAccount -Environment AzureCloud
+# Select-AzSubscription -SubscriptionObject (Get-AzSubscription -SubscriptionId $SubscriptionId)
+# Register-AzResourceProvider -Feature ManagedResolver -ProviderNamespace Microsoft.Network
+# # Register-AzResourceProvider -ProviderNamespace Microsoft.Network
 
-# Create resolver in hub
-$VNet = Get-AzVirtualNetwork -Name $VNetName -ResourceGroupName $ResourceGroupName
-New-AzDnsResolver -Name $ResolverName -ResourceGroupName $ResourceGroupName -Location $Location -VirtualNetworkId $VNet.Id
-$Resolver = Get-AzDnsResolver -Name $ResolverName -ResourceGroupName $ResourceGroupName
-$Resolver.ToJsonString()
-# Configure endpoints
-$SubnetIn = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $VNet -Name $SubnetInName
-$ipConfigIn = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMethod Dynamic -SubnetId $SubnetIn.Id
-New-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName -IPConfiguration $ipConfigIn
-$EndpointIn = Get-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
-$EndpointIn.ToJsonString()
-$SubnetOut = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $VNet -Name $SubnetOutName
-New-AzDnsResolverOutboundEndpoint -DnsResolverName $ResolverName -Name $EndpointOutName -ResourceGroupName $ResourceGroupName -SubnetId $SubnetOut.Id
-$EndpointOut = Get-AzDnsResolverOutboundEndpoint -Name $EndpointOutName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
-$EndpointOut.ToJsonString()
-# Forwarding ruleset
-New-AzDnsForwardingRuleset -Name $RulesetName -ResourceGroupName $ResourceGroupName -DnsResolverOutboundEndpoint $EndpointOut -Location $Location
-$Ruleset = Get-AzDnsForwardingRuleset -Name $RulesetName -ResourceGroupName $ResourceGroupName
-$(Get-AzDnsForwardingRuleset -Name $RulesetName -ResourceGroupName $ResourceGroupName).ToJsonString()
-# Forwarding Rule
-$TargetDNS = New-AzDnsResolverTargetDnsServerObject -IPAddress $TargetDNSIP -Port 53
-Get-AzDnsResolverTargetDnsServerObject | ft
-$ForwardingRule = New-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name -Name "corpdomain" -DomainName $TargetDomain -ForwardingRuleState "Enabled" -TargetDnsServer @($TargetDNS)
-$(Get-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name).ToJsonString()
-# Link to Hub VNet
-$Context = Get-AzContext
-$VnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $VNet.Name -VirtualNetworkId $VNet.Id -SubscriptionId $Context.Subscription.Id
-Get-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName
-# OPTIONAL: Link hub Resolver to spoke VNet
-$SpokeVNetName = "spoke1"
-$SpokeVNet = Get-AzVirtualNetwork -Name $SpokeVNetName -ResourceGroupName $ResourceGroupName
-$SpokeVnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $SpokeVNetName -VirtualNetworkId $SpokeVNet.Id -SubscriptionId $Context.Subscription.Id
-Get-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName
-# OPTIONAL: Create another resolver in spoke VNet
-$SpokeVNetName = "spoke1"
-$SpokeVNet = Get-AzVirtualNetwork -Name $SpokeVNetName -ResourceGroupName $ResourceGroupName
-$SpokeResolverName = $SpokeVNetName+ "resolver"
-$SpokeEndpointInName = $SpokeVNetName+ "in"
-$SpokeEndpointOutName = $SpokeVNetName+ "out"
-$SpokeRulesetName = $SpokeVNetName+ "ruleset"
-New-AzDnsResolver -Name $SpokeResolverName -ResourceGroupName $ResourceGroupName -Location $Location -VirtualNetworkId $SpokeVNet.Id
-$SpokeResolver = Get-AzDnsResolver -Name $SpokeResolverName -ResourceGroupName $ResourceGroupName
-$SpokeResolver.ToJsonString()
-$SpokeSubnetIn = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $SpokeVNet -Name $SubnetInName
-$SpokeIpConfigIn = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMethod Dynamic -SubnetId $SpokeSubnetIn.Id
-New-AzDnsResolverInboundEndpoint -Name $SpokeEndpointInName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName -IPConfiguration $SpokeIpConfigIn
-$SpokeEndpointIn = Get-AzDnsResolverInboundEndpoint -Name $SpokeEndpointInName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
-$SpokeEndpointIn.ToJsonString()
-$SpokeSubnetOut = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $SpokeVNet -Name $SubnetOutName
-New-AzDnsResolverOutboundEndpoint -DnsResolverName $SpokeResolverName -Name $SpokeEndpointOutName -ResourceGroupName $ResourceGroupName -SubnetId $SpokeSubnetOut.Id
-$SpokeEndpointOut = Get-AzDnsResolverOutboundEndpoint -Name $SpokeEndpointOutName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
-$SpokeEndpointOut.ToJsonString()
-New-AzDnsForwardingRuleset -Name $SpokeRulesetName -ResourceGroupName $ResourceGroupName -DnsResolverOutboundEndpoint $SpokeEndpointOut -Location $Location
-$SpokeRuleset = Get-AzDnsForwardingRuleset -Name $SpokeRulesetName -ResourceGroupName $ResourceGroupName
-$SpokeVnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $SpokeRuleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $SpokeVNet.Name -VirtualNetworkId $SpokeVNet.Id -SubscriptionId $Context.Subscription.Id
-Get-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $SpokeRuleset.Name -ResourceGroupName $ResourceGroupName
-# OPTIONAL: fwd rule from hub DNS Resolver to Spoke DNS Resolver for reverse DNS
-$TargetDNS = New-AzDnsResolverTargetDnsServerObject -IPAddress "10.1.1.68" -Port 53
-$TargetDomain = "1.1.10.in-addr.arpa."
-$RuleName = "spoke1"
+# # Create resolver in hub
+# $VNet = Get-AzVirtualNetwork -Name $VNetName -ResourceGroupName $ResourceGroupName
+# New-AzDnsResolver -Name $ResolverName -ResourceGroupName $ResourceGroupName -Location $Location -VirtualNetworkId $VNet.Id
+# $Resolver = Get-AzDnsResolver -Name $ResolverName -ResourceGroupName $ResourceGroupName
+# $Resolver.ToJsonString()
+# # Configure endpoints
+# $SubnetIn = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $VNet -Name $SubnetInName
+# $ipConfigIn = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMethod Dynamic -SubnetId $SubnetIn.Id
+# New-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName -IPConfiguration $ipConfigIn
+# $EndpointIn = Get-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
+# $EndpointIn.ToJsonString()
+# $SubnetOut = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $VNet -Name $SubnetOutName
+# New-AzDnsResolverOutboundEndpoint -DnsResolverName $ResolverName -Name $EndpointOutName -ResourceGroupName $ResourceGroupName -SubnetId $SubnetOut.Id
+# $EndpointOut = Get-AzDnsResolverOutboundEndpoint -Name $EndpointOutName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
+# $EndpointOut.ToJsonString()
+# # Forwarding ruleset
+# New-AzDnsForwardingRuleset -Name $RulesetName -ResourceGroupName $ResourceGroupName -DnsResolverOutboundEndpoint $EndpointOut -Location $Location
+# $Ruleset = Get-AzDnsForwardingRuleset -Name $RulesetName -ResourceGroupName $ResourceGroupName
+# $(Get-AzDnsForwardingRuleset -Name $RulesetName -ResourceGroupName $ResourceGroupName).ToJsonString()
+# # Forwarding Rule
+# $TargetDNS = New-AzDnsResolverTargetDnsServerObject -IPAddress $TargetDNSIP -Port 53
 # Get-AzDnsResolverTargetDnsServerObject | ft
-$ForwardingRule = New-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $SpokeRuleset.Name -Name $RuleName -DomainName $TargetDomain -ForwardingRuleState "Enabled" -TargetDnsServer @($TargetDNS)
-$(Get-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name).ToJsonString()
+# $ForwardingRule = New-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name -Name "corpdomain" -DomainName $TargetDomain -ForwardingRuleState "Enabled" -TargetDnsServer @($TargetDNS)
+# $(Get-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name).ToJsonString()
+# # Link to Hub VNet
+# $Context = Get-AzContext
+# $VnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $VNet.Name -VirtualNetworkId $VNet.Id -SubscriptionId $Context.Subscription.Id
+# Get-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName
+# # OPTIONAL: Link hub Resolver to spoke VNet
+# $SpokeVNetName = "spoke1"
+# $SpokeVNet = Get-AzVirtualNetwork -Name $SpokeVNetName -ResourceGroupName $ResourceGroupName
+# $SpokeVnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $SpokeVNetName -VirtualNetworkId $SpokeVNet.Id -SubscriptionId $Context.Subscription.Id
+# Get-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName
+# # OPTIONAL: Create another resolver in spoke VNet
+# $SpokeVNetName = "spoke1"
+# $SpokeVNet = Get-AzVirtualNetwork -Name $SpokeVNetName -ResourceGroupName $ResourceGroupName
+# $SpokeResolverName = $SpokeVNetName+ "resolver"
+# $SpokeEndpointInName = $SpokeVNetName+ "in"
+# $SpokeEndpointOutName = $SpokeVNetName+ "out"
+# $SpokeRulesetName = $SpokeVNetName+ "ruleset"
+# New-AzDnsResolver -Name $SpokeResolverName -ResourceGroupName $ResourceGroupName -Location $Location -VirtualNetworkId $SpokeVNet.Id
+# $SpokeResolver = Get-AzDnsResolver -Name $SpokeResolverName -ResourceGroupName $ResourceGroupName
+# $SpokeResolver.ToJsonString()
+# $SpokeSubnetIn = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $SpokeVNet -Name $SubnetInName
+# $SpokeIpConfigIn = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMethod Dynamic -SubnetId $SpokeSubnetIn.Id
+# New-AzDnsResolverInboundEndpoint -Name $SpokeEndpointInName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName -IPConfiguration $SpokeIpConfigIn
+# $SpokeEndpointIn = Get-AzDnsResolverInboundEndpoint -Name $SpokeEndpointInName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
+# $SpokeEndpointIn.ToJsonString()
+# $SpokeSubnetOut = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $SpokeVNet -Name $SubnetOutName
+# New-AzDnsResolverOutboundEndpoint -DnsResolverName $SpokeResolverName -Name $SpokeEndpointOutName -ResourceGroupName $ResourceGroupName -SubnetId $SpokeSubnetOut.Id
+# $SpokeEndpointOut = Get-AzDnsResolverOutboundEndpoint -Name $SpokeEndpointOutName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
+# $SpokeEndpointOut.ToJsonString()
+# New-AzDnsForwardingRuleset -Name $SpokeRulesetName -ResourceGroupName $ResourceGroupName -DnsResolverOutboundEndpoint $SpokeEndpointOut -Location $Location
+# $SpokeRuleset = Get-AzDnsForwardingRuleset -Name $SpokeRulesetName -ResourceGroupName $ResourceGroupName
+# $SpokeVnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $SpokeRuleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $SpokeVNet.Name -VirtualNetworkId $SpokeVNet.Id -SubscriptionId $Context.Subscription.Id
+# Get-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $SpokeRuleset.Name -ResourceGroupName $ResourceGroupName
+# # OPTIONAL: fwd rule from hub DNS Resolver to Spoke DNS Resolver for reverse DNS
+# $TargetDNS = New-AzDnsResolverTargetDnsServerObject -IPAddress "10.1.1.68" -Port 53
+# $TargetDomain = "1.1.10.in-addr.arpa."
+# $RuleName = "spoke1"
+# # Get-AzDnsResolverTargetDnsServerObject | ft
+# $ForwardingRule = New-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $SpokeRuleset.Name -Name $RuleName -DomainName $TargetDomain -ForwardingRuleState "Enabled" -TargetDnsServer @($TargetDNS)
+# $(Get-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name).ToJsonString()
 
-# DANGER: Delete resources
-# Hub
-Remove-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $VNetName
-Remove-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $SpokeVNetName
-Remove-AzDNSForwardingRuleset -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name
-Remove-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
-Remove-AzDnsResolverOutboundEndpoint -Name $EndpointOutName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
-Remove-AzDnsResolver -Name $ResolverName -ResourceGroupName $ResourceGroupName
-# Spoke
-Remove-AzDNSForwardingRuleset -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $SpokeRuleset.Name
-Remove-AzDnsResolverInboundEndpoint -Name $SpokeEndpointInName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
-Remove-AzDnsResolverOutboundEndpoint -Name $SpokeEndpointOutName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
-Remove-AzDnsResolver -Name $SpokeResolverName -ResourceGroupName $ResourceGroupName
+# # DANGER: Delete resources
+# # Hub
+# Remove-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $VNetName
+# Remove-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $Ruleset.Name -ResourceGroupName $ResourceGroupName -VirtualNetworkLinkName $SpokeVNetName
+# Remove-AzDNSForwardingRuleset -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $Ruleset.Name
+# Remove-AzDnsResolverInboundEndpoint -Name $EndpointInName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
+# Remove-AzDnsResolverOutboundEndpoint -Name $EndpointOutName -DnsResolverName $ResolverName -ResourceGroupName $ResourceGroupName
+# Remove-AzDnsResolver -Name $ResolverName -ResourceGroupName $ResourceGroupName
+# # Spoke
+# Remove-AzDNSForwardingRuleset -ResourceGroupName $ResourceGroupName -DnsForwardingRulesetName $SpokeRuleset.Name
+# Remove-AzDnsResolverInboundEndpoint -Name $SpokeEndpointInName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
+# Remove-AzDnsResolverOutboundEndpoint -Name $SpokeEndpointOutName -DnsResolverName $SpokeResolverName -ResourceGroupName $ResourceGroupName
+# Remove-AzDnsResolver -Name $SpokeResolverName -ResourceGroupName $ResourceGroupName
 
 
 ####################
