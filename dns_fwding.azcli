@@ -43,6 +43,11 @@ resolver_in_subnet_name=resolverin
 resolver_in_subnet_prefix=192.168.101.0/28
 resolver_out_subnet_name=resolverout
 resolver_out_subnet_prefix=192.168.101.16/28
+resolver_name=hubresolver
+in_ep_name=hubin
+out_ep_name=hubout
+fwd_ruleset_name=hubfwdruleset
+fwd_rule_name=contosocorp
 private_dns_zone=contoso.corp
 private_dns_host=test
 private_dns_fqdn="${private_dns_host}.${private_dns_zone}"
@@ -122,7 +127,8 @@ then
 fi
 
 # DNS server VM in hub to simulate onprem DNS (to test fwding from Azure DNS Resolver)
-if [[ "$create_azfw" == "yes" ]]
+# Deploy in the hub only if not simulating onprem with S2S
+if [[ "$create_onpremdns" == "yes" ]] && [[ "$create_onprem" == "no" ]]
 then
     echo "Creating DNS server VM..."
     az vm create -n $dns_vm_name -g $rg --vnet-name $vnet_name --subnet $dns_subnet_name --public-ip-address $dns_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
@@ -235,68 +241,7 @@ then
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke2_vm_pip" "netplan ip leases eth0 | grep DNS"
 fi
 
-#############################
-#  DNS resolution examples  #
-#############################
-
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $client_vm_name"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup ${client_vm_name}.${private_dns_zone}"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $client_vm_privateip"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup ${private_dns_host}.${private_dns_zone}"
-
-###########
-# Testing #
-###########
-
-# From hub VNet
-# 1. Set DNS server for the client VM in the hub
-echo "Setting client VM to use the corporate DNS server in $dns_vm_private_ip directly..."
-az network nic update --ids $client_vm_nic_id --dns-servers $dns_vm_privateip -o none
-echo "Setting client VM to use the Azure Firewall in $azfw_private_ip as DNS server..."
-az network nic update --ids $client_vm_nic_id --dns-servers $azfw_private_ip -o none
-echo "Setting client VM to use Azure DNS..."
-az network nic update --ids $client_vm_nic_id --dns-servers '' -o none
-echo "Setting client VM to use Azure DNS Resolver..."
-az network nic update --ids $client_vm_nic_id --dns-servers '192.168.101.4' -o none
-# 2. Refresh DNS lease in hub VM
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "sudo systemctl restart systemd-networkd"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "netplan ip leases eth0 | grep DNS"
-# 3. Test 3 names from the hub VM: an FQDN on a private DNS zone, a corp FQDN (defined in the DNS server), and a public FQDN
-echo "Resolving on hub VM over a private DNS zone the FQDN '${private_dns_fqdn}'..."
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $private_dns_fqdn"
-echo "Resolving on hub VM over a corporate DNS server the FQDN '${sample_fqdn}'..."
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $sample_fqdn"
-echo "Resolving on hub VM public DNS name 'microsoft.com'"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup microsoft.com"
-# 4. Send traffic to ifconfig.co, which should go through the firewall and hit an FQDN-based network rule
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "curl -s4 http://ifconfig.co"  # This should not work (dropped by the FW)
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "curl -s4 https://ifconfig.co" # This should work (allowed by the FW)
-
-# From spoke VNet
-# 1. Change the spoke VNet DNS custom server config (Azure DNS or Azure Firewall)
-echo "Setting Spoke VNet to use the corporate DNS server in $dns_vm_private_ip directly..."
-az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $dns_vm_privateip -o none
-echo "Setting spoke VNet custom DNS servers to Azure Firewall..."
-az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $azfw_private_ip -o none
-echo "Setting spoke VNet custom DNS servers to Azure DNS..."
-az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers '' -o none
-# 2. Refresh DNS lease in spoke VM
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "sudo systemctl restart systemd-networkd"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "netplan ip leases eth0 | grep DNS"
-# 3. Test 3 names from the spoke VM: an FQDN on a private DNS zone, a corp FQDN (defined in the DNS server), and a public FQDN
-echo "Resolving on spoke VM over a private DNS zone the FQDN '${private_dns_fqdn}'..."
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup $private_dns_fqdn"
-echo "Resolving on spoke VM over a corporate DNS server the FQDN '${sample_fqdn}'..."
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup $sample_fqdn"
-echo "Resolving on spoke VM public DNS name 'microsoft.com'"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup microsoft.com"
-
 # Create DNS resolver
-resolver_name=hubresolver
-in_ep_name=hubin
-out_ep_name=hubout
-fwd_ruleset_name=hubfwdruleset
-fwd_rule_name=contosocorp
 subscription_id=$(az account show --query id -o tsv)
 in_ep_subnet_id=$(az network vnet subnet show --vnet-name $vnet_name -n $resolver_in_subnet_name -g $rg --query id -o tsv)
 in_ep_config="[{private-ip-address:'',private-ip-allocation-method:'Dynamic',id:'${in_ep_subnet_id}'}]"
@@ -482,6 +427,61 @@ EOF
 
 fi
 
+#############################
+#  DNS resolution examples  #
+#############################
+
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $client_vm_name"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup ${client_vm_name}.${private_dns_zone}"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $client_vm_privateip"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup ${private_dns_host}.${private_dns_zone}"
+
+###########
+# Testing #
+###########
+
+# From hub VNet
+# 1. Set DNS server for the client VM in the hub
+echo "Setting client VM to use the corporate DNS server in $dns_vm_private_ip directly..."
+az network nic update --ids $client_vm_nic_id --dns-servers $dns_vm_privateip -o none
+echo "Setting client VM to use the Azure Firewall in $azfw_private_ip as DNS server..."
+az network nic update --ids $client_vm_nic_id --dns-servers $azfw_private_ip -o none
+echo "Setting client VM to use Azure DNS..."
+az network nic update --ids $client_vm_nic_id --dns-servers '' -o none
+echo "Setting client VM to use Azure DNS Resolver..."
+az network nic update --ids $client_vm_nic_id --dns-servers '192.168.101.4' -o none
+# 2. Refresh DNS lease in hub VM
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "sudo systemctl restart systemd-networkd"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "netplan ip leases eth0 | grep DNS"
+# 3. Test 3 names from the hub VM: an FQDN on a private DNS zone, a corp FQDN (defined in the DNS server), and a public FQDN
+echo "Resolving on hub VM over a private DNS zone the FQDN '${private_dns_fqdn}'..."
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $private_dns_fqdn"
+echo "Resolving on hub VM over a corporate DNS server the FQDN '${sample_fqdn}'..."
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $sample_fqdn"
+echo "Resolving on hub VM public DNS name 'microsoft.com'"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup microsoft.com"
+# 4. Send traffic to ifconfig.co, which should go through the firewall and hit an FQDN-based network rule
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "curl -s4 http://ifconfig.co"  # This should not work (dropped by the FW)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "curl -s4 https://ifconfig.co" # This should work (allowed by the FW)
+
+# From spoke VNet
+# 1. Change the spoke VNet DNS custom server config (Azure DNS or Azure Firewall)
+echo "Setting Spoke VNet to use the corporate DNS server in $dns_vm_private_ip directly..."
+az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $dns_vm_privateip -o none
+echo "Setting spoke VNet custom DNS servers to Azure Firewall..."
+az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $azfw_private_ip -o none
+echo "Setting spoke VNet custom DNS servers to Azure DNS..."
+az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers '' -o none
+# 2. Refresh DNS lease in spoke VM
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "sudo systemctl restart systemd-networkd"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "netplan ip leases eth0 | grep DNS"
+# 3. Test 3 names from the spoke VM: an FQDN on a private DNS zone, a corp FQDN (defined in the DNS server), and a public FQDN
+echo "Resolving on spoke VM over a private DNS zone the FQDN '${private_dns_fqdn}'..."
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup $private_dns_fqdn"
+echo "Resolving on spoke VM over a corporate DNS server the FQDN '${sample_fqdn}'..."
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup $sample_fqdn"
+echo "Resolving on spoke VM public DNS name 'microsoft.com'"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup microsoft.com"
 
 ###############
 # Diagnostics #
