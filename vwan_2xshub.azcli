@@ -19,27 +19,27 @@
 
 # Control
 no_of_hubs=2         # 1 or 2 hubs
-no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
+no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
 indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
 nva_bgp=yes          # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
+route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
 nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
-nva_in_hub2=yes      # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
-deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
-route_thru_nva=no    # Whether a static pointing to the NVA in the last spoke is configured
+deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
-global_reach=yes     # If 2 hubs and ER, connect both circuits via GR
+global_reach=no      # If 2 hubs and ER, connect both circuits via GR
 
 
 # Generic variables
 rg=vwan2hubs
 vwan=vwan
-location1=australiaeast
+location1=northeurope
 # location1=germanywestcentral
 location2=westcentralus
 password=Microsoft123!
@@ -86,10 +86,10 @@ branch4_test_route=4.4.4.0/24
 er_provider=Megaport
 er_circuit_sku=Premium
 megaport_script_path="/home/jose/repos/azcli/megaport.sh"
-hub1_er_pop=Sydney
+# hub1_er_pop=Sydney
+hub1_er_pop=Frankfurt
 mcr1_asn=65001
 gr_ip_range=172.16.31.0/29
-# hub1_er_pop=Frankfurt
 hub1_er_circuit_name="er1-$hub1_er_pop"
 hub2_er_pop=Dallas
 hub2_er_circuit_name="er2-$hub2_er_pop"
@@ -100,10 +100,10 @@ project_id="${project_name}${RANDOM}"
 machine_type=e2-micro
 gcp_asn=16550
 # gcp region 1
-region1=australia-southeast1
-zone1=australia-southeast1-b
-# region1=europe-west3
-# zone1=europe-west3-b
+# region1=australia-southeast1
+# zone1=australia-southeast1-b
+region1=europe-west3
+zone1=europe-west3-b
 gcp_vm1_name=vm1
 gcp_vpc1_name=vpc1
 gcp_subnet1_name=vm1
@@ -655,8 +655,8 @@ runcmd:
   - apt update
   - UCF_FORCE_CONFOLD=1 DEBIAN_FRONTEND=noninteractive apt install -y bird strongswan
   - sysctl -w net.ipv4.ip_forward=1
-  - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
-  - sysctl -w net.ipv4.conf.all.send_redirects = 0
+  - sysctl -w net.ipv4.conf.all.accept_redirects=0 
+  - sysctl -w net.ipv4.conf.all.send_redirects=0
 EOF
     cloudinit_string=$(cat $gnva_cloudinit | python3 -c 'import json, sys; print( json.dumps( sys.stdin.read() ) )')
     # REST payload
@@ -1810,8 +1810,8 @@ then
     if [[ -e "$megaport_script_path" ]]
     then
         echo "Creating MCR in $hub1_er_pop..."
-        $megaport_script_path -s=jomore-${hub1_er_pop} -a=create_mcr -k=$service_key_1 --mcr_asn=$mcr1_asn
-        sleep 120  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+        $megaport_script_path -s=jomore-${hub1_er_pop} -a=create_mcr -k=$service_key_1 --asn=$mcr1_asn
+        sleep 120  # Wait 1 minute before creating the connections. This could be replaced with a loop checking megaport.sh -a=list_live
         echo "Connecting MCR in $hub1_er_pop with ER circuit in hub1..."
         $megaport_script_path -s=jomore-${hub1_er_pop} -a=create_vxc -k=$service_key_1
         if [[ "$no_of_hubs" == "2" ]]
@@ -1819,7 +1819,7 @@ then
             if [[ "$hub1_er_pop" != "$hub2_er_pop" ]]
             then
                 echo "Creating MCR in $hub2_er_pop..."
-                $megaport_script_path -s=jomore-${hub2_er_pop} -a=create_mcr -k=$service_key_2 --mcr_asn=$mcr2_asn
+                $megaport_script_path -s=jomore-${hub2_er_pop} -a=create_mcr -k=$service_key_2 --asn=$mcr2_asn
                 sleep 120  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
             fi
             echo "Connecting MCR in $hub2_er_pop with ER circuit in hub2..."
@@ -2414,6 +2414,7 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_lo
 if [[ "$deploy_er" == "yes" ]]
 then
     $megaport_script_path -s=jomore -a=delete_mcr
+    $megaport_script_path -s=jomore -a=list_live
 fi
 # locations=($location1 $location2)
 # for location in ${locations[@]}; do

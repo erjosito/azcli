@@ -40,6 +40,8 @@ akslb_subnet_prefix=10.13.77.0/24
 arm_subnet_prefix=10.13.79.0/24
 aci_subnet_name=aci
 aci_subnet_prefix=10.13.100.0/24
+ep_subnet_name=aci
+ep_subnet_prefix=10.13.101.0/24
 # Other resources
 kv_name=erjositoKeyvault
 acr_name=erjositoAcr
@@ -269,7 +271,8 @@ echo "Creating Azure Bastion..."
 bastion_pip_name="${bastion_name}-pip"
 az network vnet subnet create -g $rg -n $bastion_subnet_name --vnet-name $vnet_name --address-prefix $bastion_subnet_prefix -o none
 az network public-ip create -g $rg -n $bastion_pip_name --sku Standard -l $location -o none
-az network bastion create -n $bastion_name --public-ip-address $bastion_pip_name -g $rg --vnet-name $vnet_name -l $location -o none
+az network bastion create -n $bastion_name --public-ip-address $bastion_pip_name -g $rg --vnet-name $vnet_name -l $location \
+    --enable-ip-connect true --enable-tunneling true  -o none
 vm_id=$(az vm show -n $vm_name -g $rg --query id -o tsv)
 az vm user update -u azureuser -p 'Microsoft123!' -n $vm_name -g $rg -o none
 az network bastion tunnel -n $bastion_name -g $rg --target-resource-id $vm_id --resource-port 22 --port 2022
@@ -461,6 +464,102 @@ spec:
             port:
               number: 8080
 EOF
+
+curl "http://sqlapi.${appgw_pip}.nip.io/api/healthcheck"
+curl "http://sqlapi.${appgw_pip}.nip.io/api/ip"
+
+##################
+#  Private Link  #
+##################
+
+# Create subnet
+az network vnet subnet create -n $ep_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $ep_subnet_prefix -o none
+
+# Create SQL Database
+sql_server_name=sqlserver$RANDOM
+sql_db_name=mydb
+sql_username=azure
+sql_password='Microsoft123!'
+az sql server create -n $sql_server_name -g $rg -l $location --admin-user $sql_username --admin-password $sql_password -o none
+sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName)
+az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait
+
+# Create endpoint
+echo "Creating SQL Server endpoint..."
+sql_endpoint_name=sqlep
+sql_server_id=$(az sql server show -n $sql_server_name -g $rg -o tsv --query id)
+az network private-endpoint create -n $sql_endpoint_name -g $rg -o none\
+  --vnet-name $vnet_name --subnet $ep_subnet_name \
+  --private-connection-resource-id $sql_server_id --group-id sqlServer --connection-name sqlConnection
+
+# Create Azure DNS private zone and records
+dns_zone_name=privatelink.database.windows.net
+echo "Creating DNS zone $dns_zone_name..."
+az network private-dns zone create -n $dns_zone_name -g $rg -o none
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n myDnsLink --virtual-network $vnet_name --registration-enabled false -o none
+az network private-endpoint dns-zone-group create --endpoint-name $sql_endpoint_name -g $rg -n sqlzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none
+
+# Create a deployment:
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sqlpassword
+type: Opaque
+stringData:
+  password: $sql_password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: sqlapi
+  name: sqlapi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sqlapi
+  template:
+    metadata:
+      labels:
+        app: sqlapi
+    spec:
+      containers:
+      - image: erjosito/sqlapi:1.0
+        name: sqlapi
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        - name: SQL_SERVER_USERNAME
+          value: "$sql_username"
+        - name: SQL_SERVER_FQDN
+          value: "$sql_server_fqdn"
+        - name: SQL_SERVER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: sqlpassword
+              key: password
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sqlapi
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    app: sqlapi
+EOF
+
+# Test
+curl "http://sqlapi.${appgw_pip}.nip.io/api/dns?fqdn=${sql_server_fqdn}"
+curl "http://sqlapi.${appgw_pip}.nip.io/api/sqlsrcip"
+
 
 ##############################
 # Daemonset to install stuff #

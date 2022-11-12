@@ -691,35 +691,56 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $fw_app_lo
 
 # Stop all
 function stop_lab() {
+    echo "Stopping AKS..."
     aks_name=$(az aks list -g $rg --query '[0].name' -o tsv)
-    az aks stop -n $aks_name -g $rg --no-wait
+    az aks stop -n $aks_name -g $rg --no-wait -o none
+    echo "Stopping VMs..."
     stop_vms
+    echo "Stopping AML compute..."
+    stop_aml_compute
+    echo "Stopping Azure Firewall..."
     stop_firewall
 }
 
 # Stop VMs
 function stop_vms() {
-    # vm_list=$(az vm list -o tsv -g "$rg" --query "[?contains(name,'testvm')].name")
     vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
     while IFS= read -r vm_name; do
-        az vm deallocate -g $rg -n "$vm_name" -y --no-wait
+        az vm deallocate -g $rg -n "$vm_name" --no-wait -o none
     done <<< "$vm_list"
+}
+
+# Stop AML compute
+function stop_aml_compute() {
+    compute_list=$(az ml compute list -o tsv -w $aml_ws_name -g "$rg" --query "[].name")
+    while IFS= read -r compute_name; do
+        az ml compute stop -g $rg -w $aml_ws_name -n "$compute_name" --no-wait -o none
+    done <<< "$compute_list"
 }
 
 # Start
 function start_lab() {
     aks_name=$(az aks list -g $rg --query '[0].name' -o tsv)
-    az aks start -n $aks_name -g $rg --no-wait
+    az aks start -n $aks_name -g $rg --no-wait -o none
     start_vms
     start_firewall
+    start_aml_compute
 }
 
 # Start VMs
 function start_vms() {
     vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
     while IFS= read -r vm_name; do
-        az vm start -g $rg -n "$vm_name" --no-wait
+        az vm start -g $rg -n "$vm_name" --no-wait -o none
     done <<< "$vm_list"
+}
+
+# Start AML compute
+function start_aml_compute() {
+    compute_list=$(az ml compute list -o tsv -w $aml_ws_name -g "$rg" --query "[].name")
+    while IFS= read -r compute_name; do
+        az ml compute start -g $rg -w $aml_ws_name -n "$compute_name" -o none
+    done <<< "$compute_list"
 }
 
 # Functions to start/stop the firewall
