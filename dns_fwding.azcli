@@ -10,7 +10,7 @@
 
 # Control variables
 create_azfw=yes         # Whether an AzFW is created in the hub with DNS configured
-create_onpremdns=no     # Whether a dnsmasq server is configured to simulate an onprem server
+create_onpremdns=yes    # Whether a dnsmasq server is configured to simulate an onprem server
 create_spokes=yes       # Create spokes
 create_onprem=yes       # Create VPN GW and simulate onprem
 
@@ -72,6 +72,49 @@ spoke2_resolver_in_subnet_name=resolverin
 spoke2_resolver_in_subnet_prefix=10.1.2.64/28
 spoke2_resolver_out_subnet_name=resolverout
 spoke2_resolver_out_subnet_prefix=10.1.2.80/28
+onprem_vnet_name=nva
+onprem_vnet_prefix=172.16.0.0/16
+nva_subnet_name=nva
+nva_subnet_prefix=172.16.0.0/24
+nva_name=mynva
+nva_pip_name="${nva_name}-pip"
+nva_vm_size=Standard_B1s
+nva_asn=65001
+vpngw_name=vpnvng
+vpn_psk='Microsoft123!'
+
+# Sets the variables for a previously created environment
+function set_variables() {
+    if [[ "$create_azfw" == "yes" ]]
+    then
+        azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress')
+        echo "Azure Firewall's private IP address: $azfw_private_ip"
+    fi
+    client_vm_pip=$(az network public-ip show -n $client_vm_pip_name -g $rg --query ipAddress -o tsv)
+    client_vm_nic_id=$(az vm show -n $client_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    client_vm_privateip=$(az network nic show --ids $client_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "Hub client VM addresses: $client_vm_pip, $client_vm_privateip"
+    if [[ "$create_spokes" == "yes" ]]
+    then
+        spoke1_vm_pip=$(az network public-ip show -n $spoke1_vm_pip_name -g $rg --query ipAddress -o tsv)
+        spoke1_vm_nic_id=$(az vm show -n $spoke1_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        spoke1_vm_privateip=$(az network nic show --ids $spoke1_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+        echo "Spoke1 client VM addresses: $spoke1_vm_pip, $spoke1_vm_privateip"
+        spoke2_vm_pip=$(az network public-ip show -n $spoke2_vm_pip_name -g $rg --query ipAddress -o tsv)
+        spoke2_vm_nic_id=$(az vm show -n $spoke2_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        spoke2_vm_privateip=$(az network nic show --ids $spoke2_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+        echo "Spoke2 client VM addresses: $spoke1_vm_pip, $spoke1_vm_privateip"
+    fi
+    if [[ "$create_onprem" == "yes" ]]
+    then
+        nva_pip_ip=$(az network public-ip show -n $nva_pip_name -g $rg --query ipAddress -o tsv)
+        nva_nic_id=$(az vm show -n $nva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        nva_private_ip=$(az network nic show --ids $nva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+        echo "Onprem NVA addresses: $nva_pip_ip, $nva_private_ip"
+    fi
+    in_ep_ip=$(az dns-resolver inbound-endpoint show --dns-resolver-name $resolver_name --name $in_ep_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "Private resolver's inbound endpoint IP: $in_ep_ip"
+}
 
 # RG and vnets
 echo "Creating RG and VNet..."
@@ -221,28 +264,7 @@ then
     az network vnet subnet update -g $rg --vnet-name $vnet_name -n $client_vm_subnet_name --route-table clientrt -o none
 fi
 
-# Set the hub and spoke VNets to the inbound endpoint of the hub resolver
-hub_resolver_ip="192.168.101.4"
-echo "Setting VNets to use the hub DNS Resolver IP $hub_resolver_ip..."
-az network vnet update -n $vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
-if [[ "$create_spokes" == "yes" ]]
-then
-    az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
-    az network vnet update -n $spoke2_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
-fi
-# Refresh DNS lease VM
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "sudo systemctl restart systemd-networkd"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "netplan ip leases eth0 | grep DNS"
-if [[ "$create_spokes" == "yes" ]]
-then
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "sudo systemctl restart systemd-networkd"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "netplan ip leases eth0 | grep DNS"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke2_vm_pip" "sudo systemctl restart systemd-networkd"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke2_vm_pip" "netplan ip leases eth0 | grep DNS"
-fi
-
 # Create DNS resolver
-subscription_id=$(az account show --query id -o tsv)
 in_ep_subnet_id=$(az network vnet subnet show --vnet-name $vnet_name -n $resolver_in_subnet_name -g $rg --query id -o tsv)
 in_ep_config="[{private-ip-address:'',private-ip-allocation-method:'Dynamic',id:'${in_ep_subnet_id}'}]"
 out_ep_subnet_id=$(az network vnet subnet show --vnet-name $vnet_name -n $resolver_out_subnet_name -g $rg --query id -o tsv)
@@ -271,6 +293,27 @@ hub_vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
 az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name \
         --id "$hub_vnet_id" -g $rg --name $vnet_name -o none
 
+# Set the hub and spoke VNets to the inbound endpoint of the hub resolver
+hub_resolver_ip=$(az dns-resolver inbound-endpoint show --dns-resolver-name $resolver_name --name $in_ep_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+echo "Setting VNets to use the hub DNS Resolver IP $hub_resolver_ip..."
+az network vnet update -n $vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+if [[ "$create_spokes" == "yes" ]]
+then
+    az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+    az network vnet update -n $spoke2_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+fi
+# Refresh DNS lease VM
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "sudo systemctl restart systemd-networkd"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "netplan ip leases eth0 | grep DNS"
+if [[ "$create_spokes" == "yes" ]]
+then
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "sudo systemctl restart systemd-networkd"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "netplan ip leases eth0 | grep DNS"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke2_vm_pip" "sudo systemctl restart systemd-networkd"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke2_vm_pip" "netplan ip leases eth0 | grep DNS"
+fi
+
+
 # Simulate onprem
 if [[ "$create_onprem" == "yes" ]]; then
     echo "Creating VPN Gateway..."
@@ -278,15 +321,6 @@ if [[ "$create_onprem" == "yes" ]]; then
     az network public-ip create -g $rg -n vngpip0 --sku Standard --allocation-method Static -o none
     az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn \
         --vpn-type RouteBased --vnet $vnet_name -n vpnvng --asn 65000 --public-ip-address vngpip0 -o none
-    # Variables for NVA
-    onprem_vnet_name=nva
-    onprem_vnet_prefix=172.16.0.0/16
-    nva_subnet_name=nva
-    nva_subnet_prefix=172.16.0.0/24
-    nva_name=mynva
-    nva_pip_name="${nva_name}-pip"
-    nva_vm_size=Standard_B1s
-    nva_asn=65001
     # Function to get the first IP (default gateway) of a subnet. Example: first_ip 192.168.0.64/27
     function first_ip(){
         subnet=$1
@@ -328,8 +362,6 @@ EOF
     nva_private_ip=$(az network nic show --ids $nva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nva_private_ip
     nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
     # Get VPN GW information from standalone VPN Gateway (active/active)
-    vpngw_name=vpnvng
-    vpn_psk='Microsoft123!'
     vpngw_bgp_asn=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.asn' -o tsv) && echo $vpnwg_bgp_asn
     vpngw_gw0_pip=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_gw0_pip
     vpngw_gw0_bgp_ip=$(az network vnet-gateway show -n $vpngw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_gw0_bgp_ip
@@ -550,9 +582,16 @@ az network firewall policy show -n $azfw_policy_name -g $rg --query 'dnsSettings
 az network private-dns link vnet list -g $rg -z $private_dns_zone -o table
 az network private-dns record-set a list -z $private_dns_zone -g $rg --query '[].{RecordName:name,IPv4Address:aRecords[0].ipv4Address}' -o table
 
-# Private DNS resolver
+# DNS private resolver
+az dns-resolver list -g $rg -o table
 az dns-resolver inbound-endpoint list --dns-resolver-name $resolver_name -g $rg -o table
-
+az dns-resolver inbound-endpoint list --dns-resolver-name $resolver_name -g $rg --query '[].{Name:name,Location:location,IP:ipConfigurations[0].privateIpAddress}' -o table
+az dns-resolver outbound-endpoint list --dns-resolver-name $resolver_name -g $rg -o table
+az dns-resolver forwarding-ruleset list -g $rg -o table
+az dns-resolver forwarding-ruleset list -g $rg --query '[].{Name:name,OutboundEndpoint:dnsResolverOutboundEndpoints[0].id,Location:location}' -o table
+az dns-resolver forwarding-rule list --ruleset-name $fwd_ruleset_name -g $rg -o table
+az dns-resolver forwarding-rule list --ruleset-name $fwd_ruleset_name -g $rg --query '[].{Name:name,DomainName:domainName,State:forwardingRuleState,TargetDnsServer:targetDnsServers[0].ipAddress}' -o table
+az dns-resolver vnet-link list --ruleset-name $fwd_ruleset_name -g $rg -o table
 
 # Azure Firewall DNS logs
 fw_net_logs_query='AzureDiagnostics
