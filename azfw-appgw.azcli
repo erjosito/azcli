@@ -127,23 +127,23 @@ cat $interCA_pfx | base64 > $interCA_base64
 akv_name=erjositoKeyvault
 akv_secret_name=azfwca
 akv_secret_value=$(cat $interCA_base64)
-az keyvault secret set -n $akv_secret_name --value $akv_secret_value --vault-name $akv_name
+az keyvault secret set -n $akv_secret_name --value $akv_secret_value --vault-name $akv_name -o none
 akv_secret_id=$(az keyvault secret show --vault-name $akv_name -n $akv_secret_name --query id -o tsv)
 # Create identity so that the AzFW can read from AKV
 id_name=azfwid
-az identity create -n $id_name -g $rg
+az identity create -n $id_name -g $rg -o none
 id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
-az keyvault set-policy -n "$akv_name" --object-id "$id_principal_id" --secret-permissions get list 
+az keyvault set-policy -n "$akv_name" --object-id "$id_principal_id" --secret-permissions get list -o none
 id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
 
 # Create AzFw policy with TLS
-az network firewall policy create -n "$azfw_policy_name" -g $rg --sku Premium --idps-mode Deny --cert-name "$akv_secret_name" --key-vault-secret-id "$akv_secret_id" --identity "$id_id"
+az network firewall policy create -n "$azfw_policy_name" -g $rg --sku Premium --idps-mode Deny --cert-name "$akv_secret_name" --key-vault-secret-id "$akv_secret_id" --identity "$id_id" -o none
 
 # Deploy AzFW Premium
-az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location
+az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location -o none
 azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
 azfw_policy_id=$(az network firewall policy show -n $azfw_policy_name -g $rg --query id -o tsv)
-az network firewall create -n $azfw_name -g $rg -l $location --tier Premium --policy $azfw_policy_id # Not working yet (Feb 11 2022)...
+az network firewall create -n $azfw_name -g $rg -l $location --tier Premium --policy $azfw_policy_id  -o none # Not working yet (Feb 11 2022)...
 azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id) && echo $azfw_id
 az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
