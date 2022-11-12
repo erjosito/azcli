@@ -440,16 +440,32 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup $
 # Testing #
 ###########
 
-# From hub VNet
-# 1. Set DNS server for the client VM in the hub
-echo "Setting client VM to use the corporate DNS server in $dns_vm_private_ip directly..."
-az network nic update --ids $client_vm_nic_id --dns-servers $dns_vm_privateip -o none
-echo "Setting client VM to use the Azure Firewall in $azfw_private_ip as DNS server..."
-az network nic update --ids $client_vm_nic_id --dns-servers $azfw_private_ip -o none
-echo "Setting client VM to use Azure DNS..."
-az network nic update --ids $client_vm_nic_id --dns-servers '' -o none
-echo "Setting client VM to use Azure DNS Resolver..."
-az network nic update --ids $client_vm_nic_id --dns-servers '192.168.101.4' -o none
+# Four DNS cases supported
+test_dns=azure   # Can be either azure,resolver,azfw or onprem
+
+# From hub VNet (changing the NIC settings)
+# 1. Set DNS server for the client VM in the hub to either Azure, private resolver, or corp
+if [[ "$test_dns" == "azure" ]]; then
+    echo "Setting client VM to use Azure DNS..."
+    az network nic update --ids $client_vm_nic_id --dns-servers '' -o none
+elif [[ "$test_dns" == "resolver" ]]; then
+    in_ep_ip=$(az dns-resolver inbound-endpoint show --dns-resolver-name $resolver_name --name $in_ep_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "Setting client VM to use Azure DNS Resolver's inbound endpoint IP $in_ep_ip..."
+    az network nic update --ids $client_vm_nic_id --dns-servers $in_ep_ip -o none
+elif [[ "$test_dns" == "onprem" ]]; then
+    if [[ "$create_onprem" == "yes" ]]; then
+        onprem_dns_ip=$nva_private_ip
+    else
+        onprem_dns_ip=$dns_vm_privateip
+    fi
+    echo "Setting client VM to use the corporate DNS server in $onprem_dns_ip directly..."
+    az network nic update --ids $client_vm_nic_id --dns-servers $onprem_dns_ip -o none
+elif [[ "$test_dns" == "azfw" ]]; then
+    echo "Setting client VM to use the Azure Firewall in $azfw_private_ip as DNS server..."
+    az network nic update --ids $client_vm_nic_id --dns-servers $azfw_private_ip -o none
+else
+    echo "Sorry, I don't recognize the test case '$test_dns'"
+fi
 # 2. Refresh DNS lease in hub VM
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "sudo systemctl restart systemd-networkd"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "netplan ip leases eth0 | grep DNS"
@@ -464,24 +480,49 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "nslookup m
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "curl -s4 http://ifconfig.co"  # This should not work (dropped by the FW)
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "curl -s4 https://ifconfig.co" # This should work (allowed by the FW)
 
-# From spoke VNet
-# 1. Change the spoke VNet DNS custom server config (Azure DNS or Azure Firewall)
-echo "Setting Spoke VNet to use the corporate DNS server in $dns_vm_private_ip directly..."
-az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $dns_vm_privateip -o none
-echo "Setting spoke VNet custom DNS servers to Azure Firewall..."
-az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $azfw_private_ip -o none
-echo "Setting spoke VNet custom DNS servers to Azure DNS..."
-az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers '' -o none
-# 2. Refresh DNS lease in spoke VM
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "sudo systemctl restart systemd-networkd"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "netplan ip leases eth0 | grep DNS"
-# 3. Test 3 names from the spoke VM: an FQDN on a private DNS zone, a corp FQDN (defined in the DNS server), and a public FQDN
-echo "Resolving on spoke VM over a private DNS zone the FQDN '${private_dns_fqdn}'..."
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup $private_dns_fqdn"
-echo "Resolving on spoke VM over a corporate DNS server the FQDN '${sample_fqdn}'..."
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup $sample_fqdn"
-echo "Resolving on spoke VM public DNS name 'microsoft.com'"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke1_vm_pip" "nslookup microsoft.com"
+# From spoke VNets (changing the VNet settings)
+for spoke_vnet_name in $spoke1_vnet_name $spoke2_vnet_name;
+do
+    # 1. Change the spoke VNet DNS custom server config (Azure DNS or Azure Firewall)
+    if [[ "$test_dns" == "azure" ]]; then
+        echo "Setting VNet $spoke_vnet_name custom DNS servers to Azure DNS..."
+        az network vnet update -n $spoke_vnet_name -g $rg --dns-servers '' -o none
+    elif [[ "$test_dns" == "resolver" ]]; then
+        in_ep_ip=$(az dns-resolver inbound-endpoint show --dns-resolver-name $resolver_name --name $in_ep_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+        echo "Setting client VM to use Azure DNS Resolver's IP $in_ep_ip..."
+        az network nic update --ids $client_vm_nic_id --dns-servers $in_ep_ip -o none
+    elif [[ "$test_dns" == "onprem" ]]; then
+        if [[ "$create_onprem" == "yes" ]]; then
+            onprem_dns_ip=$nva_private_ip
+        else
+            onprem_dns_ip=$dns_vm_privateip
+        fi
+        echo "Setting VNet $spoke_vnet_name to use the corporate DNS server in $onprem_dns_ip directly..."
+        az network vnet update -n $spoke_vnet_name -g $rg --dns-servers $onprem_dns_ip -o none
+    elif [[ "$test_dns" == "azfw" ]]; then
+        echo "Setting VNet $spoke_vnet_name custom DNS servers to Azure Firewall..."
+        az network vnet update -n $spoke_vnet_name -g $rg --dns-servers $azfw_private_ip -o none
+    else
+        echo "Sorry, I don't recognize the test case '$test_dns'"
+    fi
+    # 2. Refresh DNS lease in spoke VM
+    if [[ "$spoke_vnet_name" == "$spoke1_vnet_name" ]]; then
+        spoke_vm_pip=$spoke1_vm_pip
+    elif [[ "$spoke_vnet_name" == "$spoke2_vnet_name" ]]; then
+        spoke_vm_pip=$spoke2_vm_pip
+    else
+        echo "I cannot recognize the spoke VNet name $spoke_vnet_name"
+    fi
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "sudo systemctl restart systemd-networkd"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "netplan ip leases eth0 | grep DNS"
+    # 3. Test 3 names from the spoke VM: an FQDN on a private DNS zone, a corp FQDN (defined in the DNS server), and a public FQDN
+    echo "Resolving on spoke VM over a private DNS zone the FQDN '${private_dns_fqdn}'..."
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "nslookup $private_dns_fqdn"
+    echo "Resolving on spoke VM over a corporate DNS server the FQDN '${sample_fqdn}'..."
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "nslookup $sample_fqdn"
+    echo "Resolving on spoke VM public DNS name 'microsoft.com'"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$spoke_vm_pip" "nslookup microsoft.com"
+done
 
 ###############
 # Diagnostics #
@@ -505,9 +546,13 @@ az network vnet show -n $spoke2_name -g $rg --query 'dhcpOptions.dnsServers[0]'
 # Az FW DNS config
 az network firewall policy show -n $azfw_policy_name -g $rg --query 'dnsSettings'
 
-# Private DNS
+# Private DNS Zone
 az network private-dns link vnet list -g $rg -z $private_dns_zone -o table
 az network private-dns record-set a list -z $private_dns_zone -g $rg --query '[].{RecordName:name,IPv4Address:aRecords[0].ipv4Address}' -o table
+
+# Private DNS resolver
+az dns-resolver inbound-endpoint list --dns-resolver-name $resolver_name -g $rg -o table
+
 
 # Azure Firewall DNS logs
 fw_net_logs_query='AzureDiagnostics
