@@ -103,7 +103,7 @@ function set_variables() {
         spoke2_vm_pip=$(az network public-ip show -n $spoke2_vm_pip_name -g $rg --query ipAddress -o tsv)
         spoke2_vm_nic_id=$(az vm show -n $spoke2_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
         spoke2_vm_privateip=$(az network nic show --ids $spoke2_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-        echo "Spoke2 client VM addresses: $spoke1_vm_pip, $spoke1_vm_privateip"
+        echo "Spoke2 client VM addresses: $spoke2_vm_pip, $spoke2_vm_privateip"
     fi
     if [[ "$create_onprem" == "yes" ]]
     then
@@ -112,8 +112,41 @@ function set_variables() {
         nva_private_ip=$(az network nic show --ids $nva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
         echo "Onprem NVA addresses: $nva_pip_ip, $nva_private_ip"
     fi
+    if [[ "$create_onpremdns" == "yes" ]] && [[ "$create_onprem" == "no" ]]
+    then
+        dns_vm_pip=$(az network public-ip show -n $dns_vm_pip_name -g $rg --query ipAddress -o tsv)
+        dns_vm_nic_id=$(az vm show -n $dns_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        dns_vm_privateip=$(az network nic show --ids $dns_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+        echo "DNS server in hub IP addresses: $dns_vm_pip, $dns_vm_privateip"
+    fi
     in_ep_ip=$(az dns-resolver inbound-endpoint show --dns-resolver-name $resolver_name --name $in_ep_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
     echo "Private resolver's inbound endpoint IP: $in_ep_ip"
+}
+
+# Updates the SSH key for a single VM, specified in the first argument
+function update_ssh_key() {
+    vm_name=$1
+    user=$(whoami)
+    echo "Updating SSH key for VM $vm_name and user $user..."
+    az vm user update -g $rg -u $user -n $vm_name --ssh-key-value "$(< ~/.ssh/id_rsa.pub)" -o none
+}
+
+# Updates the SSH keys of all VMs in this lab
+function update_all_ssh_keys() {
+    update_ssh_key $client_vm_name
+    if [[ "$create_spokes" == "yes" ]]
+    then
+        update_ssh_key $spoke1_vm_name
+        update_ssh_key $spoke2_vm_name
+    fi
+    if [[ "$create_onprem" == "yes" ]]
+    then
+        update_ssh_key $nva_name
+    fi
+    if [[ "$create_onpremdns" == "yes" ]] && [[ "$create_onprem" == "no" ]]
+    then
+        update_ssh_key $dns_vm_name
+    fi
 }
 
 # RG and vnets
@@ -571,14 +604,20 @@ az network nic show --ids $spoke1_vm_nic_id --query 'dnsSettings.dnsServers[0]' 
 az network nic show --ids $spoke2_vm_nic_id --query 'dnsSettings.dnsServers[0]' -o tsv
 
 # VNet DNS settings
-az network vnet show -n $vnet_name -g $rg --query 'dhcpOptions.dnsServers[0]'
-az network vnet show -n $spoke1_name -g $rg --query 'dhcpOptions.dnsServers[0]'
-az network vnet show -n $spoke2_name -g $rg --query 'dhcpOptions.dnsServers[0]'
+az network vnet show -n $vnet_name -g $rg --query 'dhcpOptions.dnsServers[0]' -o tsv
+az network vnet show -n $spoke1_vnet_name -g $rg --query 'dhcpOptions.dnsServers[0]' -o tsv
+az network vnet show -n $spoke2_vnet_name -g $rg --query 'dhcpOptions.dnsServers[0]' -o tsv
+
+# VNet peerings
+az network vnet peering list -g $rg --vnet-name $vnet_name -o table
+az network vnet peering list -g $rg --vnet-name $spoke1_vnet_name -o table
+az network vnet peering list -g $rg --vnet-name $spoke2_vnet_name -o table
 
 # Az FW DNS config
 az network firewall policy show -n $azfw_policy_name -g $rg --query 'dnsSettings'
 
 # Private DNS Zone
+az network private-dns zone list -g $rg -o table
 az network private-dns link vnet list -g $rg -z $private_dns_zone -o table
 az network private-dns record-set a list -z $private_dns_zone -g $rg --query '[].{RecordName:name,IPv4Address:aRecords[0].ipv4Address}' -o table
 
