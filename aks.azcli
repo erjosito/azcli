@@ -672,13 +672,13 @@ echo "Federating managed identity and service account..."
 az identity federated-credential create -n $federated_id_name --identity-name $workload_id_name -g $rg \
     --issuer ${aks_oidc_issuer} --subject "system:serviceaccount:${sa_namespace}:${sa_name}" -o none
 
-# Mutating webhook
-tenant_id=$(az account show -o tsv --query tenantId)
-echo "Creating mutating webhook for tenant $tenant_id and service account $sa_name..."
-helm repo add azure-workload-identity https://azure.github.io/azure-workload-identity/charts
-helm repo update
-helm install workload-identity-webhook azure-workload-identity/workload-identity-webhook --namespace azure-workload-identity-system \
-  --create-namespace --set azureTenantID="${tenant_id}"
+# Mutating webhook (not required if using addon)
+# tenant_id=$(az account show -o tsv --query tenantId)
+# echo "Creating mutating webhook for tenant $tenant_id and service account $sa_name..."
+# helm repo add azure-workload-identity https://azure.github.io/azure-workload-identity/charts
+# helm repo update
+# helm install workload-identity-webhook azure-workload-identity/workload-identity-webhook --namespace azure-workload-identity-system \
+#   --create-namespace --set azureTenantID="${tenant_id}"
 
 # Test (deploy a workload, and get an AKV secret from the workload)
 # Deploy a database with our default password
@@ -697,7 +697,7 @@ kind: Pod
 metadata:
   name: yadaapi
   labels:
-    azure.workload.identity/use: "true"
+    # azure.workload.identity/use: "true"
     app: yadaapi
 spec:
   serviceAccountName: ${sa_name}
@@ -731,8 +731,12 @@ curl "http://${yada_svc_ip}/api/akvsecret?akvname=${akv_name}&akvsecret=${akv_se
 curl "http://${yada_svc_ip}/api/sqlversion"
 
 # Troubleshoot
+kubectl get MutatingWebhookConfiguration
+kubectl describe MutatingWebhookConfiguration/azure-wi-webhook-mutating-webhook-configuration
+kubectl get config-map -A
 pod_name=$(kubectl get pod -l app=yadaapi -o json | jq -r '.items[0].metadata.name') && echo $pod_name
 kubectl describe pod $pod_name
+kubectl get pod yadaapi -o json | jq -r '.spec.containers[0].env'
 
 
 #######################

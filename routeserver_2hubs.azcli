@@ -7,12 +7,12 @@
 # Control
 ars_hub_b2b=yes       # Whether enabling b2b in the hub ARS
 hub_no=2              # 1 or 2 regions
-nva_no=2              # 1 or 2 NVAs per region
+nva_no=1              # 1 or 2 NVAs per region
 nva_type=linux1nic    # Only linux supported (linux1nic | linux2nic), CSR To Do
-create_azfw=no        # Whether an AzFW is created in the hub
+create_azfw=yes       # Whether an AzFW is created in the hub
 flowlogs2logws=yes    # Whether Flow Logs are sent to an LA workspace too
 stress_test_routes=no # Whether running a stress test on the number of routes by creating many VNets peered to the hub
-next_hop=lb           # Either 'azfw', 'lb' or 'nva'. If 'lb', it sets the advertised next hop to ARS as the internal LB private IP
+next_hop=nva          # Either 'azfw', 'lb' or 'nva'. If 'lb', it sets the advertised next hop to ARS as the internal LB private IP
 use_vxlan=no          # Whether using VXLAN encap between the NVAs in different hubs
 create_onprem=yes     # Whether onprem will be simulated with an additional network
 onprem_vpn=yes        # Whether onprem will be connected via S2S VPN + BGP
@@ -789,7 +789,7 @@ protocol kernel {
 protocol static {
       route $hub1_rs_ip1/32 via $hub1_nva_default_gw;
       route $hub1_rs_ip2/32 via $hub1_nva_default_gw;
-      route $hub2_lb_ip/32 via $hub1_nva_default_gw;
+      $([[ "$nva_no" == "2" ]] && echo "route $hub2_lb_ip/32 via $hub1_nva_default_gw;" || echo "")
       route $(get_1st_private_ip hub2nva1)/32 via $hub1_nva_default_gw;
       $([[ "$nva_no" == "2" ]] && echo "route $(get_1st_private_ip hub2nva2)/32 via $hub1_nva_default_gw;" || echo "")
       route 1${nva_id}.1${nva_id}.1${nva_id}.1${nva_id}/32 via $hub1_nva_default_gw;  # Test route
@@ -922,7 +922,7 @@ protocol kernel {
 protocol static {
       route $hub2_rs_ip1/32 via $hub2_nva_default_gw;
       route $hub2_rs_ip2/32 via $hub2_nva_default_gw;
-      route $hub1_lb_ip/32 via $hub2_nva_default_gw;
+      $([[ "$nva_no" == "2" ]] && echo "route $hub1_lb_ip/32 via $hub2_nva_default_gw;" || echo "")
       route $(get_1st_private_ip hub1nva1)/32 via $hub2_nva_default_gw;
       $([[ "$nva_no" == "2" ]] && echo "route $(get_1st_private_ip hub1nva2)/32 via $hub2_nva_default_gw;" || echo "")
       route 2${nva_id}.2${nva_id}.2${nva_id}.2${nva_id}/32 via $hub2_nva_default_gw;  # Test route
@@ -1211,6 +1211,73 @@ EOF
       fi
 fi
 
+if [[ "$onprem_er" == "yes" ]]; then
+
+      # ER variables (optional)
+      er_provider=Megaport
+      er_circuit_sku=Premium
+      megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+      # hub1_er_pop=Sydney
+      hub1_er_pop=Frankfurt
+      mcr1_asn=65001
+      gr_ip_range=172.16.31.0/29
+      hub1_er_circuit_name="er1-$hub1_er_pop"
+      hub1_ergw_name=hub1ergw
+      hub1_ergw_pip=hub1ergw-pip
+      hub2_er_pop=Dallas
+      hub2_er_circuit_name="er2-$hub2_er_pop"
+      hub2_ergw_name=hub2ergw
+      hub2_ergw_pip=hub2ergw-pip
+      mcr2_asn=65002
+      # gcloud variables to simulate onprem via ER
+      project_name=onprem
+      project_id="${project_name}${RANDOM}"
+      machine_type=e2-micro
+      gcp_asn=16550
+      # gcp region 1
+      # region1=australia-southeast1
+      # zone1=australia-southeast1-b
+      region1=europe-west3
+      zone1=europe-west3-b
+      gcp_vm1_name=vm1
+      gcp_vpc1_name=vpc1
+      gcp_subnet1_name=vm1
+      gcp_subnet1_prefix='10.4.2.0/24'
+      attachment1_name=attachment1
+      router1_name=router1
+      # gcp region 2
+      region2=us-west2
+      zone2=us-west2-b
+      gcp_vm2_name=vm2
+      gcp_vpc2_name=vpc2
+      gcp_subnet2_name=vm2
+      gcp_subnet2_prefix='10.5.2.0/24'
+      attachment2_name=attachment2
+      router2_name=router2
+
+      # VNG in hub1
+      echo "Creating ER circuit in hub1..."
+      az network express-route create -n $hub1_er_circuit_name --peering-location $hub1_er_pop -g $rg -o none \
+            --bandwidth 50 Mbps --provider $er_provider -l $hub1_location --sku-family MeteredData --sku-tier $er_circuit_sku
+      hub1_service_key=$(az network express-route show -n $hub1_er_circuit_name -g $rg --query serviceKey -o tsv)
+      hub1_circuit_id=$(az network express-route show -n $hub1_er_circuit_name -g $rg -o tsv --query id) && echo $hub1_circuit_id
+      echo "Creating ER gateway in hub 1..."
+      az network public-ip create -g $rg -n $hub1_ergw_pip -l $hub1_location -o none
+      az network vnet-gateway create -g $rg -n $hub1_ergw_name --gateway-type ExpressRoute --sku Standard -l $hub1_location --vnet $hub1_vnet_name --public-ip-addresses $hub1_ergw_pip -o none
+      # az network vpn-connection create -n "${hub1_ergw_name}-${hub1_er_pop}" -g $rg -l $hub2_location --vnet-gateway1 $hub1_ergw_name --express-route-circuit2 $hub1_circuit_id -o none
+      if [[ "$hub_no" == "2" ]]; then
+            echo "Creating ER circuit in hub2..."
+            az network express-route create -n $hub2_er_circuit_name --peering-location $hub2_er_pop -g $rg -o none \
+                  --bandwidth 50 Mbps --provider $er_provider -l $hub2_location --sku-family MeteredData --sku-tier $er_circuit_sku
+            hub2_service_key=$(az network express-route show -n $hub2_er_circuit_name -g $rg --query serviceKey -o tsv)
+            hub2_circuit_id=$(az network express-route show -n $hub2_er_circuit_name -g $rg -o tsv --query id) && echo $hub2_circuit_id
+            echo "Creating ER gateway in hub 2..."
+            az network public-ip create -g $rg -n $hub2_ergw_pip -l $hub2_location -o none
+            az network vnet-gateway create -g $rg -n $hub2_ergw_name --gateway-type ExpressRoute --sku Standard -l $hub2_location --vnet $hub2_vnet_name --public-ip-addresses $hub2_ergw_pip -o none
+            # az network vpn-connection create -n "${hub2_ergw_name}-${hub2_er_pop}" -g $rg -l $hub2_location --vnet-gateway1 $hub2_ergw_name --express-route-circuit2 $hub2_circuit_id -o none
+      fi
+fi
+
 ##############################
 #        Diagnostics         #
 ##############################
@@ -1334,11 +1401,11 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "netstat -r
 
 # BGP route tables in RS
 az network routeserver peering list --routeserver $hub1_rs_name -g $rg -o table
-az network routeserver peering list-learned-routes -n hub1nva --routeserver $hub1_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-az network routeserver peering list-advertised-routes -n hub1nva --routeserver $hub1_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list-learned-routes -n hub1nva1 --routeserver $hub1_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list-advertised-routes -n hub1nva1 --routeserver $hub1_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
 az network routeserver peering list --routeserver $hub2_rs_name -g $rg -o table
-az network routeserver peering list-learned-routes -n hub2nva --routeserver $hub2_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-az network routeserver peering list-advertised-routes -n hub2nva --routeserver $hub2_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list-learned-routes -n hub2nva1 --routeserver $hub2_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list-advertised-routes -n hub2nva1 --routeserver $hub2_rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
 
 # Effective routes in nva NICs
 hub1_nva1_nic0_id=$(az vm show -n "hub1nva1" -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -1349,6 +1416,20 @@ az network nic show-effective-route-table --ids $hub1_nva1_nic0_id -o table
 az network nic show-effective-route-table --ids $hub1_nva2_nic0_id -o table
 az network nic show-effective-route-table --ids $hub2_nva1_nic0_id -o table
 az network nic show-effective-route-table --ids $hub2_nva2_nic0_id -o table
+
+# VNG neighbors
+vng_list=$(az network vnet-gateway list -o tsv -g "$rg" --query "[].name")
+while IFS= read -r vng_name; do
+      echo "BGP neighbors for gateway $vng_name:"
+      az network vnet-gateway list-bgp-peer-status -n $vng_name -g $rg -o table
+done <<< "$vng_list"
+
+# VNG learned routes
+vng_list=$(az network vnet-gateway list -o tsv -g "$rg" --query "[].name")
+while IFS= read -r vng_name; do
+      echo "BGP routes learnt for gateway $vng_name:"
+      az network vnet-gateway list-learned-routes -n $vng_name -g $rg --query 'value[].{LocalAddress:localAddress, Peer:sourcePeer, Network:network, NextHop:nextHop, ASPath: asPath, Origin:origin, Weight:weight}' -o table
+done <<< "$vng_list"
 
 # Effective routes in spokes
 spoke11_vm_nic_id=$(az vm show -n "$spoke11_vm_name" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -1368,8 +1449,10 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub1_nva_pip_ip "ping $spok
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub2_nva_pip_ip "ping $spoke22_vm_private_ip -c 5"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke11_vm_pip "ping $spoke12_vm_private_ip -c 5"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke11_vm_pip "ping $spoke22_vm_private_ip -c 5"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke11_vm_pip "ping $onprem_linuxnva_private_ip -c 5"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke21_vm_pip "ping $spoke22_vm_private_ip -c 5"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke21_vm_pip "ping $spoke12_vm_private_ip -c 5"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke21_vm_pip "ping $onprem_linuxnva_private_ip -c 5"
 
 # Connectivity tests (SSH)
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $spoke11_vm_pip $spoke12_vm_private_ip "ping -c 5 $spoke11_vm_private_ip" # SSH works, ICMP doesnt
