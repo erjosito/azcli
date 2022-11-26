@@ -138,7 +138,7 @@ function create_mcr () {
         log_msg "INFO: Creating MCR $mcr_name in Megaport location '$location_id' and ASN '$mcr_asn'..."
         # Sending call to create MCR
         buy_url="${base_url}/v2/networkdesign/buy" 
-        buy_payload_template='[{locationId: $locationId, productName: $productName, productType: "MCR2", portSpeed: 5000, config: { mcrAsn: $mcrAsn } } ]'
+        buy_payload_template='[{locationId: $locationId, productName: $productName, productType: "MCR2", portSpeed: 1000, config: { mcrAsn: $mcrAsn } } ]'
         buy_payload=$(jq -n \
             --arg locationId "$location_id" \
             --arg productName "$mcr_name" \
