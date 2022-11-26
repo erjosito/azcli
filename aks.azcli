@@ -303,10 +303,10 @@ az aks nodepool list --cluster-name $aks_name -g $rg -o table
 
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=1
-kubectl create deployment sqlapi --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
+kubectl create deployment yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
 
 # Service with kubectl
-kubectl expose deploy sqlapi --port=80 --target-port=8080
+kubectl expose deploy yadaapi --port=80 --target-port=8080
 
 # Service
 app_name=sqlapi
@@ -629,6 +629,111 @@ kubectl apply -f $yaml_file
 
 aks_id=$(az aks show -n $aks_name -g $rg --query id -o tsv)
 az advisor recommendation list --ids $aks_id -o table
+
+#######################
+#  Workload Identity  #
+#######################
+
+# Variables
+workload_id_name=workloadidtest   # Name of the User-Assigned Managed Identity
+federated_id_name=federatedid     # Name for the identity federation
+akv_name=erjositoKeyvault         # Keyvault to test
+akv_secret_name=defaultPassword       # Secret to test
+sa_name=myserviceaccount
+sa_namespace=default
+
+# Enable workload identity and create identity
+enableAksFeature EnableWorkloadIdentityPreview
+echo "Enabling workload identity in cluster..."
+az aks update -n $aks_name -g $rg --enable-oidc-issuer --enable-workload-identity true -o none
+aks_oidc_issuer="$(az aks show -n $aks_name -g $rg --query "oidcIssuerProfile.issuerUrl" -o tsv)"
+echo "Creating managed identity..."
+az identity create -n $workload_id_name -g $rg -o none
+workload_id_id="$(az identity show -n $workload_id_name -g $rg --query 'clientId' -o tsv)"
+sleep 30  # Sometimes it takes some time to properly create the identity
+az keyvault set-policy -n $akv_name --secret-permissions get --spn "${workload_id_id}" -o none
+
+# Create service account
+echo "Creating service account in AKS cluster..."
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  annotations:
+    azure.workload.identity/client-id: ${workload_id_id}
+  labels:
+    azure.workload.identity/use: "true"
+  name: $sa_name
+  namespace: $sa_workspace
+EOF
+
+# Federate identities
+echo "Federating managed identity and service account..."
+az identity federated-credential create -n $federated_id_name --identity-name $workload_id_name -g $rg \
+    --issuer ${aks_oidc_issuer} --subject "system:serviceaccount:${sa_namespace}:${sa_name}" -o none
+
+# Mutating webhook
+tenant_id=$(az account show -o tsv --query tenantId)
+echo "Creating mutating webhook for tenant $tenant_id and service account $sa_name..."
+helm repo add azure-workload-identity https://azure.github.io/azure-workload-identity/charts
+helm repo update
+helm install workload-identity-webhook azure-workload-identity/workload-identity-webhook --namespace azure-workload-identity-system \
+  --create-namespace --set azureTenantID="${tenant_id}"
+
+# Test (deploy a workload, and get an AKV secret from the workload)
+# Deploy a database with our default password
+echo "Creating Azure SQL..."
+sql_server_name=sqlserver$RANDOM
+sql_db_name=mydb
+sql_username=azure
+sql_password=$(az keyvault secret show --vault-name $akv_name -n $akv_secret_name --query value -o tsv)
+az sql server create -n $sql_server_name -g $rg -l $location --admin-user "$sql_username" --admin-password "$sql_password" -o none
+az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait -o none
+sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName) && echo $sql_server_fqdn
+# Note the annotation and the serviceAccount name in the spec
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: yadaapi
+  labels:
+    azure.workload.identity/use: "true"
+    app: yadaapi
+spec:
+  serviceAccountName: ${sa_name}
+  containers:
+    - image: erjosito/yadaapi:1.0
+      name: yadaapi
+      env:
+      - name: SQL_SERVER_FQDN
+        value: ${sql_server_fqdn}
+      - name: SQL_SERVER_USERNAME
+        value: ${sql_username}
+      - name: AKV_NAME
+        value: ${akv_name}
+      - name: AKV_SECRET_NAME
+        value: ${akv_secret_name}
+  nodeSelector:
+    kubernetes.io/os: linux
+EOF
+# Create a svc and get the IP
+kubectl expose deploy yadaapi --port=80 --target-port=8080 --type=LoadBalancer
+sleep 60
+yada_svc_ip=$(kubectl get svc/yadaapi -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null) && echo $yada_svc_ip
+curl "http://${yada_svc_ip}/api/healthcheck"
+# Get the public IP to allow it in the SQL DB firewall
+api_outbound_pip=$(curl -s "http://${yada_svc_ip}/api/ip" | jq -r .my_public_ip)
+echo "Adding $api_outbound_pip to Azure SQL firewall rules..."
+az sql server firewall-rule create -g $rg -s $sql_server_name -n yadaapi --start-ip-address $api_outbound_pip --end-ip-address $api_outbound_pip -o none
+# Get the secret name from AKV
+curl "http://${yada_svc_ip}/api/akvsecret?akvname=${akv_name}&akvsecret=${akv_secret_name}"
+# Get the SQL Version (involves getting the secret name from AKV)
+curl "http://${yada_svc_ip}/api/sqlversion"
+
+# Troubleshoot
+pod_name=$(kubectl get pod -l app=yadaapi -o json | jq -r '.items[0].metadata.name') && echo $pod_name
+kubectl describe pod $pod_name
+
 
 #######################
 # Pod Identity - Helm #
