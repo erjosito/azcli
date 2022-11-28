@@ -1559,6 +1559,18 @@ while IFS= read -r vng_name; do
       az network vnet-gateway list-learned-routes -n $vng_name -g $rg --query 'value[].{LocalAddress:localAddress, Peer:sourcePeer, Network:network, NextHop:nextHop, ASPath: asPath, Origin:origin, Weight:weight}' -o table
 done <<< "$vng_list"
 
+# MCR
+$megaport_script_path -q -s=jomore-${hub1_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,asPath} | join("\t")'
+$megaport_script_path -q -s=jomore-${hub2_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,asPath} | join("\t")'
+
+# GCP onprem simulation
+gcloud compute instances describe $gcp_vm1_name
+gcloud compute routers get-status $router1_name --region=$region1 --format=json | jq -r '.result.bestRoutesForRouter[]|{destRange,routeType,nextHopIp} | join("\t")'
+gcloud compute interconnects attachments describe $attachment1_name --region=$region1
+gcloud compute instances describe $gcp_vm2_name
+gcloud compute routers get-status $router2_name --region=$region2 --format=json | jq -r '.result.bestRoutesForRouter[]|{destRange,routeType,nextHopIp} | join("\t")'
+gcloud compute interconnects attachments describe $attachment2_name --region=$region2
+
 # Effective routes in spokes
 spoke11_vm_nic_id=$(az vm show -n "$spoke11_vm_name" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 spoke12_vm_nic_id=$(az vm show -n "$spoke12_vm_name" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -1585,6 +1597,9 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke21_vm_pip "ping $onpre
 # Connectivity tests (SSH)
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $spoke11_vm_pip $spoke12_vm_private_ip "ping -c 5 $spoke11_vm_private_ip" # SSH works, ICMP doesnt
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $spoke12_vm_pip $spoke11_vm_private_ip "ping -c 5 $spoke12_vm_private_ip" # SSH works, ICMP doesnt
+
+# Routes learnt by gateways
+
 
 ########
 # Logs #
