@@ -1977,9 +1977,20 @@ fi
 ###########
 # Cleanup #
 ###########
-
-# az network routeserver peering delete --routeserver $hub1_rs_name -g $rg -n $hub1_nva_name -y
-# az network routeserver peering delete --routeserver $hub2_rs_name -g $rg -n $hub2_nva_name -y
-# az network routeserver delete -n  $hub1_rs_name -g $rg -y
-# az network routeserver delete -n  $hub2_rs_name -g $rg -y
-# az group delete -y --no-wait -n $rg
+# Delete Megaport components
+if [[ "$onprem_er" == "yes" ]]
+then
+    $megaport_script_path -s=jomore -a=delete_mcr
+    $megaport_script_path -s=jomore -a=list_live
+fi
+# Delete GCP project
+if [[ "$onprem_er" == "yes" ]]; then
+    gcloud projects delete "$project_id"
+    gcloud projects list
+fi
+# Delete Azure
+az network routeserver peering delete --routeserver $hub1_rs_name -g $rg -n $hub1_nva_name -y
+az network routeserver peering delete --routeserver $hub2_rs_name -g $rg -n $hub2_nva_name -y
+az network routeserver delete -n  $hub1_rs_name -g $rg -y
+az network routeserver delete -n  $hub2_rs_name -g $rg -y
+az group delete -y --no-wait -n $rg
