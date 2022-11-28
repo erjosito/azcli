@@ -179,7 +179,7 @@ az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --k
 storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
 az storage container create -n $storage_container_name --public-access container \
     --auth-mode key --account-name $storage_account_name --account-key $storage_account_key
-echo "Hello world!" >"/tmp/${storage_blob_name}"
+echo 'Hello world!' >"/tmp/${storage_blob_name}"
 az storage blob upload -n "$storage_blob_name" -c "$storage_container_name" -f "/tmp/${storage_blob_name}" \
     --auth-mode key --account-name "$storage_account_name" --account-key "${storage_account_key}"
 

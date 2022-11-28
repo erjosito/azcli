@@ -99,9 +99,10 @@ nslookup ${sql_server_name}.privatelink.database.windows.net
 # Create private DNS zone
 dns_zone_name=privatelink.database.windows.net
 az network private-dns zone create -n $dns_zone_name -g $rg
-az network private-dns link vnet create -g $rg -z $dns_zone_name -n myDnsLink --virtual-network $vnet_name --registration-enabled false
-az network private-dns record-set a create -n $sql_server_name -z $dns_zone_name -g $rg
-az network private-dns record-set a add-record --record-set-name $sql_server_name -z $dns_zone_name -g $rg -a $sql_endpoint_ip
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n $vnet_name --virtual-network $vnet_name --registration-enabled false
+# az network private-dns record-set a create -n $sql_server_name -z $dns_zone_name -g $rg
+# az network private-dns record-set a add-record --record-set-name $sql_server_name -z $dns_zone_name -g $rg -a $sql_endpoint_ip
+az network private-endpoint dns-zone-group create --endpoint-name $sql_endpoint_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name
 
 # DNS resolution verification (DNS TTL might take some minutes to expire)
 curl -s "http://${vm_pip_ip}:8080/api/dns?fqdn=${sql_server_fqdn}"
@@ -202,9 +203,15 @@ az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --k
 storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
 az storage container create -n $storage_container_name --public-access container \
     --auth-mode key --account-name $storage_account_name --account-key $storage_account_key
-echo "Hello world!" >/tmp/$storage_blob_name
+echo 'Hello world!' >/tmp/$storage_blob_name
 az storage blob upload -n $storage_blob_name -c $storage_container_name -f /tmp/$storage_blob_name \
     --auth-mode key --account-name $storage_account_name --account-key "$storage_account_key"
+# 1G file
+storage_blob_name=file1G.bin
+fallocate -l 1G "/tmp/${storage_blob_name}"
+az storage blob upload -n $storage_blob_name -c $storage_container_name -f "/tmp/${storage_blob_name}" \
+    --auth-mode key --account-name "$storage_account_name" --account-key "$storage_account_key"
+
 
 # Create storage endpoint (in the SQL Subnet)
 storage_endpoint_name=storageep
@@ -221,8 +228,10 @@ nslookup ${storage_account_name}.privatelink.blob.core.windows.net
 dns_zone_name=privatelink.blob.core.windows.net
 az network private-dns zone create -n $dns_zone_name -g $rg
 az network private-dns link vnet create -g $rg -z $dns_zone_name -n myDnsLink --virtual-network $vnet_name --registration-enabled false
-az network private-dns record-set a create -n $storage_account_name -z $dns_zone_name -g $rg
-az network private-dns record-set a add-record --record-set-name $storage_account_name -z $dns_zone_name -g $rg -a $storage_endpoint_ip
+# az network private-dns record-set a create -n $storage_account_name -z $dns_zone_name -g $rg
+# az network private-dns record-set a add-record --record-set-name $storage_account_name -z $dns_zone_name -g $rg -a $storage_endpoint_ip
+az network private-endpoint dns-zone-group create --endpoint-name $storage_endpoint_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name
+
 
 # Verify DNS resolution
 curl -s "http://${vm_pip_ip}:8080/api/dns?fqdn=${storage_account_name}.privatelink.blob.core.windows.net"

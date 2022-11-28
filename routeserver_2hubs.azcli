@@ -16,7 +16,8 @@ next_hop=nva          # Either 'azfw', 'lb' or 'nva'. If 'lb', it sets the adver
 use_vxlan=no          # Whether using VXLAN encap between the NVAs in different hubs
 create_onprem=yes     # Whether onprem will be simulated with an additional network
 onprem_vpn=yes        # Whether onprem will be connected via S2S VPN + BGP
-onprem_er=no          # Whether onprem will be connected via ExpressRoute (not implemented yet)
+onprem_er=yes         # Whether onprem will be connected via ExpressRoute (not implemented yet)
+spoke_rts=yes         # Override ARS information and create RTs for the spokes with gw prop disabled
 
 # Variables
 rg=routeserver
@@ -71,6 +72,51 @@ spoke22_vnet_prefix=10.2.17.0/24
 spoke22_vm_subnet_name=vm
 spoke22_vm_subnet_prefix=10.2.17.0/26
 azfw_policy_name=azfwpolicy
+
+# ER variables (optional)
+er_provider=Megaport
+er_circuit_sku=Premium
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+# hub1_er_pop=Sydney
+hub1_er_pop=Frankfurt
+mcr1_asn=65001
+gr_ip_range=172.16.31.0/29
+hub1_er_circuit_name="er1-$hub1_er_pop"
+hub1_ergw_name=hub1ergw
+hub1_ergw_pip=hub1ergw-pip
+# hub2_er_pop=Dallas
+hub2_er_pop=Amsterdam
+hub2_er_circuit_name="er2-$hub2_er_pop"
+hub2_ergw_name=hub2ergw
+hub2_ergw_pip=hub2ergw-pip
+mcr2_asn=65002
+# gcloud variables to simulate onprem via ER
+project_name=onprem
+project_id="${project_name}${RANDOM}"
+machine_type=e2-micro
+gcp_asn=16550
+# https://cloud.google.com/compute/docs/regions-zones/
+# region1=australia-southeast1
+# zone1=australia-southeast1-b
+region1=europe-west1          # Belgium
+zone1=europe-west1-b
+gcp_vm1_name=vm1
+gcp_vpc1_name=vpc1
+gcp_subnet1_name=vm1
+gcp_subnet1_prefix='10.4.2.0/24'
+attachment1_name=attachment1
+router1_name=router1
+# region2=us-west2           # London
+# zone2=us-west2-b
+region2=europe-west3
+zone2=europe-west3-b
+gcp_vm2_name=vm2
+gcp_vpc2_name=vpc2
+gcp_subnet2_name=vm2
+gcp_subnet2_prefix='10.5.2.0/24'
+attachment2_name=attachment2
+router2_name=router2
+
 
 # Auxiliary function to manipulate CIDR
 function first_ip(){
@@ -571,6 +617,47 @@ then
             fi
       fi
 fi
+
+# Optionally create route tables for the spokes
+if [[ "$spoke_rts" == "yes" ]]; then
+      hub1_spokes_rt_name=spokes-hub1
+      hub2_spokes_rt_name=spokes-hub2
+      # Hub1
+      if [[ "$next_hop" == "lb" ]]
+      then
+            local_hub_prefix_next_hop=$hub1_lb_ip
+      elif [[ "$next_hop" == "azfw" ]]
+      then
+            local_hub_prefix_next_hop=$hub1_azfw_private_ip
+      else
+            hub1_nva_name=hub1nva1
+            hub1_nva_private_ip=$(get_1st_private_ip $hub1_nva_name)
+            local_hub_prefix_next_hop=$hub1_nva_private_ip
+      fi
+      az network route-table create -n $hub1_spokes_rt_name -g $rg -l $hub1_location --disable-bgp-route-propagation true -o none
+      az network vnet subnet update -n vm --vnet-name $spoke11_vnet_name -g $rg --route-table $hub1_spokes_rt_name -o none
+      az network vnet subnet update -n vm --vnet-name $spoke12_vnet_name -g $rg --route-table $hub1_spokes_rt_name -o none
+      az network route-table route create --route-table-name $hub1_spokes_rt_name -g $rg -n default --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $local_hub_prefix_next_hop -o none
+      # Hub2
+      if [[ "$hub_no" == "2" ]]; then
+            if [[ "$next_hop" == "lb" ]]
+            then
+                  local_hub_prefix_next_hop=$hub2_lb_ip
+            elif [[ "$next_hop" == "azfw" ]]
+            then
+                  local_hub_prefix_next_hop=$hub2_azfw_private_ip
+            else
+                  hub2_nva_name=hub2nva1
+                  hub2_nva_private_ip=$(get_1st_private_ip $hub2_nva_name)
+                  local_hub_prefix_next_hop=$hub2_nva_private_ip
+            fi
+            az network route-table create -n $hub2_spokes_rt_name -g $rg -l $hub2_location --disable-bgp-route-propagation true -o none
+            az network vnet subnet update -n vm --vnet-name $spoke21_vnet_name -g $rg --route-table $hub2_spokes_rt_name -o none
+            az network vnet subnet update -n vm --vnet-name $spoke22_vnet_name -g $rg --route-table $hub2_spokes_rt_name -o none
+            az network route-table route create --route-table-name $hub2_spokes_rt_name -g $rg -n default --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $local_hub_prefix_next_hop -o none
+      fi
+fi
+
 
 # Create VXLAN tunnels between Linux NVAs in both hubs and configure static routing
 if [[ "$hub_no" == "2" ]] && [[ "$nva_type" == "linux1nic" || "$nva_type" == "linux2nic" ]]
@@ -1212,50 +1299,7 @@ EOF
 fi
 
 if [[ "$onprem_er" == "yes" ]]; then
-
-      # ER variables (optional)
-      er_provider=Megaport
-      er_circuit_sku=Premium
-      megaport_script_path="/home/jose/repos/azcli/megaport.sh"
-      # hub1_er_pop=Sydney
-      hub1_er_pop=Frankfurt
-      mcr1_asn=65001
-      gr_ip_range=172.16.31.0/29
-      hub1_er_circuit_name="er1-$hub1_er_pop"
-      hub1_ergw_name=hub1ergw
-      hub1_ergw_pip=hub1ergw-pip
-      hub2_er_pop=Dallas
-      hub2_er_circuit_name="er2-$hub2_er_pop"
-      hub2_ergw_name=hub2ergw
-      hub2_ergw_pip=hub2ergw-pip
-      mcr2_asn=65002
-      # gcloud variables to simulate onprem via ER
-      project_name=onprem
-      project_id="${project_name}${RANDOM}"
-      machine_type=e2-micro
-      gcp_asn=16550
-      # gcp region 1
-      # region1=australia-southeast1
-      # zone1=australia-southeast1-b
-      region1=europe-west3
-      zone1=europe-west3-b
-      gcp_vm1_name=vm1
-      gcp_vpc1_name=vpc1
-      gcp_subnet1_name=vm1
-      gcp_subnet1_prefix='10.4.2.0/24'
-      attachment1_name=attachment1
-      router1_name=router1
-      # gcp region 2
-      region2=us-west2
-      zone2=us-west2-b
-      gcp_vm2_name=vm2
-      gcp_vpc2_name=vpc2
-      gcp_subnet2_name=vm2
-      gcp_subnet2_prefix='10.5.2.0/24'
-      attachment2_name=attachment2
-      router2_name=router2
-
-      # VNG in hub1
+      # Circuit and VNG in hub1
       echo "Creating ER circuit in hub1..."
       az network express-route create -n $hub1_er_circuit_name --peering-location $hub1_er_pop -g $rg -o none \
             --bandwidth 50 Mbps --provider $er_provider -l $hub1_location --sku-family MeteredData --sku-tier $er_circuit_sku
@@ -1264,7 +1308,17 @@ if [[ "$onprem_er" == "yes" ]]; then
       echo "Creating ER gateway in hub 1..."
       az network public-ip create -g $rg -n $hub1_ergw_pip -l $hub1_location -o none
       az network vnet-gateway create -g $rg -n $hub1_ergw_name --gateway-type ExpressRoute --sku Standard -l $hub1_location --vnet $hub1_vnet_name --public-ip-addresses $hub1_ergw_pip -o none
-      # az network vpn-connection create -n "${hub1_ergw_name}-${hub1_er_pop}" -g $rg -l $hub2_location --vnet-gateway1 $hub1_ergw_name --express-route-circuit2 $hub1_circuit_id -o none
+      if [[ -e "$megaport_script_path" ]]
+      then
+            echo "Creating Megaport Cloud Router and configuring circuit..."
+            $megaport_script_path -s=jomore-${hub1_er_pop} -a=create_mcr -k=$hub1_service_key --asn=$hub1_mcr_asn
+            sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+            $megaport_script_path -s=jomore-${hub1_er_pop} -a=create_vxc -k=$hub1_service_key
+      else
+            echo "Sorry, I cannot seem to find the script $megaport_script_path to interact with the Megaport API"
+      fi
+      az network vpn-connection create -n "${hub1_ergw_name}-${hub1_er_pop}" -g $rg -l $hub1_location --vnet-gateway1 $hub1_ergw_name --express-route-circuit2 $hub1_circuit_id -o none
+      # Circuit and VNG in hub2
       if [[ "$hub_no" == "2" ]]; then
             echo "Creating ER circuit in hub2..."
             az network express-route create -n $hub2_er_circuit_name --peering-location $hub2_er_pop -g $rg -o none \
@@ -1276,6 +1330,58 @@ if [[ "$onprem_er" == "yes" ]]; then
             az network vnet-gateway create -g $rg -n $hub2_ergw_name --gateway-type ExpressRoute --sku Standard -l $hub2_location --vnet $hub2_vnet_name --public-ip-addresses $hub2_ergw_pip -o none
             # az network vpn-connection create -n "${hub2_ergw_name}-${hub2_er_pop}" -g $rg -l $hub2_location --vnet-gateway1 $hub2_ergw_name --express-route-circuit2 $hub2_circuit_id -o none
       fi
+      # Google VPC
+      # Simulate onprem with Google Cloud
+      # Get environment info
+      account=$(gcloud info --format json | jq -r '.config.account')
+      billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
+      billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
+      # Create project
+      gcloud projects create $project_id --name $project_name
+      gcloud config set project $project_id
+      gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
+      gcloud services enable compute.googleapis.com
+      # VPC and instance
+      gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+      gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1
+      gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
+      gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+      gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+      gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+      # gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="ip a"    # This command will pause the script if the key file is password-protected
+      # Create interconnect
+      gcloud compute routers create $router1_name --project=$project_id --network=$gcp_vpc1_name --asn=$gcp_asn --region=$region1
+      gcloud compute interconnects attachments partner create $attachment1_name --region $region1 --router $router1_name --edge-availability-domain availability-domain-1
+      pairing_key1=$(gcloud compute interconnects attachments describe $attachment1_name --region $region1 --format json | jq -r '.pairingKey')
+      # Create VXC in Megaport
+      $megaport_script_path -g -s=jomore-${hub1_er_pop} -a=create_vxc -k=$pairing_key1
+      # Activate attachment
+      # wait_for_gcp_attachment_ready $attachment1_name $region1
+      sleep 120
+      gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --admin-enabled
+      # gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --no-enable-admin
+      if [[ "$no_of_hubs" == "2" ]]; then
+            # VPC and instance
+            gcloud compute networks create "$gcp_vpc2_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+            gcloud compute networks subnets create "$gcp_subnet2_name" --network "$gcp_vpc2_name" --range "$gcp_subnet2_prefix" --region=$region2
+            gcloud compute instances create "$gcp_vm2_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc2_name" --subnet "$gcp_subnet2_name" --zone "$zone2"
+            gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-icmp" --network "$gcp_vpc2_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+            gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-ssh" --network "$gcp_vpc2_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+            gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-web" --network "$gcp_vpc2_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+            # gcloud compute ssh $gcp_vm2_name --zone=$zone2 --command="ip a"    # This command will pause the script if the key file is password-protected
+            # Create interconnect
+            gcloud compute routers create $router2_name --project=$project_id --network=$gcp_vpc2_name --asn=$gcp_asn --region=$region2
+            gcloud compute interconnects attachments partner create $attachment2_name --region $region2 --router $router2_name --edge-availability-domain availability-domain-1
+            pairing_key2=$(gcloud compute interconnects attachments describe $attachment2_name --region $region2 --format json | jq -r '.pairingKey')
+            # Create VXC in Megaport
+            $megaport_script_path -g -s=jomore-${hub2_er_pop} -a=create_vxc -k=$pairing_key2
+            # Activate attachment
+            # wait_for_gcp_attachment_ready $attachment1_name $region1
+            sleep 120
+            gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --admin-enabled
+            # gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --no-enable-admin
+      fi
+
 fi
 
 ##############################
@@ -1283,56 +1389,78 @@ fi
 ##############################
 
 # Set variables (the (P) operator only works in zsh, not in bash)
-for hub_id in $(seq 1 $hub_no)
-do
-      # Spokes
-      for spoke_id in $(seq 1 2)
+function set_variables() {
+      for hub_id in $(seq 1 $hub_no)
       do
-            vnet_name_var=spoke${hub_id}${spoke_id}_vnet_name
-            vm_name_var=${(P)vnet_name_var}_vm_name
-            declare $vm_name_var="${(P)vnet_name_var}-vm"
-            pip_name_var=spoke${hub_id}${spoke_id}_vm_pip_name
-            declare $pip_name_var="${(P)vm_name_var}-pip"
-            nic_id_var=spoke${hub_id}${spoke_id}_vm_nic_id
-            declare $nic_id_var=$(az vm show -n "${(P)vm_name_var}" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-            private_ip_var=spoke${hub_id}${spoke_id}_vm_private_ip
-            declare $private_ip_var=$(az network nic show --ids ${(P)nic_id_var} --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-            pip_var=spoke${hub_id}${spoke_id}_vm_pip
-            declare $pip_var=$(az network public-ip show -n ${(P)pip_name_var} -g $rg --query 'ipAddress' -o tsv)
+            # Spokes
+            for spoke_id in $(seq 1 2)
+            do
+                  vnet_name_var=spoke${hub_id}${spoke_id}_vnet_name
+                  vm_name_var=${(P)vnet_name_var}_vm_name
+                  declare $vm_name_var="${(P)vnet_name_var}-vm"
+                  echo "Getting information for VM ${(P)vm_name_var}..."
+                  pip_name_var=spoke${hub_id}${spoke_id}_vm_pip_name
+                  declare $pip_name_var="${(P)vm_name_var}-pip"
+                  nic_id_var=spoke${hub_id}${spoke_id}_vm_nic_id
+                  declare $nic_id_var=$(az vm show -n "${(P)vm_name_var}" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+                  private_ip_var=spoke${hub_id}${spoke_id}_vm_private_ip
+                  declare $private_ip_var=$(az network nic show --ids ${(P)nic_id_var} --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+                  pip_var=spoke${hub_id}${spoke_id}_vm_pip
+                  declare $pip_var=$(az network public-ip show -n ${(P)pip_name_var} -g $rg --query 'ipAddress' -o tsv)
+            done
+            # NVAs
+            for nva_id in $(seq 1 $nva_no)
+            do
+                  nva_name="hub${hub_id}nva${nva_id}"
+                  echo "Getting information for NVA ${nva_name}..."
+                  pip_var=hub${hub_id}_nva${nva_id}_pip
+                  declare $pip_var=$(get_pip $nva_name)
+                  nic_id_var=hub${hub_id}_nva${nva_id}_nic_id
+                  declare $nic_id_var=$(az vm show -n "${nva_name}" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+                  private_ip_var=hub${hub_id}_nva${nva_id}_private_ip
+                  declare $private_ip_var=$(az network nic show --ids ${(P)nic_id_var} --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+            done
+            # Route Server
+            echo "Getting variables for Route Server in hub${hub_id}..."
+            rs_name_var=hub${hub_id}_rs_name
+            rs_name=${(P)rs_name_var}
+            rs_ip1_var=hub${hub_id}_rs_ip1
+            rs_ip2_var=hub${hub_id}_rs_ip2
+            rs_asn_var=hub${hub_id}_rs_asn
+            declare $rs_ip1_var=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv)
+            declare $rs_ip2_var=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[1]' -o tsv)
+            declare $rs_asn_var=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAsn' -o tsv)
+            # LBs
+            echo "Getting information from NVA Load Balancer in hub${hub_id}..."
+            nva_lb_name=hub${hub_id}_nva
+            lb_ip_var=hub${hub_id}_lb_ip
+            declare $lb_ip_var=$(az network lb frontend-ip show -n nvafrontend --lb-name $nva_lb_name -g $rg --query privateIpAddress -o tsv)
+            # Firewalls (optional)
+            if [[ "$create_azfw" == "yes" ]]
+            then
+                  echo "Getting variables for Azure Firewall in hub${hub_id}..."
+                  azfw_name=azfw${hub_id}
+                  azfw_ip_var=hub${hub_id}_azfw_private_ip
+                  declare $azfw_ip_var=$(az network firewall show -n $azfw_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+            fi
+            # ER circuits
+            if [[ "$onprem_er" == "yes" ]]
+            then
+                  echo "Getting variables for ExpressRoute in hub${hub_id}..."
+                  er_name_var=hub${hub_id}_er_circuit_name
+                  if [[ "$hub_id" == "1" ]]; then
+                        declare $er_name_var="er1-$hub1_er_pop"
+                  else
+                        declare $er_name_var="er2-$hub2_er_pop"
+                  fi
+                  er_name=${(P)er_name_var}
+                  circuit_id_var=hub${hub_id}_circuit_id
+                  service_key_var=hub${hub_id}_service_key
+                  declare $circuit_id_var=$(az network express-route show -n $er_name -g $rg -o tsv --query id)
+                  declare $service_key_var=$(az network express-route show -n $er_name -g $rg --query serviceKey -o tsv)
+            fi
       done
-      # NVAs
-      for nva_id in $(seq 1 $nva_no)
-      do
-            nva_name="hub${hub_id}nva${nva_id}"
-            pip_var=hub${hub_id}_nva${nva_id}_pip
-            declare $pip_var=$(get_pip $nva_name)
-            nic_id_var=hub${hub_id}_nva${nva_id}_nic_id
-            declare $nic_id_var=$(az vm show -n "${nva_name}" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-            private_ip_var=hub${hub_id}_nva${nva_id}_private_ip
-            declare $private_ip_var=$(az network nic show --ids ${(P)nic_id_var} --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-      done
-      # Route Server
-      rs_name_var=hub${hub_id}_rs_name
-      rs_name=${(P)rs_name_var}
-      rs_ip1_var=hub${hub_id}_rs_ip1
-      rs_ip2_var=hub${hub_id}_rs_ip2
-      rs_asn_var=hub${hub_id}_rs_asn
-      declare $rs_ip1_var=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv)
-      declare $rs_ip2_var=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[1]' -o tsv)
-      declare $rs_asn_var=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAsn' -o tsv)
-      # LBs
-      nva_lb_name=hub${hub_id}_nva
-      lb_ip_var=hub${hub_id}_lb_ip
-      declare $lb_ip_var=$(az network lb frontend-ip show -n nvafrontend --lb-name $nva_lb_name -g $rg --query privateIpAddress -o tsv)
-      # Firewalls (optional)
-      if [[ "$create_azfw" == "yes" ]]
-      then
-            azfw_name=azfw${hub_id}
-            azfw_ip_var=hub${hub_id}_azfw_private_ip
-            declare $azfw_ip_var=$(az network firewall show -n $azfw_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-      fi
-done
-
+}
 
 # Diagnose all NVAs
 cmd="sudo birdc show protocols"
