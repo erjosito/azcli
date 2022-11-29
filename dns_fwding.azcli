@@ -294,7 +294,7 @@ then
         --address-prefix 162.159.138.85/32 -n ifconfigco1 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip
     az network route-table route create --route-table-name clientrt -g $rg -o none \
         --address-prefix 162.159.137.85/32 -n ifconfigco2 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip
-    az network vnet subnet update -g $rg --vnet-name $vnet_name -n $client_vm_subnet_name --route-table clientrt -o none
+    az network vnet subnet update -g $rg --vnet-name $vnet_name -n $client_subnet_name --route-table clientrt -o none
 fi
 
 # Create DNS resolver
