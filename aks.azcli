@@ -6,7 +6,7 @@
 #################################
 
 # Variables
-rg=akstest
+rg=akstest2
 location=westcentralus
 wait_interval=5s
 use_msi=yes
@@ -16,14 +16,16 @@ aks_rbac=yes
 aks_service_cidr=10.0.0.0/16
 vm_size=Standard_B2ms    # Some possible values: Standard_B2ms, Standard_D2_v3
 preview_version=no
-network_plugin=azure     # azure/kubenet
+network_plugin=azure     # azure/kubenet/none
 # Vnet
 vnet_name=aksVnet
 vnet_prefix=10.13.0.0/16
-aks_subnet_name=aks
-aks_subnet_prefix=10.13.76.0/26  # Min /25 with Azure CNI!
+aks_subnet_name=aks1stpool
+aks_subnet_prefix=10.13.76.0/24  # Min /25 with Azure CNI!
 aks2_subnet_name=aks2ndpool
 aks2_subnet_prefix=10.13.75.0/24
+aks2_pod_subnet_name=aks2ndpoolpods
+aks2_pod_subnet_prefix=10.13.65.0/24
 pod_subnet_name=pods
 pod_subnet_prefix=10.13.80.0/24
 vm_subnet_name=vm
@@ -101,10 +103,12 @@ function enableAksFeature () {
     fi
 }
 
-enableAksFeature "AKS-IngressApplicationGatewayAddon"
-enableAksFeature "EnablePodIdentityPreview"
-enableAksFeature "MigrateToMSIClusterPreview"
-enableAksFeature "PodSubnetPreview"
+# enableAksFeature "AKS-IngressApplicationGatewayAddon"
+# enableAksFeature "EnablePodIdentityPreview"
+# enableAksFeature "MigrateToMSIClusterPreview"
+# enableAksFeature "PodSubnetPreview"
+# enableAksFeature "EnableAPIServerVnetIntegrationPreview"
+# enableAksFeature "CiliumDataplanePreview"
 
 # Update extension
 az extension update -n aks-preview
@@ -188,15 +192,18 @@ fi
 
 # Create AKS
 az aks create -g $rg -n $aks_name -l $location \
+    --pod-subnet-id $pod_subnet_id \
     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
     ${(z)identity_options} \
     --network-plugin $network_plugin --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
-    --network-policy 'calico' --load-balancer-sku Standard \
+    --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
     --dns-name-prefix cloudtrooper --no-wait
 
 # Other options you can use in the previous command
     # --enable-private-cluster --private-dns-zone none --disable-public-fqdn \
+    # --enable-apiserver-vnet-integration \
+    # --enable-cilium-dataplane  \   # https://techcommunity.microsoft.com/t5/azure-networking-blog/azure-cni-powered-by-cilium-for-azure-kubernetes-service-aks/ba-p/3662341
     # --pod-subnet-id $pod_subnet_id \
     # --enable-pod-security-policy \  # Deprecated
     # --enable-cluster-autoscaler --min-count 1 --max-count 3 \
@@ -207,6 +214,7 @@ az aks create -g $rg -n $aks_name -l $location \
     # --aks-custom-headers EnableAzureDiskFileCSIDriver=true \
     # --os-sku Mariner \
     # --uptime-sla \
+    # --network-policy 'calico' \
     # --no-wait
 
 ########
@@ -263,6 +271,28 @@ az aks update -g $rg -n $aks_name --enable-managed-identity -y
 new_aks_version=1.21.2
 az aks upgrade -n $aks_name -g $rg -k $new_aks_version -y
 
+####################
+#  Install Cilium  #
+####################
+
+if [[ "$network_plugin" ]]; then
+    CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/master/stable.txt)
+    CLI_ARCH=amd64
+    if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+    curl -L --fail --remote-name-all "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}"
+    sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+    sudo tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+    rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+
+    # Deploy Cilium
+    cilium install --azure-resource-group $rg
+
+    # Check status
+    cilium status
+    cilium connectivity test
+    k get no
+fi
+
 #####################
 # Create Az Bastion #
 #####################
@@ -288,13 +318,16 @@ az aks update -g $rg -n $aks_name --api-server-authorized-ip-ranges "${myip}/32"
 # Add a second pool #
 #####################
 
-az network vnet subnet create -g $rg -n $aks2_subnet_name --vnet-name $vnet_name --address-prefix $aks2_subnet_prefix
+az network vnet subnet create -g $rg -n $aks2_subnet_name --vnet-name $vnet_name --address-prefix $aks2_subnet_prefix -o none
+az network vnet subnet create -g $rg -n $aks2_pod_subnet_name --vnet-name $vnet_name --address-prefix $aks2_pod_subnet_prefix -o none
 vm_size=Standard_DS3_v2
 aks2_subnet_id=$(az network vnet subnet show -n $aks2_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+aks2_pod_subnet_id=$(az network vnet subnet show -n $aks2_pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 az aks nodepool add --cluster-name $aks_name -g $rg -n pool2 --node-count 1 -s $vm_size \
-    --enable-cluster-autoscaler --min-count 1 --max-count 2 \
     -k $k8s_version --mode User --vnet-subnet-id $aks2_subnet_id \
-    --node-osdisk-type Ephemeral
+    --pod-subnet-id $aks2_pod_subnet_id
+    # --node-osdisk-type Ephemeral
+    # --enable-cluster-autoscaler --min-count 1 --max-count 2 \
 az aks nodepool list --cluster-name $aks_name -g $rg -o table
 
 ###########################

@@ -9,7 +9,8 @@ location=germanywestcentral
 er_location=germanywestcentral
 er_pop=Frankfurt
 er_circuit_sku=Standard
-create_spoke=no
+create_spokes=no
+number_of_spokes=2
 simulate_onprem=no
 
 # Other possible pop/region combinations with megaport:
@@ -30,10 +31,10 @@ er_circuit_name="er-$er_pop"
 ergw_name="ergw-$er_pop"
 ergw_pip="${ergw_name}-pip"
 vnet_name="ervnet-$er_pop"
-vnet_prefix=192.168.1.0/24
+vnet_prefix=192.168.0.0/24
 vm_subnet_name=vm
-vm_subnet_prefix=192.168.1.64/26
-gw_subnet_prefix=192.168.1.0/26
+vm_subnet_prefix=192.168.0.64/26
+gw_subnet_prefix=192.168.0.0/26
 vm_name="vm-${er_pop}"
 vm_pip_name="${vm_name}-pip"
 vm_size=Standard_B1s
@@ -85,58 +86,58 @@ echo "Creating ER Gateway..."
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix -o none
 az network public-ip create -g $rg -n $ergw_pip --allocation-method Dynamic --sku Basic -l $location -o none
 az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $vnet_name --public-ip-addresses $ergw_pip -o none
-circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id
+circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id)
+echo "Connecting ER Gateway to circuit $circuit_id..."
+az network express-route update -n "$er_circuit_name" -g $rg -o none    # sometimes you need to refresh the circuit
 az network vpn-connection create -n "${ergw_name}-${er_pop}" -g $rg -l $location --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id -o none
 
 # Optional: create spoke associated to the previous VNet and configure the Hub VM as NVA
-if [[ "$create_spoke" == "yes" ]]
-then
-    spoke_vnet_name="ervnet-${er_pop}-spoke1"
-    spoke_vm_name="vm-${er_pop}-spoke1"
-    spoke_vnet_prefix=192.168.11.0/24
-    spoke_vm_subnet_name=vm
-    spoke_vm_subnet_prefix=192.168.11.64/26
-    spoke_vm_pip_name="${spoke_vm_name}-pip"
-    az network vnet create -g $rg -n $spoke_vnet_name --address-prefix $spoke_vnet_prefix --subnet-name $spoke_vm_subnet_name --subnet-prefix $spoke_vm_subnet_prefix -l $location -o none
-    az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" \
-        --public-ip-address $spoke_vm_pip_name --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_vm_subnet_name -l $location --no-wait -o none
-    az network vnet peering create -n hubtospoke1 -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
-    az network vnet peering create -n spoke1tohub -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
-    spoke1_vm_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    az network nic show-effective-route-table --ids $spoke1_vm_nic_id -o table
-    spoke1_vm_pip=$(az network public-ip show -n $spoke_vm_pip_name --query ipAddress -o tsv -g $rg) && echo $spoke_vm_pip
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm_pip "ip a"
-    # Route tables
+if [[ "$create_spokes" == "yes" ]]; then
+    # IP fwding in hub VM
+    echo "Getting information from hub VM..."
     hub_vm_pip=$(az network public-ip show -n $vm_pip_name --query ipAddress -o tsv -g $rg) && echo $hub_vm_pip
     hub_vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
     hub_vm_ip=$(az network nic show --ids $hub_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub_vm_ip
+    echo "Enabling IP forwarding in hub VM..."
+    az network nic update --ids $hub_vm_nic_id --ip-forwarding -o none
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm_pip "sudo sysctl -w net.ipv4.ip_forward=1"
-    az network nic update --ids $hub_vm_nic_id --ip-forwarding
-    az network route-table create -n spoke-${er_pop} -g $rg -l $location --disable-bgp-route-propagation
-    az network route-table route create --route-table-name spoke-${er_pop} -g $rg --address-prefix "0.0.0.0/0" --name default --next-hop-type VirtualAppliance --next-hop-ip-address "$hub_vm_ip" -o none
+    # Route table for spokes
     myip=$(curl -s4 ifconfig.co)
-    az network route-table route create --route-table-name spoke-${er_pop} -g $rg --address-prefix "${myip}/32" --name mypc --next-hop-type Internet -o none
-    az network vnet subnet update -g $rg --vnet-name $spoke_vnet_name -n $spoke_vm_subnet_name --route-table spoke-${er_pop} -o none
+    az network route-table create -n spokes-${er_pop} -g $rg -l $location --disable-bgp-route-propagation -o none
+    az network route-table route create --route-table-name spokes-${er_pop} -g $rg --address-prefix "0.0.0.0/0" --name default --next-hop-type VirtualAppliance --next-hop-ip-address "$hub_vm_ip" -o none
+    az network route-table route create --route-table-name spokes-${er_pop} -g $rg --address-prefix "${myip}/32" --name mypc --next-hop-type Internet -o none
+    # Route table for hub VM (empty)
     az network route-table create -n hub-${er_pop} -g $rg -l $location -o none
     az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table hub-${er_pop} -o none
-
-    # Optional, create second spoke
-    spoke_vnet_name="ervnet-${er_pop}-spoke2"
-    spoke_vm_name="vm-${er_pop}-spoke2"
-    spoke_vnet_prefix=192.168.12.0/24
-    spoke_vm_subnet_name=vm
-    spoke_vm_subnet_prefix=192.168.12.64/26
-    spoke_vm_pip_name="${spoke_vm_name}-pip"
-    az network vnet create -g $rg -n $spoke_vnet_name --address-prefix $spoke_vnet_prefix --subnet-name $spoke_vm_subnet_name --subnet-prefix $spoke_vm_subnet_prefix -l $location -o none
-    az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" \
-        --public-ip-address $spoke_vm_pip_name --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_vm_subnet_name -l $location --no-wait -o none
-    az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
-    az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
-    az network vnet subnet update -g $rg --vnet-name $spoke_vnet_name -n $spoke_vm_subnet_name --route-table spoke-${er_pop} -o none
-    spoke2_vm_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    az network nic show-effective-route-table --ids $spoke2_vm_nic_id -o table
-    spoke2_vm_pip=$(az network public-ip show -n $spoke_vm_pip_name --query ipAddress -o tsv -g $rg) && echo $spoke_vm_pip
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm_pip "ip a"
+    # Route table for hub GatewaySubnet??
+    az network route-table create -n vng-${er_pop} -g $rg -l $location -o none
+    az network vnet subnet update -g $rg --vnet-name $vnet_name -n GatewaySubnet --route-table vng-${er_pop} -o none
+    # Create spokes
+    for spoke_id in {1..$number_of_spokes}; do
+        spoke_vnet_name="ervnet-${er_pop}-spoke${spoke_id}"
+        spoke_vm_name="vm-${er_pop}-spoke${spoke_id}"
+        spoke_vnet_prefix=192.168.${spoke_id}.0/24
+        spoke_vm_subnet_name=vm
+        spoke_vm_subnet_prefix=192.168.${spoke_id}.64/26
+        spoke_vm_pip_name="${spoke_vm_name}-pip"
+        # Create VNet, VNet peerings and VM
+        echo "Creating spoke ${spoke_vnet_name}..."
+        az network vnet create -g $rg -n $spoke_vnet_name --address-prefix $spoke_vnet_prefix --subnet-name $spoke_vm_subnet_name --subnet-prefix $spoke_vm_subnet_prefix -l $location -o none
+        az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" --public-ip-sku Standard \
+            --public-ip-address $spoke_vm_pip_name --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_vm_subnet_name -l $location --no-wait -o none
+        az network vnet peering create -n "hubtospoke${spoke_id}" -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
+        az network vnet peering create -n "spoke${spoke_id}tohub" -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
+        # Verify spoke VM (before applying RT)
+        # spoke_vm_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        # az network nic show-effective-route-table --ids $spoke_vm_nic_id -o table
+        # echo "Verifying VM ${spoke_vm_name}..."
+        # spoke_vm_pip=$(az network public-ip show -n $spoke_vm_pip_name --query ipAddress -o tsv -g $rg) && echo $spoke_vm_pip
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke_vm_pip "ip a"
+        # Attach RT to VM subnet
+        az network vnet subnet update -g $rg --vnet-name $spoke_vnet_name -n $spoke_vm_subnet_name --route-table spokes-${er_pop} -o none
+        # Update the VNG route table
+        az network route-table route create --route-table-name vng-${er_pop} -g $rg --address-prefix $spoke_vnet_prefix --name $spoke_vnet_name --next-hop-type VirtualAppliance --next-hop-ip-address "$hub_vm_ip" -o none
+    done
 fi
 
 ##############################################################
@@ -198,6 +199,31 @@ then
     onprem_circuit_id=$(az network express-route show -n $onprem_er_circuit_name -g $rg -o tsv --query id) && echo $onprem_circuit_id
     az network vpn-connection create -n onpremcx -g $rg -l $location --vnet-gateway1 $onprem_ergw_name --express-route-circuit2 $onprem_circuit_id -o none
 fi
+
+#################################################################
+# Optional: time how long it takes to create/delete connections #
+#################################################################
+
+# Find out how many spokes are peered with the hub
+spokes=$(az network vnet peering list -g $rg --vnet-name $vnet_name -o tsv | wc -l)
+# Deleting connection
+echo "Deleting the connection with $spokes spokes configured..."
+time az network vpn-connection delete -n "${ergw_name}-${er_pop}" -g $rg -o none
+# Creating connection
+echo "Creating the connection with $spokes spokes configured..."
+time az network vpn-connection create -n "${ergw_name}-${er_pop}" -g $rg -l $location --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id -o none
+
+# Results
+# No of spokes    Deletion time     Creation time
+# ============    =============     =============
+#            0             2:22              2:33
+#           10             6:22              4:03
+#           20             8:03              6:03
+#           30             8:02              8:34
+#           40            11:22             12:34
+#           50            13:03             11:35
+#           60            14:43             15:04
+#           70            19.44
 
 #####################
 #    Diagnostics    #
@@ -278,6 +304,30 @@ az network routeserver update -n $rs_name -g $rg --allow-b2b-traffic true -o non
 #######################
 #  Cleanup - Danger!  #
 #######################
+
+# Delete all VMs
+function delete_vm() {
+    vm_name=$1
+    disk_id=$(az vm show -n $vm_name -g $rg --query storageProfile.osDisk.managedDisk.id -o tsv)
+    nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    pip_id=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+    nsg_id=$(az network nic show --ids $nic_id --query networkSecurityGroup.id -o tsv)
+    echo "Deleting VM $vm_name..."
+    az vm delete -n $vm_name -g $rg -y
+    echo "Deleting disk $disk_id..."
+    az disk delete --ids $disk_id -y
+    echo "Deleting NIC $nic_id..."
+    az network nic delete --ids $nic_id
+    echo "Deleting public IP $pip_id..."
+    az network public-ip delete --ids $pip_id
+    # echo "Deleting NSG $nsg_id..."
+    # az network nsg delete --ids $nsg_id
+}
+vm_list=$(az vm list -g $rg --query '[].name' -o tsv)
+while IFS= read -r vm; do
+    delete_vm $vm
+done <<< "$vm_list"
+
 
 # Remove MCR from Megaport
 # megaport_script_path="/home/jose/repos/azcli/megaport.sh"

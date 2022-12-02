@@ -1,0 +1,90 @@
+######################################
+# Created by Jose Moreno
+# November 2022
+#
+# Some useful commands around Virtual
+#    Networks in Azure
+######################################
+
+
+# Control
+location=eastus
+create_spokes=no
+number_of_spokes=2
+simulate_onprem=no
+enable_encryption=false
+
+# Variables
+rg=vnettest
+hub_vnet_name=hub
+vnet_prefix=192.168.0.0/24
+hub_vm_subnet_name=vm
+hub_vm_subnet_prefix=192.168.0.64/26
+gw_subnet_prefix=192.168.0.0/26
+vm_size=Standard_B1s
+
+###################
+# Enable features #
+###################
+
+function enable_nw_feature () {
+    feature_name=$1
+    state=$(az feature list -o table --query "[?contains(name, 'microsoft.network/$feature_name')].properties.state" -o tsv)
+    if [[ "$state" == "Registered" ]]
+    then
+        echo "$feature_name is already registered"
+    else
+        echo "Registering feature $feature_name..."
+        az feature register --name "$feature_name" --namespace microsoft.network
+        state=$(az feature list -o table --query "[?contains(name, 'microsoft.network/$feature_name')].properties.state" -o tsv)
+        echo "Waiting for feature $feature_name to finish registering..."
+        wait_interval=15
+        until [[ "$state" == "Registered" ]]
+        do
+            sleep $wait_interval
+            state=$(az feature list -o table --query "[?contains(name, 'microsoft.network/$feature_name')].properties.state" -o tsv)
+            echo "Current registration status for feature $feature_name is $state"
+        done
+        echo "Registering resource provider Microsoft.Network now..."
+        az provider register --namespace Microsoft.Network
+    fi
+}
+
+###################
+#      Start      #
+###################
+
+# Create RG
+echo "Creating resource group..."
+az group create -n $rg -l $location -o none
+
+# Create hub VNet and test VMs in the same or different AZs
+echo "Creating VNet and VMs..."
+az network vnet create -g $rg -n $hub_vnet_name --address-prefix $vnet_prefix --subnet-name $hub_vm_subnet_name --subnet-prefix $hub_vm_subnet_prefix -l $location --enable-encryption $enable_encryption -o none
+vm_name=hubvm1
+zone=1
+echo "Creating VM $vm_name in AZ $zone..."
+az vm create -n $vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" -o none --zone $zone \
+    --public-ip-address "${vm_name}-pip" --vnet-name $hub_vnet_name --size $vm_size --subnet $hub_vm_subnet_name -l $location
+vm_name=hubvm2
+zone=1
+echo "Creating VM $vm_name in AZ $zone..."
+az vm create -n $vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" -o none --zone $zone \
+    --public-ip-address "${vm_name}-pip" --vnet-name $hub_vnet_name --size $vm_size --subnet $hub_vm_subnet_name -l $location
+
+
+######################
+#  Performance test  #
+######################
+
+# iperf (hubvm2 will be the server)
+# Getting IPs...
+hubvm1_pip=$(az network public-ip show -n hubvm1-pip -g $rg --query ipAddress -o tsv) && echo $hubvm1_pip
+hubvm1_private_ip=$(az vm show -g $rg -n hubvm1 -d --query privateIps -o tsv) && echo $hubvm1_private_ip
+hubvm2_pip=$(az network public-ip show -n hubvm2-pip -g $rg --query ipAddress -o tsv) && echo $hubvm2_pip
+hubvm2_private_ip=$(az vm show -g $rg -n hubvm2 -d --query privateIps -o tsv) && echo $hubvm2_private_ip
+# Enable iperf server on hubvm1
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hubvm1_pip "sudo apt update && sudo apt install -y iperf3"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hubvm2_pip "sudo apt update && sudo apt install -y iperf3"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hubvm1_pip "iperf3 -s -D"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hubvm2_pip "iperf3 -c $hubvm1_private_ip"
