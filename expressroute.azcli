@@ -223,7 +223,11 @@ time az network vpn-connection create -n "${ergw_name}-${er_pop}" -g $rg -l $loc
 #           40            11:22             12:34
 #           50            13:03             11:35
 #           60            14:43             15:04
-#           70            19.44
+#           70            19.44             19,35
+#           90            28.04             24,05
+#          110            29.46             29,07
+#          130            
+#          150            
 
 #####################
 #    Diagnostics    #
@@ -330,8 +334,8 @@ done <<< "$vm_list"
 
 
 # Remove MCR from Megaport
-# megaport_script_path="/home/jose/repos/azcli/megaport.sh"
-# $megaport_script_path -q -s=jomore -a=delete_mcr
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+$megaport_script_path -q -s=jomore -a=delete_mcr
 
 # Delete RG
-# az group delete -n $rg -y --no-wait
+az group delete -n $rg -y --no-wait

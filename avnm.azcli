@@ -1,9 +1,16 @@
+################################################
+#
+# Script to create VNets and play with AVNM
+#   peering and NSG locations
+#
+################################################
+
 # Control
 max_vnet_id=5
 hub_vnet_id=0
-ip_version=ipv6    # Can be 'ipv4' or 'ipv6'
+ip_version=ipv4    # Can be 'ipv4' or 'ipv6'
 create_vwan=no     # Can be 'vwan' or 'hns'
-overload_ipv4=yes  # If yes, the same spoke IPv4 prefix will be used for all spokes
+overload_ipv4=no   # If yes, the same spoke IPv4 prefix will be used for all spokes
 public_ips=yes     # If yes, public IPs will be added to the VMs
 create_vpngw=no    # If yes, create VPNGW in the hub
 create_ergw=no     # If yes, create ERGW in the hub
@@ -231,7 +238,9 @@ az network manager post-commit --network-manager-name $avnm_name -g $rg --commit
 
 
 # Diagnostics
+az network manager list -g $rg -o table
 az network vnet list -g $rg -o table
+az network vnet list -g $rg --query '[].{Name:name,Prefix:addressSpace.addressPrefixes[0]}' -o table
 az network manager group list --network-manager-name ${avnm_name} -g $rg -o table
 az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-all" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
 az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-hub" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
