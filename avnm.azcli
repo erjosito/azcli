@@ -17,7 +17,7 @@ create_ergw=no     # If yes, create ERGW in the hub
 
 # Variables
 rg=avnm
-location=westeurope
+location=eastus
 ip_prefix="10.1"
 ipv6_prefix=ace:cab:de
 nsg_name=avnmnsg
@@ -47,7 +47,7 @@ do
         ipv4_subnet="${ip_prefix}.${vnet_id}.0/26"
     fi
     vnet_id_hex=$(printf "%02x" "$vnet_id")
-    if [[ "$ipv_version" == "ipv4" ]]; then
+    if [[ "$ip_version" == "ipv4" ]]; then
         echo "Creating VNet vnet${vnet_id} with prefix ${ipv4_vnet}..."
         az network vnet create -n "vnet${vnet_id}" -g $rg --address-prefixes $ipv4_vnet --subnet-name vm --subnet-prefixes $ipv4_subnet -o none
         if [[ "$public_ips" == "yes" ]]; then
@@ -63,8 +63,8 @@ do
         if [[ "$public_ips" == "yes" ]]; then
             az network public-ip create -n "vnet${vnet_id}vm-pipv4" -g $rg -l $location --sku Standard --allocation-method static --version IPv4 -z 1 2 3 -o none
             az network public-ip create -n "vnet${vnet_id}vm-pipv6" -g $rg -l $location --sku Standard --allocation-method static --version IPv6 -z 1 2 3 -o none
-            az network nic create -g $rg -n "vnet${vnet_id}-nic0" --vnet-name "vnet${vnet_id}" --subnet vm --network-security-group $nsg_name --public-ip-address "vnet${vnet_id}vm-pipv4"
-            az network nic ip-config create -g $rg -n myIPv6config --nic-name "vnet${vnet_id}-nic0" --private-ip-address-version IPv6 --vnet-name "vnet${vnet_id}" --subnet vm --public-ip-address "vnet${vnet_id}vm-pipv6"
+            az network nic create -g $rg -n "vnet${vnet_id}-nic0" --vnet-name "vnet${vnet_id}" --subnet vm --network-security-group $nsg_name --public-ip-address "vnet${vnet_id}vm-pipv4" -o none
+            az network nic ip-config create -g $rg -n myIPv6config --nic-name "vnet${vnet_id}-nic0" --private-ip-address-version IPv6 --vnet-name "vnet${vnet_id}" --subnet vm --public-ip-address "vnet${vnet_id}vm-pipv6" -o none
             az vm create -n "vnet${vnet_id}vm" -g $rg --image UbuntuLTS --generate-ssh-keys --size Standard_B1ms --nics "vnet${vnet_id}-nic0" --no-wait -o none
         else
             az network nic create -g $rg -n "vnet${vnet_id}-nic0" --vnet-name "vnet${vnet_id}" --subnet vm --network-security-group $nsg_name --public-ip-address '' -o none
@@ -143,7 +143,7 @@ done
 # Create AVNM instance and VNet groups
 echo "Creating AVNM instance scoped to subscription..."
 subscription_id=$(az account show --query id -o tsv)
-# The scope-access "SecurityUser" not available yet (Dec'21)
+# The scope-access "SecurityUser" not available yet (Dec'21). Still not there in Dec'22
 az network manager create -n $avnm_name -g $rg -l $location --description $avnm_description --display-name $avnm_name \
     --scope-access SecurityAdmin Connectivity \
     --network-manager-scopes subscriptions="/subscriptions/${subscription_id}" -o none
@@ -152,6 +152,11 @@ condition_hubs="{ \"allOf\": [ {\"field\": \"tags['avnmtest']\", \"equals\": \"y
 condition_spokes="{ \"allOf\": [ {\"field\": \"tags['avnmtest']\", \"equals\": \"yes\" }, {\"field\": \"tags['role']\", \"equals\": \"spoke\" } ] }"
 
 # Three groups are created, although actually only the spoke group is requried (DOES NOT WORK!!!!!)
+# NEW
+az network manager group create -n ${avnm_vnetgroup_name}-all --network-manager-name $avnm_name -g $rg --description ${avnm_vnetgroup_name}-all -o none
+az network manager group create -n ${avnm_vnetgroup_name}-hub --network-manager-name $avnm_name -g $rg --description ${avnm_vnetgroup_name}-all -o none
+az network manager group create -n ${avnm_vnetgroup_name}-spokes --network-manager-name $avnm_name -g $rg --description ${avnm_vnetgroup_name}-all -o none
+# OLD
 az network manager group create -n ${avnm_vnetgroup_name}-all --network-manager-name $avnm_name -g $rg \
     --member-type Microsoft.Network/virtualNetworks --description ${avnm_vnetgroup_name}-all \
     --conditional-membership $condition_all -o none
@@ -162,7 +167,7 @@ az network manager group create -n ${avnm_vnetgroup_name}-spokes --network-manag
     --member-type Microsoft.Network/virtualNetworks --description ${avnm_vnetgroup_name}-spokes \
     --conditional-membership $condition_spokes -o none
 
-# Optional: Test subnet group
+# Optional: Test subnet group (NOT WORKING WITH THE NEW VERSION Dec'22)
 subnet_condition="{ \"allOf\": [ {\"field\": \"name\", \"equals\": \"vm\" } ] }"
 az network manager group create -n subnetgroup --network-manager-name $avnm_name -g $rg \
     --member-type "Microsoft.Network/virtualNetworks/subnets" --description "test subnet group" \
@@ -176,16 +181,17 @@ hub_vnet_id=$(az network vnet show -n "vnet${hub_vnet_id}" -g $rg --query id -o 
 # az network manager connect-config delete --configuration-name "${avnm_config_name}-hns" -n "$avnm_name" -g "$rg" -y
 az network manager connect-config create --configuration-name "${avnm_config_name}-hns" -n "$avnm_name" -g "$rg" --description "${avnm_config_name}-hns" \
         --applies-to-groups group-connectivity="DirectlyConnected" is-global="False" network-group-id="$avnm_spokes_group_id" use-hub-gateway="False" \
-        --connectivity-topology "HubAndSpoke" --delete-existing-peering true --display-name "${avnm_config_name}-hns" --hubs resource-id="$hub_vnet_id" --is-global false
+        --connectivity-topology "HubAndSpoke" --delete-existing-peering true --display-name "${avnm_config_name}-hns" --hub resource-id="$hub_vnet_id" --is-global false -o none
 hns_config_id=$(az network manager connect-config show --configuration-name "${avnm_config_name}-hns" -n "$avnm_name" -g "$rg" --query id -o tsv)
 # az network manager connect-config delete --configuration-name "${avnm_config_name}-hns" -n "$avnm_name" -g $rg -y
 # Full mesh
 az network manager connect-config create --configuration-name "${avnm_config_name}-fullmesh" -n "$avnm_name" -g "$rg" --description "${avnm_config_name}-fullmesh" \
         --applies-to-groups group-connectivity="DirectlyConnected" is-global="False" network-group-id="$avnm_spokes_group_id" use-hub-gateway="false" \
-        --connectivity-topology "Mesh" --delete-existing-peering true --display-name "${avnm_config_name}-fullmesh" --is-global false
+        --connectivity-topology "Mesh" --delete-existing-peering true --display-name "${avnm_config_name}-fullmesh" --is-global false -o none
 mesh_config_id=$(az network manager connect-config show --configuration-name "${avnm_config_name}-fullmesh" -n "$avnm_name" -g "$rg" --query id -o tsv)
 
 # Deploy connectivity configs
+echo "Deployging mesh configuration..."
 # az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids $hns_config_id -o none
 az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "Connectivity" --target-locations $location --configuration-ids $mesh_config_id -o none
 
@@ -215,14 +221,33 @@ az network manager security-admin-config create --configuration-name "$sec_confi
 avnm_spokes_group_id=$(az network manager group show -n ${avnm_vnetgroup_name}-spokes --network-manager-name $avnm_name -g $rg --query id -o tsv)
 az network manager security-admin-config rule-collection create --configuration-name "$sec_config_name" --network-manager-name "$avnm_name" -g "$rg" -o none \
     --rule-collection-name "AllowedTraffic" --description "Allowed Traffic" --display-name "Allowed Traffic" --applies-to-groups  network-group-id="$avnm_spokes_group_id"
-# Supported actions: Allow, AlwaysAllow, Deny
+# Supported actions: Allow, AlwaysAllow, Deny. Not that not all service tags are supported ('Internet' is not)
 az network manager security-admin-config rule-collection rule create --configuration-name  $sec_config_name --network-manager-name "$avnm_name" -g "$rg" -o none \
-    --rule-collection-name "AllowedTraffic" --rule-name "DropICMP" --kind "Custom" --protocol "Icmp" --access "Deny" --priority 32 --direction "Inbound"
-
+    --rule-collection-name "AllowedTraffic" --rule-name "DropICMP" --kind "Custom" --protocol "Icmp" --access "Deny" --priority 32 --direction "Inbound" \
+    --destinations address-prefix="*" address-prefix-type="IPPrefix" --sources address-prefix="10.0.0.0/8" address-prefix-type="IPPrefix" --sources address-prefix="192.168.0.0/16" address-prefix-type="IPPrefix"
 # Deploy security configs
 # SecurityAdmin supported (SecurityUser not yet)
+echo "Deploying security config..."
 sec_config_id=$(az network manager security-admin-config show --configuration-name "${sec_config_name}" -n "$avnm_name" -g "$rg" --query id -o tsv)
 az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "SecurityAdmin" --target-locations $location --configuration-ids $sec_config_id -o none
+
+# Optional: new security configurations
+no_of_configs=10
+avnm_spokes_group_id=$(az network manager group show -n ${avnm_vnetgroup_name}-spokes --network-manager-name $avnm_name -g $rg --query id -o tsv)
+for i in {1..$no_of_configs}; do
+    sec_config_name="${avnm_config_name}-port$i"
+    echo "Creating $sec_config_name..."
+    az network manager security-admin-config create --configuration-name "$sec_config_name" --network-manager-name "$avnm_name" -g "$rg" --description "Test $i" --delete-existing-ns-gs false -o none
+    az network manager security-admin-config rule-collection create --configuration-name "$sec_config_name" --network-manager-name "$avnm_name" -g "$rg" -o none \
+        --rule-collection-name "AllowedTraffic" --description "Allowed Traffic" --display-name "Allowed Traffic" --applies-to-groups  network-group-id="$avnm_spokes_group_id"
+    az network manager security-admin-config rule-collection rule create --configuration-name  $sec_config_name --network-manager-name "$avnm_name" -g "$rg" -o none \
+        --rule-collection-name "AllowedTraffic" --rule-name "Rule$i" --kind "Custom" --protocol "Tcp" --dest-port-ranges $i --access "Deny" --priority $i --direction "Inbound" \
+        --destinations address-prefix="*" address-prefix-type="IPPrefix" --sources address-prefix="10.0.0.0/8" address-prefix-type="IPPrefix" --sources address-prefix="192.168.0.0/16" address-prefix-type="IPPrefix"
+    echo "Deploying security config $sec_config_name..."
+    sec_config_id=$(az network manager security-admin-config show --configuration-name "${sec_config_name}" -n "$avnm_name" -g "$rg" --query id -o tsv)
+    az network manager post-commit --network-manager-name $avnm_name -g $rg --commit-type "SecurityAdmin" --target-locations $location --configuration-ids $sec_config_id -o none
+done
+
 
 # Optional: testing subnet groups
 sec_config_name="${avnm_config_name}-allowTelnet"
@@ -242,9 +267,11 @@ az network manager list -g $rg -o table
 az network vnet list -g $rg -o table
 az network vnet list -g $rg --query '[].{Name:name,Prefix:addressSpace.addressPrefixes[0]}' -o table
 az network manager group list --network-manager-name ${avnm_name} -g $rg -o table
+### Not working
 az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-all" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
 az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-hub" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
 az network manager group list-effect-vnet --network-group-name "${avnm_vnetgroup_name}-spokes" -n $avnm_name -g $rg --query 'value[].{Id:id, MembershipType:membershipType}' -o table
+###
 az network manager connect-config list --network-manager-name $avnm_name -g $rg -o table
 az network manager security-admin-config list --network-manager-name $avnm_name -g $rg -o table
 az network manager security-admin-config rule-collection list --configuration-name $sec_config_name --network-manager-name $avnm_name -g $rg -o table
