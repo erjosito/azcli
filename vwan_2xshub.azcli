@@ -22,19 +22,18 @@ no_of_hubs=2         # 1 or 2 hubs
 no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
-indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
+indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
 nva_bgp=yes          # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
-nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
-nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub2=yes      # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
 deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
-
 
 # Generic variables
 rg=vwan2hubs
