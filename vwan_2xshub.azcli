@@ -686,9 +686,9 @@ EOF
     wait_until_finished $nva_id
     # Diagnostics
     echo "Getting IP addresses for the NVA instances in the hub..."
-    nva_pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
+    nva_pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $nva_pip1
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip1" "ip a"
-    nva_pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
+    nva_pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $nva_pip2
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip2" "ip a"
 }
 
