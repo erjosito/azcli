@@ -389,6 +389,10 @@ echo "Point your browser to http://${afd_fqdn} or https://${afd_fqdn}"
 # Query AzMonitor logs #
 ########################
 
+# Resources in the log analytics WS
+query='AzureDiagnostics 
+| distinct Resource '
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
 # AzFW Log Categories
 query='AzureDiagnostics 
 | where ResourceType == "AZUREFIREWALLS" 
@@ -415,6 +419,10 @@ query_afd='AzureDiagnostics
 | where TimeGenerated >= ago(10m) 
 | where Category == "FrontdoorAccessLog" 
 | project TimeGenerated, clientIp_s, httpMethod_s, requestUri_s'
+query_afd='AzureDiagnostics 
+| where TimeGenerated >= ago(10m) 
+| where Category == "FrontDoorHealthProbeLog" 
+| project TimeGenerated, POP_s, httpVerb_s, probeURL_s, httpStatusCode_s'
 query_afd='AzureDiagnostics 
 | where TimeGenerated >= ago(10m) 
 | distinct Category ' 
