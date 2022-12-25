@@ -13,7 +13,7 @@ vnet_name=azfw
 vnet_prefix=192.168.0.0/16
 vm_name=testvmlinux
 vm_pip_name=testvmlinux-pip
-nva_size=Standard_B2ms   # A bit of a larger VM is required for the AFD probes
+vm_sku=Standard_B2ms   # A bit of a larger VM is required for the AFD probes
 vm_subnet_name=vm
 vm_subnet_prefix=192.168.1.0/24
 vm_cloudinit_filename=/tmp/cloudinit-whoami.txt
@@ -326,7 +326,7 @@ test_vm_pip_name="${test_vm_name}-pip"
 test_vm_nsg_name="${test_vm_name}-nsg"
 test_vm_sku=Standard_B1s
 az vm create -n $test_vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $test_vm_sku \
-   --vnet-name $vnet_name --subnet $test_subnet_name --nsg $test_vm_nsg_name --public-ip-address $test_vm_pip_name
+   --vnet-name $vnet_name --subnet $test_subnet_name --nsg $test_vm_nsg_name --public-ip-address $test_vm_pip_name -o none
 test_vm_pip_ip=$(az network public-ip show -g $rg -n $test_vm_pip_name --query ipAddress -o tsv) && echo $test_vm_pip_ip
 # Windows
 win_user=$(whoami)
@@ -508,19 +508,64 @@ az network firewall application-rule list -c AllowAll -f $azfw_name -g $rg --que
 az network front-door backend-pool backend list --pool-name $backend_pool_name -f $afd_name -g $rg -o table
 az network front-door probe list -f $afd_name -g $rg -o table
 
-# App Gateway
-az network application-gateway list -g $appgw_rg -o table
-az network application-gateway http-listener list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway frontend-ip list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway probe list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway address-pool list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway rule show -g $appgw_rg --gateway-name $appgw_name -n rule1
-az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name -o table
-rule=$(az network application-gateway rule list -g $appgw_rg --gateway-name $appgw_name --query '[0].name' -o tsv)
-az network application-gateway rule show -g $appgw_rg --gateway-name $appgw_name -n $rule
-az network application-gateway url-path-map list -g $appgw_rg --gateway-name $appgw_name -o table
-az network application-gateway http-settings list -g $appgw_rg --gateway-name $appgw_name -o table
+##################
+#   Start/Stop   #
+##################
+
+function stop_firewall() {
+    echo "Stoping Azure Firewall ${azfw_name}..."
+    az network firewall ip-config delete -f $azfw_name -n azfw-ipconfig -g $rg -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+function start_firewall() {
+    echo "Starting Azure Firewall ${azfw_name}..."
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+function stop_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        echo "Deallocating Virtual Machine ${vm_name}..."
+        az vm deallocate -g $rg -n "$vm_name" --no-wait -o none
+    done <<< "$vm_list"
+}
+function start_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        echo "Starting Virtual Machine ${vm_name}..."
+        az vm start -g $rg -n "$vm_name" --no-wait -o none
+    done <<< "$vm_list"
+}
+function start_lab() {
+    start_vms
+    start_firewall
+}
+function stop_lab() {
+    stop_vms
+    stop_firewall
+}
+
+# Updates the SSH key for a single VM, specified in the first argument
+function update_ssh_key() {
+    vm_name=$1
+    user=$(whoami)
+    echo "Updating SSH key for VM $vm_name and user $user..."
+    az vm user update -g $rg -u $user -n $vm_name --ssh-key-value "$(< ~/.ssh/id_rsa.pub)" -o none
+}
+
+# Updates the SSH keys of all VMs in this lab
+function update_all_ssh_keys() {
+    vm_list=$(az vm list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r vm_name; do
+        update_ssh_key $vm_name
+    done <<< "$vm_list"
+}
+
+#################
+#  DANGER ZONE  #
+#               #
+#    Cleanup    #
+#################
 
 # Delete VM
 vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
