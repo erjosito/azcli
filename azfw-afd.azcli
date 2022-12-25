@@ -319,9 +319,11 @@ az network firewall policy intrusion-detection add --policy-name $azfw_policy_na
 #   or to test the AppGW effective routes
 test_subnet_name=testvm
 test_subnet_prefix=192.168.2.0/24
-az network vnet subnet create -g $rg -n $test_subnet_name --vnet-name $vnet_name --address-prefix $test_subnet_prefix
+echo "Creating subnet..."
+az network vnet subnet create -g $rg -n $test_subnet_name --vnet-name $vnet_name --address-prefix $test_subnet_prefix -o none
 # Linux
 test_vm_name=clientlinux
+echo "Creating VM $test_vm_name..."
 test_vm_pip_name="${test_vm_name}-pip"
 test_vm_nsg_name="${test_vm_name}-nsg"
 test_vm_sku=Standard_B1s
