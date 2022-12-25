@@ -34,7 +34,7 @@ az group create -n $rg -l $location -o none
 az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $azfw_subnet_name --subnet-prefixes $azfw_subnet_prefix -o none
 az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix -o none
 
-# Create Log Analytics workspace
+# Create Log Analytics workspace if none existed yet
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
 if [[ -z "$logws_name" ]]
 then
@@ -137,7 +137,7 @@ az network firewall policy create -n "$azfw_policy_name" -g $rg --sku Premium --
 
 # Deploy AzFW Premium
 az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location -o none
-azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
+azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv) && echo $azfw_pip_address
 azfw_policy_id=$(az network firewall policy show -n $azfw_policy_name -g $rg --query id -o tsv)
 
 # Go to the portal!
@@ -348,7 +348,7 @@ az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $
 az afd profile create --profile-name "${afd_name}-profile" -g $rg --sku Premium_AzureFrontDoor -o none
 az afd endpoint create --profile-name "${afd_name}-profile" -g $rg --endpoint-name "${afd_name}-ep" --enabled-state Enabled -o none
 az afd origin-group create --profile-name "${afd_name}-profile" -g $rg --origin-group-name "${afd_name}-og" \
-    --probe-request-type GET --probe-protocol Http --probe-interval-in-seconds 60 --probe-path '/healthcheck.html' \
+    --probe-request-type GET --probe-protocol Http --probe-interval-in-seconds 60 --probe-path '/api/healthcheck' \
     --sample-size 4 --successful-samples-required 3 --additional-latency-in-milliseconds 50 -o none
 # Add origin
 az afd origin create --profile-name "${afd_name}-profile" -g $rg --origin-group-name "${afd_name}-og" --origin-name "${location}-azfw" --host-name $azfw_pip_address \
@@ -484,6 +484,23 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva_pip_ip "sudo tcpdump -n
 # Restablish normal traffic flow
 az network vnet subnet update --name $azfw_subnet_name --route-table '' --vnet-name $vnet_name --resource-group $rg
 az network route-table route update --route-table-name $appgw_rt_name -g $rg --address-prefix $vm_subnet_prefix --name "ToVMSubnet"  --next-hop-type VirtualAppliance --next-hop-ip-address "$azfw_private_ip"
+
+# If asymmetric traffic, calculate % of successful requests
+success=0
+failed=0
+total=0
+while :
+do
+  return_code=$(curl -s -w "%{http_code}\n" -o /dev/null --connect-timeout 1 -H "Host:test-vm.cloudtrooper.net" "http://$azfw_pip_address:8080/api/healthcheck")
+  total=$((total+1))
+  if [[ "$return_code" == "200" ]]; then
+    success=$((success+1))
+  else
+    failed=$((failed+1))
+  fi
+  percentage=$((100*success/total))
+  echo "${total} attemts, success rate ${percentage}%"
+done
 
 ###############
 # Diagnostics #
