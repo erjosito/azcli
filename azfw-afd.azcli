@@ -524,8 +524,9 @@ az network firewall application-rule list -c AllowAll -f $azfw_name -g $rg --que
 # No yet supported with CLI (https://docs.microsoft.com/en-us/azure/firewall/snat-private-range)
 
 # AFD
-az network front-door backend-pool backend list --pool-name $backend_pool_name -f $afd_name -g $rg -o table
-az network front-door probe list -f $afd_name -g $rg -o table
+az afd origin-group list --profile-name "${afd_name}-profile" -g $rg -o table
+az afd origin list --profile-name "${afd_name}-profile" -g $rg --origin-group-name "${afd_name}-og" -o table
+az afd custom-domain list -g $rg --profile-name "${afd_name}-profile" -o table
 
 ##################
 #   Start/Stop   #
