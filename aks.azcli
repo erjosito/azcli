@@ -337,6 +337,7 @@ az aks nodepool list --cluster-name $aks_name -g $rg -o table
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=1
 kubectl create deployment yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
+# kubectl run yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --env="SQL_SERVER_FQDN=${sql_server_fqdn}" --env="SQL_SERVER_USERNAME=${sql_username}" --env="SQL_SERVER_PASSWORD=${sql_password}"
 
 # Service with kubectl
 kubectl expose deploy yadaapi --port=80 --target-port=8080

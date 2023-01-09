@@ -88,7 +88,7 @@ curl -s ${vm_pip_ip}:8080/api/printenv
 # Create private link endpoint for SQL Server
 sql_endpoint_name=sqlep
 sql_server_id=$(az sql server show -n $sql_server_name -g $rg -o tsv --query id)
-az network vnet subnet update -n $subnet_sql_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
+# az network vnet subnet update -n $subnet_sql_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
 az network private-endpoint create -n $sql_endpoint_name -g $rg --vnet-name $vnet_name --subnet $subnet_sql_name --private-connection-resource-id $sql_server_id --group-id sqlServer --connection-name sqlConnection
 sql_nic_id=$(az network private-endpoint show -n $sql_endpoint_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
 sql_endpoint_ip=$(az network nic show --ids $sql_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
