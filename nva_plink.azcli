@@ -1,0 +1,142 @@
+###################################
+# Created to integrate a pair of
+#   NVAs via private link and UDR
+#
+# Jose Moreno, Dec 2022
+###################################
+
+
+# Variables
+rg=nvaprivatelink
+location=eastus
+vm_size=Standard_B1s
+nva_size=Standard_B1s
+client_vnet_name=client
+client_vnet_prefix=10.13.76.0/24
+client_subnet_name=client
+client_subnet_prefix=10.13.76.0/26
+ple_subnet_name=ple
+ple_subnet_prefix=10.13.76.64/26
+server_vnet_name=server
+server_vnet_prefix=10.13.77.0/24
+server_subnet_name=server
+server_subnet_prefix=10.13.77.0/26
+nva_vnet_name=nva
+nva_vnet_prefix=10.13.78.0/24
+nva_subnet_name=nva
+nva_subnet_prefix=10.13.78.0/26
+pls_subnet_name=pls
+pls_subnet_prefix=10.13.78.64/26
+server_cloudinit_filename=/tmp/cloudinit-server.txt
+nva_cloudinit_filename=/tmp/cloudinit-nva.txt
+
+# Start
+az group create -n $rg -l $location -o none
+az network vnet create -n $client_vnet_name --address-prefixes $client_vnet_prefix -g $rg -l $location -o none
+az network vnet subnet create -g $rg -n $client_subnet_name --vnet-name $client_vnet_name --address-prefix $client_subnet_prefix -o none
+az network vnet subnet create -g $rg -n $ple_subnet_name --vnet-name $client_vnet_name --address-prefix $ple_subnet_prefix -o none
+az network vnet create -n $server_vnet_name --address-prefixes $server_vnet_prefix -g $rg -l $location -o none
+az network vnet subnet create -g $rg -n $server_subnet_name --vnet-name $server_vnet_name --address-prefix $server_subnet_prefix -o none
+az network vnet create -n $nva_vnet_name --address-prefixes $nva_vnet_prefix -g $rg -l $location -o none
+az network vnet subnet create -g $rg -n $nva_subnet_name --vnet-name $nva_vnet_name --address-prefix $nva_subnet_prefix -o none
+az network vnet subnet create -g $rg -n $pls_subnet_name --vnet-name $nva_vnet_name --address-prefix $pls_subnet_prefix -o none
+az network vnet subnet update -n $pls_subnet_name --vnet-name $nva_vnet_name -g $rg --disable-private-link-service-network-policies true -o none
+az network vnet peering create -n "${server_vnet_name}to${nva_vnet_name}" -g $rg --vnet-name $server_vnet_name --remote-vnet $nva_vnet_name \
+     --allow-forwarded-traffic --allow-vnet-access -o none
+az network vnet peering create -n "${nva_vnet_name}to${server_vnet_name}" -g $rg --vnet-name $nva_vnet_name --remote-vnet $server_vnet_name \
+     --allow-forwarded-traffic --allow-vnet-access -o none
+
+# Create VMs
+echo "Creating client VM..."
+az vm create -n client -g $rg --vnet-name $client_vnet_name --subnet $client_subnet_name --public-ip-address client-pip --generate-ssh-keys \
+    --image ubuntuLTS --size $vm_size -o none --nsg client-nsg --public-ip-sku Standard -o none
+cat <<EOF > $server_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update && apt install -y python3-pip nginx
+  - pip3 install flask
+  - wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
+  - python3 /root/myip.py &
+EOF
+echo "Creating server VM..."
+az vm create -n server -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_size \
+   --vnet-name $server_vnet_name --subnet $server_subnet_name --nsg server-nsg --public-ip-address server-pip \
+   --custom-data $server_cloudinit_filename -o none
+server_private_ip=$(az vm show -g $rg -n server -d --query privateIps -o tsv) && echo $server_private_ip
+
+# Create NVAs
+cat <<EOF > $nva_cloudinit_file
+#cloud-config
+runcmd:
+  - apt update && apt install -y bird strongswan
+  - sysctl -w net.ipv4.ip_forward=1
+  - sysctl -w net.ipv4.conf.all.accept_redirects=0 
+  - sysctl -w net.ipv4.conf.all.send_redirects=0
+EOF
+# NSG for onprem NVA
+echo "Creating NSG nva-nsg..."
+az network nsg create -n nva-nsg -g $rg -l $location -o none
+az network nsg rule create -n SSHin --nsg-name nva-nsg -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+az network nsg rule create -n WebRFC1918in --nsg-name nva-nsg -g $rg --priority 1010 --destination-port-ranges 8080 --access Allow --protocol Tcp -o none
+az network nsg rule create -n ICMP --nsg-name nva-nsg -g $rg --priority 1020 --destination-port-ranges '*' --access Allow --protocol Icmp -o none
+echo "Creating VM nva01..."
+az vm create -n nva01 -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address nva01_pip --public-ip-sku Standard --vnet-name $nva_vnet_name --size $nva_size --subnet $nva_subnet_name \
+    --custom-data $nva_cloudinit_file nva-nsg -o none
+nva01_nic_id=$(az vm show -n nva01 -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $nva01_nic_id --ip-forwarding -o none
+echo "Creating VM nva02..."
+az vm create -n nva02 -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    --public-ip-address nva02_pip --public-ip-sku Standard --vnet-name $nva_vnet_name --size $nva_size --subnet $nva_subnet_name \
+    --custom-data $nva_cloudinit_file nva-nsg -o none
+nva02_nic_id=$(az vm show -n nva02 -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic update --ids $nva02_nic_id --ip-forwarding -o none
+
+# Create NVA LB and private link service
+echo "Creating LB..."
+az network lb create -g $rg -n nvalb --sku Standard --vnet-name $nva_vnet_name \
+   --frontend-ip-name frontend --subnet $nva_subnet_name --backend-pool-name nva -o none
+az network lb probe create -g $rg --lb-name nvalb -n port22 --protocol tcp --port 22 -o none
+az network lb rule create -n HAports -g $rg --lb-name nvalb --protocol All --frontend-port 0 --backend-port 0 \
+   --frontend-ip-name frontend --backend-pool-name nva --probe-name port22 -o none
+nvalb_backend_id=$(az network lb address-pool show -n nva --lb-name nvalb -g $rg --query id -o tsv)
+nvalb_lb_ip=$(az network lb frontend-ip show -n frontend --lb-name nvalb -g $rg --query privateIpAddress -o tsv) && echo "$nvalb_lb_ip"
+az network private-link-service create -n nvapls -g $rg --vnet-name $nva_vnet_name --subnet $pls_subnet_name \
+    --lb-name nvalb --lb-frontend-ip-configs frontend -o none
+pls_id=$(az network private-link-service show -n nvapls -g $rg --query id -o tsv)
+nva01_ipconfig_name=$(az network nic show --ids $nva01_nic_id --query 'ipConfigurations[0].name' -o tsv)
+nva01_nic_name=$(echo $nva01_nic_id | cut -d/ -f 9)
+az network nic ip-config address-pool add --nic-name $nva01_nic_name -g $rg --ip-config-name $nva01_ipconfig_name --lb-name nvalb --address-pool nva -o none
+nva02_ipconfig_name=$(az network nic show --ids $nva02_nic_id --query 'ipConfigurations[0].name' -o tsv)
+nva02_nic_name=$(echo $nva02_nic_id | cut -d/ -f 9)
+az network nic ip-config address-pool add --nic-name $nva02_nic_name -g $rg --ip-config-name $nva02_ipconfig_name --lb-name nvalb --address-pool nva -o none
+
+# Create private link endpoint in client vnet
+az network private-endpoint create -n nvape -g $rg --vnet-name $client_vnet_name --subnet $ple_subnet_name \
+    --private-connection-resource-id $pls_id --connection-name toNVApls --manual-request false -o none
+ple_nic_id=$(az network private-endpoint show -n nvape -g $rg --query 'networkInterfaces[0].id' -o tsv)
+ple_ip=$(az network nic show --ids $ple_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+
+# Route traffic from client to server over Private Endpoint
+echo "Creating route table..."
+az network route-table create -n clientrt -g $rg -l $location -o none
+az network route-table route create -g $rg --route-table-name clientrt -n default \
+   --next-hop-type VirtualAppliance --address-prefix $server_vnet_prefix --next-hop-ip-address $ple_ip -o none
+az network vnet subnet update -n $client_subnet_name --vnet-name $client_vnet_name -g $rg --route-table clientrt -o none
+
+# Test
+client_pip=$(az network public-ip show -n client-pip -g $rg --query ipAddress -o tsv)
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $client_pip "nc -vz $server_private_ip 22"
+
+###############
+# Diagnostics #
+###############
+
+# Effective routes
+client_nic_id=$(az vm show -n client -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $client_nic_id -o table
+
+# LB
+az network lb address-pool address list -g $rg --lb-name nvalb --pool-name nva -o table
+az network nic show --ids $nva01_nic_id --query 'ipConfigurations[0].loadBalancerBackendAddressPools[0].id' -o tsv
+az network nic show --ids $nva02_nic_id --query 'ipConfigurations[0].loadBalancerBackendAddressPools[0].id' -o tsv
