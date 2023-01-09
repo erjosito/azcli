@@ -122,8 +122,8 @@ az group create -n $rg -l $location
 acr_rg=$(az acr list -o tsv --query "[?name=='$acr_name'].resourceGroup")
 acr_id=$(az acr show -n erjositoAcr -g $acr_rg --query id -o tsv)
 az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location
-az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix
-az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix
+az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix -o none
+az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix -o none
 aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 

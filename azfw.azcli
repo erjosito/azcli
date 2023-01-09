@@ -12,9 +12,9 @@
 
 # Control
 private_link=no     # Whether deploying private endpoints in a dedicated VNet (Azure Storage)
-classic_rules=yes   # Whether using classic rules or firewall policies
-create_spokes=yes   # Whether creating spoke VNets
-s2s_vpn=yes         # Whether creating a S2S VPN to onprem
+classic_rules=no    # Whether using classic rules or firewall policies
+create_spokes=no    # Whether creating spoke VNets
+s2s_vpn=no          # Whether creating a S2S VPN to onprem
 conn_monitor=no     # Whether creating connection monitors between the VMs
 
 # Variables
@@ -48,7 +48,7 @@ az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --su
 az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix -o none
 
 # Deploy Linux and Windows VMs
-az vm create -n $vm_linux_name -g $rg --image ubuntuLTS --size $vm_size --generate-ssh-keys --public-ip-address $vm_linux_pip_name --vnet-name $vnet_name --subnet $vm_subnet_name --no-wait -o none
+# az vm create -n $vm_linux_name -g $rg --image ubuntuLTS --size $vm_size --generate-ssh-keys --public-ip-address $vm_linux_pip_name --vnet-name $vnet_name --subnet $vm_subnet_name --no-wait -o none
 # az vm create -n $vm_win_name -g $rg --image win2016datacenter --admin-username $vm_win_username --admin-password $vm_win_password --public-ip-address $vm_win_pip_name --vnet-name $vnet_name --subnet $vm_subnet_name --no-wait
 # az vm list-ip-addresses -g $rg -o table
 

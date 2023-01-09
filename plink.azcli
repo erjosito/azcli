@@ -3,12 +3,12 @@ rg=plinklab
 location=westeurope
 az group create -n $rg -l $location
 # Azure SQL
-sql_server_name=myserver$RANDOM
+sql_server_name=sql$RANDOM
 # sql_server_name=$(az sql server list -g $rg --query '[0].name' -o tsv)  # For an already existing server
 sql_db_name=mydb
 sql_username=azure
 sql_password=Microsoft123!
-az sql server create -n $sql_server_name -g $rg -l $location --admin-user $sql_username --admin-password $sql_password
+az sql server create -n $sql_server_name -g $rg -l $location --admin-user $sql_username --admin-password "$sql_password" -o none
 az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait
 # Optionally configure database as serverless SKU
 # az sql db update -g $rg -s $sql_server_name -n $sql_db_name --edition GeneralPurpose --min-capacity 1 --capacity 4 --family Gen5 --compute-model Serverless --auto-pause-delay 1440
@@ -20,9 +20,9 @@ subnet_sql_name=sql
 subnet_sql_prefix=192.168.2.0/24
 subnet_vm_name=vm
 subnet_vm_prefix=192.168.13.0/24
-az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location
-az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_sql_name --address-prefix $subnet_sql_prefix
-az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_vm_name --address-prefix $subnet_vm_prefix
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location -o none
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_sql_name --address-prefix $subnet_sql_prefix -o none
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_vm_name --address-prefix $subnet_vm_prefix -o none
 
 # Create VM
 vm_name=apivm

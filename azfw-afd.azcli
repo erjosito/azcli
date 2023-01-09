@@ -13,7 +13,7 @@ vnet_name=azfw
 vnet_prefix=192.168.0.0/16
 vm_name=testvmlinux
 vm_pip_name=testvmlinux-pip
-nva_size=Standard_B2ms   # A bit of a larger VM is required for the AFD probes
+vm_sku=Standard_B2ms   # A bit of a larger VM is required for the AFD probes
 vm_subnet_name=vm
 vm_subnet_prefix=192.168.1.0/24
 vm_cloudinit_filename=/tmp/cloudinit-whoami.txt
@@ -64,7 +64,7 @@ az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm
    --custom-data $vm_cloudinit_filename -o none
 vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv) && echo $vm_private_ip
 
-# Generate certificates
+# Generate certificates for the AzFW
 # Create openssl.cnf
 cnf_filename=/tmp/openssl.cnf
 rootCA_cert=/tmp/rootCA.crt
@@ -389,6 +389,10 @@ echo "Point your browser to http://${afd_fqdn} or https://${afd_fqdn}"
 # Query AzMonitor logs #
 ########################
 
+# AzFW Resources
+query='AzureDiagnostics 
+| distinct Resource'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
 # AzFW Log Categories
 query='AzureDiagnostics 
 | where ResourceType == "AZUREFIREWALLS" 
