@@ -82,13 +82,13 @@ az network nsg rule create -n ICMP --nsg-name nva-nsg -g $rg --priority 1020 --d
 echo "Creating VM nva01..."
 az vm create -n nva01 -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
     --public-ip-address nva01_pip --public-ip-sku Standard --vnet-name $nva_vnet_name --size $nva_size --subnet $nva_subnet_name \
-    --custom-data $nva_cloudinit_file nva-nsg -o none
+    --custom-data $nva_cloudinit_file --nsg nva-nsg -o none
 nva01_nic_id=$(az vm show -n nva01 -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 az network nic update --ids $nva01_nic_id --ip-forwarding -o none
 echo "Creating VM nva02..."
 az vm create -n nva02 -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
     --public-ip-address nva02_pip --public-ip-sku Standard --vnet-name $nva_vnet_name --size $nva_size --subnet $nva_subnet_name \
-    --custom-data $nva_cloudinit_file nva-nsg -o none
+    --custom-data $nva_cloudinit_file --nsg nva-nsg -o none
 nva02_nic_id=$(az vm show -n nva02 -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 az network nic update --ids $nva02_nic_id --ip-forwarding -o none
 
