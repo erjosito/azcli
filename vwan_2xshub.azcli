@@ -18,7 +18,7 @@
 ###############
 
 # Control
-no_of_hubs=2         # 1 or 2 hubs
+no_of_hubs=1         # 1 or 2 hubs
 no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
@@ -30,15 +30,15 @@ vnet_prop=default    # Route table to propagate from VNet connections. Can be 'd
 nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=yes      # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
-deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
+deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
 
 # Generic variables
-rg=vwan2hubs
+rg=vwan
 vwan=vwan
-location1=northeurope
+location1=westcentralus
 # location1=germanywestcentral
 location2=westcentralus
 password=Microsoft123!
@@ -86,7 +86,7 @@ er_provider=Megaport
 er_circuit_sku=Premium
 megaport_script_path="/home/jose/repos/azcli/megaport.sh"
 # hub1_er_pop=Sydney
-hub1_er_pop=Frankfurt
+hub1_er_pop=Dallas
 mcr1_asn=65001
 gr_ip_range=172.16.31.0/29
 hub1_er_circuit_name="er1-$hub1_er_pop"
@@ -101,8 +101,10 @@ gcp_asn=16550
 # gcp region 1
 # region1=australia-southeast1
 # zone1=australia-southeast1-b
-region1=europe-west3
-zone1=europe-west3-b
+# region1=europe-west3
+# zone1=europe-west3-b
+region1=us-west2
+zone1=us-west2-b
 gcp_vm1_name=vm1
 gcp_vpc1_name=vpc1
 gcp_subnet1_name=vm1
@@ -697,10 +699,10 @@ EOF
 function configure_hub_nva_bgp() {
     hub_id=$1
     hub_name="hub${hub_id}"
-    nva_name="${hub_name}nva"
+    nva_name="${hub_name}-nva"
     echo "Getting public IP addresses of NVA $nva_name..."
-    nva_pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
-    nva_pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
+    nva_pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv --only-show-errors) && echo $nva_pip1
+    nva_pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv --only-show-errors) && echo $nva_pip2
     # Get RS IPs
     echo "Finding information about Route Service in $hub_name..."
     rs_ip1=$(az network vhub show -n $hub_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
@@ -1836,7 +1838,7 @@ then
     echo "Waiting until ER circuit in hub1 is provisioned..."
     until [[ "$circuit1_state" == "Provisioned" ]]
     do
-        sleep 15
+        sleep 30
         az network express-route update -n $hub1_er_circuit_name -g $rg -o none
         circuit1_state=$(az network express-route show -n $hub1_er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit1_state"
     done
@@ -1848,12 +1850,13 @@ then
         echo "Waiting until ER circuit in hub2 is provisioned..."
         until [[ "$circuit2_state" == "Provisioned" ]]
         do
-            sleep 15
+            sleep 30
             az network express-route update -n $hub2_er_circuit_name -g $rg -o none
             circuit2_state=$(az network express-route show -n $hub2_er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState) && echo "Circuit state is $circuit2_state"
         done
     fi
     # Create connections to Virtual WAN
+    sleep 60 # Wait 1min more to the private peering to show up
     peering_id_1=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name $hub1_er_circuit_name -g $rg -o tsv --query id) && echo "Private peering ID is $peering_id_1"
     if [[ -z "$peering_id_1" ]]
     then
@@ -1923,7 +1926,7 @@ then
     $megaport_script_path -g -s=jomore-${hub1_er_pop} -a=create_vxc -k=$pairing_key1
     # Activate attachment
     # wait_for_gcp_attachment_ready $attachment1_name $region1
-    sleep 120
+    sleep 180
     gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --admin-enabled
     # gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --no-enable-admin
     if [[ "$no_of_hubs" == "2" ]]; then
@@ -2343,6 +2346,14 @@ az network vhub get-effective-routes --resource-type VpnConnection --resource-id
 # Virtual WAN BGP peerings
 az network vhub bgpconnection list --vhub-name hub1 -g $rg -o table
 az network vhub bgpconnection list --vhub-name hub2 -g $rg -o table
+# Virtual WAN NVAs (in the hub)
+az network virtual-appliance list -g $rg -o table
+nva_name=hub1_nva
+nva_pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $nva_pip1
+nva_pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $nva_pip2
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip1" "sudo birdc show prot"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip2" "sudo birdc show prot"
+
 
 # MCR
 $megaport_script_path -q -s=jomore-${hub1_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,asPath} | join("\t")'

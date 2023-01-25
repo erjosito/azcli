@@ -1,5 +1,8 @@
+#############################################
 # Created by jose.moreno@microsoft.com
+#
 # July 2020
+#############################################
 
 rg=vpntest
 location=westeurope
@@ -86,8 +89,9 @@ branch_asn=65500
 username=$(whoami)
 
 # Create CSR to simulate a branch
-az vm create -n branch-nva1 -g $rg -l $location --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys --public-ip-address branch1-pip --public-ip-address-allocation static \
-    --vnet-name branch --vnet-address-prefix $branch_prefix --subnet nva --subnet-address-prefix $branch_subnet --private-ip-address $branch1_bgp_ip --size $nva_size
+az vm create -n branch-nva1 -g $rg -l $location --size $nva_size --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys \
+    --public-ip-address branch1-pip --public-ip-address-allocation static --public-ip-sku Standard \
+    --vnet-name branch --vnet-address-prefix $branch_prefix --subnet nva --subnet-address-prefix $branch_subnet --private-ip-address $branch1_bgp_ip -o none
 branch1_ip=$(az network public-ip show -n branch1-pip -g $rg --query ipAddress -o tsv) && echo $branch1_ip
 
 # With BGP

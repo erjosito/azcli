@@ -143,7 +143,7 @@ az network firewall policy create -n "$azfw_policy_name" -g $rg --sku Premium --
 az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location -o none
 azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
 azfw_policy_id=$(az network firewall policy show -n $azfw_policy_name -g $rg --query id -o tsv)
-az network firewall create -n $azfw_name -g $rg -l $location --tier Premium --policy $azfw_policy_id  -o none # Not working yet (Feb 11 2022)...
+az network firewall create -n $azfw_name -g $rg -l $location --tier Premium --policy $azfw_policy_id -o none # Not working yet (Feb 11 2022)...
 azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id) && echo $azfw_id
 az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
