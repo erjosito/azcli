@@ -233,7 +233,7 @@ function create_spoke() {
 function create_hub_nva_branch() {
     hub_id=$1
     hub_name="hub${hub_id}"
-    nva_name="${hub_name}nva"
+    nva_name="${hub_name}-nva"
     nva_asn="6510${hub_id}"
     # Set variables depending on which hub we are connecting the branch to
     if [[ "$hub_id" == "1" ]]
@@ -323,12 +323,12 @@ EOF
     fi
     nva_default_gw=$(default_gw "$nva_private_ip11" "$nva_internal_mask") && echo "Internal gateway $nva_default_gw"
     # Private/public endpoints (A/B are the redundant hub NVAs, C is onprem)
-    endpoint_a_public=$pip1
-    endpoint_a_private=$nva_ip21
-    endpoint_b_public=$pip2
-    endpoint_b_private=$nva_ip22
-    endpoint_c_public=$onprem_linuxnva_pip_ip
-    endpoint_c_private=$onprem_linuxnva_private_ip
+    endpoint_a_public="$pip1"
+    endpoint_a_private="$nva_ip21"
+    endpoint_b_public="$pip2"
+    endpoint_b_private="$nva_ip22"
+    endpoint_c_public="$onprem_linuxnva_pip_ip"
+    endpoint_c_private="$onprem_linuxnva_private_ip"
     echo "Configuring VPN between A:${endpoint_a_public}/${endpoint_a_private} and C:${endpoint_c_public}/${endpoint_c_private}"
     echo "Configuring VPN between B:${endpoint_b_public}/${endpoint_b_private} and C:${endpoint_c_public}/${endpoint_c_private}"
     # Initial config: NVA 0
@@ -2351,9 +2351,13 @@ az network virtual-appliance list -g $rg -o table
 nva_name=hub1_nva
 nva_pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $nva_pip1
 nva_pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $nva_pip2
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip1" "sudo birdc show prot"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip2" "sudo birdc show prot"
-
+nva_pip="$nva_pip1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show prot"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show route"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show prot RS1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show route protocol RS1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show prot all RS1"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show route export RS1"
 
 # MCR
 $megaport_script_path -q -s=jomore-${hub1_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,asPath} | join("\t")'

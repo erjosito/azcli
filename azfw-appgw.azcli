@@ -35,6 +35,12 @@ appgw_backenddnsname=kuard
 appgw_backendfqdn="$backenddnsname"."$dnszone"
 appgw_rt_name=appgw
 logws_name=log$RANDOM
+win_user=$(whoami)
+win_password=Microsoft123!
+win_vm_name=testvmwin
+win_vm_sku=Standard_B2ms
+win_pip_name=testvmwin-pip
+
 
 # RG and vnet
 az group create -n $rg -l $location
@@ -145,7 +151,7 @@ azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ip
 azfw_policy_id=$(az network firewall policy show -n $azfw_policy_name -g $rg --query id -o tsv)
 az network firewall create -n $azfw_name -g $rg -l $location --tier Premium --policy $azfw_policy_id -o none # Not working yet (Feb 11 2022)...
 azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id) && echo $azfw_id
-az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+az monitor diagnostic-settings create -n mydiag$RANDOM --resource $azfw_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
     --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
             {"category": "AzureFirewallDnsProxy", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
@@ -365,7 +371,7 @@ az network application-gateway rule create -g "$rg" --gateway-name "$appgw_name"
 
 # Connect app gw to Azure Monitor
 appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
-az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace $logws_id \
+az monitor diagnostic-settings create -n "mydiag$RANDOM" --resource $appgw_id --workspace $logws_id \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
     --logs '[{"category": "ApplicationGatewayAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
         {"category": "ApplicationGatewayPerformanceLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
@@ -404,8 +410,9 @@ else
     echo "No conflicting A records found in ${public_domain}"
   fi
   # Now create new A record
-  az network dns record-set a create -g $public_dns_rg -z cloudtrooper.net -n $appgw_dns_name
-  az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $appgw_dns_name -a $appgw_pip_address
+  echo "Creating record for "$appgw_dns_name" in zone $public_domain with IP address $appgw_pip_address..."
+  az network dns record-set a create -g $public_dns_rg -z $public_domain -n $appgw_dns_name -o none
+  az network dns record-set a add-record -g $public_dns_rg -z $public_domain -n $appgw_dns_name -a $appgw_pip_address -o none
 fi
 
 # Verify access to the app over the App Gateway
@@ -547,11 +554,6 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $query_acc
 ###################
 
 # You can use this VM to connect to the linux VM over HTTPS and test certificates
-win_user=$(whoami)
-win_password=Microsoft123!
-win_vm_name=testvmwin
-win_vm_sku=Standard_B2ms
-win_pip_name=testvmwin-pip
 az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $win_user --admin-password $win_password --size $win_vm_sku \
    --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $win_pip_name
 
@@ -655,6 +657,8 @@ az network nic delete --ids $vm_nic_id
 
 # VM (server)
 az vm deallocate -n $vm_name -g $rg --no-wait -o none
+az vm deallocate -n $win_vm_name -g $rg --no-wait -o none
+
 # App GW
 az network application-gateway stop -g $rg -n $appgw_name -o none
 # Az FW
