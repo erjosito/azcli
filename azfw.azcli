@@ -80,8 +80,8 @@ if [[ "$classic_rules" == "yes" ]]; then
         --protocols Udp --destination-addresses '*' --destination-ports 123 --source-addresses '*' -n NTP -o none
 else
     azfw_policy_name="${azfw_name}-policy"
-    az network firewall policy create -n $azfw_policy_name -g $rg
-    az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000
+    az network firewall policy create -n $azfw_policy_name -g $rg -o none
+    az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
     # Allow SSH and HTTP for connection monitor (uses TCP9 too)
     echo "Creating rule to allow SSH and HTTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \

@@ -1901,6 +1901,9 @@ then
     fi
 
     # Simulate onprem with Google Cloud
+    # gcloud auth list
+    # gcloud config set account 'erjosito1138@gmail.com'
+    # gcloud config set account 'jomore@contosohotels.com'
     # Get environment info
     account=$(gcloud info --format json | jq -r '.config.account')
     billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
