@@ -9,10 +9,11 @@
 
 # Control
 create_azfw=yes
+create_adx=yes
 
 # Variables
 rg=flowlogs
-location=westeurope
+location=eastus2
 vnet_name=flowlogs
 vnet_prefix=192.168.0.0/16
 subnet0_name=vm0
@@ -24,6 +25,18 @@ cloudinit_file="/tmp/cloudinit.txt"
 vm_size=Standard_B1s
 no_of_vms=4
 flows="1;2:3;4:1433:1000,1:2:80:100,3:4:443:100"  # Syntax: src:dst:port:kb/min
+
+# AzFW variables
+azfw_subnet_prefix=192.168.10.0/24
+azfw_name=myazfw
+azfw_policy_name=myazfwpolicy
+azfw_pip_name=myazfw-pip
+
+# ADX variables
+adx_sku='Dev(No SLA)_Standard_E2a_v4'
+adx_tier='Basic'     # Not able to make it work with other values such as Developer/Basic
+adx_capacity=1
+adx_name='nwlogs$RANDOM'
 
 # Some helper functions
 
@@ -139,11 +152,6 @@ function get_public_ip () {
 
 # Azure Firewall
 if [[ "$create_azfw" == "yes" ]]; then
-    # Variables
-    azfw_subnet_prefix=192.168.10.0/24
-    azfw_name=myazfw
-    azfw_policy_name=myazfwpolicy
-    azfw_pip_name=myazfw-pip
     # Start
     az network vnet subnet create --vnet-name $vnet_name --name AzureFirewallSubnet -g $rg --address-prefixes $azfw_subnet_prefix -o none
     az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location -o none
@@ -202,7 +210,79 @@ if [[ "$create_azfw" == "yes" ]]; then
     az network route-table route create  --route-table-name subnet1 -g $rg --address-prefix $subnet0_prefix --name subnet0 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
     az network vnet subnet update --name $subnet1_name --route-table subnet1 --vnet-name $vnet_name --resource-group $rg -o none
 
+fi
 
+# Aux function to add/update extension
+function add_extension() {
+    extension_name=$1
+    extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+    if [[ -z "$extension_version" ]]
+    then
+        echo "Azure CLI extension $extension_name not found, installing now..."
+        az extension add -n $extension_name -o none
+    else
+        echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
+        az extension update -n $extension_name -o none
+    fi
+    extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+    echo "Azure CLI extension $extension_name installed with version $extension_version"
+}
+
+# Azure Data eXplorer
+if [[ "$create_adx" == "yes" ]]; then
+    # Create ADX cluster
+    add_extension kusto
+    az kusto cluster create -n $adx_name --sku "name=$adx_sku" "tier=$adx_tier" "capacity=$adx_capacity" -g $rg -l $location -o none
+    az kusto database create --cluster-name $adx_name --database-name $adx_name -g $rg --read-write-database soft-delete-period=P365D hot-cache-period=P31D location=$location -o none
+    adx_id=$(az kusto cluster show -n $adx_name -g $rg --query id -o tsv)
+    adx_principal_id=$(az kusto cluster show -n $adx_name -g $rg --query 'identity.principalId' -o tsv)
+    # Create event grid
+    add_extension eventgrid
+    storage_account_name=$(az storage account list -g $rg -o tsv --query "[?location=='$location'].name" | head -1)
+    storage_account_id=$(az storage account show -n $storage_account_name -g $rg --query id --output tsv)
+    eg_name=$storage_account_name
+    az eventgrid system-topic create -n $eg_name -g $rg -l $location --topic-type microsoft.storage.storageaccounts --source $storage_account_id -o none
+    eg_id=$(az eventgrid system-topic show -n $eg_name -g $rg --query id -o tsv)
+    az role assignment create --scope $eg_id --assignee $adx_principal_id --role 'EventGrid EventSubscription Reader' -o none
+    az role assignment create --scope $storage_account_id --assignee $adx_principal_id --role 'Storage Blob Data Contributor' -o none
+    az kusto data-connection event-grid create --cluster-name $adx_name -n $eg_name --database-name $adx_name -l $location \
+         --event-grid-resource-id $eg_id --blob-storage-event-type 'Microsoft.Storage.BlobCreated' --storage-account-resource-id $storage_account_id \
+         --data-format JSON --ignore-first-record --table-name flowlogs --managed-identity-resource-id $adx_id -g $rg -o none
+    # Create Event Hubs namespace
+    eh_name=$(az eventhubs namespace list -g $rg --query '[0].name' -o tsv)
+    eh_ns_name=$eh_name
+    if [[ -z "$eh_ns_name" ]]; then
+        eh_name=nwlogs$RANDOM
+        eh_ns_name=$eh_name
+        echo "Creating Event Hub ${eh_name}..."
+        az eventhubs namespace create -n $eh_ns_name -g $rg -l $location --sku Standard -o none
+        az eventhubs eventhub create -n $eh_name -g $rg --namespace-name $eh_ns_name -o none
+    else
+        echo "Events Hub $eh_name found in RG $rg"
+    fi
+    eh_ns_cx_string=$(az eventhubs namespace authorization-rule keys list -g $rg --namespace-name $eh_ns_name --name RootManageSharedAccessKey --query primaryConnectionString -o tsv)
+    eh_ns_id=$(az eventhubs namespace show -g $rg -n $eh_ns_name --query id -o tsv)
+    eh_id=$(az eventhubs eventhub show --namespace-name $eh_ns_name -g $rg -n $eh_name --query id -o tsv)
+    az role assignment create --scope $eh_ns_id --assignee $adx_principal_id --role 'Azure Event Hubs Data Receiver' -o none
+    # az kusto data-connection event-hub data-connection-validation --cluster-name $adx_name -n $eh_name --database-name $adx_name -l $location \
+    #      --consumer-group '$Default' --event-hub-resource-id $eh_id --managed-identity-resource-id $adx_id -g $rg -o none
+    az kusto data-connection event-hub create --cluster-name $adx_name -n $eh_name --database-name $adx_name -l $location \
+         --consumer-group '$Default' --event-hub-resource-id $eh_id --managed-identity-resource-id $adx_id -g $rg -o none
+    # Add diag setting to AzFW to send logs to this Event hub
+    if [[ "$create_azfw" == "yes" ]]; then
+        azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+        az monitor diagnostic-settings create -n $eh_name --resource $azfw_id --event-hub $eh_ns_id --event-hub-rule RootManageSharedAccessKey \
+            --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+            --logs '[{"category": "AZFWNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "AZFWApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+                    {"category": "AZFWNatRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "AZFWThreatIntel", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "AZFWIdpsSignature", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "AZFWDnsQuery", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "AZFWFqdnResolveFailure", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "AZFWFatFlow", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "AZFWFlowTrace", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+    fi
 fi
 
 # Start traffic generation
@@ -258,23 +338,55 @@ do
     ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "nc -vz $dst_ip $port"
 done
 
+# ADX
+az kusto cluster list -g $rg -o table
+az kusto data-connection list --cluster-name $adx_name --database-name $adx_name -g $rg -o table
+az eventgrid system-topic list -g $rg -o table
+
 ##############
 # Stop/Start #
 ##############
 
 function stop_firewall() {
+    azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
+    azfw_ipconfig_name=$(az network firewall show -n $azfw_name -g $rg --query 'ipConfigurations[0].name' -o tsv)
     echo "Stoping Azure Firewall ${azfw_name}..."
     az network firewall ip-config delete -f $azfw_name -n azfw-ipconfig -g $rg -o none
     az network firewall update -n $azfw_name -g $rg -o none
 }
 function start_firewall() {
-    echo "Starting Azure Firewall ${azfw_name}..."
-    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
-    az network firewall update -n $azfw_name -g $rg -o none
+    azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
+    if [[ -z "$azfw_name"]]; then
+        echo "Starting Azure Firewall ${azfw_name}..."
+        azfw_ipconfig_name="${azfw_name}-ipconfig"
+        az network firewall ip-config create -f $azfw_name -n $azfw_ipconfig_name -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+        az network firewall update -n $azfw_name -g $rg -o none
+    else
+        echo "No Azure Firewall found in RG $rg"
+    fi
+}
+function stop_adx() {
+    adx_name=$(az kusto cluster list -g $rg --query '[0].name' -o tsv)
+    if [[ -z "$adx_name"]]; then
+        echo "Stopping ADX cluster $adx_name..."
+        az kusto cluster stop -n $adx_name -g $rg -o none
+    else
+        echo "No ADX cluster found in RG $rg"
+    fi
+}
+function start_adx() {
+    adx_name=$(az kusto cluster list -g $rg --query '[0].name' -o tsv)
+    if [[ -z "$adx_name"]]; then
+        echo "Starting ADX cluster $adx_name..."
+        az kusto cluster start -n $adx_name -g $rg -o none
+    else
+        echo "No ADX cluster found in RG $rg"
+    fi
 }
 function stop_lab() {
     stop_vms
     stop_firewall
+    stop_adx
 }
 function stop_vms() {
     vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
