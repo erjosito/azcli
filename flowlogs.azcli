@@ -245,9 +245,13 @@ if [[ "$create_adx" == "yes" ]]; then
     eg_id=$(az eventgrid system-topic show -n $eg_name -g $rg --query id -o tsv)
     az role assignment create --scope $eg_id --assignee $adx_principal_id --role 'EventGrid EventSubscription Reader' -o none
     az role assignment create --scope $storage_account_id --assignee $adx_principal_id --role 'Storage Blob Data Contributor' -o none
+    kql_query='.create table TestTable (TimeStamp: datetime, Value: string, Source:string)'
+    az kusto script create --cluster-name $adx_name -g $rg --database-name $adx_name --continue-on-errors true -n createTable --script-content "$kql_query" -o none
+    kql_query=".create table TestTable ingestion json mapping 'TestMapping' '[{\"column\":\"Records\",\"path\":\"$.records\"},{\"column\":\"Value\",\"path\":\"$.Value\"},{\"column\":\"Source\",\"path\":\"$.Source\"}]'"
+    az kusto script create --cluster-name $adx_name -g $rg --database-name $adx_name --continue-on-errors true -n createTable --script-content "$kql_query" -o none
     az kusto data-connection event-grid create --cluster-name $adx_name -n $eg_name --database-name $adx_name -l $location \
          --event-grid-resource-id $eg_id --blob-storage-event-type 'Microsoft.Storage.BlobCreated' --storage-account-resource-id $storage_account_id \
-         --data-format JSON --ignore-first-record --table-name flowlogs --managed-identity-resource-id $adx_id -g $rg -o none
+         --data-format JSON --table-name flowlogs --managed-identity-resource-id $adx_id -g $rg -o none
     # Create Event Hubs namespace
     eh_name=$(az eventhubs namespace list -g $rg --query '[0].name' -o tsv)
     eh_ns_name=$eh_name
