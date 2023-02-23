@@ -408,7 +408,12 @@ function start_vms() {
 }
 function start_lab() {
     start_vms
-    start_firewall
+    if [[ "$create_azfw" == "yes" ]]; then
+        start_firewall
+    fi
+    if [[ "$create_adx" == "yes" ]]; then
+        start_adx
+    fi
 }
 
 ###########
