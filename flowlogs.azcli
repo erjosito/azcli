@@ -10,6 +10,7 @@
 # Control
 create_azfw=yes
 create_adx=yes
+create_elk=yes
 
 # Variables
 rg=flowlogs
@@ -37,6 +38,13 @@ adx_sku='Dev(No SLA)_Standard_E2a_v4'
 adx_tier='Basic'     # Not able to make it work with other values such as Developer/Basic
 adx_capacity=1
 adx_name='nwlogs$RANDOM'
+
+# ElasticStack variables
+elk_subnet_prefix=192.168.20.0/24
+elk_subnet_name=elastic
+elk_vm_name=elk
+elk_vm_size=Standard_B2ms
+elk_cloudinit_file=/tmp/elk_cloudinit.txt
 
 # Some helper functions
 
@@ -84,6 +92,22 @@ function configure_flowlogs () {
         echo "Configuring Flow Logs for NSG $nsg_name into storage account $storage_account_name..."
         az network watcher flow-log create -l $nsg_location -n "${nsg_name}-${nsg_location}" -g $rg --nsg $nsg_name --storage-account $storage_account_name --log-version 2 --retention 1 -o none
     done <<< "$nsg_list"
+}
+
+# Set some variables getting the content from AKV
+function get_secrets() {
+    # Variables
+    akv_name=erjositoKeyvault
+    default_password_secret=defaultPassword
+    # Get secrets
+    akv_rg_found=$(az keyvault list -o tsv --query "[?name=='$akv_name'].resourceGroup" 2>/dev/null)
+    if [[ -n ${akv_rg_found} ]]
+    then
+        echo "INFO: AKV ${akv_name} found in resource group $akv_rg_found"
+        default_password=$(az keyvault secret show --vault-name $akv_name -n $default_password_secret --query 'value' -o tsv 2>/dev/null)
+    else
+        echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
+    fi
 }
 
 # Create RG, Vnet, NSG
@@ -228,7 +252,8 @@ function add_extension() {
     echo "Azure CLI extension $extension_name installed with version $extension_version"
 }
 
-# Azure Data eXplorer
+# Azure Data eXplorer (optional)
+# WORK IN PROGRESS!!!!
 if [[ "$create_adx" == "yes" ]]; then
     # Create ADX cluster
     add_extension kusto
@@ -287,6 +312,145 @@ if [[ "$create_adx" == "yes" ]]; then
                     {"category": "AZFWFatFlow", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
                     {"category": "AZFWFlowTrace", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
     fi
+fi
+
+# Optional: create ElasticStack VM
+# WORK IN PROGRESS!!!!
+if [[ "$create_elk" == "yes" ]]; then
+    # Create Subnet
+    echo "Creating subnet $elk_subnet_name ($elk_subnet_prefix)..."
+    az network vnet subnet create --vnet-name $vnet_name --name $elk_subnet_name -g $rg --address-prefixes $elk_subnet_prefix -o none
+    # Create NSGs
+    echo "Creating NSGs..."
+    az network nsg create -n "${elk_vm_name}-nsg" -g $rg -o none
+    az network nsg rule create -n SSH --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+    az network nsg rule create -n Kibana --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 5601 --access Allow --protocol Tcp -o none
+    az network nsg rule create -n ElasticSearch --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 9200 --access Allow --protocol Tcp -o none
+    az network nsg rule create -n ICMP --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1030 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp -o none
+    # Create Elastic Search VM
+    echo "Creating cloudinit file for Elastic Search..."
+    cat <<EOF > $elk_cloudinit_file
+#cloud-config
+packages:
+- jq
+- apt-transport-https
+runcmd:
+- wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | apt-key add -
+- echo "deb https://artifacts.elastic.co/packages/8.x/apt stable main" | tee /etc/apt/sources.list.d/elastic-8.x.list
+- apt update && apt install -y elasticsearch kibana logstash
+- apt install -y filebeat metricbeat
+- systemctl enable elasticsearch
+- systemctl enable kibana
+- systemctl start elasticsearch
+- systemctl start kibana
+EOF
+    echo "Creating Elastic Stack VM..."
+    az vm create -n $elk_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${elk_vm_name}-nsg" -o none \
+        --custom-data $elk_cloudinit_file --public-ip-sku Standard --public-ip-address "${elk_vm_name}-pip" \
+        --vnet-name $vnet_name --size $elk_vm_size --subnet $elk_subnet_name -l $location --no-wait
+    # Make sure to reset the elastic user's password with elasticsearch-setup-password or elasticsearch-reset-password !!!!
+    echo "You will be prompted now to reset the Elastic and Kibana passwords. Please enter the value of the defaultPassword variable/secret (see above in the script):"
+    elk_pip=$(az network public-ip show -n "${elk_vm_name}-pip" -g $rg --query ipAddress -o tsv)
+    ssh $elk_pip "sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -i"
+    ssh $elk_pip "sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana -i"
+    # Verify Elastic Search VM
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "systemctl status elasticsearch"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "systemctl status kibana"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u elastic:${default_password} https://localhost:9200"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u kibana_system:${default_password} https://localhost:9200/_xpack/security/_authenticate?pretty"  # Not working!
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u elastic:${default_password} https://localhost:9200/_cluster/health"
+    # Configure ElasticSearch and Kibana
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/network.host/c\network.host: 0.0.0.0' /etc/elasticsearch/elasticsearch.yml"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart elasticsearch"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/server.host/c\server.host: \"0.0.0.0\"' /etc/kibana/kibana.yml"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/server.name/c\server.name: \"elastictest\"' /etc/kibana/kibana.yml"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.username/c\elasticsearch.username: \"kibana\"' /etc/kibana/kibana.yml"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.password/c\elasticsearch.password: \"$default_password\"' /etc/kibana/kibana.yml"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.hosts/c\elasticsearch.hosts: [\"https://localhost:9200\"]' /etc/kibana/kibana.yml"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.ssl.verificationMode/c\elasticsearch.ssl.verificationMode: none' /etc/kibana/kibana.yml"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart kibana"
+    # Install logstash plugin
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo /usr/share/logstash/bin/logstash-plugin install logstash-input-azure_blob_storage"  # Errors out
+    # Configure logstash
+    storage_account_name=$(az storage account list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the storage account name if it already existed
+    storage_account_key=$(az storage account keys list -n $storage_account_name --query '[0].value' -o tsv)
+    cat <<EOF > /tmp/logstash.conf
+input {
+   azure_blob_storage {
+        storageaccount => "$storage_account_name"
+        access_key => "$storage_account_key"
+        container => "insights-logs-networksecuritygroupflowevent"
+        codec => "json"
+        # Refer https://learn.microsoft.com/azure/network-watcher/network-watcher-read-nsg-flow-logs
+        # Typical numbers could be 21/9 or 12/2 depends on the nsg log file types
+        file_head => '{"records":['
+        file_tail => ']}'
+        # Enable / tweak these settings when event is too big for codec to handle.
+        # break_json_down_policy => "with_head_tail"
+        # break_json_batch_count => 2
+    }
+}
+filter {
+    split { field => "[records]" }
+    split { field => "[records][properties][flows]"}
+    split { field => "[records][properties][flows][flows]"}
+    split { field => "[records][properties][flows][flows][flowTuples]"}
+    mutate {
+        split => { "[records][resourceId]" => "/"}
+        add_field => {"Subscription" => "%{[records][resourceId][2]}"
+                        "ResourceGroup" => "%{[records][resourceId][4]}"
+                        "NetworkSecurityGroup" => "%{[records][resourceId][8]}"}
+        convert => {"Subscription" => "string"}
+        convert => {"ResourceGroup" => "string"}
+        convert => {"NetworkSecurityGroup" => "string"}
+        split => { "[records][properties][flows][flows][flowTuples]" => ","}
+        add_field => {
+                    "unixtimestamp" => "%{[records][properties][flows][flows][flowTuples][0]}"
+                    "srcIp" => "%{[records][properties][flows][flows][flowTuples][1]}"
+                    "destIp" => "%{[records][properties][flows][flows][flowTuples][2]}"
+                    "srcPort" => "%{[records][properties][flows][flows][flowTuples][3]}"
+                    "destPort" => "%{[records][properties][flows][flows][flowTuples][4]}"
+                    "protocol" => "%{[records][properties][flows][flows][flowTuples][5]}"
+                    "trafficflow" => "%{[records][properties][flows][flows][flowTuples][6]}"
+                    "traffic" => "%{[records][properties][flows][flows][flowTuples][7]}"
+                    "flowstate" => "%{[records][properties][flows][flows][flowTuples][8]}"
+                        "packetsSourceToDest" => "%{[records][properties][flows][flows][flowTuples][9]}"
+                        "bytesSentSourceToDest" => "%{[records][properties][flows][flows][flowTuples][10]}"
+                        "packetsDestToSource" => "%{[records][properties][flows][flows][flowTuples][11]}"
+                        "bytesSentDestToSource" => "%{[records][properties][flows][flows][flowTuples][12]}"
+                        }
+        convert => {"unixtimestamp" => "integer"}
+        convert => {"srcPort" => "integer"}
+        convert => {"destPort" => "integer"}        
+    }
+    date {
+        match => ["unixtimestamp" , "UNIX"]
+    }
+}
+output {
+    stdout { codec => rubydebug }
+    elasticsearch {
+        hosts => ["https://localhost:9200"]
+        index => "nsg-flow-logs"
+        ssl => true 
+        ssl_certificate_verification => false 
+        user => "elastic" 
+        password => "$default_password"
+    }
+}  
+EOF
+    user=$(whoami)
+    scp /tmp/logstash.conf $elk_pip:/home/$user/logstash.conf
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo mv /home/${user}/logstash.conf /etc/logstash/conf.d/logstash.conf"
+    # Start logstash
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl start logstash"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl enable logstash"
+    # Import object API (to use with .ndjson files, not exactly json)
+    curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" --form file=@/tmp/visualization.ndjson "http://${elk_pip}:5601/api/saved_objects/_import"
+    # Export object API (here an example for data views aka index-patterns)
+    curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" -H 'Content-Type: application/json' "http://${elk_pip}:5601/api/saved_objects/_export" -d '{"type": "index-pattern"}'
+    # URLs
+    echo "Browse to http://$elk_pip:5601 for Kibana (the username is 'elastic')"
 fi
 
 # Start traffic generation
@@ -360,7 +524,7 @@ function stop_firewall() {
 }
 function start_firewall() {
     azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
-    if [[ -z "$azfw_name"]]; then
+    if [[ -n "$azfw_name" ]]; then
         echo "Starting Azure Firewall ${azfw_name}..."
         azfw_ipconfig_name="${azfw_name}-ipconfig"
         az network firewall ip-config create -f $azfw_name -n $azfw_ipconfig_name -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
@@ -371,7 +535,7 @@ function start_firewall() {
 }
 function stop_adx() {
     adx_name=$(az kusto cluster list -g $rg --query '[0].name' -o tsv)
-    if [[ -z "$adx_name"]]; then
+    if [[ -n "$adx_name" ]]; then
         echo "Stopping ADX cluster $adx_name..."
         az kusto cluster stop -n $adx_name -g $rg -o none
     else
@@ -380,7 +544,7 @@ function stop_adx() {
 }
 function start_adx() {
     adx_name=$(az kusto cluster list -g $rg --query '[0].name' -o tsv)
-    if [[ -z "$adx_name"]]; then
+    if [[ -n "$adx_name" ]]; then
         echo "Starting ADX cluster $adx_name..."
         az kusto cluster start -n $adx_name -g $rg -o none
     else

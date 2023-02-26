@@ -25,15 +25,14 @@ akv_name=erjositoKeyvault
 default_password_secret=defaultPassword
 
 # Get secrets
-# akv_rg_found=$(az keyvault list -o tsv --query "[?name=='$akv_name'].resourceGroup" 2>/dev/null)
-# if [[ -n ${akv_rg_found} ]]
-# then
-#     echo "INFO: AKV ${akv_name} found in resource group $akv_rg_found"
-#     default_password=$(az keyvault secret show --vault-name $akv_name -n $default_password_secret --query 'value' -o tsv 2>/dev/null)
-# else
-#     echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
-# fi
-default_password=Microsoft123!
+akv_rg_found=$(az keyvault list -o tsv --query "[?name=='$akv_name'].resourceGroup" 2>/dev/null)
+if [[ -n ${akv_rg_found} ]]
+then
+    echo "INFO: AKV ${akv_name} found in resource group $akv_rg_found"
+    default_password=$(az keyvault secret show --vault-name $akv_name -n $default_password_secret --query 'value' -o tsv 2>/dev/null)
+else
+    echo "ERROR: secrets could not be read because Azure Key Vault ${akv_name} could not be found"
+fi
 
 # Create RG and VNets
 echo "Creating RG and VNet..."
