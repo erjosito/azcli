@@ -446,9 +446,9 @@ EOF
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl start logstash"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl enable logstash"
     # Import object API (to use with .ndjson files, not exactly json)
-    curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" --form file=@/tmp/visualization.ndjson "http://${elk_pip}:5601/api/saved_objects/_import"
+    # curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" --form file=@/tmp/visualization.ndjson "http://${elk_pip}:5601/api/saved_objects/_import"
     # Export object API (here an example for data views aka index-patterns)
-    curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" -H 'Content-Type: application/json' "http://${elk_pip}:5601/api/saved_objects/_export" -d '{"type": "index-pattern"}'
+    # curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" -H 'Content-Type: application/json' "http://${elk_pip}:5601/api/saved_objects/_export" -d '{"type": "index-pattern"}'
     # URLs
     echo "Browse to http://$elk_pip:5601 for Kibana (the username is 'elastic')"
 fi
