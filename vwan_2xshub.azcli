@@ -94,8 +94,8 @@ hub2_er_pop=Dallas
 hub2_er_circuit_name="er2-$hub2_er_pop"
 mcr2_asn=65002
 # gcloud variables to simulate onprem via ER
-project_name=onprem
-project_id="${project_name}${RANDOM}"
+project_name=cci-sandbox-jomore
+project_id=cci-sandbox-jomore
 machine_type=e2-micro
 gcp_asn=16550
 # gcp region 1
@@ -1903,16 +1903,17 @@ then
     # Simulate onprem with Google Cloud
     # gcloud auth list
     # gcloud config set account 'erjosito1138@gmail.com'
-    # gcloud config set account 'jomore@contosohotels.com'
-    # Get environment info
-    account=$(gcloud info --format json | jq -r '.config.account')
-    billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
-    billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
-    # Create project
-    gcloud projects create $project_id --name $project_name
+    gcloud config set account 'jomore@contosohotels.com'
     gcloud config set project $project_id
-    gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
-    gcloud services enable compute.googleapis.com
+    # Get environment info
+    # account=$(gcloud info --format json | jq -r '.config.account')
+    # billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
+    # billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
+    # Create project
+    # gcloud projects create $project_id --name $project_name
+    # gcloud config set project $project_id
+    # gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
+    # gcloud services enable compute.googleapis.com
     # VPC and instance
     gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
     gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1

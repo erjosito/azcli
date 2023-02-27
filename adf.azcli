@@ -1,0 +1,186 @@
+###################################
+# Sample code to work with ADF
+#   networking config
+#
+# Feb 2023
+###################################
+
+
+# Variables
+rg=adf
+location=eastus
+suffix=$RANDOM
+adf_name="adf$suffix"
+storage_account1_name="storage1$suffix"
+storage_account1_cxfile="/tmp/storage1.json"
+storage_account1_link_name=$storage_account1_name
+storage_account2_name="storage1$suffix"
+storage_account2_link_name=$storage_account2_name
+storage_container_name=mycontainer
+file1_name=/tmp/file1.txt
+blob_name=helloworld.txt
+input_dataset_file=/tmp/inputdataset.json
+output_dataset_file=/tmp/outputdataset.json
+pipeline_file=/tmp/pipeline.json
+pipeline_name=BlobCopy
+output_file_name=/tmp/outputfile.txt
+managed_ir_file=/tmp/managedir.json
+managed_ir_name=managedir
+
+# Create RG
+az group create -n $rg -l $location -o none
+
+# Create storage account
+az storage account create -n $storage_account1_name -g $rg -l $location -o none
+az storage container create -n $storage_container_name --account-name $storage_account1_name --auth-mode key -o none
+storage_account1_key=$(az storage account keys list -n $storage_account1_name --query '[0].value' -o tsv)
+echo 'HelloWorld' > $file1_name
+az storage blob upload --account-name $storage_account1_name --name input/$blob_name --container-name $storage_container_name --file $file1_name --auth-mode key --account-key $storage_account1_key --overwrite -o none
+
+# Create ADF
+az datafactory create --factory-name $adf_name -g $rg -o none
+storage_account1_cx=$(az storage account show-connection-string -g $rg -n $storage_account1_name --key key1 -o tsv)
+cat <<EOF > $storage_account1_cxfile
+{
+    "type": "AzureBlobStorage",
+    "typeProperties": {
+        "connectionString": "$storage_account1_cx"
+    }
+}
+EOF
+az datafactory linked-service create -g $rg --factory-name $adf_name --linked-service-name $storage_account1_link_name --properties @$storage_account1_cxfile -o none
+
+# Input dataset
+cat <<EOF > $input_dataset_file
+{
+    "linkedServiceName": {
+        "referenceName": "$storage_account1_link_name",
+        "type": "LinkedServiceReference"
+    },
+    "annotations": [],
+    "type": "Binary",
+    "typeProperties": {
+        "location": {
+            "type": "AzureBlobStorageLocation",
+            "fileName": "$blob_name",
+            "folderPath": "input",
+            "container": "$storage_container_name"
+        }
+    }
+}
+EOF
+az datafactory dataset create -g $rg --dataset-name InputDataset --factory-name $adf_name --properties @$input_dataset_file -o none
+
+# Output dataset
+cat <<EOF > $output_dataset_file
+{
+    "linkedServiceName": {
+        "referenceName": "$storage_account1_link_name",
+        "type": "LinkedServiceReference"
+    },
+    "annotations": [],
+    "type": "Binary",
+    "typeProperties": {
+        "location": {
+            "type": "AzureBlobStorageLocation",
+            "folderPath": "output",
+            "container": "$storage_container_name"
+        }
+    }
+}
+EOF
+az datafactory dataset create -g $rg --dataset-name OutputDataset --factory-name $adf_name --properties @$output_dataset_file -o none
+
+# Pipeline
+cat <<EOF > $pipeline_file
+{
+    "name": "Adfv2QuickStartPipeline",
+    "properties": {
+        "activities": [
+            {
+                "name": "CopyFromBlobToBlob",
+                "type": "Copy",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "7.00:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "BinarySource",
+                        "storeSettings": {
+                            "type": "AzureBlobStorageReadSettings",
+                            "recursive": true
+                        }
+                    },
+                    "sink": {
+                        "type": "BinarySink",
+                        "storeSettings": {
+                            "type": "AzureBlobStorageWriteSettings"
+                        }
+                    },
+                    "enableStaging": false
+                },
+                "inputs": [
+                    {
+                        "referenceName": "InputDataset",
+                        "type": "DatasetReference"
+                    }
+                ],
+                "outputs": [
+                    {
+                        "referenceName": "OutputDataset",
+                        "type": "DatasetReference"
+                    }
+                ]
+            }
+        ],
+        "annotations": []
+    }
+}
+EOF
+az datafactory pipeline create -g $rg --factory-name $adf_name --name $pipeline_name --pipeline @$pipeline_file -o none
+
+# Integration runtime
+cat <<EOF > $managed_ir_file
+{
+    "type": "Managed",
+    "typeProperties": {
+        "computeProperties": {
+            "location": "$location",
+            "dataFlowProperties": {
+                "computeType": "General",
+                "coreCount": 8,
+                "timeToLive": 10
+            }
+        }
+    },
+    "managedVirtualNetwork": {
+        "type": "ManagedVirtualNetworkReference",
+        "referenceName": "default"
+    }
+}
+EOF
+
+az datafactory integration-runtime managed create -g $rg --factory-name $adf_name --name $managed_ir_name --compute-properties @$managed_ir_file -o none
+
+# Run pipeline
+run_id=$(az datafactory pipeline create-run -g $rg --factory-name $adf_name --name $pipeline_name --query runId -o tsv)
+az datafactory pipeline-run show -g $rg --factory-name $adf_name --run-id $run_id
+# az storage blob show --account-name $storage_account1_name --account-key $storage_account1_key --container-name $storage_container_name --name output/$blob_name
+az storage blob download --account-name $storage_account1_name --account-key $storage_account1_key --container-name $storage_container_name --name output/$blob_name
+
+###############
+# Diagnostics #
+###############
+
+az datafactory list -g $rg -o table
+az datafactory dataset list -g $rg --factory-name $adf_name -o table
+az datafactory pipeline list -g $rg --factory-name $adf_name -o table
+az datafactory integration-runtime list -g $rg --factory-name $adf_name -o table
+az datafactory integration-runtime show -n $managed_ir_name -g $rg --factory-name $adf_name
+az storage blog list --account-name $storage_account1_name --account-key $storage_account1_key --container-name $storage_container_name -o table

@@ -39,12 +39,27 @@ query="Resources | where type=~'microsoft.containerservice/managedclusters' | pr
 | where enableDdosProtection == 'false'"
 
 # Network
-query="where type=='microsoft.network/virtualnetworkgateways' | where not (tolower(properties.sku.name) contains 'az') | distinct name,resourceGroup"
 query="where type=='microsoft.network/routetables' | where properties.disableBgpRoutePropagation==true | distinct name,resourceGroup"
 query="where type=='microsoft.network/virtualnetworkgateways' | where tolower(properties.gatewayType) == 'vpn' | project  name,resourceGroup,ipcount=array_length(properties.ipConfigurations) | where ipcount==1"
 query="where type=='microsoft.network/networksecuritygroups'"
 query="resources | where type == 'microsoft.network/virtualnetworks' | extend addressSpace = todynamic(properties.addressSpace) | extend addressPrefix = todynamic(properties.addressSpace.addressPrefixes) | mvexpand addressSpace | mvexpand addressPrefix | project name, id, location, resourceGroup, subscriptionId, cidr = addressPrefix | extend compliant = (cidr matches regex @'^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')  | project id, compliant, cidr"
 query="resources | where type == 'microsoft.network/virtualnetworks' | mvexpand properties.virtualNetworkPeerings | project id, peeringName=properties_virtualNetworkPeerings.name, compliant = (properties_virtualNetworkPeerings.properties.allowVirtualNetworkAccess == True)"
+# - AZ-redundant VNGs
+query="resources | where type=='microsoft.network/virtualnetworkgateways' | where properties.gatewayType == 'Vpn' | extend compliant = (not (tolower(properties.sku.name) contains 'az')) | distinct id, compliant"
+# - Check "disable gateway propagation for RTs attached to GatewaySubnet"
+query="Resources | where type=='microsoft.network/virtualnetworks' 
+| project id,resourceGroup,name,subnets=properties.subnets 
+| mv-expand subnets
+| project id,resourceGroup,name,subnetName=tostring(subnets.name),routeTableId=tostring(subnets.properties.routeTable.id)
+| where subnetName == 'GatewaySubnet'
+| join (Resources | where type == 'microsoft.network/routetables' 
+| project routeTableName=name,routeTableId=id, disableBgpRoutePropagation=properties.disableBgpRoutePropagation
+) on routeTableId
+| project id,compliant = (disableBgpRoutePropagation == False)"
+
+# To Do
+# deny-any in NSGs
+query="where type=='microsoft.network/networksecuritygroups' | mvexpand properties.securityRules | project id,name,ruleAction=securityRules.action,rulePriority=securityRules.priority"
 
 # See available types
 query="distinct type"

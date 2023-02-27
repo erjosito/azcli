@@ -5,9 +5,9 @@
 #################################
 
 # Control
-location=germanywestcentral
-er_location=germanywestcentral
-er_pop=Frankfurt
+location=southcentralus
+er_location=southcentralus
+er_pop=Dallas
 er_circuit_sku=Standard
 create_spokes=no
 number_of_spokes=2
@@ -41,8 +41,8 @@ vm_size=Standard_B1s
 mcr_asn=65001
 megaport_script_path="/home/jose/repos/azcli/megaport.sh"
 # gcloud (to simulate onprem ER)
-project_name=onprem
-project_id="${project_name}${RANDOM}"
+project_name=cci-sandbox-jomore
+project_id=cci-sandbox-jomore
 machine_type=e2-micro
 gcp_asn=16550
 region=us-east1  # other values: europe-west3, australia-southeast1, us-east1

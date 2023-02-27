@@ -59,6 +59,11 @@ do
                mcr_asn="${i#*=}"
                shift # past argument=value
                ;;
+          # Only version 2 is working (default)
+          --mcr-version=*)
+               mcr_version="${i#*=}"
+               shift # past argument=value
+               ;;
           -g|--google-cloud)
                gcp=yes
                shift # past argument=value
@@ -135,15 +140,22 @@ function create_mcr () {
     mcr_status=$(echo "$product_json" | jq -r '.[].provisioningStatus')
     if [[ -z "$mcr_id" ]]
     then
-        log_msg "INFO: Creating MCR $mcr_name in Megaport location '$location_id' and ASN '$mcr_asn'..."
+        if [[ "$mcr_version" == 1 ]]; then
+            mcr_product=MCR1
+        else
+            mcr_product=MCR2
+        fi
+        log_msg "INFO: Creating $mcr_product $mcr_name in Megaport location '$location_id' and ASN '$mcr_asn'..."
         # Sending call to create MCR
-        buy_url="${base_url}/v2/networkdesign/buy" 
-        buy_payload_template='[{locationId: $locationId, productName: $productName, productType: "MCR2", portSpeed: 1000, config: { mcrAsn: $mcrAsn } } ]'
+        buy_url="${base_url}/v2/networkdesign/buy"
+        buy_payload_template='[{locationId: $locationId, productName: $productName, productType: $mcrProduct, portSpeed: 1000, config: { mcrAsn: $mcrAsn } } ]'
         buy_payload=$(jq -n \
             --arg locationId "$location_id" \
             --arg productName "$mcr_name" \
             --arg mcrAsn "$mcr_asn" \
+            --arg mcrProduct "$mcr_product" \
             "$buy_payload_template")
+        # log_msg "Sending payload to REST API: $buy_payload..."
         buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
         if [[ "$quiet" == "no" ]]; then
             echo "$buy_response" | jq
@@ -385,7 +397,7 @@ case $action in
         mcr_id=$(list_products "LIVE" | jq -r '.[].productUid')
         log_msg "INFO: MCR ID $mcr_id"
         if [[ "$gcp" == "yes" ]]; then
-            log_msg "INFO: Getting GUIDs for ExpressRoute ports..."
+            log_msg "INFO: Getting GUIDs for Google Partner Interconnect ports..."
             validation_json=$(validate_gcp_key "$service_key")
             port_id=$(echo "$validation_json" | jq -r '.ports[0] | .productUid')
             log_msg "INFO: Port ID found: $port_id"
