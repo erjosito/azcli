@@ -183,4 +183,8 @@ az datafactory dataset list -g $rg --factory-name $adf_name -o table
 az datafactory pipeline list -g $rg --factory-name $adf_name -o table
 az datafactory integration-runtime list -g $rg --factory-name $adf_name -o table
 az datafactory integration-runtime show -n $managed_ir_name -g $rg --factory-name $adf_name
+az datafactory managed-virtual-network list -g $rg --factory-name $adf_name -o table
+managed_vnet_name=$(az datafactory managed-virtual-network list -g $rg --factory-name $adf_name --query '[0].name' -o tsv)
+az datafactory managed-private-endpoint list -g $rg --factory-name $adf_name --managed-virtual-network-name $managed_vnet_name -o table
+az datafactory managed-private-endpoint show -g $rg --factory-name $adf_name --managed-virtual-network-name $managed_vnet_name -n AzureFunction544
 az storage blog list --account-name $storage_account1_name --account-key $storage_account1_key --container-name $storage_container_name -o table
