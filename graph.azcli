@@ -59,8 +59,7 @@ query="Resources | where type=='microsoft.network/virtualnetworks'
 
 # To Do
 # deny-any in NSGs
-query="where type=='microsoft.network/networksecuritygroups' | mvexpand properties.securityRules | project id,name,ruleAction=securityRules.action,rulePriority=securityRules.priority"
-
+ query="where type=='microsoft.network/networksecuritygroups' | mvexpand properties.securityRules | project id,name,ruleAction=properties_securityRules.properties.access,rulePriority=properties_securityRules.properties.priority,ruleDst=properties_securityRules.properties.destinationAddressPrefix,ruleSrc=properties_securityRules.properties.sourceAddressPrefix,ruleProt=properties_securityRules.properties.protocol,ruleDirection=properties_securityRules.properties.direction,rulePort=properties_securityRules.properties.destinationPortRange | summarize Denies=countif(ruleAction=='Deny') by name,tostring(ruleDirection)"
 # See available types
 query="distinct type"
 
