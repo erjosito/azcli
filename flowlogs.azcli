@@ -370,10 +370,12 @@ EOF
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/elasticsearch.ssl.verificationMode/c\elasticsearch.ssl.verificationMode: none' /etc/kibana/kibana.yml"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart kibana"
     # Install logstash plugin
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo /usr/share/logstash/bin/logstash-plugin install logstash-input-azure_blob_storage"  # Errors out
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo /usr/share/logstash/bin/logstash-plugin install logstash-input-azureblob"  # Errors out!
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo /usr/share/logstash/bin/logstash-plugin install logstash-input-azure_blob_storage"
     # Configure logstash
     storage_account_name=$(az storage account list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the storage account name if it already existed
     storage_account_key=$(az storage account keys list -n $storage_account_name --query '[0].value' -o tsv)
+    # From https://learn.microsoft.com/en-us/azure/network-watcher/network-watcher-visualize-nsg-flow-logs-open-source-tools
     cat <<EOF > /tmp/logstash.conf
 input {
    azure_blob_storage {
@@ -381,10 +383,10 @@ input {
         access_key => "$storage_account_key"
         container => "insights-logs-networksecuritygroupflowevent"
         codec => "json"
-        # Refer https://learn.microsoft.com/azure/network-watcher/network-watcher-read-nsg-flow-logs
-        # Typical numbers could be 21/9 or 12/2 depends on the nsg log file types
         file_head => '{"records":['
         file_tail => ']}'
+        interval => 300
+        path_filters => ['**/*.json']
         # Enable / tweak these settings when event is too big for codec to handle.
         # break_json_down_policy => "with_head_tail"
         # break_json_batch_count => 2
@@ -392,46 +394,82 @@ input {
 }
 filter {
     split { field => "[records]" }
-    split { field => "[records][properties][flows]"}
-    split { field => "[records][properties][flows][flows]"}
-    split { field => "[records][properties][flows][flows][flowTuples]"}
+    split { field => "[records][properties][flows]" }
+    split { field => "[records][properties][flows][flows]" }
+    split { field => "[records][properties][flows][flows][flowTuples]" }
     mutate {
         split => { "[records][resourceId]" => "/"}
-        add_field => {"Subscription" => "%{[records][resourceId][2]}"
-                        "ResourceGroup" => "%{[records][resourceId][4]}"
-                        "NetworkSecurityGroup" => "%{[records][resourceId][8]}"}
+        add_field => {
+            "Subscription" => "%{[records][resourceId][2]}"
+            "ResourceGroup" => "%{[records][resourceId][4]}"
+            "NetworkSecurityGroup" => "%{[records][resourceId][8]}"
+        }
         convert => {"Subscription" => "string"}
         convert => {"ResourceGroup" => "string"}
         convert => {"NetworkSecurityGroup" => "string"}
         split => { "[records][properties][flows][flows][flowTuples]" => ","}
         add_field => {
-                    "unixtimestamp" => "%{[records][properties][flows][flows][flowTuples][0]}"
-                    "srcIp" => "%{[records][properties][flows][flows][flowTuples][1]}"
-                    "destIp" => "%{[records][properties][flows][flows][flowTuples][2]}"
-                    "srcPort" => "%{[records][properties][flows][flows][flowTuples][3]}"
-                    "destPort" => "%{[records][properties][flows][flows][flowTuples][4]}"
-                    "protocol" => "%{[records][properties][flows][flows][flowTuples][5]}"
-                    "trafficflow" => "%{[records][properties][flows][flows][flowTuples][6]}"
-                    "traffic" => "%{[records][properties][flows][flows][flowTuples][7]}"
-                    "flowstate" => "%{[records][properties][flows][flows][flowTuples][8]}"
-                        "packetsSourceToDest" => "%{[records][properties][flows][flows][flowTuples][9]}"
-                        "bytesSentSourceToDest" => "%{[records][properties][flows][flows][flowTuples][10]}"
-                        "packetsDestToSource" => "%{[records][properties][flows][flows][flowTuples][11]}"
-                        "bytesSentDestToSource" => "%{[records][properties][flows][flows][flowTuples][12]}"
-                        }
+            "unixtimestamp" => "%{[records][properties][flows][flows][flowTuples][0]}"
+            "srcIp" => "%{[records][properties][flows][flows][flowTuples][1]}"
+            "destIp" => "%{[records][properties][flows][flows][flowTuples][2]}"
+            "srcPort" => "%{[records][properties][flows][flows][flowTuples][3]}"
+            "destPort" => "%{[records][properties][flows][flows][flowTuples][4]}"
+            "protocol" => "%{[records][properties][flows][flows][flowTuples][5]}"
+            "trafficflow" => "%{[records][properties][flows][flows][flowTuples][6]}"
+            "traffic" => "%{[records][properties][flows][flows][flowTuples][7]}"
+            "flowstate" => "%{[records][properties][flows][flows][flowTuples][8]}"
+            "packetsSourceToDest" => "%{[records][properties][flows][flows][flowTuples][9]}"
+            "bytesSentSourceToDest" => "%{[records][properties][flows][flows][flowTuples][10]}"
+            "packetsDestToSource" => "%{[records][properties][flows][flows][flowTuples][11]}"
+            "bytesSentDestToSource" => "%{[records][properties][flows][flows][flowTuples][12]}"
+        }
         convert => {"unixtimestamp" => "integer"}
         convert => {"srcPort" => "integer"}
-        convert => {"destPort" => "integer"}        
+        convert => {"destPort" => "integer"}
+        convert => {"packetsSourceToDest" => "integer"}
+        convert => {"bytesSourceToDest" => "integer"}
+        convert => {"packetsDestToSource" => "integer"}
+        convert => {"bytesSentDestToSource" => "integer"}
     }
     date {
         match => ["unixtimestamp" , "UNIX"]
     }
 }
 output {
+    elasticsearch {
+        hosts => ["https://localhost:9200"]
+        index => "nsg-flow-logs-%{+xxxx.ww}"
+        ssl => true 
+        ssl_certificate_verification => false 
+        user => "elastic" 
+        password => "$default_password"
+    }
+}  
+EOF
+    # From https://github.com/janmg/logstash-input-azure_blob_storage
+    cat <<EOF > /tmp/logstash.conf
+input {
+    azure_blob_storage {
+        codec => "json"
+        storageaccount => "$storage_account_name"
+        access_key => "$storage_account_key"
+        container => "insights-logs-networksecuritygroupflowevent"
+        logtype => "nsgflowlog"
+        prefix => "resourceId=/"
+        path_filters => ['**/*.json']
+        addfilename => true
+        registry_create_policy => "resume"
+        registry_local_path => "/usr/share/logstash/plugin"
+        interval => 300
+        debug_timer => true
+        debug_until => 100
+    }
+}
+output {
     stdout { codec => rubydebug }
     elasticsearch {
         hosts => ["https://localhost:9200"]
-        index => "nsg-flow-logs"
+        index => "nsg-flow-logs-%{+xxxx.ww}"
         ssl => true 
         ssl_certificate_verification => false 
         user => "elastic" 
@@ -443,6 +481,7 @@ EOF
     scp /tmp/logstash.conf $elk_pip:/home/$user/logstash.conf
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo mv /home/${user}/logstash.conf /etc/logstash/conf.d/logstash.conf"
     # Start logstash
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart logstash"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl start logstash"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl enable logstash"
     # Import object API (to use with .ndjson files, not exactly json)
