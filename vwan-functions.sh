@@ -2022,6 +2022,7 @@ function effective_routes_nic {
 function effective_routes_rt {
     hub_name=$1
     rt_name=$2
+    subscription_id=$(az account show -o tsv --query id)
     rt_id="/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/$hub_name/hubRouteTables/$rt_name"
     uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
     body="{\"resourceId\": \"$rt_id\", \"virtualWanResourceType\": \"RouteTable\"}"

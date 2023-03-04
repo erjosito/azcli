@@ -35,10 +35,10 @@ deploy_er=no         # Whether ER should be provided (note you need an account w
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
+routing_intent=yes   # Whether RI is configured
+ri_policy=both       # internet/private/both
 location1=westcentralus
-# location1=germanywestcentral
 location2=eastus
-wait_interval=15
 
 # Generic variables
 rg=vwan
@@ -49,6 +49,7 @@ vwan_hub2_prefix=192.168.2.0/23
 username=$(whoami)
 vm_size=Standard_B1s
 nva_size=Standard_B2ms
+wait_interval=15
 # Branches
 publisher=cisco
 offer=cisco-csr-1000v
@@ -124,8 +125,9 @@ attachment2_name=attachment2
 router2_name=router2
 # REST URLs and JSON templates
 vwan_api_version=2022-07-01
-rtintent_json='{ properties: { routingPolicies = [ $routing_policies ] } }'
+rtintent_json='{ properties: { routingPolicies: [ $routing_policies ] } }'
 rtintent_policy_json='{name: $policy_name, destinations: [ $policy_destination ], nextHop: $policy_nexthop}'
+subscription_id=$(az account show -o tsv --query id)
 
 #############
 # Functions #
@@ -139,28 +141,29 @@ rtintent_policy_json='{name: $policy_name, destinations: [ $policy_destination ]
 function put_routing_intent() {
     # Get AzFW ID
     hub_id=$1
-    az network firewall show -n azfw${hub_id} -g $rg --query id -o tsv
+    azfw_id=$(az network vhub show -n hub${hub_id} -g $rg --query 'azureFirewall.id' -o tsv)
     # Construct JSON for policies (Internet/Private)
     rtintent_policy_internet_json_string=$(jq -n \
         --arg policy_name "InternetTraffic" \
         --arg policy_destination "Internet" \
-        --arg policy_nexthop "$azfwid" \
+        --arg policy_nexthop "$azfw_id" \
         "$rtintent_policy_json")
     rtintent_policy_private_json_string=$(jq -n \
         --arg policy_name "PrivateTrafficPolicy" \
         --arg policy_destination "PrivateTraffic" \
-        --arg policy_nexthop "$azfwid" \
+        --arg policy_nexthop "$azfw_id" \
         "$rtintent_policy_json")
     # Construct JSON for routing intent (depending on parameter)
-    if [[ "$2" == 'internet' ]]; then
+    policy=$2
+    if [[ "$policy" == 'internet' ]]; then
         rtintent_json_string=$(jq -n \
             --arg routing_policies "${rtintent_policy_internet_json_string}" \
             "$rtintent_json")
-    elif [[ "$2" == 'private' ]]; then
+    elif [[ "$policy" == 'private' ]]; then
         rtintent_json_string=$(jq -n \
             --arg routing_policies "${rtintent_policy_private_json_string}" \
             "$rtintent_json")
-    elif [[ "$2" == 'both' ]]; then
+    elif [[ "$policy" == 'both' ]]; then
         rtintent_json_string=$(jq -n \
             --arg routing_policies "${rtintent_policy_internet_json_string},${rtintent_policy_private_json_string}" \
             "$rtintent_json")
@@ -168,14 +171,92 @@ function put_routing_intent() {
         echo "Routing intent policy $2 not recognized, only 'internet', 'private' or 'both' supported"
         return
     fi
+    # Remove escapes from string (jq substitution doesnt work for objects)
+    rtintent_json_string=$(echo "$rtintent_json_string" | sed "s@\\\\@@g")
+    rtintent_json_string=$(echo "${rtintent_json_string}" | sed "s@\"{@{@g")
+    rtintent_json_string=$(echo "${rtintent_json_string}" | sed "s@}\"@}@g")
     # Send REST
     subscription_id=$(az account show --query id -o tsv)
     hub_name="hub$1"
     intent_name="intent$1"
     rtintent_uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualHubs/${hub_name}/routingIntent/${intent_name}?api-version=$vwan_api_version"
-    az rest --method put --uri $rtintent_uri --body $rtintent_json_string -o none
-    wait_until_hub_finished $hub_name
+    # echo "Sending PUT request to $rtintent_uri..."
+    az rest --method put --uri $rtintent_uri --headers Content-Type=application/json --body $rtintent_json_string -o none
+    wait_until_finished_rest $rtintent_uri
 }
+
+# Get details of routing intent for a hub
+function get_routing_intent() {
+    hub_name="hub$1"
+    intent_name="intent$1"
+    rtintent_uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualHubs/${hub_name}/routingIntent/${intent_name}?api-version=$vwan_api_version"
+    # echo "Sending GET request to $rtintent_uri..."
+    az rest --method get --uri $rtintent_uri
+}
+
+# Using the REST API for the effective routes
+function get_async_routes {
+    uri=$1
+    body=$2
+    location=$(az rest --method post --uri $uri --body $body --debug 2>&1 | grep Location | cut -d\' -f 4)
+    echo "Waiting to get info from $location..."
+    wait_interval=5
+    sleep $wait_interval
+    table=$(az rest --method get --uri $location --query 'value')
+    # table=$(az rest --method get --uri $location --query 'value[]' -o table | sed "s|/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/vwanlab2/providers/Microsoft.Network||g")
+    until [[ -n "$table" ]]
+    do
+        sleep $wait_interval
+        table=$(az rest --method get --uri $location --query 'value')
+    done
+    # Remove verbosity
+    table=$(echo $table | sed "s|/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network||g")
+    table=$(echo $table | sed "s|/virtualHubs/||g")
+    table=$(echo $table | sed "s|/vpnGateways/||g")
+    table=$(echo $table | sed "s|/hubVirtualNetworkConnections||g")
+    # echo $table | jq
+    echo "Route Origin\tAddress Prefixes\tNext Hop Type\tNext Hops\tAS Path"
+    echo $table | jq -r '.[] | "\(.routeOrigin)\t\(.addressPrefixes[])\t\(.nextHopType)\t\(.nextHops[])\t\(.asPath)"'
+}
+function effective_routes_rt {
+    hub_name=$1
+    rt_name=$2
+    rt_id="/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/$hub_name/hubRouteTables/$rt_name"
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
+    body="{\"resourceId\": \"$rt_id\", \"virtualWanResourceType\": \"RouteTable\"}"
+    get_async_routes $uri $body
+}
+function effective_routes_vpncx {
+    hub_name=$1
+    vpncx_name=$2
+    vpngw_id=$(az network vhub show -n ${hub_name} -g $rg --query vpnGateway.id -o tsv)
+    vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    vpncx_id=$(az network vpn-gateway connection show -n $vpncx_name --gateway-name $vpngw_name -g $rg --query id -o tsv)
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
+    body="{\"resourceId\": \"$vpncx_id\", \"virtualWanResourceType\": \"VpnConnection \"}"
+    get_async_routes $uri $body
+}
+
+function inbound_routes_vpncx {
+    hub_name=$1
+    vpncx_name=$2
+    vpngw_id=$(az network vhub show -n ${hub_name} -g $rg --query vpnGateway.id -o tsv)
+    vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    vpncx_id=$(az network vpn-gateway connection show -n $vpncx_name --gateway-name $vpngw_name -g $rg --query id -o tsv)
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/inboundRoutes?api-version=$vwan_api_version"
+    body="{\"resourceUri\": \"$vpncx_id\", \"connectionType\": \"VpnConnection \"}"
+    get_async_routes $uri $body
+}
+
+function effective_routes_vnetcx {
+    hub_name=$1
+    cx_name=$2
+    cx_id=$(az network vhub connection show -n $cx_name --vhub-name $hub_name -g $rg --query id -o tsv)
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
+    body="{\"resourceId\": \"$cx_id\", \"virtualWanResourceType\": \"ExpressRouteConnection\"}"
+    get_async_routes $uri $body
+}
+
 
 # Wait for resource to be created
 function wait_until_finished {
@@ -200,28 +281,28 @@ function wait_until_finished {
      fi
 }
 
-# Leverages wait_until_finished to check that all resources in a hub are Succeeded
-function wait_until_hub_finished {
-    hub_name=$1
-    hub_id=$(az network vhub show -n $hub_name -g $rg --query id -o tsv)
-    wait_until_finished $hub_id
-    # Check state of connections
-    # echo "Hub state is $(get_vhub_state $hub_name), checking connections..."
-    connections=$(get_vnetcx_state $hub_name | grep Updating)
-    until [[ -z "$connections" ]]
-    do
+# Wait for resource to be created, use REST API
+function wait_until_finished_rest {
+     resource_uri=$1
+     echo "Waiting for resource $resource_uri to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az rest --method get --uri $rtintent_uri | jq -r '.properties.provisioningState')
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
         sleep $wait_interval
-        connections=$(get_vnetcx_state $hub_name | grep Updating)
-    done
-    # Check state of route tables
-    # echo "No connections in Updating state in hub $hub_name, checking route tables..."
-    rts=$(get_rt_state $hub_name | grep Updating)
-    until [[ -z "$rts" ]]
-    do
-        sleep $wait_interval
-        rts=$(get_rt_state $hub_name | grep Updating)
-    done
+        state=$(az rest --method get --uri $rtintent_uri | jq -r '.properties.provisioningState')
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
 }
+
 
 # Helper function to calculate the default gateway for a subnet
 # Example: default_gw 172.16.1.31 255.255.255.248
@@ -1278,13 +1359,15 @@ then
     az network firewall create -n azfw1 -g $rg --vhub hub1 --policy $azfw_policy_name -l $location1 --sku AZFW_Hub --public-ip-count 1 -o none
     azfw1_id=$(az network firewall show -n azfw1 -g $rg --query id -o tsv)
     if [[ "$create_routes" == "yes" ]]; then
-        echo "Creating static routes in hub 1..."
+        echo "Creating static routes in hub1..."
         az network vhub route-table route add -n defaultRouteTable --vhub-name hub1 -g $rg \
-            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
+            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" \
             --next-hop-type ResourceId --next-hop $azfw1_id -o none
-        az network vhub route-table route add -n hub1Vnet --vhub-name hub1 -g $rg \
-            --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
-            --next-hop-type ResourceId --next-hop $azfw1_id -o none
+        if [[ "$create_custom_rt" == "yes" ]]; then
+            az network vhub route-table route add -n hub1Vnet --vhub-name hub1 -g $rg \
+                --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" \
+                --next-hop-type ResourceId --next-hop $azfw1_id -o none
+        fi
     fi
     if [[ "$no_of_hubs" == "2" ]]
     then
@@ -1292,13 +1375,15 @@ then
         az network firewall create -n azfw2 -g $rg --vhub hub2 --policy $azfw_policy_name -l $location2 --sku AZFW_Hub --public-ip-count 1 -o none
         azfw2_id=$(az network firewall show -n azfw2 -g $rg --query id -o tsv)
         if [[ "$create_routes" == "yes" ]]; then
-            echo "Creating static routes in hub 2..."
+            echo "Creating static routes in hub2..."
             az network vhub route-table route add -n defaultRouteTable --vhub-name hub2 -g $rg \
-                --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" \
+                --route-name default --destination-type CIDR --destinations '0.0.0.0/0' '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' \
                 --next-hop-type ResourceId --next-hop $azfw2_id -o none
-            az network vhub route-table route add -n hub2Vnet --vhub-name hub2 -g $rg \
-                --route-name default --destination-type CIDR --destinations "0.0.0.0/0" "10.0.0.0/8" "172.16.0.0/12" \
-                --next-hop-type ResourceId --next-hop $azfw2_id -o none
+            if [[ "$create_custom_rt" == "yes" ]]; then
+                az network vhub route-table route add -n hub2Vnet --vhub-name hub2 -g $rg \
+                    --route-name default --destination-type CIDR --destinations '0.0.0.0/0' '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' \
+                    --next-hop-type ResourceId --next-hop $azfw2_id -o none
+            fi
         fi
     fi
 
@@ -1595,7 +1680,7 @@ then
     for vm_name in ${vm_names[@]}; do
         echo "Enabling IP forwarding for $vm_name..."
         vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-        az network nic update --ids $vm_nic_id --ip-forwarding
+        az network nic update --ids $vm_nic_id --ip-forwarding -o none
     done
 fi
 
@@ -2035,7 +2120,14 @@ then
         gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --admin-enabled
         # gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --no-enable-admin
     fi
+fi
 
+# Optional: enable routing intent
+if [[ "$routing_intent" == "yes" ]]; then
+    put_routing_intent 1 $ri_policy
+    if [[ "$no_of_hubs" == "2" ]]; then
+        put_routing_intent 2 $ri_policy
+    fi
 fi
 
 ##############################
@@ -2428,6 +2520,9 @@ subscription_id=$(az account show -o tsv --query id)
 az network vhub get-effective-routes --resource-type RouteTable --resource-id $hub1_default_rt_id -g $rg -n hub1 --query 'value[].{Prefix:addressPrefixes[0],ASPath:asPath,NextHopType:nextHopType,NextHop:nextHops[0],Origin:routeOrigin}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft.Network\//,""); print }'
 az network vhub get-effective-routes --resource-type ExpressRouteConnection --resource-id $hub1_ergw_cx0_id -g $rg -n hub1 -o table --query 'value[].{Prefix:addressPrefixes[0],ASPath:asPath,NextHopType:nextHopType,NextHop:nextHops[0],Origin:routeOrigin}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft.Network\//,""); print }'
 az network vhub get-effective-routes --resource-type VpnConnection --resource-id $hub1_vpn_cx_id -g $rg -n hub1 -o table --query 'value[].{Prefix:addressPrefixes[0],ASPath:asPath,NextHopType:nextHopType,NextHop:nextHops[0],Origin:routeOrigin}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft.Network\//,""); print }'
+# RTv3
+az network vhub route-table route list -n defaultRouteTable --vhub-name hub1 -g $rg --query '[].{Name:name, Destinations:to_string(destinations), NextHop:nextHop}' -o table
+az network vhub route-table route list -n defaultRouteTable --vhub-name hub2 -g $rg --query '[].{Name:name, Destinations:to_string(destinations), NextHop:nextHop}' -o table
 # Virtual WAN BGP peerings
 az network vhub bgpconnection list --vhub-name hub1 -g $rg -o table
 az network vhub bgpconnection list --vhub-name hub2 -g $rg -o table
