@@ -1097,11 +1097,11 @@ then
     wait_interval_csr=30
     echo "Waiting until CSR in branch${branch_id} is reachable..."
     command="sho ver | i uptime"
-    command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "$command")
+    command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "$command")
     until [[ -n "$command_output" ]]
     do
         sleep $wait_interval_csr
-        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "$command")
+        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "$command")
     done
     echo $command_output
 
@@ -1116,19 +1116,19 @@ then
     sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw1_gw0_pip}|g" $config_file_local
     sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw1_gw1_pip}|g" $config_file_local
     sed -i "s|\*\*BGP_ID\*\*|${branch1_asn}|g" $config_file_local
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip <<EOF
   config t
     file prompt quiet
 EOF
-    scp $config_file_local ${branch1_ip}:/${config_file_csr}
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "copy bootflash:${config_file_csr} running-config"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "wr mem"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip int b"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip "sh ip bgp summary"
+    scp -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $config_file_local ${branch1_ip}:/${config_file_csr}
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "copy bootflash:${config_file_csr} running-config"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "wr mem"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "sh ip int b"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "sh ip bgp summary"
     myip=$(curl -s4 ifconfig.co)
     loopback_ip=10.11.11.11
     default_gateway=$branch1_gateway
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch1_ip <<EOF
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip <<EOF
 config t
     username $username password 0 $password
     no ip domain lookup
@@ -1155,11 +1155,11 @@ EOF
         wait_interval_csr=30
         echo "Waiting until CSR in branch${branch_id} is reachable..."
         command="sho ver | i uptime"
-        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "$command")
+        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "$command")
         until [[ -n "$command_output" ]]
         do
             sleep $wait_interval_csr
-            command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "$command")
+            command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "$command")
         done
         echo $command_output
 
@@ -1174,19 +1174,19 @@ EOF
         sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw2_gw0_pip}|g" $config_file_local
         sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw2_gw1_pip}|g" $config_file_local
         sed -i "s|\*\*BGP_ID\*\*|${branch2_asn}|g" $config_file_local
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip <<EOF
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip <<EOF
   config t
     file prompt quiet
 EOF
-        scp $config_file_local ${branch2_ip}:/${config_file_csr}
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "copy bootflash:${config_file_csr} running-config"
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "wr mem"
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "sh ip int b"
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip "sh ip bgp summary"
+        scp -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $config_file_local ${branch2_ip}:/${config_file_csr}
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "copy bootflash:${config_file_csr} running-config"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "wr mem"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "sh ip int b"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "sh ip bgp summary"
         myip=$(curl -s4 ifconfig.co)
         loopback_ip=10.22.22.22
         default_gateway=$branch2_gateway
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch2_ip <<EOF
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip <<EOF
 config t
     username $username password 0 $password
     no ip domain lookup
