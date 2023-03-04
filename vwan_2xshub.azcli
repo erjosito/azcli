@@ -5,7 +5,7 @@
 # The script creates a VWAN lab with
 #  * 2 secure vhubs
 #  * 2 branches connecting over VPN (simulated via Cisco CSR)
-#
+#vn
 # CLI extensions required:
 # * virtual-wan
 # * azure-firewall
@@ -18,29 +18,31 @@
 ###############
 
 # Control
-no_of_hubs=1         # 1 or 2 hubs
+no_of_hubs=2         # 1 or 2 hubs
 no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
-create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
-indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
+create_routes=yes    # Whether static routes are created or not in RT's secure hub(s)
+create_custom_rt=no  # Whether a custom RT for VNets will be created
+indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
 nva_bgp=yes          # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
-vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet'
-vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none'
-nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
-nva_in_hub2=yes      # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
+vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet' (if 'vnet', $create_custom_rt must be yes)
+vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none' (if 'vnet', $create_custom_rt must be yes)
+nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
-deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
+deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
+location1=westcentralus
+# location1=germanywestcentral
+location2=eastus
+wait_interval=15
 
 # Generic variables
 rg=vwan
 vwan=vwan
-location1=westcentralus
-# location1=germanywestcentral
-location2=westcentralus
 password=Microsoft123!
 vwan_hub1_prefix=192.168.0.0/23
 vwan_hub2_prefix=192.168.2.0/23
@@ -120,14 +122,63 @@ gcp_subnet2_name=vm2
 gcp_subnet2_prefix='10.5.2.0/24'
 attachment2_name=attachment2
 router2_name=router2
+# REST URLs and JSON templates
+vwan_api_version=2022-07-01
+rtintent_json='{ properties: { routingPolicies = [ $routing_policies ] } }'
+rtintent_policy_json='{name: $policy_name, destinations: [ $policy_destination ], nextHop: $policy_nexthop}'
 
 #############
 # Functions #
 #############
 
+# REST API: PUT routing intent
+# https://learn.microsoft.com/en-us/rest/api/virtualwan/routing-intent/create-or-update?tabs=HTTP
+# Parameters:
+# - hub id (1 or 2)
+# - policies (internet, private or both)
+function put_routing_intent() {
+    # Get AzFW ID
+    hub_id=$1
+    az network firewall show -n azfw${hub_id} -g $rg --query id -o tsv
+    # Construct JSON for policies (Internet/Private)
+    rtintent_policy_internet_json_string=$(jq -n \
+        --arg policy_name "InternetTraffic" \
+        --arg policy_destination "Internet" \
+        --arg policy_nexthop "$azfwid" \
+        "$rtintent_policy_json")
+    rtintent_policy_private_json_string=$(jq -n \
+        --arg policy_name "PrivateTrafficPolicy" \
+        --arg policy_destination "PrivateTraffic" \
+        --arg policy_nexthop "$azfwid" \
+        "$rtintent_policy_json")
+    # Construct JSON for routing intent (depending on parameter)
+    if [[ "$2" == 'internet' ]]; then
+        rtintent_json_string=$(jq -n \
+            --arg routing_policies "${rtintent_policy_internet_json_string}" \
+            "$rtintent_json")
+    elif [[ "$2" == 'private' ]]; then
+        rtintent_json_string=$(jq -n \
+            --arg routing_policies "${rtintent_policy_private_json_string}" \
+            "$rtintent_json")
+    elif [[ "$2" == 'both' ]]; then
+        rtintent_json_string=$(jq -n \
+            --arg routing_policies "${rtintent_policy_internet_json_string},${rtintent_policy_private_json_string}" \
+            "$rtintent_json")
+    else
+        echo "Routing intent policy $2 not recognized, only 'internet', 'private' or 'both' supported"
+        return
+    fi
+    # Send REST
+    subscription_id=$(az account show --query id -o tsv)
+    hub_name="hub$1"
+    intent_name="intent$1"
+    rtintent_uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualHubs/${hub_name}/routingIntent/${intent_name}?api-version=$vwan_api_version"
+    az rest --method put --uri $rtintent_uri --body $rtintent_json_string -o none
+    wait_until_hub_finished $hub_name
+}
+
 # Wait for resource to be created
 function wait_until_finished {
-     wait_interval=15
      resource_id=$1
      resource_name=$(echo $resource_id | cut -d/ -f 9)
      echo "Waiting for resource $resource_name to finish provisioning..."
@@ -147,6 +198,29 @@ function wait_until_finished {
         ((seconds=${run_time}%60))
         echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
      fi
+}
+
+# Leverages wait_until_finished to check that all resources in a hub are Succeeded
+function wait_until_hub_finished {
+    hub_name=$1
+    hub_id=$(az network vhub show -n $hub_name -g $rg --query id -o tsv)
+    wait_until_finished $hub_id
+    # Check state of connections
+    # echo "Hub state is $(get_vhub_state $hub_name), checking connections..."
+    connections=$(get_vnetcx_state $hub_name | grep Updating)
+    until [[ -z "$connections" ]]
+    do
+        sleep $wait_interval
+        connections=$(get_vnetcx_state $hub_name | grep Updating)
+    done
+    # Check state of route tables
+    # echo "No connections in Updating state in hub $hub_name, checking route tables..."
+    rts=$(get_rt_state $hub_name | grep Updating)
+    until [[ -z "$rts" ]]
+    do
+        sleep $wait_interval
+        rts=$(get_rt_state $hub_name | grep Updating)
+    done
 }
 
 # Helper function to calculate the default gateway for a subnet
@@ -811,11 +885,13 @@ then
 fi
 
 # Create RT for vnets
-echo "Creating custom RT for VNets..."
-az network vhub route-table create -n hub1Vnet --vhub-name hub1 -g $rg --labels vnet -o none
-if [[ "$no_of_hubs" == "2" ]]
-then
-    az network vhub route-table create -n hub2Vnet --vhub-name hub2 -g $rg --labels vnet -o none
+if [[ "$create_custom_rt" == "yes" ]]; then
+    echo "Creating custom RT for VNets..."
+    az network vhub route-table create -n hub1Vnet --vhub-name hub1 -g $rg --labels vnet -o none
+    if [[ "$no_of_hubs" == "2" ]]
+    then
+        az network vhub route-table create -n hub2Vnet --vhub-name hub2 -g $rg --labels vnet -o none
+    fi
 fi
 
 # Add nohub1/nohub2 labels to default RTs
@@ -823,14 +899,18 @@ fi
 # az network vhub route-table update -n defaultRouteTable --vhub-name hub2 -g $rg --labels default nohub1
 
 # Retrieve IDs of RTs. We will need this when creating the connections
-hub1_vnet_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n hub1Vnet --query id -o tsv)
 hub1_default_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n defaultRouteTable --query id -o tsv)
 hub1_none_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n noneRouteTable --query id -o tsv)
+if [[ "$create_custom_rt" == "yes" ]]; then
+    hub1_vnet_rt_id=$(az network vhub route-table show --vhub-name hub1 -g $rg -n hub1Vnet --query id -o tsv)
+fi
 if [[ "$no_of_hubs" == "2" ]]
 then
     hub2_default_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n defaultRouteTable --query id -o tsv)
-    hub2_vnet_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n hub2Vnet --query id -o tsv)
     hub2_none_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n noneRouteTable --query id -o tsv)
+    if [[ "$create_custom_rt" == "yes" ]]; then
+        hub2_vnet_rt_id=$(az network vhub route-table show --vhub-name hub2 -g $rg -n hub2Vnet --query id -o tsv)
+    fi
 fi
 
 # Define which association/propagations we will use
@@ -896,6 +976,7 @@ az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Outbound_All --
     --access Allow --protocol '*' --source-address-prefixes '*' --direction Outbound \
     --destination-address-prefixes '*' --destination-port-ranges '*' -o none
 # Configure NSG flow logs
+echo "Configuring NSG flow logs..."
 storage_account1_name=vwan$RANDOM$location1
 az storage account create -n $storage_account1_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location1 -o none
 az network watcher flow-log create -l $location1 -n flowlog-$location1 -g $rg \
