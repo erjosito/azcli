@@ -198,7 +198,11 @@ function get_routing_intent() {
 function get_async_routes {
     uri=$1
     body=$2
-    location=$(az rest --method post --uri $uri --body $body --debug 2>&1 | grep Location | cut -d\' -f 4)
+    if [[ -z "$body" ]]; then
+        location=$(az rest --method post --uri $uri --debug 2>&1 | grep Location | cut -d\' -f 4)
+    else
+        location=$(az rest --method post --uri $uri --body $body --debug 2>&1 | grep Location | cut -d\' -f 4)
+    fi
     echo "Waiting to get info from $location..."
     wait_interval=5
     sleep $wait_interval
@@ -262,8 +266,7 @@ function bgp_advertised_routes {
     hub_name=hub$1
     bgp_connection_name=$(az network vhub bgpconnection list --vhub-name hub1 -g $rg --query '[0].name' -o tsv)
     uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/bgpConnections/${bgp_connection_name}/advertisedRoutes?api-version=$vwan_api_version"
-    body=""
-    get_async_routes $uri $body
+    get_async_routes $uri
 }
 
 function effective_routes_vnetcx {
