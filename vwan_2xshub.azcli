@@ -247,6 +247,24 @@ function inbound_routes_vpncx {
     body="{\"resourceUri\": \"$vpncx_id\", \"connectionType\": \"VpnConnection \"}"
     get_async_routes $uri $body
 }
+function outbound_routes_vpncx {
+    hub_name=$1
+    vpncx_name=$2
+    vpngw_id=$(az network vhub show -n ${hub_name} -g $rg --query vpnGateway.id -o tsv)
+    vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    vpncx_id=$(az network vpn-gateway connection show -n $vpncx_name --gateway-name $vpngw_name -g $rg --query id -o tsv)
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/outboundRoutes?api-version=$vwan_api_version"
+    body="{\"resourceUri\": \"$vpncx_id\", \"connectionType\": \"VpnConnection \"}"
+    get_async_routes $uri $body
+}
+
+function bgp_advertised_routes {
+    hub_name=hub$1
+    bgp_connection_name=$(az network vhub bgpconnection list --vhub-name hub1 -g $rg --query '[0].name' -o tsv)
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/bgpConnections/${bgp_connection_name}/advertisedRoutes?api-version=$vwan_api_version"
+    body=""
+    get_async_routes $uri $body
+}
 
 function effective_routes_vnetcx {
     hub_name=$1
