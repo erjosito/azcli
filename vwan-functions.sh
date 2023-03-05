@@ -28,7 +28,8 @@ azfw_policy_name=vwan
 
 # REST Variables
 # vwan_api_version=2020-05-01
-vwan_api_version=2021-03-01
+# vwan_api_version=2021-03-01
+vwan_api_version=2022-07-01
 subscription_id=$(az account show --query id -o tsv)
 # JSON
 vwan_json='{location: $location, properties: {disableVpnEncryption: false, type: $sku}}'
@@ -42,6 +43,8 @@ vnet_cx_json='{properties: {remoteVirtualNetwork: {id: $vnet_id}, enableInternet
 rt_json='{properties: {routes: [], labels: []}}'
 route_json='{name: $name, destinationType: "CIDR", destinations: [ $prefixes ], nextHopType: $type, nextHop: $nexthop }'
 cxroute_json='{name: $name, addressPrefixes: [ $prefixes ], nextHopIpAddress: $nexthop }'
+rtintent_json='{ properties: { routingPolicies: [ $routing_policies ] } }'
+rtintent_policy_json='{name: $policy_name, destinations: [ $policy_destination ], nextHop: $policy_nexthop}'
 
 
 ###############
@@ -77,6 +80,8 @@ function wait_until_finished {
         # echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
      fi
 }
+
+
 
 function wait_until_csr_finished {
     branch_id=$1
@@ -134,6 +139,68 @@ function wait_until_gw_finished {
     done
     wait_until_finished $gw_id
 }
+
+# REST API: PUT routing intent
+# https://learn.microsoft.com/en-us/rest/api/virtualwan/routing-intent/create-or-update?tabs=HTTP
+# Parameters:
+# - hub id (1 or 2)
+# - policies (internet, private or both)
+function put_routing_intent() {
+    # Get AzFW ID
+    hub_id=$1
+    azfw_id=$(az network vhub show -n hub${hub_id} -g $rg --query 'azureFirewall.id' -o tsv)
+    # Construct JSON for policies (Internet/Private)
+    rtintent_policy_internet_json_string=$(jq -n \
+        --arg policy_name "InternetTraffic" \
+        --arg policy_destination "Internet" \
+        --arg policy_nexthop "$azfw_id" \
+        "$rtintent_policy_json")
+    rtintent_policy_private_json_string=$(jq -n \
+        --arg policy_name "PrivateTrafficPolicy" \
+        --arg policy_destination "PrivateTraffic" \
+        --arg policy_nexthop "$azfw_id" \
+        "$rtintent_policy_json")
+    # Construct JSON for routing intent (depending on parameter)
+    policy=$2
+    if [[ "$policy" == 'internet' ]]; then
+        rtintent_json_string=$(jq -n \
+            --arg routing_policies "${rtintent_policy_internet_json_string}" \
+            "$rtintent_json")
+    elif [[ "$policy" == 'private' ]]; then
+        rtintent_json_string=$(jq -n \
+            --arg routing_policies "${rtintent_policy_private_json_string}" \
+            "$rtintent_json")
+    elif [[ "$policy" == 'both' ]]; then
+        rtintent_json_string=$(jq -n \
+            --arg routing_policies "${rtintent_policy_internet_json_string},${rtintent_policy_private_json_string}" \
+            "$rtintent_json")
+    else
+        echo "Routing intent policy $2 not recognized, only 'internet', 'private' or 'both' supported"
+        return
+    fi
+    # Remove escapes from string (jq substitution doesnt work for objects)
+    rtintent_json_string=$(echo "$rtintent_json_string" | sed "s@\\\\@@g")
+    rtintent_json_string=$(echo "${rtintent_json_string}" | sed "s@\"{@{@g")
+    rtintent_json_string=$(echo "${rtintent_json_string}" | sed "s@}\"@}@g")
+    # Send REST
+    subscription_id=$(az account show --query id -o tsv)
+    hub_name="hub$1"
+    intent_name="intent$1"
+    rtintent_uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualHubs/${hub_name}/routingIntent/${intent_name}?api-version=$vwan_api_version"
+    # echo "Sending PUT request to $rtintent_uri..."
+    az rest --method put --uri $rtintent_uri --headers Content-Type=application/json --body $rtintent_json_string -o none
+    wait_until_finished_rest $rtintent_uri
+}
+
+# Get details of routing intent for a hub
+function get_routing_intent() {
+    hub_name="hub$1"
+    intent_name="intent$1"
+    rtintent_uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualHubs/${hub_name}/routingIntent/${intent_name}?api-version=$vwan_api_version"
+    # echo "Sending GET request to $rtintent_uri..."
+    az rest --method get --uri $rtintent_uri
+}
+
 
 # Get JSON for a hub or all hubs
 function get_vhub {
@@ -1987,19 +2054,31 @@ function ssh_through {
 #  Effective routes  #
 ######################
 
+# Using the REST API for the effective routes
 function get_async_routes {
     uri=$1
     body=$2
-    location=$(az rest --method post --uri $uri --body $body --debug 2>&1 | grep Location | cut -d\' -f 4)
+    json_key=$3
+    if [[ -z "$json_key" ]]; then
+        json_key='value'
+    fi
+    if [[ -z "$body" || "$body" == "none" ]]; then
+        request1_data=$(az rest --method post --uri $uri --debug 2>&1)
+    else
+        request1_data=$(az rest --method post --uri $uri --body $body --debug 2>&1)
+    fi
+    response_code=$(echo $request1_data | grep 'Response status' | cut -d: -f4 | tr -d ' ')
+    echo "Received return code $response_code from request to $uri"
+    location=$(echo $request1_data | grep Location | cut -d\' -f 4)
     echo "Waiting to get info from $location..."
     wait_interval=5
     sleep $wait_interval
-    table=$(az rest --method get --uri $location --query 'value')
+    table=$(az rest --method get --uri $location --query "$json_key")
     # table=$(az rest --method get --uri $location --query 'value[]' -o table | sed "s|/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/vwanlab2/providers/Microsoft.Network||g")
     until [[ -n "$table" ]]
     do
         sleep $wait_interval
-        table=$(az rest --method get --uri $location --query 'value')
+        table=$(az rest --method get --uri $location --query "$json_key")
     done
     # Remove verbosity
     table=$(echo $table | sed "s|/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network||g")
@@ -2007,10 +2086,16 @@ function get_async_routes {
     table=$(echo $table | sed "s|/vpnGateways/||g")
     table=$(echo $table | sed "s|/hubVirtualNetworkConnections||g")
     # echo $table | jq
-    echo "Route Origin\tAddress Prefixes\tNext Hop Type\tNext Hops\tAS Path"
-    echo $table | jq -r '.[] | "\(.routeOrigin)\t\(.addressPrefixes[])\t\(.nextHopType)\t\(.nextHops[])\t\(.asPath)"'
+    if [[ "$json_key" == "RouteServiceRole_IN_0" || "$json_key" == "RouteServiceRole_IN_1" ]]; then
+        echo "Origin\tLocal Address\tNetwork      \tNext Hop\tAS Path"
+        echo $table | jq -r '.[] | "\(.origin)\t\(.localAddress)\t\(.network)\t\(.nextHop)\t\(.asPath)"'
+    else
+        echo "Route Origin\tAddress Prefixes\tNext Hop Type\tNext Hops\tAS Path"
+        echo $table | jq -r '.[] | "\(.routeOrigin)\t\(.addressPrefixes[])\t\(.nextHopType)\t\(.nextHops[])\t\(.asPath)"'
+    fi
 }
 
+# This is not REST :)
 function effective_routes_nic {
     hub_id=$1
     spoke_id=$2
@@ -2019,6 +2104,8 @@ function effective_routes_nic {
     az network nic show-effective-route-table -n $nic_name -g $rg -o table
 }
 
+# Effective routes VWAN
+# https://learn.microsoft.com/en-us/rest/api/virtualwan/virtual-hubs/get-effective-virtual-hub-routes?tabs=HTTP
 function effective_routes_rt {
     hub_name=$1
     rt_name=$2
@@ -2028,7 +2115,6 @@ function effective_routes_rt {
     body="{\"resourceId\": \"$rt_id\", \"virtualWanResourceType\": \"RouteTable\"}"
     get_async_routes $uri $body
 }
-
 function effective_routes_vpncx {
     hub_name=$1
     vpncx_name=$2
@@ -2039,7 +2125,6 @@ function effective_routes_vpncx {
     body="{\"resourceId\": \"$vpncx_id\", \"virtualWanResourceType\": \"VpnConnection \"}"
     get_async_routes $uri $body
 }
-
 function effective_routes_vnetcx {
     hub_name=$1
     cx_name=$2
@@ -2049,13 +2134,139 @@ function effective_routes_vnetcx {
     get_async_routes $uri $body
 }
 
-# Not working
-function effective_routes_hub {
+# Inbound routes (NOT WORKING!)
+# https://learn.microsoft.com/en-us/rest/api/virtualwan/virtual-hubs/get-inbound-routes?tabs=HTTP
+function inbound_routes_vpncx {
     hub_name=$1
-    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/effectiveRoutes?api-version=$vwan_api_version"
-    body=""
-    get_async_routes $uri $body  # This does not work yet
+    vpncx_name=$2
+    vpngw_id=$(az network vhub show -n ${hub_name} -g $rg --query vpnGateway.id -o tsv)
+    vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    # If no VPN cx was specified, just take the first one
+    if [[ -z "$2" ]]; then
+        vpncx_id=$(az network vpn-gateway connection list --gateway-name $vpngw_name -g $rg --query '[0].id' -o tsv)
+        echo "No connection specified, using $vpncx_id"
+    else
+        vpncx_id=$(az network vpn-gateway connection show -n $vpncx_name --gateway-name $vpngw_name -g $rg --query id -o tsv)
+        echo "Found VPN connection ID: $vpncx_id"
+    fi
+    uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/inboundRoutes?api-version=$vwan_api_version"
+    body="{\"resourceUri\": \"$vpncx_id\", \"connectionType\": \"VpnConnection \"}"
+    get_async_routes $uri $body
 }
+function inbound_routes_ercx {
+    hub_name=$1
+    vpncx_name=$2
+    ergw_id=$(az network vhub show -n ${hub_name} -g $rg --query expressRouteGateway.id -o tsv)
+    ergw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    # If no ER cx was specified, just take the first one
+    if [[ -z "$2" ]]; then
+        ercx_id=$(az network express-route gateway connection list --gateway-name $ergw_name -g $rg --query '[0].id' -o tsv)
+        echo "No connection specified, using $ercx_id"
+    else
+        ercx_id=$(az network express-route gateway connection show -n $ercx_name --gateway-name $ergw_name -g $rg --query id -o tsv)
+        echo "Found ER connection ID: $ercx_id"
+    fi
+    uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/inboundRoutes?api-version=$vwan_api_version"
+    body="{\"resourceUri\": \"$vpncx_id\", \"connectionType\": \"ExpressRouteConnection \"}"
+    get_async_routes "$uri" "$body"
+}
+function inbound_routes_vnetcx {
+    hub_name=$1
+    cx_name=$2
+    # If no VNet cx specified, just take the first one
+    if [[ -z "$2" ]]; then
+        cx_id=$(az network vhub connection list --vhub-name $hub_name -g $rg --query '[0].id' -o tsv)
+        echo "No connection specified, using $cx_id"
+    else
+        cx_id=$(az network vhub connection show -n $cx_name --vhub-name $hub_name -g $rg --query id -o tsv)
+        echo "Found VNet connection ID: $cx_id"
+    fi
+    uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/inboundRoutes?api-version=$vwan_api_version"
+    body="{\"resourceUri\": \"$cx_id\", \"connectionType\": \"HubVirtualNetworkConnection \"}"
+    get_async_routes "$uri" "$body"
+}
+# Outbound routes (NOT WORKING!)
+# https://learn.microsoft.com/en-us/rest/api/virtualwan/virtual-hubs/get-outbound-routes?tabs=HTTP
+function outbound_routes_vpncx {
+    hub_name=$1
+    vpncx_name=$2
+    vpngw_id=$(az network vhub show -n ${hub_name} -g $rg --query vpnGateway.id -o tsv)
+    vpngw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    # If no ER cx was specified, just take the first one
+    if [[ -z "$2" ]]; then
+        vpncx_id=$(az network vpn-gateway connection list --gateway-name $vpngw_name -g $rg --query '[0].id' -o tsv)
+        echo "No connection specified, using $vpncx_id"
+    else
+        vpncx_id=$(az network vpn-gateway connection show -n $vpncx_name --gateway-name $vpngw_name -g $rg --query id -o tsv)
+        echo "Found VPN connection ID: $vpncx_id"
+    fi
+    uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/outboundRoutes?api-version=$vwan_api_version"
+    body="{\"resourceUri\": \"$vpncx_id\", \"connectionType\": \"VpnConnection \"}"
+    get_async_routes "$uri" "$body"
+}
+function outbound_routes_ercx {
+    hub_name=$1
+    vpncx_name=$2
+    ergw_id=$(az network vhub show -n ${hub_name} -g $rg --query expressRouteGateway.id -o tsv)
+    ergw_name=$(echo $vpngw_id | cut -d/ -f 9)
+    # If no ER cx was specified, just take the first one
+    if [[ -z "$2" ]]; then
+        ercx_id=$(az network express-route gateway connection list --gateway-name $ergw_name -g $rg --query '[0].id' -o tsv)
+        echo "No connection specified, using $ercx_id"
+    else
+        ercx_id=$(az network express-route gateway connection show -n $ercx_name --gateway-name $ergw_name -g $rg --query id -o tsv)
+        echo "Found ER connection ID: $ercx_id"
+    fi
+    uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/outboundRoutes?api-version=$vwan_api_version"
+    body="{\"resourceUri\": \"$vpncx_id\", \"connectionType\": \"ExpressRouteConnection \"}"
+    get_async_routes "$uri" "$body"
+}
+function outbound_routes_vnetcx {
+    hub_name=$1
+    cx_name=$2
+    # If no VNet cx specified, just take the first one
+    if [[ -z "$2" ]]; then
+        cx_id=$(az network vhub connection list --vhub-name $hub_name -g $rg --query '[0].id' -o tsv)
+        echo "No connection specified, using $cx_id"
+    else
+        cx_id=$(az network vhub connection show -n $cx_name --vhub-name $hub_name -g $rg --query id -o tsv)
+        echo "Found VNet connection ID: $cx_id"
+    fi
+    uri="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/outboundRoutes?api-version=$vwan_api_version"
+    body="{\"resourceUri\": \"$cx_id\", \"connectionType\": \"HubVirtualNetworkConnection \"}"
+    get_async_routes "$uri" "$body"
+}
+
+# Advertised routes
+# https://learn.microsoft.com/en-us/rest/api/virtualwan/virtual-hub-bgp-connections/list-advertised-routes?tabs=HTTP
+function bgp_advertised_routes {
+    hub_name=$1
+    # If no BGP connection name specified, just take the first one
+    if [[ -z "$2" ]]; then
+        bgp_connection_name=$(az network vhub bgpconnection list --vhub-name $hub_name -g $rg --query '[0].name' -o tsv)
+        echo "No BGP peer name specified, using $bgp_connection_name"
+    else
+        bgp_connection_name=$2
+    fi
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/bgpConnections/${bgp_connection_name}/advertisedRoutes?api-version=$vwan_api_version"
+    get_async_routes $uri 'none' 'RouteServiceRole_IN_0'
+}
+
+# Learnt routes
+# https://learn.microsoft.com/en-us/rest/api/virtualwan/virtual-hub-bgp-connections/list-learned-routes?tabs=HTTP
+function bgp_learned_routes {
+    hub_name=$1
+    # If no BGP connection name specified, just take the first one
+    if [[ -z "$2" ]]; then
+        bgp_connection_name=$(az network vhub bgpconnection list --vhub-name $hub_name -g $rg --query '[0].name' -o tsv)
+        echo "No BGP peer name specified, using $bgp_connection_name"
+    else
+        bgp_connection_name=$2
+    fi
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/bgpConnections/${bgp_connection_name}/learnedRoutes?api-version=$vwan_api_version"
+    get_async_routes $uri 'none' 'RouteServiceRole_IN_0'
+}
+
 
 ######################
 # Specific scenarios #

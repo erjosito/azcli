@@ -32,6 +32,7 @@ nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to
 nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
 deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
+deploy_gcp=no        # Whether an onprem location to be connected over ER should be deployed in Google Cloud
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
@@ -199,10 +200,11 @@ function get_async_routes {
     uri=$1
     body=$2
     if [[ -z "$body" ]]; then
-        location=$(az rest --method post --uri $uri --debug 2>&1 | grep Location | cut -d\' -f 4)
+        request1_data=$(az rest --method post --uri $uri --debug 2>&1)
     else
-        location=$(az rest --method post --uri $uri --body $body --debug 2>&1 | grep Location | cut -d\' -f 4)
+        request1_data=$(az rest --method post --uri $uri --body $body --debug 2>&1)
     fi
+    location=$(echo $request1_data | grep Location | cut -d\' -f 4)
     echo "Waiting to get info from $location..."
     wait_interval=5
     sleep $wait_interval
@@ -240,7 +242,7 @@ function effective_routes_vpncx {
     body="{\"resourceId\": \"$vpncx_id\", \"virtualWanResourceType\": \"VpnConnection \"}"
     get_async_routes $uri $body
 }
-
+# Inbound routes
 function inbound_routes_vpncx {
     hub_name=$1
     vpncx_name=$2
@@ -262,10 +264,21 @@ function outbound_routes_vpncx {
     get_async_routes $uri $body
 }
 
+# Advertised routes
+# https://learn.microsoft.com/en-us/rest/api/virtualwan/virtual-hub-bgp-connections/list-advertised-routes?tabs=HTTP
 function bgp_advertised_routes {
-    hub_name=hub$1
+    hub_name=$1
     bgp_connection_name=$(az network vhub bgpconnection list --vhub-name hub1 -g $rg --query '[0].name' -o tsv)
     uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/bgpConnections/${bgp_connection_name}/advertisedRoutes?api-version=$vwan_api_version"
+    get_async_routes $uri
+}
+
+# Learnt routes
+# https://learn.microsoft.com/en-us/rest/api/virtualwan/virtual-hub-bgp-connections/list-learned-routes?tabs=HTTP
+function bgp_learned_routes {
+    hub_name=$1
+    bgp_connection_name=$(az network vhub bgpconnection list --vhub-name hub1 -g $rg --query '[0].name' -o tsv)
+    uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/virtualHubs/${hub_name}/bgpConnections/${bgp_connection_name}/learnedRoutes?api-version=$vwan_api_version"
     get_async_routes $uri
 }
 
@@ -2079,7 +2092,8 @@ then
             fi
         fi
     fi
-    # Configure Global Reach
+
+    # Configure Global Reach (optional)
     if [[ "$global_reach" == "yes" ]]; then
         echo "Creating Global Reach connection..."
         hub2_er_circuit_id=$(az network express-route show -n $hub2_er_circuit_name -g $rg -o tsv --query id)
@@ -2087,59 +2101,61 @@ then
             -n "${hub1_er_pop}-to-${hub2_er_pop}" --peer-circuit $hub2_er_circuit_id --address-prefix $gr_ip_range -o none
     fi
 
-    # Simulate onprem with Google Cloud
-    # gcloud auth list
-    # gcloud config set account 'erjosito1138@gmail.com'
-    gcloud config set account 'jomore@contosohotels.com'
-    gcloud config set project $project_id
-    # Get environment info
-    # account=$(gcloud info --format json | jq -r '.config.account')
-    # billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
-    # billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
-    # Create project
-    # gcloud projects create $project_id --name $project_name
-    # gcloud config set project $project_id
-    # gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
-    # gcloud services enable compute.googleapis.com
-    # VPC and instance
-    gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
-    gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1
-    gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
-    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
-    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
-    gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
-    # gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="ip a"    # This command will pause the script if the key file is password-protected
-    # Create interconnect
-    gcloud compute routers create $router1_name --project=$project_id --network=$gcp_vpc1_name --asn=$gcp_asn --region=$region1
-    gcloud compute interconnects attachments partner create $attachment1_name --region $region1 --router $router1_name --edge-availability-domain availability-domain-1
-    pairing_key1=$(gcloud compute interconnects attachments describe $attachment1_name --region $region1 --format json | jq -r '.pairingKey')
-    # Create VXC in Megaport
-    $megaport_script_path -g -s=jomore-${hub1_er_pop} -a=create_vxc -k=$pairing_key1
-    # Activate attachment
-    # wait_for_gcp_attachment_ready $attachment1_name $region1
-    sleep 180
-    gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --admin-enabled
-    # gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --no-enable-admin
-    if [[ "$no_of_hubs" == "2" ]]; then
+    # Simulate ER onprem with Google Cloud (optional)
+    if [[ "$deploy_gcp" == "yes" ]]; then
+        # gcloud auth list
+        # gcloud config set account 'erjosito1138@gmail.com'
+        gcloud config set account 'jomore@contosohotels.com'
+        gcloud config set project $project_id
+        # Get environment info
+        # account=$(gcloud info --format json | jq -r '.config.account')
+        # billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
+        # billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
+        # Create project
+        # gcloud projects create $project_id --name $project_name
+        # gcloud config set project $project_id
+        # gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
+        # gcloud services enable compute.googleapis.com
         # VPC and instance
-        gcloud compute networks create "$gcp_vpc2_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
-        gcloud compute networks subnets create "$gcp_subnet2_name" --network "$gcp_vpc2_name" --range "$gcp_subnet2_prefix" --region=$region2
-        gcloud compute instances create "$gcp_vm2_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc2_name" --subnet "$gcp_subnet2_name" --zone "$zone2"
-        gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-icmp" --network "$gcp_vpc2_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
-        gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-ssh" --network "$gcp_vpc2_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
-        gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-web" --network "$gcp_vpc2_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
-        # gcloud compute ssh $gcp_vm2_name --zone=$zone2 --command="ip a"    # This command will pause the script if the key file is password-protected
+        gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+        gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1
+        gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+        # gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="ip a"    # This command will pause the script if the key file is password-protected
         # Create interconnect
-        gcloud compute routers create $router2_name --project=$project_id --network=$gcp_vpc2_name --asn=$gcp_asn --region=$region2
-        gcloud compute interconnects attachments partner create $attachment2_name --region $region2 --router $router2_name --edge-availability-domain availability-domain-1
-        pairing_key2=$(gcloud compute interconnects attachments describe $attachment2_name --region $region2 --format json | jq -r '.pairingKey')
+        gcloud compute routers create $router1_name --project=$project_id --network=$gcp_vpc1_name --asn=$gcp_asn --region=$region1
+        gcloud compute interconnects attachments partner create $attachment1_name --region $region1 --router $router1_name --edge-availability-domain availability-domain-1
+        pairing_key1=$(gcloud compute interconnects attachments describe $attachment1_name --region $region1 --format json | jq -r '.pairingKey')
         # Create VXC in Megaport
-        $megaport_script_path -g -s=jomore-${hub2_er_pop} -a=create_vxc -k=$pairing_key2
+        $megaport_script_path -g -s=jomore-${hub1_er_pop} -a=create_vxc -k=$pairing_key1
         # Activate attachment
         # wait_for_gcp_attachment_ready $attachment1_name $region1
-        sleep 120
-        gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --admin-enabled
-        # gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --no-enable-admin
+        sleep 180
+        gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --admin-enabled
+        # gcloud compute interconnects attachments partner update $attachment1_name --region $region1 --no-enable-admin
+        if [[ "$no_of_hubs" == "2" ]]; then
+            # VPC and instance
+            gcloud compute networks create "$gcp_vpc2_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+            gcloud compute networks subnets create "$gcp_subnet2_name" --network "$gcp_vpc2_name" --range "$gcp_subnet2_prefix" --region=$region2
+            gcloud compute instances create "$gcp_vm2_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc2_name" --subnet "$gcp_subnet2_name" --zone "$zone2"
+            gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-icmp" --network "$gcp_vpc2_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+            gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-ssh" --network "$gcp_vpc2_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+            gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-web" --network "$gcp_vpc2_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+            # gcloud compute ssh $gcp_vm2_name --zone=$zone2 --command="ip a"    # This command will pause the script if the key file is password-protected
+            # Create interconnect
+            gcloud compute routers create $router2_name --project=$project_id --network=$gcp_vpc2_name --asn=$gcp_asn --region=$region2
+            gcloud compute interconnects attachments partner create $attachment2_name --region $region2 --router $router2_name --edge-availability-domain availability-domain-1
+            pairing_key2=$(gcloud compute interconnects attachments describe $attachment2_name --region $region2 --format json | jq -r '.pairingKey')
+            # Create VXC in Megaport
+            $megaport_script_path -g -s=jomore-${hub2_er_pop} -a=create_vxc -k=$pairing_key2
+            # Activate attachment
+            # wait_for_gcp_attachment_ready $attachment1_name $region1
+            sleep 120
+            gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --admin-enabled
+            # gcloud compute interconnects attachments partner update $attachment2_name --region $region2 --no-enable-admin
+        fi
     fi
 fi
 
