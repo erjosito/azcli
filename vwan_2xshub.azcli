@@ -38,6 +38,7 @@ public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
 routing_intent=yes   # Whether RI is configured
 ri_policy=both       # internet/private/both
+private_link=yes     # whether private endpoints will be created for the storage accounts in each region (in the first spoke, using the flow logs storage accounts)
 location1=westcentralus
 location2=eastus
 
@@ -137,22 +138,33 @@ subscription_id=$(az account show -o tsv --query id)
 # REST API: PUT routing intent
 # https://learn.microsoft.com/en-us/rest/api/virtualwan/routing-intent/create-or-update?tabs=HTTP
 # Parameters:
-# - hub id (1 or 2)
-# - policies (internet, private or both)
+# 1. hub id (1 or 2)
+# 2. policies (internet, private or both)
+# 3. next hop (azfw/nva)
 function put_routing_intent() {
     # Get AzFW ID
     hub_id=$1
-    azfw_id=$(az network vhub show -n hub${hub_id} -g $rg --query 'azureFirewall.id' -o tsv)
+    if [[ "$hub_id" == "1" ]]; then
+        location="$location1"
+    else
+        location="$location2"
+    fi
+    if [[ -z "$3" ]] || [[ "$3" == "azfw" ]]; then
+        nexthop_id=$(az network vhub show -n hub${hub_id} -g $rg --query 'azureFirewall.id' -o tsv)
+    else
+        nexthop_id=$(az network virtual-appliance list -g $rg -o tsv --query "[?location=='$location'].id" | head -1)
+    fi
+    echo "Using next hop ID $nexthop_id to create/update routing intent policy..."
     # Construct JSON for policies (Internet/Private)
     rtintent_policy_internet_json_string=$(jq -n \
         --arg policy_name "InternetTraffic" \
         --arg policy_destination "Internet" \
-        --arg policy_nexthop "$azfw_id" \
+        --arg policy_nexthop "$nexthop_id" \
         "$rtintent_policy_json")
     rtintent_policy_private_json_string=$(jq -n \
         --arg policy_name "PrivateTrafficPolicy" \
         --arg policy_destination "PrivateTraffic" \
-        --arg policy_nexthop "$azfw_id" \
+        --arg policy_nexthop "$nexthop_id" \
         "$rtintent_policy_json")
     # Construct JSON for routing intent (depending on parameter)
     policy=$2
@@ -2161,15 +2173,86 @@ fi
 
 # Optional: enable routing intent
 if [[ "$routing_intent" == "yes" ]]; then
-    put_routing_intent 1 $ri_policy
+    put_routing_intent 1 $ri_policy azfw
     if [[ "$no_of_hubs" == "2" ]]; then
-        put_routing_intent 2 $ri_policy
+        put_routing_intent 2 $ri_policy azfw
+    fi
+fi
+
+# Optional: create private endpoints
+# Variables
+storage_container_name=privatelink
+storage_blob_name=test.txt
+tmp_file='/tmp/${storage_blob_name}'
+subnet_name=privateendpoints
+dns_zone_name=privatelink.blob.core.windows.net
+# Function:
+function create_storage_private_link() {
+    hub_id=$1
+    storage_endpoint_name=storageep${hub_id}
+    if [[ "$hub_id" == "1" ]]; then
+        location=$location1
+    else
+        location=$location2
+    fi
+    vnet_name=spoke${hub_id}1-$location
+    subnet_prefix="10.${hub_id}.1.64/26"
+    # Get storage account name
+    echo "Trying to find storage account in $location..."
+    storage_account_name=$(az storage account list -g $rg -o tsv --query "[?location=='$location'].name" | head -1)
+    storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
+    echo "Storage account $storage_account_name found in location $location, uploading test file..."
+    find_container=$(az storage container show -n $storage_container_name --account-name $storage_account_name --auth-mode key --account-key $storage_account_key)
+    if [[ -z "$find_container" ]]; then
+        az storage container create -n $storage_container_name --public-access container --auth-mode key --account-name $storage_account_name --account-key $storage_account_key -o none
+        echo 'Hello world!' >"$tmp_file"
+        az storage blob upload -n "$storage_blob_name" -c "$storage_container_name" -f "/tmp/${storage_blob_name}" --auth-mode key --account-name "$storage_account_name" --account-key "${storage_account_key}" --overwrite -o none
+    else
+        echo "Container $storage_container_name already exists"
+    fi
+    # Create private DNS zone and register with all VNets
+    find_zone=$(az network private-dns zone show -n $dns_zone_name -g $rg 2>/dev/null)
+    if [[ -z "$find_zone" ]]; then
+        az network private-dns zone create -n $dns_zone_name -g $rg -o none
+        vnet_list=$(az network vnet list -g $rg --query '[].name' -o tsv)
+        while IFS= read -r vnet_to_link; do
+            echo "Linking zone $dns_zone_name to VNet $vnet_to_link..."
+            az network private-dns link vnet create -g $rg -z $dns_zone_name -n $vnet_to_link --virtual-network $vnet_to_link --registration-enabled false --only-show-errors -o none
+        done <<< "$vnet_list"
+    else
+        echo "Private DNS Zone $dns_zone_name already exists in RG $rg"
+    fi
+    # Create endpoint
+    echo "Creating private endpoint for storage account $storage_account_name..."
+    find_endpoint=$(az network private-endpoint show -n $storage_endpoint_name -g $rg 2>/dev/null)
+    if [[ -z "$find_endpoint" ]]; then
+        storage_account_id=$(az storage account show -n $storage_account_name -g $rg -o tsv --query id)
+        az network vnet subnet create -g $rg -n $subnet_name --vnet-name $vnet_name --address-prefix $subnet_prefix -o none
+        az network private-endpoint create -n $storage_endpoint_name -l $location -g $rg --vnet-name $vnet_name --subnet $subnet_name --private-connection-resource-id $storage_account_id --group-id blob --connection-name blob -o none
+        az network private-endpoint dns-zone-group create --endpoint-name $storage_endpoint_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none
+    else
+        echo "Endpoint $storage_endpoint_name already exists"
+    fi
+}
+# Main:
+if [[ "$private_link" == "yes" ]]; then
+    create_storage_private_link 1
+    if [[ "$no_of_hubs" == "2" ]]; then
+        create_storage_private_link 2
     fi
 fi
 
 ##############################
 #      Routing changes       #
 ##############################
+
+# Change routing intent to NVA
+if [[ "$nva_in_hub1" == "yes" ]] && [[ $routing_intent == "yes" ]]; then
+    put_routing_intent 1 $ri_policy nva
+fi
+if [[ "$nva_in_hub2" == "yes" ]] && [[ $routing_intent == "yes" ]] && [[ "$no_of_hubs" == "2" ]]; then
+    put_routing_intent 2 $ri_policy nva
+fi
 
 # Change propagation in all connections. For example:
 #   change_prop default
@@ -2273,6 +2356,20 @@ function add_static_routes() {
     fi
 }
 
+# Changes Private Endpoint network policies
+function disable_network_policies() {
+    if [[ -z $1 ]]; then
+        disable='true'
+    else
+        disable=$1
+    fi
+    if [[ "$private_link" == "yes" ]]; then
+        az network vnet subnet update -n privateendpoint --vnet-name "spoke11-$location1" -g $rg --disable-private-endpoint-network-policies true -o none
+        if [[ "$no_of_hubs" == "2" ]]; then
+            az network vnet subnet update -n privateendpoint --vnet-name "spoke21-$location2" -g $rg --disable-private-endpoint-network-policies true -o none
+        fi
+    fi
+}
 
 ################################
 #   Modify ER bow-tie design   #
