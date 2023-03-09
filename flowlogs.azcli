@@ -42,7 +42,7 @@ adx_name='nwlogs$RANDOM'
 # ElasticStack variables
 elk_subnet_prefix=192.168.20.0/24
 elk_subnet_name=elastic
-elk_vm_name=elk
+elk_vm_name=elkvm
 elk_vm_size=Standard_B2ms
 elk_cloudinit_file=/tmp/elk_cloudinit.txt
 
@@ -347,7 +347,7 @@ EOF
     echo "Creating Elastic Stack VM..."
     az vm create -n $elk_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${elk_vm_name}-nsg" -o none \
         --custom-data $elk_cloudinit_file --public-ip-sku Standard --public-ip-address "${elk_vm_name}-pip" \
-        --vnet-name $vnet_name --size $elk_vm_size --subnet $elk_subnet_name -l $location --no-wait
+        --vnet-name $vnet_name --size $elk_vm_size --subnet $elk_subnet_name -l $location
     # Make sure to reset the elastic user's password with elasticsearch-setup-password or elasticsearch-reset-password !!!!
     echo "You will be prompted now to reset the Elastic and Kibana passwords. Please enter the value of the defaultPassword variable/secret (see above in the script):"
     elk_pip=$(az network public-ip show -n "${elk_vm_name}-pip" -g $rg --query ipAddress -o tsv)

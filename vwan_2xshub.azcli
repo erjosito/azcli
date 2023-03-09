@@ -18,13 +18,13 @@
 ###############
 
 # Control
-no_of_hubs=2         # 1 or 2 hubs
+no_of_hubs=1         # 1 or 2 hubs
 no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
-create_routes=yes    # Whether static routes are created or not in RT's secure hub(s)
+create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
 create_custom_rt=no  # Whether a custom RT for VNets will be created
-indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
-nva_bgp=yes          # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
+indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
+nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet' (if 'vnet', $create_custom_rt must be yes)
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none' (if 'vnet', $create_custom_rt must be yes)
@@ -37,7 +37,7 @@ er_bow_tie=no        # If creating ER in multiple regions, whether each region s
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
 routing_intent=yes   # Whether RI is configured
-ri_policy=both       # internet/private/both
+ri_policy=internet   # internet/private/both
 private_link=yes     # whether private endpoints will be created for the storage accounts in each region (in the first spoke, using the flow logs storage accounts)
 location1=westcentralus
 location2=eastus
@@ -52,6 +52,7 @@ username=$(whoami)
 vm_size=Standard_B1s
 nva_size=Standard_B2ms
 wait_interval=15
+azfw_policy_name=vwanfwpolicy
 # Branches
 publisher=cisco
 offer=cisco-csr-1000v
@@ -1365,7 +1366,6 @@ fi
 if [[ "$secure_hub" == "yes" ]]
 then
     # Create Azure Firewall policy with sample policies
-    azfw_policy_name=vwanfwpolicy
     az network firewall policy create -n $azfw_policy_name -g $rg -o none
     az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 100 -o none
     # Allow SSH and HTTP for connection monitor (uses TCP9 too)
@@ -2132,9 +2132,14 @@ then
         gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
         gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1
         gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
-        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
-        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
-        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --quiet --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --quiet --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --quiet --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+        # For IPsec (only required if configuring the VM as IPsec NVA)
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-udp4500" --verbosity=error --network "$gcp_vpc1_name" --priority=1050 --direction=INGRESS --rules=udp:4500 --source-ranges=192.168.0.0/16 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-udp500" --verbosity=error --network "$gcp_vpc1_name" --priority=1060 --direction=INGRESS --rules=udp:500 --source-ranges=192.168.0.0/16 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-udp4500-egress" --verbosity=error --network "$gcp_vpc1_name" --priority=1150 --direction=EGRESS --rules=udp:4500 --source-ranges=0.0.0.0/0 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-udp500-egress" --verbosity=error --network "$gcp_vpc1_name" --priority=1160 --direction=EGRESS --rules=udp:500 --source-ranges=0.0.0.0/0 --action=ALLOW
         # gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="ip a"    # This command will pause the script if the key file is password-protected
         # Create interconnect
         gcloud compute routers create $router1_name --project=$project_id --network=$gcp_vpc1_name --asn=$gcp_asn --region=$region1
@@ -2358,16 +2363,51 @@ function add_static_routes() {
 
 # Changes Private Endpoint network policies
 function disable_network_policies() {
+    subnet_name=privateendpoints
     if [[ -z $1 ]]; then
         disable='true'
     else
         disable=$1
     fi
     if [[ "$private_link" == "yes" ]]; then
-        az network vnet subnet update -n privateendpoint --vnet-name "spoke11-$location1" -g $rg --disable-private-endpoint-network-policies true -o none
+        az network vnet subnet update -n $subnet_name --vnet-name "spoke11-$location1" -g $rg --disable-private-endpoint-network-policies true -o none
         if [[ "$no_of_hubs" == "2" ]]; then
-            az network vnet subnet update -n privateendpoint --vnet-name "spoke21-$location2" -g $rg --disable-private-endpoint-network-policies true -o none
+            az network vnet subnet update -n $subnet_name --vnet-name "spoke21-$location2" -g $rg --disable-private-endpoint-network-policies true -o none
         fi
+    fi
+}
+
+# Bounce ER connection
+function bounce_er_cx() {
+    # Variables
+    if [[ "$1" == "1" ]]; then
+        circuit_name=$hub1_er_circuit_name
+    else
+        circuit_name=$hub2_er_circuit_name
+    fi
+    hub_name="hub${1}"
+    vng_name="${hub_name}ergw"
+    # Get info
+    peering_id=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name $circuit_name -g $rg -o tsv --query id) && echo "Private peering for circuit $circuit_name ID is $peering_id"
+    cx_name=$(az network express-route gateway connection list --gateway-name $vng_name -g $rg --query 'value[0].name' -o tsv)
+    ass_rt_id=$(az network express-route gateway connection list --gateway-name $vng_name -g $rg --query 'value[0].routingConfiguration.associatedRouteTable.id' -o tsv)
+    prop_rt_id=$(az network express-route gateway connection list --gateway-name $vng_name -g $rg --query 'value[0].routingConfiguration.propagatedRouteTables.ids[0].id' -o tsv)
+    prop_label=$(az network express-route gateway connection list --gateway-name $vng_name -g $rg --query 'value[0].routingConfiguration.propagatedRouteTables.labels[0]' -o tsv)
+    echo "Routing information for existing connection:"
+    echo "Associated RT: $ass_rt_id"
+    echo "Propagating to RT: $prop_rt_id"
+    echo "Propagating to label: $prop_label"
+    sleep 60
+    # Go!
+    if [[ -z "$peering_id" ]]
+    then
+        echo "Could not find private peering for ER circuit $circuit_name, you might have to refresh in the portal?"
+    else
+        echo "Deleting connection to circuit $circuit_name from hub $hub_name..."
+        az network express-route gateway connection delete --gateway-name $vng_name -n $cx_name -o none
+        echo "Connecting VWAN hub $hub_name to ER circuit $circuit_name..."
+        az network express-route gateway connection create --gateway-name $vng_name -n $cx_name -g $rg --peering $peering_id \
+            --associated-route-table $ass_rt_id --propagated-route-tables $prop_rt_id --labels $prop_label -o none
     fi
 }
 
@@ -2632,6 +2672,7 @@ az network express-route list-route-tables -g $rg -n $hub2_er_circuit_name --pat
 az network express-route list-route-tables -g $rg -n $hub2_er_circuit_name --path secondary --peering-name AzurePrivatePeering --query value -o table
 
 # ExpressRoute gateways
+az network express-route gateway connection list --gateway-name hub1ergw -g $rg --query value -o table
 az network express-route gateway connection list --gateway-name hub2ergw -g $rg --query value -o table
 
 # Virtual WAN
