@@ -2388,26 +2388,25 @@ function bounce_er_cx() {
     hub_name="hub${1}"
     vng_name="${hub_name}ergw"
     # Get info
-    peering_id=$(az network express-route peering show -n "AzurePrivatePeering" --circuit-name $circuit_name -g $rg -o tsv --query id) && echo "Private peering for circuit $circuit_name ID is $peering_id"
-    cx_name=$(az network express-route gateway connection list --gateway-name $vng_name -g $rg --query 'value[0].name' -o tsv)
-    ass_rt_id=$(az network express-route gateway connection list --gateway-name $vng_name -g $rg --query 'value[0].routingConfiguration.associatedRouteTable.id' -o tsv)
-    prop_rt_id=$(az network express-route gateway connection list --gateway-name $vng_name -g $rg --query 'value[0].routingConfiguration.propagatedRouteTables.ids[0].id' -o tsv)
-    prop_label=$(az network express-route gateway connection list --gateway-name $vng_name -g $rg --query 'value[0].routingConfiguration.propagatedRouteTables.labels[0]' -o tsv)
+    peering_id=$(az network express-route peering show --only-show-errors -n "AzurePrivatePeering" --circuit-name $circuit_name -g $rg -o tsv --query id) && echo "Private peering for circuit $circuit_name ID is $peering_id"
+    cx_name=$(az network express-route gateway connection list --only-show-errors --gateway-name $vng_name -g $rg --query 'value[0].name' -o tsv)
+    ass_rt_id=$(az network express-route gateway connection list --only-show-errors --gateway-name $vng_name -g $rg --query 'value[0].routingConfiguration.associatedRouteTable.id' -o tsv)
+    prop_rt_id=$(az network express-route gateway connection list --only-show-errors --gateway-name $vng_name -g $rg --query 'value[0].routingConfiguration.propagatedRouteTables.ids[0].id' -o tsv)
+    prop_label=$(az network express-route gateway connection list --only-show-errors --gateway-name $vng_name -g $rg --query 'value[0].routingConfiguration.propagatedRouteTables.labels[0]' -o tsv)
     echo "Routing information for existing connection:"
     echo "Associated RT: $ass_rt_id"
     echo "Propagating to RT: $prop_rt_id"
     echo "Propagating to label: $prop_label"
-    sleep 60
     # Go!
     if [[ -z "$peering_id" ]]
     then
         echo "Could not find private peering for ER circuit $circuit_name, you might have to refresh in the portal?"
     else
         echo "Deleting connection to circuit $circuit_name from hub $hub_name..."
-        az network express-route gateway connection delete --gateway-name $vng_name -n $cx_name -o none
+        az network express-route gateway connection delete --gateway-name $vng_name -n $cx_name -g $rg -o none --only-show-errors
         echo "Connecting VWAN hub $hub_name to ER circuit $circuit_name..."
         az network express-route gateway connection create --gateway-name $vng_name -n $cx_name -g $rg --peering $peering_id \
-            --associated-route-table $ass_rt_id --propagated-route-tables $prop_rt_id --labels $prop_label -o none
+            --associated-route-table $ass_rt_id --propagated-route-tables $prop_rt_id --labels $prop_label -o none --only-show-errors
     fi
 }
 
