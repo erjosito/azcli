@@ -480,14 +480,15 @@ function config_csr_base () {
     csr_id=$1
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress 2>/dev/null)
     asn=$(get_router_asn_from_id "$csr_id")
-    myip=$(curl -s4 ifconfig.co)
+    echo "Trying to get your public IP address..."
+    myip=$(curl -s4 ifconfig.me)
     # Check we have a valid IP
-    until [[ $myip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+    until [[ "$myip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
     do
-        sleep 5
-        myip=$(curl -s4 ifconfig.co)
+        sleep 15
+        myip=$(curl -s4 ifconfig.me)
     done
-    echo "Our IP seems to be $myip"
+    echo "Your public IP seems to be $myip"
     default_gateway="10.${csr_id}.0.1"
     echo "Configuring CSR ${csr_ip} for VPN and BGP..."
     username=$(whoami)
@@ -912,6 +913,7 @@ function config_gw_logging () {
 
 # Deploy base config for all CSRs
 function config_csrs_base () {
+    echo "Configuring CSRs..."
     for router in "${routers[@]}"
     do
         type=$(get_router_type  "$router")
