@@ -321,7 +321,7 @@ if [[ "$create_elk" == "yes" ]]; then
     echo "Creating subnet $elk_subnet_name ($elk_subnet_prefix)..."
     az network vnet subnet create --vnet-name $vnet_name --name $elk_subnet_name -g $rg --address-prefixes $elk_subnet_prefix -o none
     # Create NSGs
-    echo "Creating NSGs..."
+    echo "Creating NSG for Elastic VM..."
     az network nsg create -n "${elk_vm_name}-nsg" -g $rg -o none
     az network nsg rule create -n SSH --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
     az network nsg rule create -n Kibana --nsg-name "${elk_vm_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 5601 --access Allow --protocol Tcp -o none
@@ -349,17 +349,24 @@ EOF
         --custom-data $elk_cloudinit_file --public-ip-sku Standard --public-ip-address "${elk_vm_name}-pip" \
         --vnet-name $vnet_name --size $elk_vm_size --subnet $elk_subnet_name -l $location
     # Make sure to reset the elastic user's password with elasticsearch-setup-password or elasticsearch-reset-password !!!!
+    echo "Sleeping now until Elastic gets installed..."
+    sleep 300
     echo "You will be prompted now to reset the Elastic and Kibana passwords. Please enter the value of the defaultPassword variable/secret (see above in the script):"
     elk_pip=$(az network public-ip show -n "${elk_vm_name}-pip" -g $rg --query ipAddress -o tsv)
     ssh $elk_pip "sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -i"
     ssh $elk_pip "sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana -i"
     # Verify Elastic Search VM
+    if [[ -z "$default_password" ]]; then
+        echo "ERROR: default_password is empty. Please enter the value of the defaultPassword variable/secret (see above in the script):"
+        read default_password
+    fi
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "systemctl status elasticsearch"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "systemctl status kibana"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u elastic:${default_password} https://localhost:9200"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u kibana_system:${default_password} https://localhost:9200/_xpack/security/_authenticate?pretty"  # Not working!
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "curl -sk -u elastic:${default_password} https://localhost:9200/_cluster/health"
     # Configure ElasticSearch and Kibana
+    echo "Configuring ElasticSearch and Kibana..."
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/network.host/c\network.host: 0.0.0.0' /etc/elasticsearch/elasticsearch.yml"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart elasticsearch"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo sed -i '/server.host/c\server.host: \"0.0.0.0\"' /etc/kibana/kibana.yml"
@@ -458,11 +465,14 @@ input {
         prefix => "resourceId=/"
         path_filters => ['**/*.json']
         addfilename => true
-        registry_create_policy => "resume"
-        registry_local_path => "/usr/share/logstash/plugin"
         interval => 300
         debug_timer => true
         debug_until => 100
+    }
+}
+filter {
+    json {
+        source => "message"
     }
 }
 output {
