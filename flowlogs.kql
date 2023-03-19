@@ -1,0 +1,76 @@
+// Create table to receive raw logs from Azure Storage (over Event Grid)
+.create table ['rawFlowLogs']  (['records']:dynamic, ['EventProcessedUtcTime']:datetime, ['PartitionId']:int, ['EventEnqueuedUtcTime']:datetime)
+
+// Create Mapping function
+.create-or-alter function 
+with (docstring = 'Parses raw flowlogs records into strongly-typed columns', folder = 'FlowLogs')
+FlowLogMapping() {
+    rawFlowLogs
+    | mv-expand records = records   
+    | project   Time = todatetime(records["time"]),
+                macAddress = tostring(records["macAddress"]),
+                category = tostring(records["category"]),
+                flowLogVersion = toint(records["flowLogVersion"]),
+                flowLogGUID = tostring(records["flowLogGUID"]),
+                flowLogResourceID = tostring(records["flowLogGUID"]),
+                targetResourceID = tostring(records["targetResourceID"]),
+                vnetResourceID = tostring(records["vnetResourceID"]),
+                nicResourceID = tostring(records["nicResourceID"]),
+                vmResourceID = tostring(records["vmResrouceID"]),
+                location = tostring(records["location"]),
+                zone = tostring(records["zone"]),
+                flowRecords = todynamic(records["flowRecords"])
+    | mv-expand flowRecords
+    | extend fields = split(flowRecords, ',')
+    | extend    Timestamp = tostring(fields[0]),
+                SourceIP = tostring(fields[1]),
+                DestinationIP = tostring(fields[2]),
+                SrcPort = tostring(fields[3]),
+                DstPort = tostring(fields[4]),
+                L4Protocol = tostring(fields[5]),
+                Direction = tostring(fields[6]),
+                State = tostring(fields[7]),
+                Encryption = tostring(fields[8]),
+                PacketsSrcToDst = toint(fields[9]),
+                BytesSrcToDst = toint(fields[10]),
+                PacketDstToSrc = toint(fields[11]),
+                BytesDstToSrc = toint(fields[12])
+    | project-away flowRecords
+}
+
+// Test (and expand 'flowRecords')
+FlowLogMapping()
+
+// Create target table for structured logs
+.create table flowLogs (
+    Time:datetime,
+    macAddress:string,
+    category:string,
+    flowLogVersion:int,
+    flowLogGUID:string,
+    flowLogResourceID:string,
+    targetResourceID:string,
+    vnetResourceID:string,
+    vmResourceID:string,
+    nicResourceID:string,
+    location:string,
+    zone:string,
+    flowRecords:dynamic,
+    Timestamp:string,
+    SourceIP:string,
+    DestinationIP:string,
+    SrcPort:string,
+    DstPort:string,
+    L4Protocol:string,
+    Direction:string,
+    State:string,
+    Encryption:string,
+    PacketsSrcToDst:int,
+    BytesSrcToDst:int,
+    PacketsDstToSrc:int,
+    BytesDstToSrc:int
+)
+
+// Update policy for rawFlowLogs
+.alter table FlowLogs policy update
+@'[{ "IsEnabled": true, "Source": "rawFlowLogs", "Query": "FlowLogMapping()", "IsTransactional": false, "PropagateIngestionProperties": false}]'

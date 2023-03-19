@@ -38,6 +38,8 @@ adx_sku='Dev(No SLA)_Standard_E2a_v4'
 adx_tier='Basic'     # Not able to make it work with other values such as Developer/Basic
 adx_capacity=1
 adx_name='nwlogs$RANDOM'
+adx_fwlogs_table=FirewallLogs
+adx_flowlogs_table=FlowLogs
 
 # ElasticStack variables
 elk_subnet_prefix=192.168.20.0/24
@@ -261,7 +263,7 @@ if [[ "$create_adx" == "yes" ]]; then
     az kusto database create --cluster-name $adx_name --database-name $adx_name -g $rg --read-write-database soft-delete-period=P365D hot-cache-period=P31D location=$location -o none
     adx_id=$(az kusto cluster show -n $adx_name -g $rg --query id -o tsv)
     adx_principal_id=$(az kusto cluster show -n $adx_name -g $rg --query 'identity.principalId' -o tsv)
-    # Create event grid
+    # Create event grid (required for storage integration in ADX)
     add_extension eventgrid
     storage_account_name=$(az storage account list -g $rg -o tsv --query "[?location=='$location'].name" | head -1)
     storage_account_id=$(az storage account show -n $storage_account_name -g $rg --query id --output tsv)
@@ -277,28 +279,24 @@ if [[ "$create_adx" == "yes" ]]; then
     az kusto data-connection event-grid create --cluster-name $adx_name -n $eg_name --database-name $adx_name -l $location \
          --event-grid-resource-id $eg_id --blob-storage-event-type 'Microsoft.Storage.BlobCreated' --storage-account-resource-id $storage_account_id \
          --data-format JSON --table-name flowlogs --managed-identity-resource-id $adx_id -g $rg -o none
-    # Create Event Hubs namespace
-    eh_name=$(az eventhubs namespace list -g $rg --query '[0].name' -o tsv)
-    eh_ns_name=$eh_name
-    if [[ -z "$eh_ns_name" ]]; then
-        eh_name=nwlogs$RANDOM
-        eh_ns_name=$eh_name
-        echo "Creating Event Hub ${eh_name}..."
-        az eventhubs namespace create -n $eh_ns_name -g $rg -l $location --sku Standard -o none
-        az eventhubs eventhub create -n $eh_name -g $rg --namespace-name $eh_ns_name -o none
-    else
-        echo "Events Hub $eh_name found in RG $rg"
-    fi
-    eh_ns_cx_string=$(az eventhubs namespace authorization-rule keys list -g $rg --namespace-name $eh_ns_name --name RootManageSharedAccessKey --query primaryConnectionString -o tsv)
-    eh_ns_id=$(az eventhubs namespace show -g $rg -n $eh_ns_name --query id -o tsv)
-    eh_id=$(az eventhubs eventhub show --namespace-name $eh_ns_name -g $rg -n $eh_name --query id -o tsv)
-    az role assignment create --scope $eh_ns_id --assignee $adx_principal_id --role 'Azure Event Hubs Data Receiver' -o none
-    # az kusto data-connection event-hub data-connection-validation --cluster-name $adx_name -n $eh_name --database-name $adx_name -l $location \
-    #      --consumer-group '$Default' --event-hub-resource-id $eh_id --managed-identity-resource-id $adx_id -g $rg -o none
     az kusto data-connection event-hub create --cluster-name $adx_name -n $eh_name --database-name $adx_name -l $location \
          --consumer-group '$Default' --event-hub-resource-id $eh_id --managed-identity-resource-id $adx_id -g $rg -o none
-    # Add diag setting to AzFW to send logs to this Event hub
+
+    # Configure firewall logs to ADX via events hub
     if [[ "$create_azfw" == "yes" ]]; then
+        # Create Event Hubs namespace
+        eh_name=$(az eventhubs namespace list -g $rg --query '[0].name' -o tsv)
+        eh_ns_name=$eh_name
+        if [[ -z "$eh_ns_name" ]]; then
+            eh_name=nwlogs$RANDOM
+            eh_ns_name=$eh_name
+            echo "Creating Event Hub ${eh_name}..."
+            az eventhubs namespace create -n $eh_ns_name -g $rg -l $location --sku Standard -o none
+            az eventhubs eventhub create -n $eh_name -g $rg --namespace-name $eh_ns_name -o none
+        else
+            echo "Events Hub $eh_name found in RG $rg"
+        fi
+        # Add diag setting to AzFW to send logs to this Event hub
         azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
         az monitor diagnostic-settings create -n $eh_name --resource $azfw_id --event-hub $eh_ns_id --event-hub-rule RootManageSharedAccessKey \
             --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
@@ -311,6 +309,16 @@ if [[ "$create_adx" == "yes" ]]; then
                     {"category": "AZFWFqdnResolveFailure", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
                     {"category": "AZFWFatFlow", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
                     {"category": "AZFWFlowTrace", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+        # Create table for firewall logs
+        echo "Run this query in ADX (https://dataexplorer.azure.com/clusters/$adx_name.$location/databases/$adx_name) and run the query in https://github.com/gbeaud/azure-demos/blob/main/adx-logs-management/adx-update-policy-structured-logs.kql"
+        # Link EH to ADX
+        eh_ns_cx_string=$(az eventhubs namespace authorization-rule keys list -g $rg --namespace-name $eh_ns_name --name RootManageSharedAccessKey --query primaryConnectionString -o tsv)
+        eh_ns_id=$(az eventhubs namespace show -g $rg -n $eh_ns_name --query id -o tsv)
+        eh_id=$(az eventhubs eventhub show --namespace-name $eh_ns_name -g $rg -n $eh_name --query id -o tsv)
+        az role assignment create --scope $eh_ns_id --assignee $adx_principal_id --role 'Azure Event Hubs Data Receiver' -o none
+        # az kusto data-connection event-hub data-connection-validation --cluster-name $adx_name -n $eh_name --database-name $adx_name -l $location \
+        #      --consumer-group '$Default' --event-hub-resource-id $eh_id --managed-identity-resource-id $adx_id -g $rg -o none
+
     fi
 fi
 
@@ -382,77 +390,6 @@ EOF
     # Configure logstash
     storage_account_name=$(az storage account list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the storage account name if it already existed
     storage_account_key=$(az storage account keys list -n $storage_account_name --query '[0].value' -o tsv)
-    # From https://learn.microsoft.com/en-us/azure/network-watcher/network-watcher-visualize-nsg-flow-logs-open-source-tools
-    cat <<EOF > /tmp/logstash.conf
-input {
-   azure_blob_storage {
-        storageaccount => "$storage_account_name"
-        access_key => "$storage_account_key"
-        container => "insights-logs-networksecuritygroupflowevent"
-        codec => "json"
-        file_head => '{"records":['
-        file_tail => ']}'
-        interval => 300
-        path_filters => ['**/*.json']
-        # Enable / tweak these settings when event is too big for codec to handle.
-        # break_json_down_policy => "with_head_tail"
-        # break_json_batch_count => 2
-    }
-}
-filter {
-    split { field => "[records]" }
-    split { field => "[records][properties][flows]" }
-    split { field => "[records][properties][flows][flows]" }
-    split { field => "[records][properties][flows][flows][flowTuples]" }
-    mutate {
-        split => { "[records][resourceId]" => "/"}
-        add_field => {
-            "Subscription" => "%{[records][resourceId][2]}"
-            "ResourceGroup" => "%{[records][resourceId][4]}"
-            "NetworkSecurityGroup" => "%{[records][resourceId][8]}"
-        }
-        convert => {"Subscription" => "string"}
-        convert => {"ResourceGroup" => "string"}
-        convert => {"NetworkSecurityGroup" => "string"}
-        split => { "[records][properties][flows][flows][flowTuples]" => ","}
-        add_field => {
-            "unixtimestamp" => "%{[records][properties][flows][flows][flowTuples][0]}"
-            "srcIp" => "%{[records][properties][flows][flows][flowTuples][1]}"
-            "destIp" => "%{[records][properties][flows][flows][flowTuples][2]}"
-            "srcPort" => "%{[records][properties][flows][flows][flowTuples][3]}"
-            "destPort" => "%{[records][properties][flows][flows][flowTuples][4]}"
-            "protocol" => "%{[records][properties][flows][flows][flowTuples][5]}"
-            "trafficflow" => "%{[records][properties][flows][flows][flowTuples][6]}"
-            "traffic" => "%{[records][properties][flows][flows][flowTuples][7]}"
-            "flowstate" => "%{[records][properties][flows][flows][flowTuples][8]}"
-            "packetsSourceToDest" => "%{[records][properties][flows][flows][flowTuples][9]}"
-            "bytesSentSourceToDest" => "%{[records][properties][flows][flows][flowTuples][10]}"
-            "packetsDestToSource" => "%{[records][properties][flows][flows][flowTuples][11]}"
-            "bytesSentDestToSource" => "%{[records][properties][flows][flows][flowTuples][12]}"
-        }
-        convert => {"unixtimestamp" => "integer"}
-        convert => {"srcPort" => "integer"}
-        convert => {"destPort" => "integer"}
-        convert => {"packetsSourceToDest" => "integer"}
-        convert => {"bytesSourceToDest" => "integer"}
-        convert => {"packetsDestToSource" => "integer"}
-        convert => {"bytesSentDestToSource" => "integer"}
-    }
-    date {
-        match => ["unixtimestamp" , "UNIX"]
-    }
-}
-output {
-    elasticsearch {
-        hosts => ["https://localhost:9200"]
-        index => "nsg-flow-logs-%{+xxxx.ww}"
-        ssl => true 
-        ssl_certificate_verification => false 
-        user => "elastic" 
-        password => "$default_password"
-    }
-}  
-EOF
     # From https://github.com/janmg/logstash-input-azure_blob_storage
     cat <<EOF > /tmp/logstash.conf
 input {
@@ -465,18 +402,26 @@ input {
         prefix => "resourceId=/"
         path_filters => ['**/*.json']
         addfilename => true
-        interval => 300
+        interval => 60
         debug_timer => true
         debug_until => 100
+        registry_create_policy => "start_over"
     }
 }
 filter {
     json {
         source => "message"
     }
+    mutate {
+        add_field => { "environment" => "test-env" }
+        remove_field => [ "message" ]
+    }
+    date {
+        match => ["unixtimestamp", "UNIX"]
+    }
 }
 output {
-    stdout { codec => rubydebug }
+    stdout { codec => json }
     elasticsearch {
         hosts => ["https://localhost:9200"]
         index => "nsg-flow-logs-%{+xxxx.ww}"
@@ -494,12 +439,22 @@ EOF
     # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl restart logstash"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl start logstash"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $elk_pip "sudo systemctl enable logstash"
+    # Export object API (index-patterns and dashboard)
+    # curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" -H 'Content-Type: application/json' "http://${elk_pip}:5601/api/saved_objects/_export" -d '{"objects": [ {"type": "index-pattern", "id":  "130ee8d1-b379-4eb2-bbcc-16375396dc49"} ] }' >./flowlogs_index.ndjson
+    # curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" -H 'Content-Type: application/json' "http://${elk_pip}:5601/api/saved_objects/_export" -d '{"objects": [ {"type": "dashboard", "id": "0f215dd0-c40c-11ed-84b5-4b9e67d15531"} ] }' >./flowlogs_dashboard.ndjson
     # Import object API (to use with .ndjson files, not exactly json)
-    # curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" --form file=@/tmp/visualization.ndjson "http://${elk_pip}:5601/api/saved_objects/_import"
-    # curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" --form file=@/tmp/dashboard.json "http://${elk_pip}:5601/api/saved_objects/_import"
-    # Export object API (here an example for data views aka index-patterns)
-    # curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" -H 'Content-Type: application/json' "http://${elk_pip}:5601/api/saved_objects/_export" -d '{"type": "index-pattern"}'
-    # curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" -H 'Content-Type: application/json' "http://${elk_pip}:5601/api/saved_objects/_export" -d '{"type": "dashboard"}'
+    if [[ -e "./flowlogs_index.ndjson" ]]; then
+        echo "Importing data index..."
+        curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" --form file=@./flowlogs_index.ndjson "http://${elk_pip}:5601/api/saved_objects/_import"
+    else
+        echo "Sorry, couldn't find file ./flowlogs_index.ndjson"
+    fi
+    if [[ -e "./flowlogs_dashboard.ndjson" ]]; then
+        echo "Importing Kibana dashboard..."
+        curl -sk -u elastic:${default_password} -X POST -H "kbn-xsrf: true" --form file=@./flowlogs_dashboard.ndjson "http://${elk_pip}:5601/api/saved_objects/_import"
+    else
+        echo "Sorry, couldn't find file ./flowlogs_dashboard.ndjson"
+    fi
     # URLs
     echo "Browse to http://$elk_pip:5601 for Kibana (the username is 'elastic')"
 fi
@@ -559,8 +514,13 @@ done
 
 # ADX
 az kusto cluster list -g $rg -o table
-az kusto data-connection list --cluster-name $adx_name --database-name $adx_name -g $rg -o table
+az kusto database list --cluster-name $adx_name -g $rg --only-show-errors -o table
+az kusto script list --cluster-name $adx_name --database-name $adx_name -g $rg -o table
+az kusto data-connection list --cluster-name $adx_name --database-name $adx_name -g $rg --only-show-errors -o table
 az eventgrid system-topic list -g $rg -o table
+# List tables
+kql_query='.show tables details'
+
 
 ##############
 # Stop/Start #
