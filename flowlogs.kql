@@ -1,7 +1,11 @@
 // Create table to receive raw logs from Azure Storage (over Event Grid)
 .create table ['rawFlowLogs']  (['records']:dynamic, ['EventProcessedUtcTime']:datetime, ['PartitionId']:int, ['EventEnqueuedUtcTime']:datetime)
 
-// Create Mapping function
+/////////////////////
+//  VNet Flow Logs //
+/////////////////////
+
+// Create Mapping function (VNet Flow Logs)
 .create-or-alter function 
 with (docstring = 'Parses raw flowlogs records into strongly-typed columns', folder = 'FlowLogs')
 FlowLogMapping() {
@@ -38,10 +42,7 @@ FlowLogMapping() {
     | project-away flowRecords
 }
 
-// Test (and expand 'flowRecords')
-FlowLogMapping()
-
-// Create target table for structured logs
+// Create target table for VNet Flow Logs
 .create table flowLogs (
     Time:datetime,
     macAddress:string,
@@ -72,5 +73,78 @@ FlowLogMapping()
 )
 
 // Update policy for rawFlowLogs
-.alter table FlowLogs policy update
+.alter table flowLogs policy update
+@'[{ "IsEnabled": true, "Source": "rawFlowLogs", "Query": "FlowLogMapping()", "IsTransactional": false, "PropagateIngestionProperties": false}]'
+
+////////////////////
+//  NSG Flow Logs //
+////////////////////
+
+// Create Mapping function (NSG Flow Logs)
+.create-or-alter function 
+with (docstring = 'Parses raw flowlogs records into strongly-typed columns', folder = 'FlowLogs')
+FlowLogMapping() {
+    rawFlowLogs
+    | mv-expand records = records   
+    | take 1
+    | project   Time = todatetime(records["time"]),
+                macAddress = tostring(records["macAddress"]),
+                category = tostring(records["category"]),
+                flowLogVersion = toint(records["properties"]["Version"]),
+                nsgResourceID = tostring(records["resourceId"]),
+                flows = todynamic(records["properties"]["flows"])
+    | mv-expand flows
+    | extend rule = tostring(flows["rule"])
+    | extend flowsFlows = todynamic(flows["flows"])
+    | mv-expand flowsFlows
+    | extend macAddress2=tostring(flowsFlows["mac"]),
+             flowsFlowsTuples = todynamic(flowsFlows["flowTuples"])
+    | mv-expand flowsFlowsTuples
+    | extend fields = split(flowsFlowsTuples, ',')
+    | extend Timestamp = tostring(fields[0]),
+             srcIP = tostring(fields[1]),
+             dstIP = tostring(fields[2]),
+             srcPort = tostring(fields[3]),
+             dstPort = tostring(fields[4]),
+             Protocol = tostring(fields[5]),
+             Direction = tostring(fields[6]),
+             Decision = tostring(fields[7]),
+             State = tostring(fields[8]),
+             PacketsSrcToDst = toint(fields[9]),
+             BytesSrcToDst = toint(fields[10]),
+             PacketDstToSrc = toint(fields[11]),
+             BytesDstToSrc = toint(fields[12])
+    | project-away flows, flowsFlows, flowsFlowsTuples,fields
+}
+
+// Create target table for NSG Flow Logs
+.drop table flowLogs
+.create table flowLogs (
+    Time:datetime,
+    macAddress:string,
+    category:string,
+    flowLogVersion:int,
+    nsgResourceID:string,
+    flows:dynamic,
+    rule:string,
+    flowsFlows:dynamic,
+    macAddress2:string,
+    flowsFlowsTuples:dynamic,
+    Timestamp:string,
+    srcIP:string,
+    dstIP:string,
+    srcPort:string,
+    dstPort:string,
+    Protocol:string,
+    Direction:string,
+    Decision:string,
+    State:string,
+    PacketsSrcToDst:int,
+    BytesSrcToDst:int,
+    PacketsDstToSrc:int,
+    BytesDstToSrc:int
+)
+
+// Update policy for rawFlowLogs
+.alter table flowLogs policy update
 @'[{ "IsEnabled": true, "Source": "rawFlowLogs", "Query": "FlowLogMapping()", "IsTransactional": false, "PropagateIngestionProperties": false}]'
