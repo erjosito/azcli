@@ -11,18 +11,30 @@
 query="where type=~'microsoft.containerservice/managedclusters'"
 query="where type=='microsoft.containerservice/managedclusters' | distinct id"
 query="where type=='microsoft.containerservice/managedclusters' | distinct name,resourceGroup"
-query="where type=='microsoft.containerservice/managedclusters' | where sku.tier=='Paid' | distinct name,resourceGroup"
-query="where type=='microsoft.containerservice/managedclusters' | where properties.publicNetworkAccess=='Enabled' and isnull(properties.apiServerAccessProfile) | distinct name,resourceGroup"
-query="where type=='microsoft.containerservice/managedclusters' | where isnotnull(properties.networkProfile.networkPolicy) | distinct name,resourceGroup"
-query="where type=='microsoft.containerservice/managedclusters' | where isnotnull(properties.addonProfiles.httpApplicationRouting) | distinct name,resourceGroup"
-query="where type=='microsoft.containerservice/managedclusters' | where isnotnull(properties.addonProfiles.omsagent) | distinct name,resourceGroup"
-query="where type=='microsoft.containerservice/managedclusters' | where isnotnull(properties.addonProfiles.aciConnectorLinux) and properties.addonProfiles.aciConnectorLinux.enabled==true | distinct name,resourceGroup"
-query="where type=='microsoft.containerservice/managedclusters' | where properties.nodeResourceGroup \!startswith 'MC_' | distinct name,resourceGroup"
+# Paid SKU
+query="where type=='microsoft.containerservice/managedclusters' | extend compliant = (sku.tier=='Paid') | distinct id,compliant"
+# API IP filters
+query="where type=='microsoft.containerservice/managedclusters' | extend compliant = not(properties.publicNetworkAccess==true and isnull(properties.apiServerAccessProfile)) | distinct id,compliant"
+# Network policy addon
+query="where type=='microsoft.containerservice/managedclusters' | extend compliant=(isnotnull(properties.networkProfile.networkPolicy)) | distinct id,compliant"
+# No app routing addon
+query="where type=='microsoft.containerservice/managedclusters' | extend compliant = not(isnotnull(properties.addonProfiles.httpApplicationRouting)) | distinct id,compliant"
+# OMS plugin deployed
+query="where type=='microsoft.containerservice/managedclusters' | extend compliant=isnotnull(properties.addonProfiles.omsagent) | distinct id,compliant"
+# ACI connector plugin deployed
+query="where type=='microsoft.containerservice/managedclusters' | extend compliant = (isnotnull(properties.addonProfiles.aciConnectorLinux) and properties.addonProfiles.aciConnectorLinux.enabled==true) | distinct id,compliant"
+# Using custom infra RG names
+query="where type=='microsoft.containerservice/managedclusters' | extend compliant = (properties.nodeResourceGroup \!startswith 'MC_') | distinct id,compliant"
+# ?
 query="where type=='microsoft.containerservice/managedclusters' | project name=name+"-"properties.agentPoolProfiles[].name"
-query="where type=='microsoft.containerservice/managedclusters' | project resourceGroup,name,pools=properties.agentPoolProfiles | mv-expand pools | where pools.osDiskType=='Managed' | project name=strcat(name,'-',pools.name), resourceGroup"
+# Using managed disks
+query="where type=='microsoft.containerservice/managedclusters' | project id,pools=properties.agentPoolProfiles | mv-expand pools | project id,ManagedDisk=(pools.osDiskType=='Managed')"
+# Existing User Pool
 query="where type=='microsoft.containerservice/managedclusters' | project resourceGroup,name,pools=properties.agentPoolProfiles | mv-expand pools | where pools.mode=='User' | distinct name,resourceGroup"
-query="where type=='microsoft.containerservice/managedclusters' | project resourceGroup,name,pools=properties.agentPoolProfiles | project name,resourceGroup,poolcount=array_length(pools) | where poolcount > 1"
-query="where type=='microsoft.containerservice/managedclusters' | where isnull(zones) | distinct name,resourceGroup"
+# Using >1 pool
+query="where type=='microsoft.containerservice/managedclusters' | project id,pools=properties.agentPoolProfiles | extend poolcount=array_length(pools) | extend compliant = (poolcount > 1) | distinct id,compliant"
+# AZs
+query="where type=='microsoft.containerservice/managedclusters' | extend compliant = isnotnull(zones) | distinct id, compliant"
 query="where type=='microsoft.containerservice/managedclusters' | where properties.servicePrincipalProfile.clientId=='msi' | distinct name,resourceGroup"
 query="where type=='microsoft.containerservice/managedclusters' | where isnull(properties.aadProfile) | distinct name,resourceGroup"
 query="where type=='microsoft.containerservice/managedclusters' | project resourceGroup,name,pools=properties.agentPoolProfiles | mv-expand pools | project subnetId=tostring(pools.vnetSubnetID) | where isnotempty(subnetId)"
@@ -85,3 +97,44 @@ query="Resources | where type == 'microsoft.compute/virtualmachines' | summarize
 
 # Run query
 az graph query -q "$query" --query data -o tsv
+
+#############
+#   Other   #
+#############
+# Create array with multiple tests
+query_list=()
+query_list+=("resources |  where type=='microsoft.containerservice/managedclusters' | extend compliant = (sku.tier=='Paid') | distinct id,compliant")
+query_list+=("resources |  where type=='microsoft.containerservice/managedclusters' | extend compliant=(isnotnull(properties.networkProfile.networkPolicy)) | distinct id,compliant")
+query_list+=("resources |  where type=='microsoft.containerservice/managedclusters' | extend compliant = not(isnotnull(properties.addonProfiles.httpApplicationRouting)) | distinct id,compliant")
+query_list+=("resources |  where type=='microsoft.containerservice/managedclusters' | extend compliant=isnotnull(properties.addonProfiles.omsagent) | distinct id,compliant")
+query_list+=("resources |  where type=='microsoft.containerservice/managedclusters' | extend compliant = (isnotnull(properties.addonProfiles.aciConnectorLinux) and properties.addonProfiles.aciConnectorLinux.enabled==true) | distinct id,compliant")
+query_list+=("resources |  where type=='microsoft.containerservice/managedclusters' | extend compliant = (properties.nodeResourceGroup \!startswith 'MC_') | distinct id,compliant")
+query_list+=("resources |  where type=='microsoft.containerservice/managedclusters' | project id,pools=properties.agentPoolProfiles | mv-expand pools | project id,ManagedDisk=(pools.osDiskType=='Managed')")
+query_list+=("resources |  where type=='microsoft.containerservice/managedclusters' | extend compliant = isnotnull(zones) | distinct id, compliant")
+# Merge queries into one
+i=0
+uber_query=''
+for query in $query_list; do
+    modified_query="${query} | extend query='Query$i'"
+    echo "Query ${i}: ${modified_query}"
+    # If this is not the first query, we need to append a union statement
+    if [[ "$i" != "0" ]]; then
+        uber_query+=" | union ("
+    fi
+    # Append query
+    uber_query+=$modified_query
+    # Close union statement
+    if [[ "$i" != "0" ]]; then
+        uber_query+=")"
+    fi
+    # Next
+    i=$((i + 1))
+done
+echo "Running uber query:"
+echo $uber_query
+az graph query -q "$uber_query" --query data -o table
+# ERROR:
+# {
+#     "code": "TooManyUnionLegs",
+#     "message": "The number of tabular expressions involved in union operators is 8, and has exceeded the limit of 3. Please consider involving less tabular expressions in union."
+# }
