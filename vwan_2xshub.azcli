@@ -18,29 +18,30 @@
 ###############
 
 # Control
-no_of_hubs=1         # 1 or 2 hubs
+no_of_hubs=2         # 1 or 2 hubs
 no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
 create_custom_rt=no  # Whether a custom RT for VNets will be created
-indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
-nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
+indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
+redundant_nva=no     # Whether the NVA in the last spoke is redundant (2nd VM in the same subnet)
+nva_bgp=yes          # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet' (if 'vnet', $create_custom_rt must be yes)
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none' (if 'vnet', $create_custom_rt must be yes)
 nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
-nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub2=yes      # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
 deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
 deploy_gcp=no        # Whether an onprem location to be connected over ER should be deployed in Google Cloud
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
-routing_intent=yes   # Whether RI is configured
+routing_intent=no    # Whether RI is configured
 ri_policy=internet   # internet/private/both
-private_link=yes     # whether private endpoints will be created for the storage accounts in each region (in the first spoke, using the flow logs storage accounts)
-location1=westcentralus
-location2=eastus
+private_link=no      # whether private endpoints will be created for the storage accounts in each region (in the first spoke, using the flow logs storage accounts)
+location1=eastus
+location2=westcentralus
 
 # Generic variables
 rg=vwan
@@ -502,7 +503,7 @@ EOF
     az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding -o none
     echo "Getting information about the created VM..."
     onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $onprem_linuxnva_pip_ip
-    onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $onprem_linuxnva_private_ip
+    onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo $onprem_linuxnva_private_ip
     onprem_linuxnva_default_gw=$(default_gw "$onprem_linuxnva_ip" "255.255.255.192") && echo $onprem_linuxnva_default_gw
     # Public IPs of the external interfaces of the VWAN NVAs
     echo "Getting public IPs of the NVA $nva_name deployed in the virtual hub..."
@@ -817,6 +818,10 @@ EOF
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ipsec status"
     echo "BGP peerings in onprem NVA:"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols"
+    echo "IPSec status in Virtual WAN NVA:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ipsec status"
+    echo "BGP peerings in Virtual WAN NVA:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show protocols"
 }
 
 # Create a Linux NVA in the hub
@@ -1625,9 +1630,36 @@ then
         az network vnet peering create -n 24to2${indirect_spoke_id}1 -g $rg --vnet-name spoke2${indirect_spoke_id}-${location2} --remote-vnet spoke2${indirect_spoke_id}1-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
         az network vnet peering create -n 24to2${indirect_spoke_id}2 -g $rg --vnet-name spoke2${indirect_spoke_id}-${location2} --remote-vnet spoke2${indirect_spoke_id}2-${location2} --allow-vnet-access --allow-forwarded-traffic -o none
     fi
+
+    # If redundant NVAs, create second VM in each NVA spoke
+    if [[ "$redundant_nva" == "yes" ]]; then
+        echo "Creating second NVA VM in spoke 1${indirect_spoke_id}..."
+        az vm create -n spoke1${indirect_spoke_id}-vm2 -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+            --public-ip-address spoke1${indirect_spoke_id}-pip2 --public-ip-sku Standard --vnet-name spoke1${indirect_spoke_id}-$location1 --nsg "vm-nsg-${location1}" --size $vm_size \
+            --subnet vm --custom-data $cloudinit_file -o none
+        if [[ "$no_of_hubs" == "2" ]]
+        then
+            echo "Creating second NVA VM in spoke 2${indirect_spoke_id}..."
+            az vm create -n spoke2${indirect_spoke_id}-vm2 -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+                --public-ip-address spoke2${indirect_spoke_id}-pip2 --public-ip-sku Standard --vnet-name spoke2${indirect_spoke_id}-$location2 --nsg "vm-nsg-${location2}" --size $vm_size \
+                --subnet vm --custom-data $cloudinit_file -o none
+        fi
+    fi
     # Configure IP forwarding in the NVA NICs
     echo "Configuring IP forwarding in NVA NICs..."
-    vm_names=("spoke1${indirect_spoke_id}-vm" "spoke2${indirect_spoke_id}-vm")
+    if [[ "redundant_nva" == "yes" ]]; then
+        if [[ "$no_of_hubs" == "1" ]]; then
+            vm_names=("spoke1${indirect_spoke_id}-vm" "spoke1${indirect_spoke_id}-vm2")
+        else
+            vm_names=("spoke1${indirect_spoke_id}-vm" "spoke1${indirect_spoke_id}-vm2" "spoke2${indirect_spoke_id}-vm" "spoke2${indirect_spoke_id}-vm2")
+        fi
+    else
+        if [[ "$no_of_hubs" == "1" ]]; then
+            vm_names=("spoke1${indirect_spoke_id}-vm")
+        else
+            vm_names=("spoke1${indirect_spoke_id}-vm" "spoke2${indirect_spoke_id}-vm")
+        fi
+    fi
     for vm_name in ${vm_names[@]}; do
         echo "Enabling IP forwarding for $vm_name..."
         vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -1637,7 +1669,7 @@ then
     echo "Creating route tables for indirect spokes with default route pointing to the NVA..."
     myip=$(curl -s4 ifconfig.co)
     nva1_nic_id=$(az vm show -n spoke1${indirect_spoke_id}-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    nva1_ip=$(az network nic show --ids $nva1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    nva1_ip=$(az network nic show --ids $nva1_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
     az network route-table create -n indirectspokes-$location1 -g $rg -l $location1 -o none
     az network route-table route create -n default -g $rg --route-table-name indirectspokes-$location1 \
         --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $nva1_ip -o none
@@ -1648,7 +1680,7 @@ then
     if [[ "$no_of_hubs" == "2" ]]
     then
         nva2_nic_id=$(az vm show -n spoke2${indirect_spoke_id}-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-        nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+        nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
         az network route-table create -n indirectspokes-$location2 -g $rg -l $location2 -o none
         az network route-table route create -n default -g $rg --route-table-name indirectspokes-$location2 \
             --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $nva2_ip -o none
@@ -1737,7 +1769,7 @@ then
     echo "Getting information about NVA in spoke 1${indirect_spoke_id}..."
     username=$(whoami)
     nva1_nic_id=$(az vm show -n "spoke1${indirect_spoke_id}-vm" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    nva1_ip=$(az network nic show --ids $nva1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo "$nva1_ip"
+    nva1_ip=$(az network nic show --ids $nva1_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo "$nva1_ip"
     nva1_pip=$(az network public-ip show -n "spoke1${indirect_spoke_id}-pip" -g $rg --query ipAddress -o tsv) && echo "$nva1_pip"
     nva1_default_gw="10.1.${indirect_spoke_id}.1"
     nva1_asn="6501${indirect_spoke_id}"
@@ -1752,7 +1784,7 @@ then
     then
         echo "Getting information about NVA in spoke 2${indirect_spoke_id}..."
         nva2_nic_id=$(az vm show -n "spoke2${indirect_spoke_id}-vm" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-        nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo "$nva2_ip"
+        nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo "$nva2_ip"
         nva2_pip=$(az network public-ip show -n "spoke2${indirect_spoke_id}-pip" -g $rg --query ipAddress -o tsv) && echo "$nva2_pip"
         nva2_default_gw="10.2.${indirect_spoke_id}.1"
         nva2_asn="6502${indirect_spoke_id}"
@@ -1814,7 +1846,7 @@ EOF
     then
         # Get information
         nva2_nic_id=$(az vm show -n "spoke2${indirect_spoke_id}-vm" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-        nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo "$nva2_ip"
+        nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo "$nva2_ip"
         nva2_pip=$(az network public-ip show -n "spoke2${indirect_spoke_id}-pip" -g $rg --query ipAddress -o tsv) && echo "$nva2_pip"
         nva2_default_gw="10.2.${indirect_spoke_id}.1"
         nva2_asn="6501${indirect_spoke_id}"
@@ -2458,12 +2490,12 @@ spoke21_nic_id=$(az vm show -n spoke21-vm -g "$rg" --query 'networkProfile.netwo
 spoke22_nic_id=$(az vm show -n spoke22-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 branch1_nic_id=$(az vm show -n branch1-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 branch2_nic_id=$(az vm show -n branch2-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-spoke11_ip=$(az network nic show --ids $spoke11_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-spoke12_ip=$(az network nic show --ids $spoke12_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-spoke21_ip=$(az network nic show --ids $spoke21_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-spoke22_ip=$(az network nic show --ids $spoke22_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-branch1_ip=$(az network nic show --ids $branch1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-branch2_ip=$(az network nic show --ids $branch2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+spoke11_ip=$(az network nic show --ids $spoke11_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+spoke12_ip=$(az network nic show --ids $spoke12_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+spoke21_ip=$(az network nic show --ids $spoke21_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+spoke22_ip=$(az network nic show --ids $spoke22_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+branch1_ip=$(az network nic show --ids $branch1_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+branch2_ip=$(az network nic show --ids $branch2_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
 
 # Sample connectivity tests
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke11_pip "ping -c 5 $spoke12_ip"
