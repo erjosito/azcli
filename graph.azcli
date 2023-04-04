@@ -51,6 +51,9 @@ query="Resources | where type=~'microsoft.containerservice/managedclusters' | pr
 | where enableDdosProtection == 'false'"
 
 # Network
+# Inspect availabe types
+query="resources | where type contains 'microsoft.network' | distinct type"
+# Misc
 query="where type=='microsoft.network/routetables' | where properties.disableBgpRoutePropagation==true | distinct name,resourceGroup"
 query="where type=='microsoft.network/virtualnetworkgateways' | where tolower(properties.gatewayType) == 'vpn' | project  name,resourceGroup,ipcount=array_length(properties.ipConfigurations) | where ipcount==1"
 query="where type=='microsoft.network/networksecuritygroups'"
@@ -83,7 +86,10 @@ query="Resources | where type == 'microsoft.network/frontdoorwebapplicationfirew
 query="Resources | where type == 'microsoft.network/frontdoorwebapplicationfirewallpolicies'"
 query="Resources | where type =='microsoft.cdn/profiles/afdendpoints'"
 query="Resources | where type =='microsoft.cdn/profiles'"
-
+# Azure Bastion H&S
+query="resources | where type=='microsoft.network/virtualnetworks' | project id,resourceGroup,name,subnets=properties.subnets | mv-expand subnets | project id,name,subnetName=subnets.name | summarize GatewaySubnets=countif(subnetName=='GatewaySubnet'),BastionSubnets=countif(subnetName=='AzureBastionSubnet') by id,name | extend compliant = (GatewaySubnets==0 or BastionSubnets==1)"
+# Azure Bastion VWAN: no vnet connections over ARG!!!
+query="resources | where type=='microsoft.network/virtualhubs'"
 
 # To Do
 # AFD with single origin, no probes
