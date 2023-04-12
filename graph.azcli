@@ -88,7 +88,7 @@ query="Resources | where type =='microsoft.cdn/profiles/afdendpoints'"
 query="Resources | where type =='microsoft.cdn/profiles'"
 # Azure Bastion H&S
 query="resources | where type=='microsoft.network/virtualnetworks' | project id,resourceGroup,name,subnets=properties.subnets | mv-expand subnets | project id,name,subnetName=subnets.name | summarize GatewaySubnets=countif(subnetName=='GatewaySubnet'),BastionSubnets=countif(subnetName=='AzureBastionSubnet') by id,name | extend compliant = (GatewaySubnets==0 or BastionSubnets==1)"
-# Azure Bastion VWAN: no vnet connections over ARG!!!
+# Azure Bastion VWAN: no vnet connections over ARG!!! BTW, no route tables either
 query="resources | where type=='microsoft.network/virtualhubs'"
 
 # To Do
