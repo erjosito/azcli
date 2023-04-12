@@ -1,14 +1,15 @@
-# Create a simple hub and spoke environment
-# Used for FTA Live sessions
+# Create a complex hub and spoke environment
+# The control variables shape the environment
 
 # Control
-no_of_spokes=10
+no_of_spokes=3
 no_of_subnets_per_spoke=4
+no_of_vms_per_subnet=2
 create_azfw=yes
 intra_spoke_traffic_to_azfw=yes
-use_asgs=yes
 per_vm_nsg=no
-use_ip_groups=no
+use_asgs=yes
+use_ip_groups=yes
 
 # Variables
 rg=complexhns
@@ -21,11 +22,27 @@ azfw_name=hnsfw
 azfw_policy_name=hnsfwpolicy
 spoke_vnet_prefix_beginning='192.168.'
 spoke_vnet_prefix_end='.0/24'
-spoke_subnet_prefix_ends=('.0/26' '.64/26' '.128/26' '.192/26')
+spoke_subnet_prefix_ends=('.0/28' '.16/28' '.32/28' '.48/28' '.64/28' '.80/28' '.96/28' '.112/28' '.128/28' '.144/28' '.160/28' '.176/28' '.192/28' '.208/28' '.224/28' '.240/28')
 vm_size=Standard_B1s
 
+# Get the subnet prefix for a given spoke and subnet
+function get_subnet_prefix() {
+    spoke_id=$1
+    subnet_id=$2
+    shell_short=$(echo $SHELL | rev | cut -d/ -f 1 | rev)
+    if [[ "$shell_short" == "zsh" ]]; then
+        spoke_subnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_subnet_prefix_ends[$subnet_id]}"
+    elif [[ "$shell_short" == "bash" ]]; then
+        spoke_subnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_subnet_prefix_ends[$((subnet_id-1))]}"
+    else
+        echo "Unknown shell $shell_short"
+        exit 1
+    fi
+    echo $spoke_subnet_prefix
+}
+
 # Create environment
-echo "Creating RG and hub VNet..."
+echo "Creating RG $rg and hub VNet with prefix $hub_vnet_prefix..."
 az group create -n $rg -l $location -o none --only-show-errors
 az network vnet create -g $rg -n $hub_vnet_name --address-prefix $hub_vnet_prefix -l $location -o none --only-show-errors
 for spoke_id in {1..$no_of_spokes}; do
@@ -36,13 +53,8 @@ for spoke_id in {1..$no_of_spokes}; do
     # Create subnets
     for subnet_id in {1..$no_of_subnets_per_spoke}; do
         spoke_subnet_name="subnet${subnet_id}"
-        # Not sure if in all shells the array index starts at 0 or 1 (for bash it is 0, for zsh it is 1)
-        if [[ "$SHELL" == "/usr/bin/zsh" ]]; then
-            spoke_subnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_subnet_prefix_ends[$subnet_id]}"
-        else
-            spoke_subnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_subnet_prefix_ends[$((subnet_id-1))]}"
-        fi
-        echo "Creating spoke subnet ${subnet_name} in VNet ${spoke_vnet_name} with prefix ${spoke_subnet_prefix}..."
+        spoke_subnet_prefix=$(get_subnet_prefix $spoke_id $subnet_id)
+        echo "Creating spoke subnet ${spoke_subnet_name} in VNet ${spoke_vnet_name} with prefix ${spoke_subnet_prefix}..."
         az network vnet subnet create -n $spoke_subnet_name -g $rg --vnet-name $spoke_vnet_name --address-prefix $spoke_subnet_prefix -o none --only-show-errors
     done
 done
@@ -56,21 +68,44 @@ if [[ "$create_azfw" == "yes" ]]; then
     echo "Creating Azure Firewall policy..."
     az network firewall policy create -n $azfw_policy_name -g $rg -o none
     az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000 -o none --only-show-errors
+    # Create IP group RFC1918 if required
+    if [[ "$use_ip_groups" == "yes" ]]; then
+        echo "Creating IP group for RFC1918 prefixes..."
+        az network ip-group create -n 'rfc1918' -g $rg --location $location --ip-addresses '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' -o none --only-show-errors
+    fi
     # Allow SSH and HTTP
     echo "Creating rule to allow SSH and HTTP..."
-    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-        --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols TCP --destination-ports 22 80 -o none --only-show-errors
+    if [[ "$use_ip_groups" == "yes" ]]; then
+        az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+            --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
+            --destination-ip-groups 'rfc1918' --source-ip-groups 'rfc1918' --ip-protocols TCP --destination-ports 22 80 -o none --only-show-errors
+    else
+        az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+            --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
+            --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols TCP --destination-ports 22 80 -o none --only-show-errors
+    fi
     # Allow ICMP
     echo "Creating rule to allow ICMP..."
-    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-        --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols ICMP --destination-ports "1-65535" -o none --only-show-errors
+    if [[ "$use_ip_groups" == "yes" ]]; then
+        az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+            --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
+            --destination-ip-groups 'rfc1918' --source-ip-groups 'rfc1918' --ip-protocols ICMP --destination-ports "1-65535" -o none --only-show-errors
+    else
+        az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+            --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
+            --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols ICMP --destination-ports "1-65535" -o none --only-show-errors
+    fi
     # Allow NTP
     echo "Creating rule to allow NTP..."
-    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
-        --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
-        --destination-addresses '*' --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --ip-protocols UDP --destination-ports "123" -o none --only-show-errors
+    if [[ "$use_ip_groups" == "yes" ]]; then
+        az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+            --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
+            --destination-addresses '*' --source-ip-groups 'rfc1918' --ip-protocols UDP --destination-ports "123" -o none --only-show-errors
+    else
+        az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+            --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
+            --destination-addresses '*' --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --ip-protocols UDP --destination-ports "123" -o none --only-show-errors
+    fi
     # Create Az FW
     echo "Creating Azure Firewall..."
     az network firewall create -n $azfw_name -g $rg --policy $azfw_policy_name -l $location -o none --only-show-errors
@@ -85,27 +120,30 @@ fi
 
 # Azure Firewall - create VNet-to-VNet rules (WIP)
 if [[ "$create_azfw" == "yes" ]]; then
-    spoke_vnet_name="spoke${spoke_id}"
-    spoke_vnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_vnet_prefix_end}"
     if [[ "$use_ip_groups" == "yes" ]]; then
         echo "Creating IP group for spoke VNet $spoke_vnet_name..."
         az network ip-group create -n $spoke_vnet_name -g $rg --location $location --ip-addresses $spoke_vnet_prefix -o none --only-show-errors
     fi
     for spoke_id in {1..$no_of_spokes}; do
+        spoke_vnet_name="spoke${spoke_id}"
+        spoke_vnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_vnet_prefix_end}"
+        rcg_prio="100${spoke_id}"
+        echo "Creating RCG $spoke_vnet_name..."
+        az network firewall policy rule-collection-group create -n $spoke_vnet_name --policy-name $azfw_policy_name -g $rg --priority $rcg_prio -o none --only-show-errors
         for subnet_id in {1..$no_of_subnets_per_spoke}; do
             spoke_subnet_name="subnet${subnet_id}"
-            spoke_subnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_subnet_prefix_ends[$subnet_id]}"
+            spoke_subnet_prefix=$(get_subnet_prefix $spoke_id $subnet_id)
             if [[ "$use_ip_groups" == "yes" ]]; then
                 ip_group_name="${spoke_vnet_name}-${spoke_subnet_name}"
                 echo "Creating IP group ${ip_group_name}..."
                 az network ip-group create -n $ip_group_name -g $rg --location $location --ip-addresses $spoke_subnet_prefix -o none --only-show-errors
                 echo "Creating rule to allow SSH and HTTP from subnet $spoke_subnet_name in VNet $spoke_vnet_name using IP groups..."
-                az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name "${spoke_vnet_name}-${spoke_subnet_name}" -g $rg \
+                az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name "${spoke_vnet_name} -g $rg \
                     --name $spoke_subnet_name --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
                     --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-ip-groups $ip_group_name --ip-protocols TCP --destination-ports 22 80 -o none --only-show-errors
             else
                 echo "Creating rule to allow SSH and HTTP from subnet $spoke_subnet_name in VNet $spoke_vnet_name using hard-coded IP addresses..."
-                az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name "${spoke_vnet_name}-${spoke_subnet_name}" -g $rg \
+                az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name "${spoke_vnet_name} -g $rg \
                     --name $spoke_subnet_name --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
                     --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses $spoke_subnet_prefix --ip-protocols TCP --destination-ports 22 80 -o none --only-show-errors
             fi
@@ -132,17 +170,19 @@ for spoke_id in {1..$no_of_spokes}; do
     fi
     for subnet_id in {1..$no_of_subnets_per_spoke}; do
         spoke_subnet_name="subnet${subnet_id}"
-        spoke_vm_name="spoke${spoke_id}-${subnet_id}-vm"
         # Create VMs, optionally with NSGs
-        if [[ "$per_vm_nsg" == "yes" ]]; then
-            echo "Creating VM ${spoke_vm_name} in subnet ${subnet_name} in VNet ${spoke_vnet_name} with a dedicated NSG..."
-            az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg "${spoke_vm_name}-nsg" \
-                --public-ip-address '' --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
-        else
-            echo "Creating VM ${spoke_vm_name} in subnet ${subnet_name} in VNet ${spoke_vnet_name} with no NSG..."
-            az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg '' \
-                --public-ip-address '' --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
-        fi
+        for vm_id in {1..$no_of_vms_per_subnet}; do
+            spoke_vm_name="spoke${spoke_id}-${subnet_id}-vm-${vm_id}"
+            if [[ "$per_vm_nsg" == "yes" ]]; then
+                echo "Creating VM ${spoke_vm_name} in subnet ${subnet_name} in VNet ${spoke_vnet_name} with a dedicated NSG..."
+                az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg "${spoke_vm_name}-nsg" \
+                    --public-ip-address '' --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
+            else
+                echo "Creating VM ${spoke_vm_name} in subnet ${subnet_name} in VNet ${spoke_vnet_name} with no NSG..."
+                az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg '' \
+                    --public-ip-address '' --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
+            fi
+        done
         # Optionally use ASGs
         if [[ "$use_asgs" == "yes" ]]; then
             echo "Creating ASG "${spoke_vnet_name}-${spoke_subnet_name}"..."
@@ -161,9 +201,11 @@ done
 # Shutdown created VMs for cost savings
 for spoke_id in {1..$no_of_spokes}; do
     for subnet_id in {1..$no_of_subnets_per_spoke}; do
-        spoke_vm_name="spoke${spoke_id}-${subnet_id}-vm"
-        echo "Shutting down VM ${spoke_vm_name}..."
-        az vm deallocate -n $spoke_vm_name -g $rg --no-wait -o none --only-show-errors
+        for vm_id in {1..$no_of_vms_per_subnet}; do
+            spoke_vm_name="spoke${spoke_id}-${subnet_id}-vm-${vm_id}"
+            echo "Shutting down VM ${spoke_vm_name}..."
+            az vm deallocate -n $spoke_vm_name -g $rg --no-wait -o none --only-show-errors
+        done
     done
 done
 
@@ -181,11 +223,7 @@ if [[ "$create_azfw" == "yes" ]]; then
         spoke_vnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_vnet_prefix_end}"
         for subnet_id in {1..$no_of_subnets_per_spoke}; do
             spoke_subnet_name="subnet${subnet_id}"
-            if [[ "$SHELL" == "/usr/bin/zsh" ]]; then
-                spoke_subnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_subnet_prefix_ends[$subnet_id]}"
-            else
-                spoke_subnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_subnet_prefix_ends[$((subnet_id-1))]}"
-            fi
+            spoke_subnet_prefix=$(get_subnet_prefix $spoke_id $subnet_id)
             # If intra-spoke traffic is sent to AzFW, create a route table for each spoke subnet
             if [[ "$intra_spoke_traffic_to_azfw" == "yes" ]]; then
                 route_table_name="${spoke_vnet_name}-${spoke_subnet_name}-rt"
@@ -219,17 +257,17 @@ if [[ "$per_vm_nsg" == "no" ]]; then
                 _value=$(expr $subnet_id % 2)
                 (( $_value == 0 )) && subnet_even_asg="${spoke_vnet_name}-EvenSubnet" || subnet_even_asg="${spoke_vnet_name}-OddSubnet"
                 echo "Creating NSG rule for intra-VNet traffic using ASGs..."
-                az network nsg rule create -g $rg --nsg-name $nsg_name -n "OddEvenSubnet" --priority 100 --source-asgs $spoke_subnet_name \
-                    --source-port-ranges '*' --destination-asgs $subnet_even_asg --destination-port-ranges '*' --access Allow \
+                az network nsg rule create -g $rg --nsg-name $nsg_name -n "OddEvenSubnet" --priority 100 --source-asgs "${spoke_vnet_name}-${spoke_subnet_name}" \
+                    --source-port-ranges '*' --destination-asgs "${subnet_even_asg}" --destination-port-ranges '*' --access Allow \
                     --protocol '*' --description "Allow traffic to ASG $subnet_even_asg" -o none --only-show-errors
             else
                 echo "Creating NSG rule for intra-VNet traffic..."
-                spoke_subnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_subnet_prefix_ends[$subnet_id]}"
+                spoke_subnet_prefix=$(get_subnet_prefix $spoke_id $subnet_id)
                 dst_subnet_id=$((subnet_id+1))
                 if [[ $dst_subnet_id -gt $no_of_subnets_per_spoke ]]; then
                     dst_subnet_id=1
                 fi
-                dst_spoke_subnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_subnet_prefix_ends[$dst_subnet_id]}"
+                dst_spoke_subnet_prefix=$(get_subnet_prefix $spoke_id $dst_subnet_id)
                 az network nsg rule create -g $rg --nsg-name $nsg_name -n "intra-vnet" --priority 100 --source-address-prefixes "$spoke_subnet_prefix" \
                     --source-port-ranges '*' --destination-address-prefixes "$dst_spoke_subnet_prefix" --destination-port-ranges '*' --access Allow \
                     --protocol '*' --description "Allow intra-VNet traffic" -o none --only-show-errors
@@ -240,6 +278,25 @@ if [[ "$per_vm_nsg" == "no" ]]; then
         done
     done
 fi
+
+###############
+# Diagnostics #
+###############
+
+# Print all route tables
+rt_list=$(az network route-table list -g $rg --query '[].name' -o tsv)
+echo $rt_list | while IFS= read -r rt; do
+    echo "Route table $rt:"
+    az network route-table route list -g $rg --route-table-name $rt -o table
+done
+
+# Print all NSGs
+nsg_list=$(az network nsg list -g $rg --query '[].name' -o tsv)
+echo $nsg_list | while IFS= read -r nsg; do
+    echo "NSG $nsg:"
+    az network nsg rule list -g $rg --nsg-name $nsg -o table
+done
+
 
 # Cleanup
 # az group delete -y -n $rg --no-wait
