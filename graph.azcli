@@ -90,10 +90,17 @@ query="Resources | where type =='microsoft.cdn/profiles'"
 query="resources | where type=='microsoft.network/virtualnetworks' | project id,resourceGroup,name,subnets=properties.subnets | mv-expand subnets | project id,name,subnetName=subnets.name | summarize GatewaySubnets=countif(subnetName=='GatewaySubnet'),BastionSubnets=countif(subnetName=='AzureBastionSubnet') by id,name | extend compliant = (GatewaySubnets==0 or BastionSubnets==1)"
 # Azure Bastion VWAN: no vnet connections over ARG!!! BTW, no route tables either
 query="resources | where type=='microsoft.network/virtualhubs'"
+# Azure Firewall
+query="resources | where type=='microsoft.network/firewallpolicies' | extend compliant = (properties.sku.tier == 'Premium') | distinct id,compliant"
+query="resources | where type=='microsoft.network/firewallpolicies' | extend compliant = (properties.threatIntelMode=='Deny') | distinct id,compliant"
+query="resources | where type=='microsoft.network/firewallpolicies' | extend compliant = (properties.dnsSettings.enableProxy == true) | distinct id,compliant"
+query="resources | where type=='microsoft.network/firewallpolicies' | extend compliant = (properties.intrusionDetection.mode == 'Deny') | project id, compliant"
+
 
 # To Do
 # AFD with single origin, no probes
 # AFD: same FQDN as origin
+# AzFW
 
 # See available types
 query="distinct type"
