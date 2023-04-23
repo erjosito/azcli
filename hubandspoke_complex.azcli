@@ -159,18 +159,19 @@ if [[ "$create_azfw" == "yes" ]]; then
         for subnet_id in {1..$no_of_subnets_per_spoke}; do
             spoke_subnet_name="subnet${subnet_id}"
             spoke_subnet_prefix=$(get_subnet_prefix $spoke_id $subnet_id)
+            collection_priority="10${spoke_id}${subnet_id}"
             if [[ "$use_ip_groups" == "yes" ]]; then
                 ip_group_name="${spoke_vnet_name}-${spoke_subnet_name}"
                 echo "Creating IP group ${ip_group_name}..."
                 az network ip-group create -n $ip_group_name -g $rg --location $location --ip-addresses $spoke_subnet_prefix -o none --only-show-errors
-                echo "Creating rule to allow SSH and HTTP from subnet $spoke_subnet_name in VNet $spoke_vnet_name using IP groups..."
-                az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name "${spoke_vnet_name} -g $rg \
-                    --name $spoke_subnet_name --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
-                    --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-ip-groups $ip_group_name --ip-protocols TCP --destination-ports 22 80 -o none --only-show-errors
+                echo "Creating rule to allow SSH and HTTP with priority $collection_priority from subnet $spoke_subnet_name in VNet $spoke_vnet_name using IP groups..."
+                az network firewall policy rule-collection-group collection add-filter-collection --policy-name "$azfw_policy_name" --rule-collection-group-name "${spoke_vnet_name}" -g $rg \
+                    --name $spoke_subnet_name --collection-priority $collection_priority --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description 'SSH and HTTP' \
+                    --destination-ip-groups 'rfc1918' --source-ip-groups $ip_group_name --ip-protocols TCP --destination-ports 22 80 -o none --only-show-errors
             else
-                echo "Creating rule to allow SSH and HTTP from subnet $spoke_subnet_name in VNet $spoke_vnet_name using hard-coded IP addresses..."
-                az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name "${spoke_vnet_name} -g $rg \
-                    --name $spoke_subnet_name --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
+                echo "Creating rule to allow SSH and HTTP with priority $collection_priority from subnet $spoke_subnet_name in VNet $spoke_vnet_name using hard-coded IP addresses..."
+                az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name "${spoke_vnet_name}" -g $rg \
+                    --name $spoke_subnet_name --collection-priority $collection_priority --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description 'SSH and HTTP' \
                     --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses $spoke_subnet_prefix --ip-protocols TCP --destination-ports 22 80 -o none --only-show-errors
             fi
         done
@@ -239,7 +240,7 @@ for spoke_id in {1..$no_of_spokes}; do
             az network asg create -g $rg -n "${spoke_vnet_name}-${spoke_subnet_name}" --location $location -o none --only-show-errors
             _value=$(expr $subnet_id % 2)
             (( $_value == 0 )) && subnet_even_asg="${spoke_vnet_name}-EvenSubnet" || subnet_even_asg="${spoke_vnet_name}-OddSubnet"
-            echo "Updating VM ${spoke_vm_name} in subnet ${subnet_name} in VNet ${spoke_vnet_name} with ASGs..."
+            echo "Updating VM ${spoke_vm_name} in subnet ${spoke_subnet_name} in VNet ${spoke_vnet_name} with ASGs..."
             nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
             nic_name=$(echo $nic_id | cut -d'/' -f9)
             ip_config_name=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].name' -o tsv)
@@ -409,18 +410,22 @@ fi
 ###############
 
 # Print all route tables
-rt_list=$(az network route-table list -g $rg --query '[].name' -o tsv)
-echo $rt_list | while IFS= read -r rt; do
-    echo "Route table $rt:"
-    az network route-table route list -g $rg --route-table-name $rt -o table
-done
+function show_routes() {
+        rt_list=$(az network route-table list -g $rg --query '[].name' -o tsv)
+        echo $rt_list | while IFS= read -r rt; do
+            echo "Route table $rt:"
+            az network route-table route list -g $rg --route-table-name $rt -o table
+        done
+}
 
 # Print all NSGs
-nsg_list=$(az network nsg list -g $rg --query '[].name' -o tsv)
-echo $nsg_list | while IFS= read -r nsg; do
-    echo "NSG $nsg:"
-    az network nsg rule list -g $rg --nsg-name $nsg -o table
-done
+function show_nsgs() {
+    nsg_list=$(az network nsg list -g $rg --query '[].name' -o tsv)
+    echo $nsg_list | while IFS= read -r nsg; do
+        echo "NSG $nsg:"
+        az network nsg rule list -g $rg --nsg-name $nsg -o table
+    done
+}
 
 
 # Cleanup
