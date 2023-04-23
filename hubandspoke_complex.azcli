@@ -76,13 +76,22 @@ if [[ "$shared_services_spoke" == "yes" ]]; then
     nsg_name="SharedServicesNSG"
     echo "Creating NSG ${nsg_name}..."
     az network nsg create -n $nsg_name -g $rg -o none --only-show-errors
-    # Create subnets (each with a default NSG)
+    # Create subnets assigned to the NSG
     for subnet_id in {1..$no_of_subnets_per_spoke}; do
         spoke_subnet_name="subnet${subnet_id}"
         spoke_subnet_prefix=$(get_subnet_prefix $spoke_id $subnet_id)
         echo "Creating shared services subnet ${spoke_subnet_name} in VNet ${spoke_vnet_name} with prefix ${spoke_subnet_prefix}..."
         az network vnet subnet create -n $spoke_subnet_name -g $rg --vnet-name $spoke_vnet_name --address-prefix $spoke_subnet_prefix --nsg $nsg_name -o none --only-show-errors
     done
+    # Add rules to the NSG to explicitly allow traffic from the spokes (and ideally to drop everything else)
+    for spoke_id in {1..$no_of_spokes}; do
+        spoke_vnet_name="spoke${spoke_id}"
+        spoke_vnet_prefix="${spoke_vnet_prefix_beginning}${spoke_id}${spoke_vnet_prefix_end}"
+        echo "Adding rule to NSG $nsg_name to allow traffic from spoke VNet ${spoke_vnet_name} with prefix ${spoke_vnet_prefix}..."
+        az network nsg rule create -g $rg --nsg-name $nsg_name -n "AllowTrafficFromSpoke${spoke_id}" --priority "20${spoke_id}" --source-address-prefixes $spoke_vnet_prefix --source-port-ranges '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol '*' --description "Allow traffic from spoke VNet ${spoke_vnet_name} with prefix ${spoke_vnet_prefix}" -o none --only-show-errors
+    done
+    echo "Adding explicit deny rule to NSG $nsg_name..."
+    az network nsg rule create -g $rg --nsg-name $nsg_name -n "DenyAll" --priority "999" --source-address-prefixes '*' --source-port-ranges '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol '*' --description "Explicit deny" -o none --only-show-errors
 fi
 
 # Azure Firewall (optional)
@@ -205,8 +214,8 @@ if [[ "$shared_services_spoke" == "yes" ]]; then
     for spoke_id in {1..$no_of_spokes}; do
         spoke_vnet_name="spoke${spoke_id}"
         echo "Peering VNet $spoke_vnet_name with $ss_vnet_name..."
-        az network vnet peering create -n "Sharedto${spoke_vnet_name}" -g $rg --vnet-name $ss_vnet_name --remote-vnet $ss_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
-        az network vnet peering create -n "${spoke_vnet_name}toShared" -g $rg --vnet-name $spoke_vnet_name --remote-vnet $hub_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
+        az network vnet peering create -n "Sharedto${spoke_vnet_name}" -g $rg --vnet-name $ss_vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
+        az network vnet peering create -n "${spoke_vnet_name}toShared" -g $rg --vnet-name $spoke_vnet_name --remote-vnet $ss_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
     done
 fi
 
@@ -215,9 +224,12 @@ for spoke_id in {1..$no_of_spokes}; do
     spoke_vnet_name="spoke${spoke_id}"
     if [[ "$use_asgs" == "yes" ]]; then
         echo "Creating ASGs for $spoke_vnet_name..."
+        # Do we need an ASG for all VMs in the VNet?? Maybe for the rule to Shared Services? (using the VNet prefix now)
         az network asg create -g $rg -n $spoke_vnet_name --location $location -o none --only-show-errors
-        az network asg create -g $rg -n "${spoke_vnet_name}-EvenSubnet" --location $location -o none --only-show-errors
-        az network asg create -g $rg -n "${spoke_vnet_name}-OddSubnet" --location $location -o none --only-show-errors
+        if [[ "$odd_even_asgs" == "yes" ]]; then
+            az network asg create -g $rg -n "${spoke_vnet_name}-EvenSubnet" --location $location -o none --only-show-errors
+            az network asg create -g $rg -n "${spoke_vnet_name}-OddSubnet" --location $location -o none --only-show-errors
+        fi
     fi
     for subnet_id in {1..$no_of_subnets_per_spoke}; do
         spoke_subnet_name="subnet${subnet_id}"
@@ -225,11 +237,11 @@ for spoke_id in {1..$no_of_spokes}; do
         for vm_id in {1..$no_of_vms_per_subnet}; do
             spoke_vm_name="spoke${spoke_id}-${subnet_id}-vm-${vm_id}"
             if [[ "$per_vm_nsg" == "yes" ]]; then
-                echo "Creating VM ${spoke_vm_name} in subnet ${subnet_name} in VNet ${spoke_vnet_name} with a dedicated NSG..."
+                echo "Creating VM ${spoke_vm_name} in subnet ${spoke_subnet_name} in VNet ${spoke_vnet_name} with a dedicated NSG..."
                 az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg "${spoke_vm_name}-nsg" \
                     --public-ip-address '' --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
             else
-                echo "Creating VM ${spoke_vm_name} in subnet ${subnet_name} in VNet ${spoke_vnet_name} with no NSG..."
+                echo "Creating VM ${spoke_vm_name} in subnet ${spoke_subnet_name} in VNet ${spoke_vnet_name} with no NSG..."
                 az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg '' \
                     --public-ip-address '' --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
             fi
@@ -238,13 +250,13 @@ for spoke_id in {1..$no_of_spokes}; do
         if [[ "$use_asgs" == "yes" ]]; then
             echo "Creating ASG "${spoke_vnet_name}-${spoke_subnet_name}"..."
             az network asg create -g $rg -n "${spoke_vnet_name}-${spoke_subnet_name}" --location $location -o none --only-show-errors
-            _value=$(expr $subnet_id % 2)
-            (( $_value == 0 )) && subnet_even_asg="${spoke_vnet_name}-EvenSubnet" || subnet_even_asg="${spoke_vnet_name}-OddSubnet"
             echo "Updating VM ${spoke_vm_name} in subnet ${spoke_subnet_name} in VNet ${spoke_vnet_name} with ASGs..."
             nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
             nic_name=$(echo $nic_id | cut -d'/' -f9)
             ip_config_name=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].name' -o tsv)
-            if [[ "$odd_even_asgs"]]; then
+            if [[ "$odd_even_asgs" == "yes" ]]; then
+                _value=$(expr $subnet_id % 2)
+                (( $_value == 0 )) && subnet_even_asg="${spoke_vnet_name}-EvenSubnet" || subnet_even_asg="${spoke_vnet_name}-OddSubnet"
                 az network nic ip-config update -g $rg --nic-name $nic_name -n $ip_config_name --asgs $spoke_vnet_name "${spoke_vnet_name}-${spoke_subnet_name}" $subnet_even_asg -o none --only-show-errors
             else
                 az network nic ip-config update -g $rg --nic-name $nic_name -n $ip_config_name --asgs $spoke_vnet_name "${spoke_vnet_name}-${spoke_subnet_name}" -o none --only-show-errors
@@ -255,17 +267,18 @@ done
 
 # Shared services VMs
 if [[ "$shared_services_spoke" == "yes" ]]; then
-    ss_spoke_id=$((no_of_spokes+1)))
+    ss_spoke_id=$((no_of_spokes+1))
     ss_spoke_vnet_prefix="${spoke_vnet_prefix_beginning}${ss_spoke_id}${spoke_vnet_prefix_end}"
     for subnet_id in {1..$no_of_subnets_per_spoke}; do
         spoke_subnet_name="subnet${subnet_id}"
         # Create VMs, optionally with NSGs
         for vm_id in {1..$no_of_vms_per_subnet}; do
             spoke_vm_name="SharedServices-${subnet_id}-vm-${vm_id}"
-            echo "Creating VM ${spoke_vm_name} in subnet ${subnet_name} in VNet ${spoke_vnet_name} with no NSG..."
+            echo "Creating VM ${spoke_vm_name} in subnet ${spoke_subnet_name} in VNet ${ss_vnet_name} with no NSG..."
             az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg '' \
-                --public-ip-address '' --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
+                --public-ip-address '' --vnet-name $ss_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
         done
+    done
 fi
 
 # Shutdown created VMs for cost savings
@@ -278,7 +291,7 @@ for spoke_id in {1..$no_of_spokes}; do
         done
     done
 done
-if [["shared_services_spoke"]]; then
+if [[ "$shared_services_spoke" == "yes" ]]; then
     for subnet_id in {1..$no_of_subnets_per_spoke}; do
         for vm_id in {1..$no_of_vms_per_subnet}; do
             spoke_vm_name="SharedServices-${subnet_id}-vm-${vm_id}"
@@ -390,14 +403,21 @@ if [[ "$per_vm_nsg" == "no" ]]; then
             done
             # Create rule for traffic to shared services
             if [[ "$shared_services_spoke" == "yes" ]]; then
-                ss_spoke_id=$((no_of_spokes+1)))
+                ss_spoke_id=$((no_of_spokes+1))
                 ss_spoke_vnet_prefix="${spoke_vnet_prefix_beginning}${ss_spoke_id}${spoke_vnet_prefix_end}"
-                az network nsg rule create -g $rg --nsg-name $nsg_name -n "SharedServices" --priority 400 --source-address-prefixes "$spoke_vnet_prefix" \
-                    --source-port-ranges '*' --destination-address-prefixes "$ss_spoke_vnet_prefix" --destination-port-ranges '*' --access Allow \
-                    --protocol '*' --description "Allow traffic to shared services VNet" -o none --only-show-errors
+                if [[ "$use_asgs" == "yes" ]]; then
+                    az network nsg rule create -g $rg --nsg-name $nsg_name -n "SharedServices" --priority 400 --source-asgs "$spoke_vnet_name" \
+                        --source-port-ranges '*' --destination-address-prefixes "$ss_spoke_vnet_prefix" --destination-port-ranges '*' --access Allow \
+                        --protocol '*' --description "Allow traffic to shared services VNet" -o none --only-show-errors
+                else
+                    az network nsg rule create -g $rg --nsg-name $nsg_name -n "SharedServices" --priority 400 --source-address-prefixes "$spoke_vnet_prefix" \
+                        --source-port-ranges '*' --destination-address-prefixes "$ss_spoke_vnet_prefix" --destination-port-ranges '*' --access Allow \
+                        --protocol '*' --description "Allow traffic to shared services VNet" -o none --only-show-errors
+                fi
             fi
             # Assign NSG to subnet
             for subnet_id in {1..$no_of_subnets_per_spoke}; do
+                spoke_subnet_name="subnet${subnet_id}"
                 echo "Associating NSG $nsg_name with subnet $spoke_subnet_name..."
                 az network vnet subnet update -n $spoke_subnet_name -g $rg --vnet-name $spoke_vnet_name --network-security-group $nsg_name -o none --only-show-errors
             done
