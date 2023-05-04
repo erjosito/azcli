@@ -80,6 +80,10 @@ query="resources | where type=='microsoft.network/networksecuritygroups' | mvexp
 | union (resources | where type=='microsoft.network/networksecuritygroups' | where array_length(properties.securityRules)==0 | extend compliant=false | project id,compliant)"
 # Subnets without NSGs
 query="Resources | where type=='microsoft.network/virtualnetworks' | project id,resourceGroup,name,subnets=properties.subnets | mv-expand subnets | project id,name,subnetName=subnets.name,subnetNsg=subnets.properties.networkSecurityGroup | where not (subnetName in ('GatewaySubnet', 'AzureFirewallSubnet', 'RouteServerSubnet', 'AzureBastionSubnet')) | extend compliant = isnotnull(subnetNsg)"
+# Subnets without UDR
+query="Resources | where type=='microsoft.network/virtualnetworks' | project id,resourceGroup,name,subnets=properties.subnets | mv-expand subnets | project id,name,subnetName=tostring(subnets.name),subnetRT=subnets.properties.routeTable.id | where not (subnetName in ('GatewaySubnet', 'AzureFirewallSubnet', 'RouteServerSubnet', 'AzureBastionSubnet')) | extend compliant = isnotnull(subnetRT) | distinct id, compliant, subnetName"
+# Subnets without UDR not peered to VWAN
+query="Resources | where type=='microsoft.network/virtualnetworks' | project id,resourceGroup,name,subnets=properties.subnets | mv-expand subnets | project id,name,subnetId=tostring(subnets.id), subnetName=tostring(subnets.name),subnetRT=subnets.properties.routeTable.id | where not (subnetName in ('GatewaySubnet', 'AzureFirewallSubnet', 'RouteServerSubnet', 'AzureBastionSubnet')) | extend hasRT = isnotnull(subnetRT) | distinct id, hasRT, subnetId | join kind=fullouter (resources | where type == 'microsoft.network/virtualnetworks' | mvexpand properties.virtualNetworkPeerings | extend isVWAN=(tolower(split(properties_virtualNetworkPeerings.name, '_')[0]) == 'remotevnettohubpeering') | mv-expand properties.subnets | project id, isVWAN, name, subnetId=tostring(properties_subnets.id), subnetName=tostring(properties_subnets.name) | summarize PeeredToVWAN=max(isVWAN) by id, subnetId | project id, subnetId, isVWANpeer = (PeeredToVWAN == true)) on subnetId | project id=iff(isnotempty(id), id, id1), subnetId=iff(isnotempty(subnetId), subnetId, subnetId1), hasRT, isVWANpeer | extend compliant = (hasRT==true or isVWANpeer==true) | distinct id, subnetId, compliant"
 # AFD WAF enabled and in prevention mode
 query="Resources | where type == 'microsoft.network/frontdoorwebapplicationfirewallpolicies' | project policyName=name, policyId=id,policySku=sku.name, links=properties.securityPolicyLinks, enabledState=properties.policySettings.enabledState, mode=properties.policySettings.mode | mvexpand links | extend securityPolicy=links.id | extend securityPolicyParts=split(securityPolicy, '/') | extend profileId=strcat_array(array_slice(securityPolicyParts, 0, -3), '/') | project id=profileId, compliant=((enabledState=='Enabled') and (mode=='Prevention')), enabledState, mode"
 # AFD
@@ -95,6 +99,18 @@ query="resources | where type=='microsoft.network/firewallpolicies' | extend com
 query="resources | where type=='microsoft.network/firewallpolicies' | extend compliant = (properties.threatIntelMode=='Deny') | distinct id,compliant"
 query="resources | where type=='microsoft.network/firewallpolicies' | extend compliant = (properties.dnsSettings.enableProxy == true) | distinct id,compliant"
 query="resources | where type=='microsoft.network/firewallpolicies' | extend compliant = (properties.intrusionDetection.mode == 'Deny') | project id, compliant"
+# VWAN: no vnet connections over ARG!!! BTW, no route tables either
+query="resources | where type=='microsoft.network/virtualhubs'"
+query="resources | where type=='microsoft.network/virtualwans'"
+query="resources | where type=='microsoft.network/virtualwans' | extend compliant = (properties.allowBranchToBranchTraffic == true) | project id, compliant"
+query="resources | where type=='microsoft.network/virtualhubs' | extend compliant = (properties.allowBranchToBranchTraffic == true) | project id, compliant"
+query="resources | where type=='microsoft.network/virtualhubs' | extend compliant = (properties.hubRoutingPreference == 'ASPath') | project id, compliant"
+query="resources | where type=='microsoft.network/virtualhubs' | extend addressPrefixLength=toint(split(properties.addressPrefix, '/')[1]) | extend compliant = (addressPrefixLength >= 22 and addressPrefixLength <= 23)"
+query="resources | where type=='microsoft.network/virtualhubs' | extend compliant = isnotnull(properties.azureFirewall.id) | project id, compliant"
+# Trying to get VNets peered to VWAN from the VNet side
+query="resources | where type == 'microsoft.network/virtualnetworks' | mvexpand properties.virtualNetworkPeerings | extend isVWAN=(tolower(split(properties_virtualNetworkPeerings.name, '_')[0]) == 'remotevnettohubpeering') | summarize PeeredToVWAN=max(isVWAN) by id | project id, compliant = (PeeredToVWAN == true)" 
+# Subnets of the VNets peered to VWAN
+query="resources | where type == 'microsoft.network/virtualnetworks' | mvexpand properties.virtualNetworkPeerings | extend isVWAN=(tolower(split(properties_virtualNetworkPeerings.name, '_')[0]) == 'remotevnettohubpeering') | mv-expand properties.subnets | project id, isVWAN, name, subnetId=tostring(properties_subnets.id), subnetName=tostring(properties_subnets.name) | summarize PeeredToVWAN=max(isVWAN) by id, subnetId | project id, subnetId, compliant = (PeeredToVWAN == true)"
 
 
 # To Do

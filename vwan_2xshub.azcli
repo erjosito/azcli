@@ -19,7 +19,7 @@
 
 # Control
 no_of_hubs=1         # 1 or 2 hubs
-no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
+no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=no        # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
 create_custom_rt=no  # Whether a custom RT for VNets will be created
@@ -29,10 +29,10 @@ nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whethe
 route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet' (if 'vnet', $create_custom_rt must be yes)
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none' (if 'vnet', $create_custom_rt must be yes)
-nva_in_hub1=yes       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
-deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
+deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
 deploy_gcp=no        # Whether an onprem location to be connected over ER should be deployed in Google Cloud
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
