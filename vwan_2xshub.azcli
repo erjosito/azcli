@@ -18,18 +18,18 @@
 ###############
 
 # Control
-no_of_hubs=1         # 1 or 2 hubs
+no_of_hubs=2         # 1 or 2 hubs
 no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
-secure_hub=no        # Whether firewalls are provisioned in the hubs
+secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
 create_custom_rt=no  # Whether a custom RT for VNets will be created
-indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
+indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
 redundant_nva=no     # Whether the NVA in the last spoke is redundant (2nd VM in the same subnet)
-nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
+nva_bgp=yes          # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet' (if 'vnet', $create_custom_rt must be yes)
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none' (if 'vnet', $create_custom_rt must be yes)
-nva_in_hub1=yes       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
 deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
@@ -37,11 +37,13 @@ deploy_gcp=no        # Whether an onprem location to be connected over ER should
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
-routing_intent=no    # Whether RI is configured
-ri_policy=internet   # internet/private/both
+routing_intent=yes   # Whether RI is configured
+ri_policy=both       # internet/private/both
 private_link=no      # whether private endpoints will be created for the storage accounts in each region (in the first spoke, using the flow logs storage accounts)
 location1=westcentralus
-location2=eastus
+location2=northcentralus
+hub1_er_pop=Dallas
+hub2_er_pop=Dallas
 
 # Generic variables
 rg=vwan
@@ -92,12 +94,9 @@ branch4_test_route=4.4.4.0/24
 er_provider=Megaport
 er_circuit_sku=Premium
 megaport_script_path="/home/jose/repos/azcli/megaport.sh"
-# hub1_er_pop=Sydney
-hub1_er_pop=Dallas
 mcr1_asn=65001
 gr_ip_range=172.16.31.0/29
 hub1_er_circuit_name="er1-$hub1_er_pop"
-hub2_er_pop=Dallas
 hub2_er_circuit_name="er2-$hub2_er_pop"
 mcr2_asn=65002
 # gcloud variables to simulate onprem via ER
@@ -507,16 +506,16 @@ EOF
     onprem_linuxnva_default_gw=$(default_gw "$onprem_linuxnva_ip" "255.255.255.192") && echo $onprem_linuxnva_default_gw
     # Public IPs of the external interfaces of the VWAN NVAs
     echo "Getting public IPs of the NVA $nva_name deployed in the virtual hub..."
-    pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv) && echo $pip1
-    pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv) && echo $pip2
+    pip1=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].publicIpAddress' -o tsv --only-show-errors) && echo $pip1
+    pip2=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].publicIpAddress' -o tsv --only-show-errors) && echo $pip2
     # Private IPs of the external interfaces of the VWAN NVAs
     echo "Getting private IPs (external NICs) of the NVA $nva_name deployed in the virtual hub..."
-    nva_ip21=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].privateIpAddress' -o tsv) && echo $nva_ip21
-    nva_ip22=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].privateIpAddress' -o tsv) && echo $nva_ip22
+    nva_ip21=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[1].privateIpAddress' -o tsv --only-show-errors) && echo $nva_ip21
+    nva_ip22=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[3].privateIpAddress' -o tsv --only-show-errors) && echo $nva_ip22
     # Private IPs VWAN NVAs
     echo "Getting private IPs (internal NICs) of the NVA $nva_name deployed in the virtual hub..."
-    nva_private_ip11=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[0].privateIpAddress' -o tsv) && echo $nva_private_ip11
-    nva_private_ip12=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[2].privateIpAddress' -o tsv) && echo $nva_private_ip12
+    nva_private_ip11=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[0].privateIpAddress' -o tsv --only-show-errors) && echo $nva_private_ip11
+    nva_private_ip12=$(az network virtual-appliance show -n $nva_name -g $rg --query 'virtualApplianceNics[2].privateIpAddress' -o tsv --only-show-errors) && echo $nva_private_ip12
     # Gateway for the VWAN NVA (internal NIC)
     nva_internal_mask=$(ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$pip1" "ifconfig eth1 | grep netmask | sed -n 's/.* netmask \([^ ]*\).*/\1/p'") && echo "Network mask $nva_internal_mask"
     if [[ "${nva_internal_mask:0:11}" != "255.255.255" ]]
@@ -818,10 +817,14 @@ EOF
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo ipsec status"
     echo "BGP peerings in onprem NVA:"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "sudo birdc show protocols"
-    echo "IPSec status in Virtual WAN NVA:"
+    echo "IPSec status in Virtual WAN NVA instance 0:"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo ipsec status"
-    echo "BGP peerings in Virtual WAN NVA:"
+    echo "BGP peerings in Virtual WAN NVA instance 0:"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip1 "sudo birdc show protocols"
+    echo "IPSec status in Virtual WAN NVA instance 1:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo ipsec status"
+    echo "BGP peerings in Virtual WAN NVA instance 1:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $pip2 "sudo birdc show protocols"
 }
 
 # Create a Linux NVA in the hub
@@ -1091,16 +1094,16 @@ az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_SSH --p
     --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
     --destination-address-prefixes '*' --destination-port-ranges 22 -o none
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_HTTP --priority 1010 --direction Inbound \
-    --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' \
+    --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' \
     --destination-address-prefixes '*' --destination-port-ranges 9 80 443 -o none
 # az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_HTTP_Return --priority 1015 --direction Inbound \
 #     --access Allow --protocol Tcp --source-address-prefixes '*' \
-#     --destination-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --destination-port-ranges 80 443
+#     --destination-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' --destination-port-ranges 80 443
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
     --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
     --destination-address-prefixes '*' --destination-port-ranges 500 4500 -o none
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_NTP --priority 1030 \
-    --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --direction Inbound \
+    --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' --direction Inbound \
     --destination-address-prefixes '*' --destination-port-ranges 123 -o none
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_Icmp --priority 1040 \
     --access Allow --protocol Icmp --source-address-prefixes '*' --direction Inbound \
@@ -1126,13 +1129,13 @@ then
             --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
             --destination-address-prefixes '*' --destination-port-ranges 22 -o none
         az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_HTTP --priority 1010 \
-            --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' \
+            --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' \
             --destination-address-prefixes '*' --destination-port-ranges 9 80 443 -o none
         az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
             --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
             --destination-address-prefixes '*' --destination-port-ranges 500 4500 -o none
         az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_NTP --priority 1030 \
-            --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '20.0.0.0/6' '192.168.0.0/16' --direction Inbound \
+            --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' --direction Inbound \
             --destination-address-prefixes '*' --destination-port-ranges 123 -o none
         az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_Icmp --priority 1040 \
             --access Allow --protocol Icmp --source-address-prefixes '*' --direction Inbound \
@@ -1377,24 +1380,24 @@ then
     echo "Creating rule to allow SSH and HTTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols TCP --destination-ports 9 22 80 -o none
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols TCP --destination-ports 9 22 80 -o none
     # Allow ICMP
     echo "Creating rule to allow ICMP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols ICMP --destination-ports "1-65535" -o none
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols ICMP --destination-ports "1-65535" -o none
     # Allow NTP
     echo "Creating rule to allow NTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
-        --destination-addresses '*' --source-addresses "10.0.0.0/8" "20.0.0.0/6" --ip-protocols UDP --destination-ports "123" -o none
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "192.168.0.0/16" --ip-protocols UDP --destination-ports "123" -o none
     # Example application collection with 2 rules (ipconfig.co, api.ipify.org)
     echo "Creating rule to allow ifconfig.co and api.ipify.org..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
-        --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 -o none
+        --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --protocols Http=80 Https=443 -o none
     az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
-        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 --rule-type ApplicationRule -o none
+        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --protocols Http=80 Https=443 --rule-type ApplicationRule -o none
     # Example application collection with wildcards (*.ubuntu.com)
     echo "Creating rule to allow *.ubuntu.com..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -1713,7 +1716,7 @@ then
     for vm_name in ${vm_names[@]}; do
         echo "Installing BIRD in VM $vm_name..."
         nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-        pip_id=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+        pip_id=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].publicIPAddress.id' -o tsv)
         vm_pip=$(az network public-ip show --ids $pip_id --query 'ipAddress' -o tsv)
         ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo apt update && sudo apt install -y bird"
     done
@@ -2726,6 +2729,7 @@ subscription_id=$(az account show -o tsv --query id)
 az network vhub get-effective-routes --resource-type RouteTable --resource-id $hub1_default_rt_id -g $rg -n hub1 --query 'value[].{Prefix:addressPrefixes[0],ASPath:asPath,NextHopType:nextHopType,NextHop:nextHops[0],Origin:routeOrigin}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft.Network\//,""); print }'
 az network vhub get-effective-routes --resource-type ExpressRouteConnection --resource-id $hub1_ergw_cx0_id -g $rg -n hub1 -o table --query 'value[].{Prefix:addressPrefixes[0],ASPath:asPath,NextHopType:nextHopType,NextHop:nextHops[0],Origin:routeOrigin}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft.Network\//,""); print }'
 az network vhub get-effective-routes --resource-type VpnConnection --resource-id $hub1_vpn_cx_id -g $rg -n hub1 -o table --query 'value[].{Prefix:addressPrefixes[0],ASPath:asPath,NextHopType:nextHopType,NextHop:nextHops[0],Origin:routeOrigin}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft.Network\//,""); print }'
+
 # RTv3
 az network vhub route-table route list -n defaultRouteTable --vhub-name hub1 -g $rg --query '[].{Name:name, Destinations:to_string(destinations), NextHop:nextHop}' -o table
 az network vhub route-table route list -n defaultRouteTable --vhub-name hub2 -g $rg --query '[].{Name:name, Destinations:to_string(destinations), NextHop:nextHop}' -o table
@@ -2744,6 +2748,11 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show 
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show route protocol RS1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show prot all RS1"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$nva_pip" "sudo birdc show route export RS1"
+# Routing Intent
+ri1_name=$(az network vhub routing-intent list --vhub hub1 -g $rg --query '[].name' -o tsv --only-show-errors)
+az network vhub routing-intent show -n $ri1_name --vhub hub1 -g $rg --query routingPolicies -o table --only-show-errors
+ri2_name=$(az network vhub routing-intent list --vhub hub2 -g $rg --query '[].name' -o tsv --only-show-errors)
+az network vhub routing-intent show -n $ri2_name --vhub hub2 -g $rg --query routingPolicies -o table --only-show-errors
 
 # MCR
 $megaport_script_path -q -s=jomore-${hub1_er_pop} -a=bgp_routes | jq -r '.[] | {prefix,best,source,asPath} | join("\t")'
@@ -2780,9 +2789,16 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nva2_pip "sudo systemctl st
 # Firewall Logs from Azure Monitor #
 ####################################
 
+# Easy
+# query='AzureDiagnostics | distinct Category'
+query='AzureDiagnostics
+| where TimeGenerated >= ago(5m) 
+| where Category == "AzureFirewallNetworkRule"
+| project TimeGenerated, Resource, msg_s'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query -o tsv
 # Firewall Network Rules
 fw_net_logs_query='AzureDiagnostics
-| where Category == "AzureFirewallNetworkRule"
+| where Category == "AzureFirewallNetworkRule"
 | where TimeGenerated >= ago(5m) 
 | parse msg_s with Protocol " request from " SourceIP ":" SourcePortInt:int " to " TargetIP ":" TargetPortInt:int *
 | parse msg_s with * ". Action: " Action1a
