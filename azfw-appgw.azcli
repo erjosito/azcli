@@ -6,6 +6,12 @@
 #
 ############################################################################
 
+# Control
+nginx_vm=yes       # Whether an NGINX VM should be created to compare it to the app gw
+nginx_aas=no       # Whether an NGINX-aaS should be created to compare it to the app gw (doesnt work in AIRS subs)
+windows_vm=no      # Whether a Windows VM should be created
+file_uploads=no    # Whether to upload files to the VMs to test the AzFW IDPS functionality
+
 # Variables
 rg=azfwappgw
 location=eastus
@@ -40,13 +46,25 @@ win_password=Microsoft123!
 win_vm_name=testvmwin
 win_vm_sku=Standard_B2ms
 win_pip_name=testvmwin-pip
+nginx_aas_name=nginx-aas
+nginx_aas_sku=standard_Monthly
+nginx_aas_pip_name=nginx-aas-pip
+nginx_aas_subnet_name=nginx-aas
+nginx_aas_subnet_prefix=192.168.210.0/24
+nginx_vm_name=nginx
+nginx_pip_name=nginx-pip
+nginx_nsg_name=nginx-nsg
+nginx_subnet_name=nginx
+nginx_subnet_prefix=192.168.211.0/24
+nginx_cloudinit_filename=/tmp/cloudinit-nginx.txt
+nginx_vm_sku=Standard_B1s
 
 
 # RG and vnet
-az group create -n $rg -l $location
-az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $azfw_subnet_name --subnet-prefixes $azfw_subnet_prefix
-az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix
-az network vnet subnet create --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --address-prefixes $appgw_subnet_prefix
+az group create -n $rg -l $location -o none --only-show-errors
+az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix --subnet-name $azfw_subnet_name --subnet-prefixes $azfw_subnet_prefix -o none --only-show-errors
+az network vnet subnet create -n $vm_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $vm_subnet_prefix -o none --only-show-errors
+az network vnet subnet create --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --address-prefixes $appgw_subnet_prefix -o none --only-show-errors
 
 # Create Log Analytics workspace
 # logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv)  # Retrieve the WS name if it already existed
@@ -257,8 +275,8 @@ http {
 EOF
 scp "$nginx_config_file" "${vm_pip_address}:~/"
 # Put public certs in NGINX. Note: you need to have some public certs in advance
-cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2022/star_cloudtrooper_net_chain.pem"
-key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2022/star_cloudtrooper_net.key"
+cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2023/star_cloudtrooper_net_fullchain.pem"
+key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2023/CSR/star_cloudtrooper_net.key"
 scp "$cert_file" "${vm_pip_address}:~/ssl.crt"
 scp "$key_file" "${vm_pip_address}:~/ssl.key"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo mv ./* /etc/nginx/"
@@ -268,6 +286,7 @@ ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo system
 # Create A record in public domain
 public_domain=cloudtrooper.net
 vm_dns_name='appgwfw-vm'
+vm_fqdn="${vm_dns_name}.${public_domain}" && echo $vm_fqdn
 public_dns_rg=$(az network dns zone list --query "[?name=='$public_domain'].resourceGroup" -o tsv)
 if [[ -z "$public_dns_rg" ]]
 then
@@ -286,7 +305,6 @@ else
   az network dns record-set a create -g $public_dns_rg -z cloudtrooper.net -n $vm_dns_name
   az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $vm_dns_name -a $vm_pip_address
 fi
-vm_fqdn="${vm_dns_name}.${public_domain}" && echo $vm_fqdn
 curl "https://${vm_fqdn}/api/healthcheck"
 
 ######################
@@ -395,6 +413,7 @@ az network vnet subnet update --name $vm_subnet_name --route-table $rt_name --vn
 # Create A record in public domain for AppGW
 public_domain=cloudtrooper.net
 appgw_dns_name='appgwfw-gw'
+appgw_fqdn="${appgw_dns_name}.${public_domain}" && echo $appgw_fqdn
 public_dns_rg=$(az network dns zone list --query "[?name=='$public_domain'].resourceGroup" -o tsv)
 if [[ -z "$public_dns_rg" ]]
 then
@@ -414,36 +433,149 @@ else
   az network dns record-set a create -g $public_dns_rg -z $public_domain -n $appgw_dns_name -o none
   az network dns record-set a add-record -g $public_dns_rg -z $public_domain -n $appgw_dns_name -a $appgw_pip_address -o none
 fi
-
 # Verify access to the app over the App Gateway
-appgw_fqdn="${appgw_dns_name}.${public_domain}" && echo $vm_fqdn
 curl -k "https://${appgw_fqdn}/api/healthcheck"
+
+# NGINX VM (optional)
+if [[ "$nginx_vm" == "yes" ]]; then
+    # Create subnet and public IP
+    az network public-ip create -n $nginx_pip_name -g $rg -l $location --sku Standard -o none --only-show-errors
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $nginx_subnet_name --address-prefixes $nginx_subnet_prefix -o none --only-show-errors
+    appgw_rt_name=appgwrt   # Attach same RT as in the AppGW subnet
+    az network vnet subnet update --name $nginx_subnet_name --route-table $appgw_rt_name --vnet-name $vnet_name --resource-group $rg -o none --only-show-errors
+    # Create an Ubuntu VM with NGINX
+    cat <<EOF > $nginx_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update && apt install -y nginx
+EOF
+    az network nsg create -n $nginx_nsg_name -g $rg -o none --only-show-errors
+    az network nsg rule create -n ssh --nsg-name $nginx_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp -o none --only-show-errors
+    az network nsg rule create -n http80 --nsg-name $nginx_nsg_name -g $rg --priority 510 --destination-port-ranges 80 --access Allow --protocol Tcp -o none --only-show-errors
+    az network nsg rule create -n http8080 --nsg-name $nginx_nsg_name -g $rg --priority 520 --destination-port-ranges 8080 --access Allow --protocol Tcp -o none --only-show-errors
+    az network nsg rule create -n https443 --nsg-name $nginx_nsg_name -g $rg --priority 530 --destination-port-ranges 443 --access Allow --protocol Tcp -o none --only-show-errors
+    az network nsg rule create -n https8443 --nsg-name $nginx_nsg_name -g $rg --priority 540 --destination-port-ranges 8443 --access Allow --protocol Tcp -o none --only-show-errors
+    az vm create -n $nginx_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
+      --vnet-name $vnet_name --subnet $nginx_subnet_name --nsg $nginx_nsg_name --public-ip-address $nginx_pip_name \
+      --custom-data $nginx_cloudinit_filename -o none --only-show-errors
+    nginx_pip=$(az network public-ip show -n $nginx_pip_name -g $rg -o tsv --query ipAddress)
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "ip a"
+    nginx_vm_config_file=/tmp/nginx.conf
+    cat <<EOF > $nginx_vm_config_file
+worker_processes auto;
+events {
+  worker_connections 1024;
+}
+pid        /var/run/nginx.pid;
+http {
+    server {
+        listen [::]:443 ssl;
+        listen 443 ssl;
+        server_name localhost;
+        ssl_protocols              TLSv1.2;
+        ssl_ciphers                ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-DSS-AES128-GCM-SHA256:kEDH+AESGCM:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA256:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA:DHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:ECDHE-RSA-RC4-SHA:ECDHE-ECDSA-RC4-SHA:AES128:AES256:RC4-SHA:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!3DES:!MD5:!PSK;
+        ssl_prefer_server_ciphers  on;
+        ssl_session_cache    shared:SSL:10m; # a 1mb cache can hold about 4000 sessions, so we can hold 40000 sessions
+        ssl_session_timeout  24h;
+        keepalive_timeout 75; # up from 75 secs default
+        add_header Strict-Transport-Security 'max-age=31536000; includeSubDomains';
+        ssl_certificate      /etc/nginx/ssl.crt;
+        ssl_certificate_key  /etc/nginx/ssl.key;
+        proxy_ssl_verify off;   # Important, since the AzFW will return self signed certs!
+        location /api/ {
+            proxy_pass https://$azfw_private_ip:443 ;
+            proxy_set_header Connection "";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            # proxy_set_header X-Forwarded-For \$remote_addr;
+            proxy_buffer_size          128k;
+            proxy_buffers              4 256k;
+            proxy_busy_buffers_size    256k;
+        }
+    }
+}
+EOF
+    scp "$nginx_vm_config_file" "${nginx_pip}:~/"
+    # Put public certs in NGINX. Note: you need to have some public certs in advance
+    cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2023/star_cloudtrooper_net_fullchain.pem"
+    key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2023/CSR/star_cloudtrooper_net.key"
+    scp "$cert_file" "${nginx_pip}:~/ssl.crt"
+    scp "$key_file" "${nginx_pip}:~/ssl.key"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo mv ./* /etc/nginx/"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "systemctl status nginx"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $nginx_pip "sudo systemctl restart nginx"
+    # Create A record in public domain for NGINX VM
+    public_domain=cloudtrooper.net
+    nginx_dns_name='appgwfw-nginx'
+    nginx_fqdn="${nginx_dns_name}.${public_domain}" && echo $nginx_fqdn
+    public_dns_rg=$(az network dns zone list --query "[?name=='$public_domain'].resourceGroup" -o tsv)
+    if [[ -z "$public_dns_rg" ]]
+    then
+      echo "ERROR: I could not find the public DNS zone $public_domain in subscription $sub_name"
+    else
+      # First, remove any existing A-record if already exists
+      a_record_set=$(az network dns record-set a show -n "$nginx_dns_name" -z "$public_domain" -g "$public_dns_rg" -o tsv --query id 2>/dev/null)
+      if [[ -n "$a_record_set" ]]
+      then
+        echo "Deleting existing A record for ${nginx_dns_name}.${public_domain}..."
+        az network dns record-set a delete -n "$nginx_dns_name" -z "$public_domain" -g "$public_dns_rg" -y
+      else
+        echo "No conflicting A records found in ${public_domain}"
+      fi
+      # Now create new A record
+      echo "Creating record for "$nginx_dns_name" in zone $public_domain with IP address $nginx_pip..."
+      az network dns record-set a create -g $public_dns_rg -z $public_domain -n $nginx_dns_name -o none
+      az network dns record-set a add-record -g $public_dns_rg -z $public_domain -n $nginx_dns_name -a $nginx_pip -o none
+    fi
+    # Verify access to the app over the NGINX proxy
+    curl -k "https://${nginx_fqdn}/api/healthcheck"
+
+fi
+
+# NGNIXaaS (optional)
+if [[ "$nginx_aas" == "yes" ]]; then
+    # Create subnet and public IP
+    az network public-ip create -n $nginx_aas_pip_name -g $rg -l $location --sku Standard -o none --only-show-errors
+    nginx_aas_pip_id=$(az network public-ip show -n $nginx_aas_pip_name -g $rg -o tsv --query id)
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $nginx_aas_subnet_name --address-prefixes $nginx_aas_subnet_prefix -o none --only-show-errors
+    az network vnet subnet update -g $rg --vnet-name $vnet_name -n $nginx_aas_subnet_name --delegations NGINX.NGINXPLUS/nginxDeployments -o none --only-show-errors
+    nginx_aas_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $nginx_aas_subnet_name -o tsv --query id)
+    nginx_aas_frontend_config="{public-ip-addresses:[{id:$nginx_aas_pip_id}]}"
+    nginx_aas_nic_config="{subnet-id:$nginx_aas_subnet_id}"
+    # Create the NGINXaaS deployment
+    az nginx deployment create -n nginxaasdeployment -g $rg -l $location --sku name=$nginx_aas_sku -o none --only-show-errors \
+         --network-profile "front-end-ip-configuration=$nginx_aas_frontend_config" "network-interface-configuration=$nginx_aas_nic_config"
+fi
 
 ########################
 #     File Uploads     #
 ########################
 
-# Verify IDPS is blocking traffic
-curl -A "BlackSun" -k "https://${appgw_fqdn}/api/healthcheck"
+if [[ "$file_uploads" == "yes" ]]; then
 
-# Test file upload - legit file
-test_file="/tmp/testfile"
-echo $(tr -dc a-zA-Z0-9 </dev/urandom 2>/dev/null| head -c 25) >$test_file
-curl -k -F "data=@${test_file}" "https://${appgw_fqdn}/api/filesize"
+    # Verify IDPS is blocking traffic
+    curl -A "BlackSun" -k "https://${appgw_fqdn}/api/healthcheck"
 
-# Test file upload - bad file (should be blocked)
-bad_file="/tmp/badfile"
-echo 'uid=0(root) gid=0(root) groups=0(root)' >$bad_file
-curl -k -F "data=@${bad_file}" "https://${appgw_fqdn}/api/filesize"
+    # Test file upload - legit file
+    test_file="/tmp/testfile"
+    echo $(tr -dc a-zA-Z0-9 </dev/urandom 2>/dev/null| head -c 25) >$test_file
+    curl -k -F "data=@${test_file}" "https://${appgw_fqdn}/api/filesize"
 
-# Other bad files, check https://github.com/wicar/malware.wicar.org/tree/master/data
-# bad_file_url="https://secure.eicar.org/eicar.com"
-# bad_file_url=https://raw.githubusercontent.com/wicar/malware.wicar.org/master/data/adobe_flash_hacking_team_uaf.html
-# bad_file_url=https://github.com/wicar/malware.wicar.org/raw/master/data/vlc_amv.amv
-bad_file_url=https://raw.githubusercontent.com/wicar/malware.wicar.org/master/data/ms10_090_ie_css_clip_ie6.html
-wget -q $bad_file_url -O $bad_file
-curl -k -F "data=@${bad_file}" "https://${appgw_fqdn}/api/filesize"
+    # Test file upload - bad file (should be blocked)
+    bad_file="/tmp/badfile"
+    echo 'uid=0(root) gid=0(root) groups=0(root)' >$bad_file
+    curl -k -F "data=@${bad_file}" "https://${appgw_fqdn}/api/filesize"
 
+    # Other bad files, check https://github.com/wicar/malware.wicar.org/tree/master/data
+    # bad_file_url="https://secure.eicar.org/eicar.com"
+    # bad_file_url=https://raw.githubusercontent.com/wicar/malware.wicar.org/master/data/adobe_flash_hacking_team_uaf.html
+    # bad_file_url=https://github.com/wicar/malware.wicar.org/raw/master/data/vlc_amv.amv
+    bad_file_url=https://raw.githubusercontent.com/wicar/malware.wicar.org/master/data/ms10_090_ie_css_clip_ie6.html
+    wget -q $bad_file_url -O $bad_file
+    curl -k -F "data=@${bad_file}" "https://${appgw_fqdn}/api/filesize"
+
+fi
 
 ############################################################################################
 # Verify AzFW DNS requirement (host HTTP header must resolve to the packet destination IP) #
@@ -554,8 +686,10 @@ az monitor log-analytics query -w $logws_customerid --analytics-query $query_acc
 ###################
 
 # You can use this VM to connect to the linux VM over HTTPS and test certificates
-az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $win_user --admin-password $win_password --size $win_vm_sku \
-   --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $win_pip_name
+if [[ "$windows_vm == "yes" ]]; then
+    az vm create -n $win_vm_name -g $rg --image win2019datacenter --admin-username $win_user --admin-password $win_password --size $win_vm_sku \
+      --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $win_pip_name -o none --only-show-errors
+fi
 
 #################
 # Test Analyzer #
@@ -656,14 +790,19 @@ az network nic delete --ids $vm_nic_id
 ########
 
 # VM (server)
-az vm deallocate -n $vm_name -g $rg --no-wait -o none
-az vm deallocate -n $win_vm_name -g $rg --no-wait -o none
+function stop_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        az vm deallocate -g $rg -n "$vm_name" --no-wait -o none --only-show-errors
+    done <<< "$vm_list"
+}
+stop_vms
 
 # App GW
-az network application-gateway stop -g $rg -n $appgw_name -o none
+az network application-gateway stop -g $rg -n $appgw_name -o none --only-show-errors
 # Az FW
 ipconfig_name=$(az network firewall ip-config list -f $azfw_name -g $rg --query '[0].name' -o tsv)
-az network firewall ip-config delete -f $azfw_name -g $rg -n $ipconfig_name -o none
+az network firewall ip-config delete -f $azfw_name -g $rg -n $ipconfig_name -o none --only-show-errors
 
 #########
 # Start #

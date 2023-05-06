@@ -86,24 +86,24 @@ else
     echo "Creating rule to allow SSH and HTTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols TCP --destination-ports 9 22 80 -o none
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols TCP --destination-ports 9 22 80 -o none
     # Allow ICMP
     echo "Creating rule to allow ICMP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
     # Allow NTP
     echo "Creating rule to allow NTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
-        --destination-addresses '*' --source-addresses "10.0.0.0/8" "20.0.0.0/6" --ip-protocols UDP --destination-ports "123" -o none
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "192.168.0.0/16" --ip-protocols UDP --destination-ports "123" -o none
     # Example application collection with 2 rules (ipconfig.co, api.ipify.org)
     echo "Creating rule to allow ifconfig.co and api.ipify.org..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
-        --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 -o none
+        --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --protocols Http=80 Https=443 -o none
     az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
-        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 --rule-type ApplicationRule -o none
+        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --protocols Http=80 Https=443 --rule-type ApplicationRule -o none
     # Example application collection with wildcards (*.ubuntu.com)
     echo "Creating rule to allow *.ubuntu.com..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
