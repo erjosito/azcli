@@ -118,7 +118,7 @@ query="resources | where type=='microsoft.network/applicationgateways' | extend 
 
 query="resources | where type=='microsoft.network/virtualnetworks' | project id,subnets=properties.subnets | mv-expand subnets | project id, subnetId = subnets.id, subnetPrefix = subnets.properties.addressPrefix"
 # ALB
-query="resources | where type=='microsoft.network/loadbalancers' | mvexpand properties.outboundRules | summarize countOutRules=count() by id | join kind=rightouter (resources | where type=='microsoft.network/loadbalancers' | project id) on id | project id, compliant = isnull(countOutRules)"
+query="resources | where type=='microsoft.network/loadbalancers' | mvexpand properties.outboundRules | summarize countOutRules=count() by id | join kind=rightouter (resources | where type=='microsoft.network/loadbalancers' | project id) on id | project id=id1, compliant = isnull(countOutRules)"
 
 # To Do
 # AFD with single origin, no probes
