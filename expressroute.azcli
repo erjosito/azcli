@@ -5,15 +5,20 @@
 #################################
 
 # Control
-location=southcentralus
-er_location=southcentralus
-er_pop=Dallas
-er_circuit_sku=Standard
+location=australiaeast
+er_location=australiaeast
+er_pop=Sydney
+er_circuit_sku=Local
+er_circuit_family=MeteredData  # other values: MeteredData, UnlimitedData
+er_circuit_bw=50
 create_spokes=no
 number_of_spokes=2
 simulate_onprem=no
 
 # Other possible pop/region combinations with megaport:
+# location=southcentralus
+# er_location=southcentralus
+# er_pop=Dallas
 # location=germanywestcentral
 # er_location=germanywestcentral
 # er_pop=Frankfurt
@@ -59,8 +64,13 @@ echo "Creating resource group..."
 az group create -n $rg -l $location -o none
 
 # Create ER circuit
-az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg -o none \
-    --bandwidth 50 Mbps --provider $er_provider -l $er_location --sku-family MeteredData --sku-tier $er_circuit_sku
+if [[ "$er_circuit_sku" == "Local" ]]; then
+    er_circuit_family="UnlimitedData"
+    er_circuit_bw="1000"
+fi
+echo "Creating ER circuit..."
+az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg -o none --only-show-errors \
+    --bandwidth $er_circuit_bw Mbps --provider $er_provider -l $er_location --sku-family $er_circuit_family --sku-tier $er_circuit_sku
 service_key=$(az network express-route show -n $er_circuit_name -g $rg --query serviceKey -o tsv)
 
 # Provision Megaport MCR in location
