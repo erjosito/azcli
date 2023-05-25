@@ -5,7 +5,7 @@
 # The script creates a VWAN lab with
 #  * 2 secure vhubs
 #  * 2 branches connecting over VPN (simulated via Cisco CSR)
-#vn
+#
 # CLI extensions required:
 # * virtual-wan
 # * azure-firewall
@@ -19,6 +19,7 @@
 
 # Control
 no_of_hubs=2         # 1 or 2 hubs
+hrp=ASPath           # Can be ASPath, ExpressRoute or VPN
 no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
@@ -32,18 +33,19 @@ vnet_prop=default    # Route table to propagate from VNet connections. Can be 'd
 nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
 deploy_vpngw=yes     # Whether VPN GWs should be deployed
-deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
-deploy_gcp=no        # Whether an onprem location to be connected over ER should be deployed in Google Cloud
+branch5=yes          # Whether a 2nd S2S branch in hub1 should be deployed
+deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
+deploy_gcp=yes       # Whether an onprem location to be connected over ER should be deployed in Google Cloud
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=no      # If 2 hubs and ER, connect both circuits via GR
-routing_intent=yes   # Whether RI is configured
+routing_intent=no    # Whether RI is configured
 ri_policy=both       # internet/private/both
 private_link=no      # whether private endpoints will be created for the storage accounts in each region (in the first spoke, using the flow logs storage accounts)
 location1=westcentralus
 location2=northcentralus
 hub1_er_pop=Dallas
-hub2_er_pop=Dallas
+hub2_er_pop=Chicago
 
 # Generic variables
 rg=vwan
@@ -61,6 +63,7 @@ publisher=cisco
 offer=cisco-csr-1000v
 sku=16_12-byol
 version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+# Branch1 (VPN in hub1)
 branch1_prefix=10.4.1.0/24
 branch1_prefix_long="10.4.1.0 255.255.255.0"
 branch1_subnet=10.4.1.0/26
@@ -68,6 +71,7 @@ branch1_vm_subnet=10.4.1.64/26
 branch1_gateway=10.4.1.1
 branch1_bgp_ip=10.4.1.10
 branch1_asn=65501
+# Branch2 (VPN in hub2)
 branch2_prefix=10.5.1.0/24
 branch2_prefix_long="10.5.1.0 255.255.255.0"
 branch2_vm_subnet=10.5.1.64/26
@@ -76,6 +80,7 @@ branch2_gateway=10.5.1.1
 branch2_bgp_ip=10.5.1.10
 branch2_2ary_bgp_ip=10.5.1.20
 branch2_asn=65502
+# Branch3 (SDWAN in hub1)
 branch3_prefix=10.4.3.0/24
 branch3_subnet=10.4.3.0/26
 branch3_vm_subnet=10.4.3.64/26
@@ -83,6 +88,7 @@ branch3_gateway=10.4.3.1
 branch3_bgp_ip=10.4.3.75
 branch3_asn=65503
 branch3_test_route=3.3.3.0/24
+# Branch4 (SDWAN in hub2)
 branch4_prefix=10.5.3.0/24
 branch4_vm_subnet=10.5.3.64/26
 branch4_subnet=10.5.3.0/26
@@ -90,6 +96,14 @@ branch4_gateway=10.5.3.1
 branch4_bgp_ip=10.5.3.75
 branch4_asn=65504
 branch4_test_route=4.4.4.0/24
+# Branch5 (2nd VPN in hub1)
+branch5_prefix=10.4.5.0/24
+branch5_prefix_long="10.4.5.0 255.255.255.0"
+branch5_subnet=10.4.5.0/26
+branch5_vm_subnet=10.4.5.64/26
+branch5_gateway=10.4.5.1
+branch5_bgp_ip=10.4.5.10
+branch5_asn=65505
 # ER (optional)
 er_provider=Megaport
 er_circuit_sku=Premium
@@ -100,8 +114,10 @@ hub1_er_circuit_name="er1-$hub1_er_pop"
 hub2_er_circuit_name="er2-$hub2_er_pop"
 mcr2_asn=65002
 # gcloud variables to simulate onprem via ER
-project_name=cci-sandbox-jomore
-project_id=cci-sandbox-jomore
+# project_name=cci-sandbox-jomore
+# project_id=cci-sandbox-jomore
+project_name=onpremsim
+project_id="${project_name}${RANDOM}"
 machine_type=e2-micro
 gcp_asn=16550
 # gcp region 1
@@ -1202,6 +1218,25 @@ then
     fi
 fi
 
+# Create CSR to simulate branch5
+if [[ "$deploy_vpngw" == "yes" ]] && [[ "$branch5" == "yes" ]]
+then
+    # You might have to accept the CSR marketplace terms to deploy the image
+    echo "Creating NVA branch5-nva..."
+    az vm create -n branch5-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} \
+        --generate-ssh-keys --admin-username $username --nsg $nsg1_name --size $nva_size --disable-integrity-monitoring \
+        --public-ip-address branch5-pip --public-ip-address-allocation static --public-ip-sku Standard --private-ip-address $branch5_bgp_ip \
+        --vnet-name branch5 --vnet-address-prefix $branch5_prefix --subnet nva --subnet-address-prefix $branch5_subnet -o none
+    branch5_ip=$(az network public-ip show -n branch5-pip -g $rg --query ipAddress -o tsv)
+    az network vpn-site create -n branch5 -g $rg -l $location1 --virtual-wan $vwan --device-vendor cisco --device-model csr --link-speed 100 --ip-address $branch5_ip  \
+        --asn $branch5_asn --bgp-peering-address $branch5_bgp_ip --with-link -o none
+    branch5_link_id=$(az network vpn-site link list --site-name branch5 -g $rg --query '[0].id' -o tsv)
+    az network vpn-gateway connection create -n branch5 --gateway-name hubvpn1 -g $rg --remote-vpn-site branch5 --with-link true --vpn-site-link $branch5_link_id \
+        --enable-bgp true --protocol-type IKEv2 --shared-key "$password" --connection-bandwidth 100 --routing-weight 10 \
+        --associated-route-table $hub1_default_rt_id --propagated-route-tables $hub1_default_rt_id --labels default --internet-security true -o none
+fi
+
+
 # Configure branches (CSRs)
 
 # Get parameters for VPN GW in hub1
@@ -1362,7 +1397,7 @@ then
     echo "Configuring VPN gateways..."
     gw_id_list=$(az network vpn-gateway list -g $rg --query '[].id' -o tsv)
     while IFS= read -r gw_id; do
-        az monitor diagnostic-settings create -n mydiag --resource $gw_id --workspace $logws_id \
+        az monitor diagnostic-settings create -n mydiag$RANDOM --resource $gw_id --workspace $logws_id \
             --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
             --logs '[{"category": "GatewayDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
                     {"category": "TunnelDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
@@ -1370,6 +1405,105 @@ then
                     {"category": "IKEDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
     done <<< "$gw_id_list"
 fi
+
+
+# Configure CSR for branch5
+# Get parameters for VPN GW in hub1
+if [[ "$deploy_vpngw" == "yes" ]] && [[ "$branch5" == "yes" ]]
+then
+    vpngw1_config=$(az network vpn-gateway show -n hubvpn1 -g $rg)
+    site=branch5
+    vpngw1_gw0_pip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]')
+    vpngw1_gw1_pip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]')
+    vpngw1_gw0_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
+    vpngw1_gw1_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
+    vpngw1_bgp_asn=$(echo $vpngw1_config | jq -r '.bgpSettings.asn')  # This is today always 65515
+    echo "Extracted info for hubvpn1: Gateway0 $vpngw1_gw0_pip, $vpngw1_gw0_bgp_ip. Gateway1 $vpngw1_gw1_pip, $vpngw1_gw0_bgp_ip. ASN $vpngw1_bgp_asn"
+
+    # Wait until CSR in branch5 takes SSH connections
+    wait_interval_csr=30
+    echo "Waiting until CSR in branch${branch_id} is reachable..."
+    command="sho ver | i uptime"
+    command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "$command")
+    until [[ -n "$command_output" ]]
+    do
+        sleep $wait_interval_csr
+        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "$command")
+    done
+    echo $command_output
+
+    # Create CSR config for branch 1
+    csr_config_url="https://raw.githubusercontent.com/erjosito/azure-wan-lab/master/csr_config_2tunnels_tokenized.txt"
+    config_file_csr='branch5_csr.cfg'
+    config_file_local='/tmp/branch5_csr.cfg'
+    wget $csr_config_url -O $config_file_local
+    sed -i "s|\*\*PSK\*\*|${password}|g" $config_file_local
+    sed -i "s|\*\*GW0_Private_IP\*\*|${vpngw1_gw0_bgp_ip}|g" $config_file_local
+    sed -i "s|\*\*GW1_Private_IP\*\*|${vpngw1_gw1_bgp_ip}|g" $config_file_local
+    sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw1_gw0_pip}|g" $config_file_local
+    sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw1_gw1_pip}|g" $config_file_local
+    sed -i "s|\*\*BGP_ID\*\*|${branch5_asn}|g" $config_file_local
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip <<EOF
+  config t
+    file prompt quiet
+EOF
+    scp -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $config_file_local ${branch5_ip}:/${config_file_csr}
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "copy bootflash:${config_file_csr} running-config"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "wr mem"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "sh ip int b"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "sh ip bgp summary"
+    myip=$(curl -s4 ifconfig.co)
+    loopback_ip=10.55.55.55
+    default_gateway=$branch5_gateway
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip <<EOF
+config t
+    username $username password 0 $password
+    no ip domain lookup
+    interface Loopback0
+        ip address ${loopback_ip} 255.255.255.255
+    router bgp ${branch5_asn}
+        redistribute static route-map S2B
+    route-map S2B
+        match ip address prefix-list S2B
+    ip prefix-list S2B permit ${branch5_prefix}
+    ip route ${branch5_prefix_long} ${default_gateway}
+    ip route ${vpngw1_gw0_pip} 255.255.255.255 ${default_gateway}
+    ip route ${vpngw1_gw1_pip} 255.255.255.255 ${default_gateway}
+    ip route ${myip} 255.255.255.255 ${default_gateway}
+    line vty 0 15
+        exec-timeout 0 0
+end
+write mem
+EOF
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "sh ip int b"
+fi  # if $deploy_vpngw == yes
+
+# Configure VPN gateways to log to Azure Monitor
+# Create LA workspace if it doesnt exist
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    logws_name=vwanlogs$RANDOM
+    echo "Creating log analytics workspace $logws_name..."
+    az monitor log-analytics workspace create -n $logws_name -g $rg -l $location1 -o none
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+if [[ "$deploy_vpngw" == "yes" ]]
+then
+    # VPN gateways
+    echo "Configuring VPN gateways..."
+    gw_id_list=$(az network vpn-gateway list -g $rg --query '[].id' -o tsv)
+    while IFS= read -r gw_id; do
+        az monitor diagnostic-settings create -n mydiag$RANDOM --resource $gw_id --workspace $logws_id \
+            --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+            --logs '[{"category": "GatewayDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+                    {"category": "TunnelDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "RouteDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                    {"category": "IKEDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+    done <<< "$gw_id_list"
+fi
+
 
 if [[ "$secure_hub" == "yes" ]]
 then
@@ -1390,7 +1524,12 @@ then
     echo "Creating rule to allow NTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
-        --destination-addresses '*' --source-addresses "10.0.0.0/8" "192.168.0.0/16" --ip-protocols UDP --destination-ports "123" -o none
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --ip-protocols UDP --destination-ports "123" -o none
+    # Allow IPsec
+    echo "Creating rule to allow NTP..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ipsec --collection-priority 104 --action Allow --rule-name allowIPsec --rule-type NetworkRule --description "Egress IPsec traffic" \
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --ip-protocols UDP --destination-ports "500" "4500" -o none
     # Example application collection with 2 rules (ipconfig.co, api.ipify.org)
     echo "Creating rule to allow ifconfig.co and api.ipify.org..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -1446,7 +1585,7 @@ then
     fw_id_list=$(az network firewall list -g $rg --query '[].id' -o tsv)
     while IFS= read -r fw_id; do
         # --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
-        az monitor diagnostic-settings create -n mydiag --resource $fw_id --workspace $logws_id \
+        az monitor diagnostic-settings create -n mydiag$RANDOM --resource $fw_id --workspace $logws_id \
             --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
             --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
                     {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
@@ -1737,6 +1876,20 @@ then
     az network route-table route create -n default -g $rg --route-table-name branch1vm-$location1 \
         --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch1_bgp_ip -o none
     az network vnet subnet update -n vm --vnet-name branch1 -g $rg --route-table branch1vm-$location1 -o none
+    # VM in branch5
+    if [[ "$branch5" == "yes" ]]; then
+        az vm create -n branch5-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+            --public-ip-address branch5-vm-pip --public-ip-sku Standard --vnet-name branch5 --nsg $nsg1_name --size $vm_size \
+            --subnet vm --subnet-address-prefix $branch5_vm_subnet --custom-data $cloudinit_file -o none --only-show-errors
+        az vm extension set --vm-name branch5-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4 -o none
+        az network route-table create -n branch5vm-$location1 -g $rg -l $location1 -o none
+        myip=$(curl -s4 ifconfig.co)
+        az network route-table route create -n mypc -g $rg --route-table-name branch5vm-$location1 \
+            --address-prefix "${myip}/32" --next-hop-type Internet -o none
+        az network route-table route create -n default -g $rg --route-table-name branch5vm-$location1 \
+            --address-prefix "0.0.0.0/0" --next-hop-type VirtualAppliance --next-hop-ip-address $branch5_bgp_ip -o none
+        az network vnet subnet update -n vm --vnet-name branch5 -g $rg --route-table branch5vm-$location1 -o none
+    fi
     # VM in branch2
     if [[ "$no_of_hubs" == "2" ]]
     then
@@ -1752,9 +1905,12 @@ then
         az network vnet subnet update -n vm --vnet-name branch2 -g $rg --route-table branch2vm-$location2 -o none
     fi
     # Configure IP forwarding in the CSR NICs
-    if [[ "$no_of_hubs" == "1" ]]
-    then
-        vm_names=("branch1-nva")
+    if [[ "$no_of_hubs" == "1" ]]; then
+        if [[ "$branch5" == "yes" ]]; then
+            vm_names=("branch1-vm" "branch5-vm")
+        else
+            vm_names=("branch1-vm")
+        fi
     else
         vm_names=("branch1-nva" "branch2-nva")
     fi
@@ -1852,7 +2008,7 @@ EOF
         nva2_ip=$(az network nic show --ids $nva2_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo "$nva2_ip"
         nva2_pip=$(az network public-ip show -n "spoke2${indirect_spoke_id}-pip" -g $rg --query ipAddress -o tsv) && echo "$nva2_pip"
         nva2_default_gw="10.2.${indirect_spoke_id}.1"
-        nva2_asn="6501${indirect_spoke_id}"
+        nva2_asn="6502${indirect_spoke_id}"
         echo "Getting information about the Route Service in hub2..."
         hub2_rs_ip1=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $hub2_rs_ip1
         hub2_rs_ip2=$(az network vhub show -n hub2 -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $hub2_rs_ip2
@@ -2151,25 +2307,25 @@ then
     # Simulate ER onprem with Google Cloud (optional)
     if [[ "$deploy_gcp" == "yes" ]]; then
         # gcloud auth list
-        # gcloud config set account 'erjosito1138@gmail.com'
-        gcloud config set account 'jomore@contosohotels.com'
+        gcloud config set account 'erjosito1138@gmail.com'
+        # gcloud config set account 'jomore@contosohotels.com'
         gcloud config set project $project_id
         # Get environment info
-        # account=$(gcloud info --format json | jq -r '.config.account')
-        # billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
-        # billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
+        account=$(gcloud info --format json | jq -r '.config.account')
+        billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
+        billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
         # Create project
-        # gcloud projects create $project_id --name $project_name
-        # gcloud config set project $project_id
-        # gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
-        # gcloud services enable compute.googleapis.com
+        gcloud projects create $project_id --name $project_name
+        gcloud config set project $project_id
+        gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
+        gcloud services enable compute.googleapis.com
         # VPC and instance
         gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
         gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1
         gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
         gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --quiet --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
         gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --quiet --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
-        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --quiet --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+        gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --quiet --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 --action=ALLOW
         # For IPsec (only required if configuring the VM as IPsec NVA)
         gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-udp4500" --verbosity=error --network "$gcp_vpc1_name" --priority=1050 --direction=INGRESS --rules=udp:4500 --source-ranges=192.168.0.0/16 --action=ALLOW
         gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-udp500" --verbosity=error --network "$gcp_vpc1_name" --priority=1060 --direction=INGRESS --rules=udp:500 --source-ranges=192.168.0.0/16 --action=ALLOW
@@ -2194,7 +2350,7 @@ then
             gcloud compute instances create "$gcp_vm2_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc2_name" --subnet "$gcp_subnet2_name" --zone "$zone2"
             gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-icmp" --network "$gcp_vpc2_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
             gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-ssh" --network "$gcp_vpc2_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
-            gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-web" --network "$gcp_vpc2_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+            gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-web" --network "$gcp_vpc2_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 --action=ALLOW
             # gcloud compute ssh $gcp_vm2_name --zone=$zone2 --command="ip a"    # This command will pause the script if the key file is password-protected
             # Create interconnect
             gcloud compute routers create $router2_name --project=$project_id --network=$gcp_vpc2_name --asn=$gcp_asn --region=$region2
@@ -2445,6 +2601,18 @@ function bounce_er_cx() {
     fi
 }
 
+# Change routing preference
+# Takes the routing preference as first parameter (Can be ASPath, ExpressRoute or VpnGateway)
+function set_routing_preference() {
+    # routing_preference=ASPath  # Can be ASPath, ExpressRoute or VpnGateway
+    routing_preference=$1
+    az network vhub update -n hub1 -g $rg --hub-routing-preference $routing_preference -o none
+    if [[ "$no_of_hubs" == "2" ]]; then
+        az network vhub update -n hub2 -g $rg --hub-routing-preference $routing_preference -o none
+    fi
+}
+set_routing_preference $hrp
+
 ################################
 #   Modify ER bow-tie design   #
 ################################
@@ -2463,15 +2631,6 @@ function add_bow_tie() {
 function remove_bow_tie() {
     az network express-route gateway connection delete --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg -o none
     az network express-route gateway connection delete --gateway-name hub2ergw -n "hub2ergw-${hub1_er_pop}" -g $rg -o none
-}
-
-# Change routing preference
-# Takes the routing preference as first parameter (Can be ASPath, ExpressRoute or VpnGateway)
-function set_routing_preference() {
-    # routing_preference=ASPath  # Can be ASPath, ExpressRoute or VpnGateway
-    routing_preference=$1
-    az network vhub update -n hub1 -g $rg --hub-routing-preference $routing_preference -o none
-    az network vhub update -n hub2 -g $rg --hub-routing-preference $routing_preference -o none
 }
 
 ##############################
@@ -2548,11 +2707,11 @@ do
         --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type ExternalAddress \
         --endpoint-source-resource-id "$vm_id_list[$src_vm]" --endpoint-source-name $src_vm \
         --endpoint-dest-address "ubuntu.com" --endpoint-dest-name ubuntucom \
-        --test-config-name Http --protocol Http --http-method GET --https-prefer false -o none
+        --test-config-name Http --protocol Http --http-method GET --https-prefer false -o none --only-show-errors
     # An ICMP config is added
     echo "Adding ICMP config to connection monitor $monitor_name..."
     az network watcher connection-monitor test-configuration add --connection-monitor $monitor_name -l $location \
-        -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name -o none
+        -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name --frequency 30 -o none --only-show-errors
     # Plus the rest of the VMs are added as targets
     while IFS= read -r dst_vm
     do
@@ -2560,10 +2719,57 @@ do
         then
             echo "Adding destination $dst_vm to connection monitor $monitor_name..."
             az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location \
-                --resource-id "$vm_id_list[$dst_vm]" --name $dst_vm --type AzureVM --dest-test-groups $test_name -o none
+                --resource-id "$vm_id_list[$dst_vm]" --name $dst_vm --type AzureVM --dest-test-groups $test_name -o none --only-show-errors
         fi
     done <<< "$vm_list"
 done <<< "$vm_list"
+
+# Update created monitors with GCP VMs as external endpoints
+if [[ "$deploy_gcp" == "yes" ]]; then
+    gcp_vm1_ip=$(gcloud compute instances describe $gcp_vm1_name --zone $zone1 --format json | jq -r '.networkInterfaces[0].networkIP')
+    gcloud compute ssh $gcp_vm1_name --zone=$zone1 --command="sudo apt update && sudo apt install -y apache2"
+    if [[ "$no_of_hubs" == "2" ]]; then
+        gcp_vm2_ip=$(gcloud compute instances describe $gcp_vm2_name --zone $zone2 --format json | jq -r '.networkInterfaces[0].networkIP')
+        gcloud compute ssh $gcp_vm2_name --zone=$zone2 --command="sudo apt update && sudo apt install -y apache2"
+    fi
+    while IFS= read -r src_vm
+    do
+        test_name="${src_vm}"
+        location=$(az vm show -n $src_vm -g $rg --query location -o tsv)
+        monitor_name="${src_vm}-${location}"
+        # echo "Adding ICMP config to connection monitor $monitor_name..."
+        # az network watcher connection-monitor test-configuration add --connection-monitor $monitor_name -l $location \
+        #     -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name --frequency 30 -o none
+        echo "Adding endpoint gcp-${gcp_vm1_name} with IP address ${gcp_vm1_ip} to connection monitor $monitor_name..."
+        az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location \
+            --address "$gcp_vm1_ip" --name "gcp-${gcp_vm1_name}" --type ExternalAddress --dest-test-groups $test_name -o none --only-show-errors
+        if [[ "$no_of_hubs" == "2" ]]; then
+            echo "Adding endpoint gcp-${gcp_vm2_name} with IP address ${gcp_vm2_ip} to connection monitor $monitor_name..."
+            az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location \
+                --address "$gcp_vm2_ip" --name "gcp-${gcp_vm2_name}" --type ExternalAddress --dest-test-groups $test_name -o none --only-show-errors
+        fi
+    done <<< "$vm_list"
+fi
+
+# This section can be used if some of the previous commands did not work, to correct the monitors
+# while IFS= read -r src_vm
+# do
+#     test_name="${src_vm}"
+#     location=$(az vm show -n $src_vm -g $rg --query location -o tsv)
+#     monitor_name="${src_vm}-${location}"
+#     # Update test configs
+#     # echo "Adding ICMP config to connection monitor $monitor_name..."
+#     # az network watcher connection-monitor test-configuration add --connection-monitor $monitor_name -l $location \
+#     #     -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name --frequency 30 -o none --only-show-errors
+#     # Add target
+#     dst_vm='branch5-vm'
+#     if [[ "$src_vm" != "$dst_vm" ]]
+#     then
+#         echo "Adding destination $dst_vm to connection monitor $monitor_name..."
+#         az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location \
+#             --resource-id "$vm_id_list[$dst_vm]" --name $dst_vm --type AzureVM --dest-test-groups $test_name -o none --only-show-errors
+#     fi
+# done <<< "$vm_list"
 
 # Represents results in table form (configurable interval, default 5m)
 function monitor_results() {
