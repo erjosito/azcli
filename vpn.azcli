@@ -21,24 +21,24 @@ function create_gw {
     vnet_prefix=10.${id}.0.0/16
     subnet_prefix=10.${id}.0.0/24
     vm_subnet_prefix=10.${id}.1.0/24
-    az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name GatewaySubnet --subnet-prefix $subnet_prefix
-    az network vnet subnet create -g $rg -n vm --vnet-name $vnet_name --address-prefix $vm_subnet_prefix
-    az network public-ip create -g $rg -n pip0
+    az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name GatewaySubnet --subnet-prefix $subnet_prefix -o none --only-show-errors
+    az network vnet subnet create -g $rg -n vm --vnet-name $vnet_name --address-prefix $vm_subnet_prefix -o none --only-show-errors
+    az network public-ip create -g $rg -n pip0 -o none --only-show-errors
     if [[ $no_of_gws == "1" ]]
     then
-        az network public-ip create -g $rg -n pip${id}
-        az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id} --no-wait
+        az network public-ip create -g $rg -n pip${id} -o none --only-show-errors
+        az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id} --no-wait -o none --only-show-errors
     else
         az network public-ip create -g $rg -n pip${id}a
         az network public-ip create -g $rg -n pip${id}b
-        az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id}a pip${id}b --no-wait
+        az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet vnet${id} -n vng${id} --asn 6500${id} --public-ip-address pip${id}a pip${id}b --no-wait -o none --only-show-errors
     fi
 }
 
 function connect_gws {
     gw1_id=$1
     gw2_id=$2
-    az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n ${gw1_id}to${gw2_id} --vnet-gateway1 vng${gw1_id} --vnet-gateway2 vng${gw2_id}
+    az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n ${gw1_id}to${gw2_id} --vnet-gateway1 vng${gw1_id} --vnet-gateway2 vng${gw2_id} -o none --only-show-errors
 }
 
 ################
@@ -46,7 +46,7 @@ function connect_gws {
 ################
 
 # Create RG
-az group create -n $rg -l $location
+az group create -n $rg -l $location -o none --only-show-errors
 
 # Create VPN GW in one vnet
 create_gw 1 1   # active/passive
@@ -57,9 +57,9 @@ create_gw 1 1   # active/passive
 azurevm_name=testvm
 azurevm_pip_name="${azurevm_name}-pip"
 vm_size=Standard_B1s
-az network nsg create -n "${azurevm_name}-nsg" -g $rg
+az network nsg create -n "${azurevm_name}-nsg" -g $rg -o none --only-show-errors
 az vm create -n $azurevm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
-    --public-ip-address $azurevm_pip_name --vnet-name vnet1 --size $vm_size --subnet vm
+    --public-ip-address $azurevm_pip_name --vnet-name vnet1 --size $vm_size --subnet vm -o none --only-show-errors
 
 # Connection between Azure VNGs
 # az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n 0to11 --vnet-gateway1 vng0 --vnet-gateway2 vng11
