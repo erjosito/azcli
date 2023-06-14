@@ -6,7 +6,7 @@
 #################################
 
 # Variables
-rg=akstest2
+rg=akstest
 location=westcentralus
 wait_interval=5s
 use_msi=yes
@@ -14,9 +14,11 @@ use_msi=yes
 aks_name=aks
 aks_rbac=yes
 aks_service_cidr=10.0.0.0/16
-vm_size=Standard_B2ms    # Some possible values: Standard_B2ms, Standard_D2_v3
-preview_version=no
-network_plugin=azure     # azure/kubenet/none
+vm_size=Standard_B2ms         # Some possible values: Standard_B2ms, Standard_D2_v3
+preview_version=yes
+network_plugin=azure_cilium   # azure/kubenet/none/azure_overlay/azure_cilium
+network_policy=calico         # azure/calico/cilium/none
+az_monitor=no
 # Vnet
 vnet_name=aksVnet
 vnet_prefix=10.13.0.0/16
@@ -111,6 +113,7 @@ function enableAksFeature () {
 # enableAksFeature "CiliumDataplanePreview"
 
 # Update extension
+echo "Updating aks-preview extension..."
 az extension update -n aks-preview
 
 ########
@@ -118,28 +121,30 @@ az extension update -n aks-preview
 ########
 
 # Create RG, LA workspace, vnet, AKS
-az group create -n $rg -l $location
+echo "Creating RG and VNet..."
+az group create -n $rg -l $location -o none
 acr_rg=$(az acr list -o tsv --query "[?name=='$acr_name'].resourceGroup")
 acr_id=$(az acr show -n erjositoAcr -g $acr_rg --query id -o tsv)
-az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location -o none
 az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix -o none
 az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix -o none
 aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 
 # Create LA workspace
-# Create Log Analytics workspace
-logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
-if [[ -z "$logws_name" ]]
-then
-    logws_name=log$RANDOM
-    echo "INFO: Creating log analytics workspace ${logws_name}..."
-    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
-else
-    echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+if [[ "$az_monitor" == 'yes' ]]; then
+    logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+    if [[ -z "$logws_name" ]]
+    then
+        logws_name=log$RANDOM
+        echo "INFO: Creating log analytics workspace ${logws_name}..."
+        az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+    else
+        echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+    fi
+    logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+    logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 fi
-logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
-logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 
 # Get latest supported/preview version
 k8s_versions=$(az aks get-versions -l $location -o json)
@@ -190,12 +195,41 @@ else
     # identity_options="--enable-managed-identity"
 fi
 
+# Change network policy format if none specified
+if [[ "$network_policy" == 'none' ]]; then
+    network_policy=''
+fi
+
+# CNI options
+if [[ "$network_plugin" == 'azure' ]]; then
+    cni_options="--network-plugin azure"
+elif [[ "$network_plugin" == 'kubenet' ]]; then
+    cni_options="--network-plugin kubenet"
+elif [[ "$network_plugin" == 'azure_cilium' ]]; then
+    cni_options="--network-plugin azure --network-dataplane cilium"
+    if [[ "$network_policy" != "cilium" ]]; then
+        echo "Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
+        network_policy=cilium
+    fi
+elif [[ "$network_plugin" == 'azure_overlay' ]]; then
+    cni_options="--network-plugin azure --network-dataplane cilium --network-plugin-mode overlay"
+    if [[ "$network_policy" != "cilium" ]]; then
+        echo "Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
+        network_policy=cilium
+    fi
+else
+    echo "ERROR: Network plugin $network_plugin not supported"
+    exit 1
+fi
+
 # Create AKS
 az aks create -g $rg -n $aks_name -l $location \
     --pod-subnet-id $pod_subnet_id \
     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
     ${(z)identity_options} \
-    --network-plugin $network_plugin --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
+    ${(z)cni_options} \
+    --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
+    --network-policy $network_policy \
     --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
     --dns-name-prefix cloudtrooper --no-wait
@@ -234,7 +268,9 @@ kubectl get nodes
 ######################
 
 # Enable monitoring addon
-az aks enable-addons -g $rg -n $aks_name --addons monitoring --workspace-resource-id "$logws_id"
+if [[ "$az_monitor" == 'yes' ]]; then
+    az aks enable-addons -g $rg -n $aks_name --addons monitoring --workspace-resource-id "$logws_id"
+fi
 
 # Enable AKV addon (Work In Progress)
 az aks enable-addons -g $rg -n $aks_name --addons azure-keyvault-secrets-provider
