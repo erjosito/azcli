@@ -223,7 +223,8 @@ else
 fi
 
 # Create AKS
-az aks create -g $rg -n $aks_name -l $location \
+echo "Deploying cluster..."
+az aks create -g $rg -n $aks_name -l $location -o none \
     --pod-subnet-id $pod_subnet_id \
     -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
     ${(z)identity_options} \
@@ -311,7 +312,7 @@ az aks upgrade -n $aks_name -g $rg -k $new_aks_version -y
 #  Install Cilium  #
 ####################
 
-if [[ "$network_plugin" ]]; then
+if [[ "$network_plugin" == 'none' ]]; then
     CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/master/stable.txt)
     CLI_ARCH=amd64
     if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
@@ -328,6 +329,61 @@ if [[ "$network_plugin" ]]; then
     cilium connectivity test
     k get no
 fi
+
+#######################
+# Troubleshoot Cilium #
+#######################
+
+kubectl -n kube-system get pods -l k8s-app=cilium
+cilium version
+cilium status
+cilium status --verbose
+k get cep
+kubectl get cep -o jsonpath='{range .items[*]}{@.status.id}{"="}{@.status.status.policy.spec.policy-enabled}{"\n"}{end}'
+
+
+# From https://github.com/cilium/cilium/blob/main/contrib/k8s/k8s-cilium-exec.sh
+function get_cilium_pods {
+    kubectl -n kube-system get pods -l k8s-app=cilium -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName | \
+       grep cilium
+}
+function run_command {
+    while read -r podName nodeName ; do
+      (
+        title="==== Detail from pod ${podName}, on node ${nodeName}"
+        msg=$( kubectl -n "kube-system" exec -c "cilium-agent" "${podName}" -- "${@}" 2>&1 )
+        echo -e "$title \n$msg\n"
+      )&
+    done <<< "$(get_cilium_pods)"
+    wait
+}
+run_command cilium status
+run_command cilium-health status
+
+# Monitor
+pod_name=$(kubectl -n kube-system get pods -l k8s-app=cilium -o jsonpath='{.items[0].metadata.name}')
+apipod_ip=$(kubectl get pods -l run=api -o jsonpath='{.items[0].status.podIP}')
+webpod_ip=$(kubectl get pods -l run=web -o jsonpath='{.items[0].status.podIP}')
+# See https://docs.cilium.io/en/stable/cmdref/cilium_monitor/
+kubectl -n kube-system exec -ti $pod_name -- cilium monitor
+kubectl -n kube-system exec -ti $pod_name -- cilium monitor --type drop
+kubectl -n kube-system exec -ti $pod_name -- cilium monitor --from 567
+kubectl -n kube-system exec -ti $pod_name -- cilium monitor --from 644 --type drop
+kubectl -n kube-system exec -ti $pod_name -- cilium monitor | grep -v 168.63.129.16 | grep "$apipod_ip" | grep "$webpod_ip"
+
+# Sample outputs
+# xx drop (Policy denied) flow 0x48bbc6f0 to endpoint 644, file bpf_lxc.c line 2001, , identity world->23553: 168.63.129.16:53042 -> 10.13.80.36:8080 tcp SYN
+# xx drop (Policy denied) flow 0x290953e8 to endpoint 0, file bpf_lxc.c line 1182, , identity 23553->11944: 10.13.80.36:35161 -> 10.13.80.15:53 udp
+
+# Finding pod ID (from ceps)
+apipod_id=$(k get cep -l run=api -o jsonpath='{.items[0].status.id}') && echo "API pod has ID $apipod_id"
+# Finding pod ID (from the cilium pod)
+kubectl -n kube-system exec -ti $pod_name -- cilium endpoint list -o jsonpath='{range [*]}{.id}{"\t"}{.status.external-identifiers.pod-name}{"\n"}{end}'
+ns=default
+apipod_name=$(kubectl get pods -n $ns -l run=api -o jsonpath='{.items[0].metadata.name}')
+apipod_id=$(kubectl -n kube-system exec -ti $pod_name -- cilium endpoint list -o jsonpath="{[?(@.status.external-identifiers.pod-name=='$ns/$apipod_name')].id}") && echo $apipod_id
+
+
 
 #####################
 # Create Az Bastion #
@@ -374,6 +430,159 @@ az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=1
 kubectl create deployment yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
 # kubectl run yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --env="SQL_SERVER_FQDN=${sql_server_fqdn}" --env="SQL_SERVER_USERNAME=${sql_username}" --env="SQL_SERVER_PASSWORD=${sql_password}"
+
+# Full YADA app
+sql_server_name=sqlserver$RANDOM
+sql_db_name=mydb
+sql_username=azure
+sql_password=$(openssl rand -base64 10)  # 10-character random password
+echo "Creating SQL Server $sql_server_name..."
+az sql server create -n $sql_server_name -g $rg -l $location --admin-user "$sql_username" --admin-password "$sql_password" -o none
+az sql db create -n $sql_db_name -s $sql_server_name -g $rg -e Basic -c 5 --no-wait -o none
+sql_server_fqdn=$(az sql server show -n $sql_server_name -g $rg -o tsv --query fullyQualifiedDomainName)
+echo "SQL server created: $sql_server_fqdn"
+echo "Creating API..."
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sqlpassword
+type: Opaque
+stringData:
+  password: $sql_password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    run: api
+  name: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      run: api
+  template:
+    metadata:
+      labels:
+        run: api
+    spec:
+      containers:
+      - image: erjosito/yadaapi:1.0
+        name: api
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        - name: SQL_SERVER_USERNAME
+          value: "$sql_username"
+        - name: SQL_SERVER_FQDN
+          value: "$sql_server_fqdn"
+        - name: SQL_SERVER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: sqlpassword
+              key: password
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    run: api
+EOF
+echo "Creating Web..."
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    run: web
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      run: web
+  template:
+    metadata:
+      labels:
+        run: web
+    spec:
+      containers:
+      - image: erjosito/yadaweb:1.0
+        name: web
+        ports:
+        - containerPort: 80
+          protocol: TCP
+        env:
+        - name: API_URL
+          value: "http://api:8080"
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 80
+  selector:
+    run: web
+EOF
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-netpol
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      run: api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              run: web
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - ipBlock:
+            cidr: 168.63.129.16/32
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: UDP
+          port: 53
+EOF
+yadaapi_ip=$(kubectl get svc/api -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null) && echo $yadaapi_ip
+yadaweb_ip=$(kubectl get svc/web -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null) && echo $yadaweb_ip
+curl -s4 "http://${yadaapi_ip}:8080/api/healthcheck"
+curl -s4 "http://${yadaweb_ip}/healthcheck.html"
+yadaapi_egress_ip=$(curl -s "http://${yadaapi_ip}:8080/api/ip" | jq -r .my_public_ip)
+echo "YADA API egress IP: $yadaapi_egress_ip"
+az sql server firewall-rule create -g "$rg" -s "$sql_server_name" -n public_api_aci-source --start-ip-address "$yadaapi_egress_ip" --end-ip-address "$yadaapi_egress_ip"
+
 
 # Service with kubectl
 kubectl expose deploy yadaapi --port=80 --target-port=8080
