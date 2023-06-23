@@ -9,6 +9,9 @@
 
 # Kubernetes
 query="where type=~'microsoft.containerservice/managedclusters'"
+
+where type=='microsoft.containerservice/managedclusters' | project name, resourceType=type, resourceId=id, subscriptionId, resourceGroup, location, tags, uniqueName=name
+
 query="where type=='microsoft.containerservice/managedclusters' | distinct id"
 query="where type=='microsoft.containerservice/managedclusters' | distinct name,resourceGroup"
 # Paid SKU

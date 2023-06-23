@@ -6,7 +6,7 @@
 #################################
 
 # Variables
-rg=akstest
+rg=wl-akstest
 location=westcentralus
 wait_interval=5s
 use_msi=yes
@@ -232,7 +232,7 @@ az aks create -g $rg -n $aks_name -l $location -o none \
     --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
     --network-policy $network_policy \
     --load-balancer-sku Standard \
-    --node-resource-group "$aks_name"-iaas-"$RANDOM" \
+    --node-resource-group "wl-$aks_name"-iaas-"$RANDOM" \
     --dns-name-prefix cloudtrooper --no-wait
 
 # Other options you can use in the previous command
@@ -366,14 +366,17 @@ run_command cilium-health status
 # level=info msg="Rewrote endpoint BPF program" containerID= datapathPolicyRevision=18 desiredPolicyRevision=19 endpointID=644 identity=23553 ipv4= ipv6= k8sPodName=/ subsys=endpoint
 
 # Monitor
-cilium_pod_name=$(kubectl -n kube-system get pods -l k8s-app=cilium -o jsonpath='{.items[0].metadata.name}')
+label="run=api"
+workload_pod_name=$(kubectl get pods -l $label -o jsonpath='{.items[0].metadata.name}')
+workload_node_name=$(kubectl get pods -l $label -o jsonpath='{.items[0].spec.nodeName}')
+cilium_pod_name=$(kubectl -n kube-system get pods -l k8s-app=cilium -o jsonpath="{.items[?(@.spec.nodeName=='$workload_node_name')].metadata.name}")
 apipod_ip=$(kubectl get pods -l run=api -o jsonpath='{.items[0].status.podIP}')
-webpod_ip=$(kubectl get pods -l run=web -o jsonpath='{.items[0].status.podIP}')
+
 # See https://docs.cilium.io/en/stable/cmdref/cilium_monitor/
 kubectl -n kube-system exec -ti $cilium_pod_name -- cilium monitor
 kubectl -n kube-system exec -ti $cilium_pod_name -- cilium monitor --type drop
 kubectl -n kube-system exec -ti $cilium_pod_name -- cilium monitor --from 567
-kubectl -n kube-system exec -ti $cilium_pod_name -- cilium monitor --from 644 --type drop
+kubectl -n kube-system exec -ti $cilium_pod_name -- cilium monitor --from $apipod_ip --type drop
 kubectl -n kube-system exec -ti $cilium_pod_name -- cilium monitor | grep -v 168.63.129.16 | grep "$apipod_ip" | grep "$webpod_ip"
 
 # Sample outputs
@@ -381,12 +384,6 @@ kubectl -n kube-system exec -ti $cilium_pod_name -- cilium monitor | grep -v 168
 # xx drop (Policy denied) flow 0x290953e8 to endpoint 0, file bpf_lxc.c line 1182, , identity 23553->11944: 10.13.80.36:35161 -> 10.13.80.15:53 udp
 # xx drop (Policy denied) flow 0xaccce700 to endpoint 0, file bpf_lxc.c line 1182, , identity 23553->world: 10.13.80.36:49057 -> 13.71.193.33:1433 tcp SYN
 # xx drop (Policy denied) flow 0xd7fa1fe8 to endpoint 0, file bpf_lxc.c line 1182, , identity 23553->world: 10.13.80.36:52243 -> 13.78.248.58:11039 tcp SYN
-
-# Finding cilium pod in a multi-node cluster
-label="run=api"
-workload_pod_name=$(kubectl get pods -l $label -o jsonpath='{.items[0].metadata.name}')
-workload_node_name=$(kubectl get pods -l $label -o jsonpath='{.items[0].spec.nodeName}')
-cilium_pod_name=$(kubectl -n kube-system get pods -l k8s-app=cilium -o jsonpath="{.items[?(@.spec.nodeName=='$workload_node_name')].metadata.name}")
 
 # Finding pod ID (from ceps)
 apipod_id=$(k get cep -l run=api -o jsonpath='{.items[0].status.id}') && echo "API pod has ID $apipod_id"
@@ -435,7 +432,8 @@ az aks update -g $rg -n $aks_name --api-server-authorized-ip-ranges "${myip}/32"
 
 az network vnet subnet create -g $rg -n $aks2_subnet_name --vnet-name $vnet_name --address-prefix $aks2_subnet_prefix -o none
 az network vnet subnet create -g $rg -n $aks2_pod_subnet_name --vnet-name $vnet_name --address-prefix $aks2_pod_subnet_prefix -o none
-vm_size=Standard_DS3_v2
+# vm_size=Standard_DS3_v2
+vm_size=Standard_B2ms
 aks2_subnet_id=$(az network vnet subnet show -n $aks2_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 aks2_pod_subnet_id=$(az network vnet subnet show -n $aks2_pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 az aks nodepool add --cluster-name $aks_name -g $rg -n pool2 --node-count 1 -s $vm_size \
