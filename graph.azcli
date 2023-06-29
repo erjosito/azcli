@@ -10,7 +10,16 @@
 # Kubernetes
 query="where type=~'microsoft.containerservice/managedclusters'"
 
-where type=='microsoft.containerservice/managedclusters' | project name, resourceType=type, resourceId=id, subscriptionId, resourceGroup, location, tags, uniqueName=name
+# bluehorse
+query="resources | where type=='microsoft.containerservice/managedclusters' | project name, resourceType=type, resourceId=id, subscriptionId, resourceGroup, location, tags, uniqueName=name"
+query="where type=='microsoft.containerservice/managedclusters' | extend nodepool = properties.agentPoolProfiles | mv-expand nodepool | project id=strcat(id, '/agentPools/', nodepool.name), name=nodepool.name, resourceGroup, subscriptionId, location, tags, zones"
+query="where type=='microsoft.containerservice/managedclusters' | extend nodepool = properties.agentPoolProfiles | mv-expand nodepool | project sourceResourceId=strcat(id, '/agentPools/', nodepool.name), targetResourceId=id"
+query="where type=='microsoft.containerservice/managedclusters' | extend nodepool = properties.agentPoolProfiles | mv-expand nodepool | project sourceResourceId=strcat(id, '/agentPools/', nodepool.name), targetResourceId=nodepool.vnetSubnetID"
+
+resources
+| where type =~ 'microsoft.web/sites'
+| where isnotnull(properties.virtualNetworkSubnetId)
+| project sourceResourceId=id, targetResourceId=properties.virtualNetworkSubnetId, criticality='Runtime'
 
 query="where type=='microsoft.containerservice/managedclusters' | distinct id"
 query="where type=='microsoft.containerservice/managedclusters' | distinct name,resourceGroup"

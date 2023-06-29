@@ -1,0 +1,379 @@
+###########################################
+# Created to play around with k8s fleet mgr
+#
+# June 2023, Jose Moreno
+###########################################
+
+rg=fleet
+location1=eastus2
+location2=westus
+aks_service_cidr=10.0.0.0/16
+vm_size=Standard_B2ms         # Some possible values: Standard_B2ms, Standard_D2_v3
+preview_version=yes
+network_plugin=azure          # azure/azure_overlay/azure_cilium
+network_policy=calico         # azure/calico/cilium/none
+aks1_name=aks1
+aks1_vnet_name=vnet1
+aks1_vnet_prefix=172.16.0.0/16
+aks1_nodepool1_subnet_name=systemnodes
+aks1_nodepool1_subnet_prefix=172.16.0.0/26
+aks1_nodepool2_subnet_name=usernodes
+aks1_nodepool2_subnet_prefix=172.16.0.64/26
+aks1_pod_subnet_name=nodes
+aks1_pod_subnet_prefix=172.16.64.0/22
+aks2_name=aks2
+aks2_vnet_name=vnet2
+aks2_vnet_prefix=172.17.0.0/16
+aks2_nodepool1_subnet_name=systemnodes
+aks2_nodepool1_subnet_prefix=172.17.0.0/26
+aks2_nodepool2_subnet_name=usernodes
+aks2_nodepool2_subnet_prefix=172.17.0.64/26
+aks2_pod_subnet_name=nodes
+aks2_pod_subnet_prefix=172.17.64.0/22
+fleet_name=fleet
+
+####################
+# Helper functions #
+####################
+
+# Wait for resource to be created
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
+###################
+# Enable features #
+###################
+
+function enableAksFeature () {
+    feature_name=$1
+    state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
+    if [[ "$state" == "Registered" ]]
+    then
+        echo "$feature_name is already registered"
+    else
+        echo "Registering feature $feature_name..."
+        az feature register --name "$feature_name" --namespace microsoft.containerservice -o none
+        state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
+        echo "Waiting for feature $feature_name to finish registering..."
+        wait_interval=15
+        until [[ "$state" == "Registered" ]]
+        do
+            sleep $wait_interval
+            state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
+            echo "Current registration status for feature $feature_name is $state"
+        done
+        echo "Registering resource provider Microsoft.ContainerService now..."
+        az provider register --namespace Microsoft.ContainerService -o none
+    fi
+}
+
+# enableAksFeature "AKS-IngressApplicationGatewayAddon"
+# enableAksFeature "EnablePodIdentityPreview"
+# enableAksFeature "MigrateToMSIClusterPreview"
+# enableAksFeature "PodSubnetPreview"
+# enableAksFeature "EnableAPIServerVnetIntegrationPreview"
+# enableAksFeature "CiliumDataplanePreview"
+
+# Update extension
+echo "Updating aks-preview extension..."
+az extension update -n aks-preview
+
+####################
+#      Start       #
+####################
+
+# Create resource group
+echo "Creating resource group $rg..."
+az group create -n $rg -l $location1 -o none --only-show-errors
+# Create VNets
+echo "Creating VNets..."
+az network vnet create -g $rg -n $aks1_vnet_name --address-prefix $aks1_vnet_prefix -l $location1 -o none --only-show-errors
+az network vnet create -g $rg -n $aks2_vnet_name --address-prefix $aks2_vnet_prefix -l $location2 -o none --only-show-errors
+# Create subnets
+echo "Creating subnets..."
+az network vnet subnet create -g $rg --vnet-name $aks1_vnet_name -n $aks1_nodepool1_subnet_name --address-prefix $aks1_nodepool1_subnet_prefix -o none --only-show-errors
+az network vnet subnet create -g $rg --vnet-name $aks1_vnet_name -n $aks1_nodepool2_subnet_name --address-prefix $aks1_nodepool2_subnet_prefix -o none --only-show-errors
+az network vnet subnet create -g $rg --vnet-name $aks1_vnet_name -n $aks1_pod_subnet_name --address-prefix $aks1_pod_subnet_prefix -o none --only-show-errors
+aks1_nodepool1_subnet_id=$(az network vnet subnet show -n $aks1_nodepool1_subnet_name --vnet-name $aks1_vnet_name -g $rg --query id -o tsv)
+aks1_nodepool2_subnet_id=$(az network vnet subnet show -n $aks1_nodepool2_subnet_name --vnet-name $aks1_vnet_name -g $rg --query id -o tsv)
+aks1_pod_subnet_id=$(az network vnet subnet show -n $aks1_pod_subnet_name --vnet-name $aks1_vnet_name -g $rg --query id -o tsv)
+az network vnet subnet create -g $rg --vnet-name $aks2_vnet_name -n $aks2_nodepool1_subnet_name --address-prefix $aks2_nodepool1_subnet_prefix -o none --only-show-errors
+az network vnet subnet create -g $rg --vnet-name $aks2_vnet_name -n $aks2_nodepool2_subnet_name --address-prefix $aks2_nodepool2_subnet_prefix -o none --only-show-errors
+az network vnet subnet create -g $rg --vnet-name $aks2_vnet_name -n $aks2_pod_subnet_name --address-prefix $aks2_pod_subnet_prefix -o none --only-show-errors
+aks2_nodepool1_subnet_id=$(az network vnet subnet show -n $aks2_nodepool1_subnet_name --vnet-name $aks2_vnet_name -g $rg --query id -o tsv)
+aks2_nodepool2_subnet_id=$(az network vnet subnet show -n $aks2_nodepool2_subnet_name --vnet-name $aks2_vnet_name -g $rg --query id -o tsv)
+aks2_pod_subnet_id=$(az network vnet subnet show -n $aks2_pod_subnet_name --vnet-name $aks2_vnet_name -g $rg --query id -o tsv)
+
+# Peering VNets
+echo "Peering VNets..."
+az network vnet peering create -n "vnet1tovnet2" -g $rg --vnet-name $aks1_vnet_name --remote-vnet $aks2_vnet_name \
+--allow-forwarded-traffic --allow-vnet-access -o none --only-show-errors
+az network vnet peering create -n "vnet2tovnet1" -g $rg --vnet-name $aks2_vnet_name --remote-vnet $aks1_vnet_name \
+--allow-forwarded-traffic --allow-vnet-access -o none --only-show-errors
+
+# Get latest supported/preview version
+k8s_versions=$(az aks get-versions -l $location1 -o json)
+if [[ "$preview_version" == "yes" ]]; then
+    k8s_main_version=$(echo $k8s_versions | jq '.values[]' | jq -rsc 'sort_by(.version) | reverse[0] | .version')
+    echo "Latest supported main k8s version is $k8s_main_version (in preview)"
+else
+    k8s_main_version=$(echo $k8s_versions | jq '.values[] | select(.isPreview == null)' | jq -rsc 'sort_by(.version) | reverse[0] | .version')
+    echo "Latest supported main k8s version (not in preview) is $k8s_main_version"
+fi
+k8s_version=$(echo $k8s_versions | jq -r '.values[] | select(.version == "'$k8s_main_version'") | .patchVersions | keys_unsorted[]' | sort -r | head -1)
+echo "Latest supported k8s patch version for $k8s_main_version is $k8s_version"
+
+# Create managed identity
+id_name=aksid
+id_id=$(az identity show -n $id_name -g $rg --query id -o tsv 2>/dev/null)
+if [[ -z "$id_id" ]]; then
+    echo "Identity $id_name not found, creating a new one..."
+    az identity create -n $id_name -g $rg -o none
+    id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
+else
+    echo "Identity $id_name found with ID $id_id"
+fi
+id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
+aks1_vnet_id=$(az network vnet show -n $aks1_vnet_name -g $rg --query id -o tsv)
+aks2_vnet_id=$(az network vnet show -n $aks2_vnet_name -g $rg --query id -o tsv)
+sleep 15 # Time for creation to propagate
+az role assignment create --scope $aks1_vnet_id --assignee $id_principal_id --role Contributor -o none
+az role assignment create --scope $aks2_vnet_id --assignee $id_principal_id --role Contributor -o none
+
+# CNI options
+if [[ "$network_plugin" == 'azure' ]]; then
+    cni_options="--network-plugin azure"
+elif [[ "$network_plugin" == 'azure_cilium' ]]; then
+    cni_options="--network-plugin azure --network-dataplane cilium"
+    if [[ "$network_policy" != "cilium" ]]; then
+        echo "Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
+        network_policy=cilium
+    fi
+elif [[ "$network_plugin" == 'azure_overlay' ]]; then
+    cni_options="--network-plugin azure --network-dataplane cilium --network-plugin-mode overlay"
+    if [[ "$network_policy" != "cilium" ]]; then
+        echo "Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
+        network_policy=cilium
+    fi
+else
+    echo "ERROR: Network plugin $network_plugin not supported"
+    exit 1
+fi
+
+# Create Fleet Mgr and AKS clusters
+echo "Deploying clusters..."
+az aks create -g $rg -n $aks1_name -l $location1 -o none \
+    --pod-subnet-id $aks1_pod_subnet_id \
+    -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
+    --enable-managed-identity --assign-identity $id_id \
+    ${(z)cni_options} \
+    --vnet-subnet-id $aks1_nodepool1_subnet_id --service-cidr $aks_service_cidr \
+    --network-policy $network_policy \
+    --load-balancer-sku Standard \
+    --node-resource-group "$aks1_name"-iaas-"$RANDOM" \
+    --no-wait
+az aks create -g $rg -n $aks2_name -l $location2 -o none \
+    --pod-subnet-id $aks2_pod_subnet_id \
+    -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
+    --enable-managed-identity --assign-identity $id_id \
+    ${(z)cni_options} \
+    --vnet-subnet-id $aks2_nodepool1_subnet_id --service-cidr $aks_service_cidr \
+    --network-policy $network_policy \
+    --load-balancer-sku Standard \
+    --node-resource-group "$aks2_name"-iaas-"$RANDOM" \
+    --no-wait
+echo "Deploying fleet manager..."
+az fleet create -g $rg -n $fleet_name -l $location1 -o none --no-wait
+
+# Wait for clusters to finish creating...
+aks1_id=$(az aks show -n $aks1_name -g $rg --query id -o tsv)
+aks2_id=$(az aks show -n $aks2_name -g $rg --query id -o tsv)
+wait_until_finished $aks1_id
+wait_until_finished $aks2_id
+
+# Join clusters
+echo "Joining clusters to fleet..."
+az fleet member create -g $rg --fleet-name $fleet_name -n $aks1_name --member-cluster-id $aks1_id -o none
+az fleet member create -g $rg --fleet-name $fleet_name -n $aks2_name --member-cluster-id $aks2_id -o none
+
+# Add permissions to current logged in user
+export my_identity=$(az ad signed-in-user show --query "id" --output tsv)
+export fleet_role="Azure Kubernetes Fleet Manager RBAC Cluster Admin"
+export fleet_id=$(az fleet show -g $rg -n $fleet_name --query id -o tsv)
+az role assignment create --role "${fleet_role}" --assignee ${my_identity} --scope ${fleet_id} -o none
+
+# Get kubeconfigs
+echo "Getting kubeconfigs..."
+az aks get-credentials -n $aks1_name -g $rg --overwrite-existing
+az aks get-credentials -n $aks2_name -g $rg --overwrite-existing
+az fleet get-credentials -n $fleet_name -g $rg --overwrite-existing
+
+# Deploy kuard workload to fleet
+echo "Deploying kuard workload to fleet..."
+kubectx hub
+kubectl create namespace kuard-demo
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kuard
+  namespace: kuard-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: kuard
+  template:
+    metadata:
+      labels:
+        app: kuard
+    spec:
+      containers:
+        - name: kuard
+          image: gcr.io/kuar-demo/kuard-amd64:blue
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kuard
+  namespace: kuard-demo
+  labels:
+    app: kuard
+spec:
+  ports:
+    - port: 8080
+  selector:
+    app: kuard
+---
+apiVersion: networking.fleet.azure.com/v1alpha1
+kind: ServiceExport
+metadata:
+  name: kuard
+  namespace: kuard-demo
+EOF
+cat <<EOF | kubectl apply -f -
+apiVersion: fleet.azure.com/v1alpha1
+kind: ClusterResourcePlacement
+metadata:
+  name: kuard-demo
+spec:
+  resourceSelectors:
+    - group: ""
+      version: v1
+      kind: Namespace
+      name: kuard-demo
+  policy:
+    affinity:
+      clusterAffinity:
+        clusterSelectorTerms:
+          - labelSelector:
+              matchLabels:
+                fleet.azure.com/location: $location1
+          - labelSelector:
+              matchLabels:
+                fleet.azure.com/location: $location2
+EOF
+
+# Deploy MCS to one of the member clusters
+kubectx $aks1_name
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.fleet.azure.com/v1alpha1
+kind: MultiClusterService
+metadata:
+  name: kuard
+  namespace: kuard-demo
+#   annotations:
+#      service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  serviceImport:
+    name: kuard
+EOF
+
+# AKS updates
+az fleet updaterun create --resource-group $GROUP --fleet-name $FLEET --name run-1 --upgrade-type Full --kubernetes-version 1.26.0
+az fleet updaterun create --resource-group $GROUP --fleet-name $FLEET --name run-2 --upgrade-type 
+az fleet member create --resource-group $GROUP --fleet-name $FLEET --name member1 --member-cluster-id $AKS_CLUSTER_ID --update-group group-1a
+az fleet member update --resource-group $GROUP --fleet-name $FLEET --name member1 --update-group group-1a
+az fleet updaterun create --resource-group $GROUP --fleet-name $FLEET --name run-3 --upgrade-type Full --kubernetes-version 1.26.0 --stages example-stages.json
+az fleet updaterun start --resource-group $GROUP --fleet-name $FLEET --name run-3
+
+# Break AKS1 with an NSG
+echo "Creating NSG to deny all inbound traffic to AKS1..."
+nsg_name=deny-all-$location1
+az network nsg create -g $rg --name $nsg_name --location $location1 -o none --only-show-errors
+az network nsg rule create -g $rg --nsg-name $nsg_name --name deny-all-inbound --priority 100 --access Deny --protocol '*' --direction Inbound --source-address-prefixes '*' --source-port-ranges '*' --destination-address-prefixes '*' --destination-port-ranges '*' -o none --only-show-errors
+az network nsg rule create -g $rg --nsg-name $nsg_name --name deny-all-outbound --priority 110 --access Deny --protocol '*' --direction Outbound --source-address-prefixes '*' --source-port-ranges '*' --destination-address-prefixes '*' --destination-port-ranges '*' -o none --only-show-errors
+az network vnet subnet update -g $rg --vnet-name $aks1_vnet_name --name $aks1_nodepool1_subnet_name --network-security-group $nsg_name -o none --only-show-errors
+
+# Remove AKS1 NSG to restablish service
+assigned_nsg_name=$(az network vnet subnet show -g $rg --vnet-name $aks1_vnet_name --name $aks1_nodepool1_subnet_name --query networkSecurityGroup.id -o tsv)
+if [[ -z "$assigned_nsg_name" ]]; then
+    echo "No NSG assigned, nothing to do"
+else
+    echo "Removing NSG from subnets..."
+    az network vnet subnet update -g $rg --vnet-name $aks1_vnet_name --name $aks1_nodepool1_subnet_name --network-security-group null -o none --only-show-errors
+fi
+
+###############
+# Diagnostics #
+###############
+
+# Get infra RGs
+# api_version=2023-06-15-preview
+# az rest --method GET --url "${fleet_id}?api-version=${api_version}"
+# az rest --method GET --url "${fleet_id}?api-version=${api_version}" | jq '.properties.nodeResourceGroup'
+fleet_infra_rg=$(az group list --query '[].name' -o tsv | grep $fleet_name | grep 'MC_')
+az resource list -g $fleet_infra_rg -o table
+aks1_infra_rg=$(az aks show -n $aks1_name -g $rg --query nodeResourceGroup -o tsv)
+aks2_infra_rg=$(az aks show -n $aks2_name -g $rg --query nodeResourceGroup -o tsv)
+az resource list -g $aks1_infra_rg -o table
+az resource list -g $aks2_infra_rg -o table
+
+# List Azure resources
+az aks list -g $rg -o table
+az fleet list -g $rg -o table
+az fleet member list -g $rg -f $fleet_name -o table
+
+# Fleet cluster
+kubectx hub
+k get mc --show-labels
+k get crp
+k -n kuard-demo get svcexport
+k -n kuard-demo get mcs
+
+# Get all pods
+kubectx $aks1_name
+kubectl get pods -n kuard-demo -o wide
+kubectx $aks2_name
+kubectl get pods -n kuard-demo -o wide
+
+# Get MCS
+kubectx $aks1_name
+kubectl get mcs kuard --namespace kuard-demo
