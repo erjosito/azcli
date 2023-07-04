@@ -288,12 +288,12 @@ echo "Creating VMSS..."
 if [[ "$custom_lb" == "yes" ]]; then
     az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
         --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id -z 1 2 3 --lb-sku Standard \
-        --load-balancer $lb_name --health-probe $lb_probe_name --automatic-repairs-grace-period 30 --automatic-repairs-action replace \
+        --load-balancer $lb_name --health-probe $lb_probe_name --automatic-repairs-grace-period 30 --automatic-repairs-action Replace \
         --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1 -o none
     echo 'Creating inbound NAT rule...'
     lb_frontend_name=$(az network lb frontend-ip list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
     lb_backend_name=$(az network lb address-pool list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
-    az network lb inbound-nat-rule create --backend-port 22 --lb-name $lb_name --name ssh --protocol Tcp -g $rg --backend-pool-name $lb_backend_name --frontend-ip-name $lb_frontend_name --frontend-port-range-start 1022 --frontend-port-range-start 1030
+    az network lb inbound-nat-rule create --backend-port 22 --lb-name $lb_name --name ssh --protocol Tcp -g $rg --backend-pool-name $lb_backend_name --frontend-ip-name $lb_frontend_name --frontend-port-range-start 1022 --frontend-port-range-end 1030
 else
     az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
         --vnet-name $vnet_name --subnet $nva_subnet_name --assign-identity $id_id -z 1 2 3 \

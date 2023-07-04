@@ -101,7 +101,9 @@ az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name -
 
 # Deploy RS (no --no-wait option)
 rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-az network routeserver create -n rs -g $rg --hosted-subnet $rs_subnet_id -l $location
+rs_pip_name=rs-pip
+az network public-ip create -n $rs_pip_name -g $rg -l $location --sku Standard -o none --only-show-errors
+az network routeserver create -n rs -g $rg --hosted-subnet $rs_subnet_id -l $location --public-ip-address $rs_pip_name -o none --only-show-errors
 rs_asn=$(az network routeserver show -n rs -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
 rs_ip1=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
 rs_ip2=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2

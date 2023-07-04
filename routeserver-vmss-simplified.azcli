@@ -1,0 +1,328 @@
+##############################################################
+#
+# This script demonstrates how to deploy a VMSS with BIRD, and
+#   have ARS pre-configured with different possible IP addresses
+#   for the VMSS subnet, so that the VMSS functionality is reduced.
+#
+# This script uses these CLI extensions:
+# - automation
+#
+# Jose Moreno, July 2023
+##############################################################
+
+# Control
+route_to_inject='1.1.1.1/32'
+route_next_hop='10.13.76.78'
+
+# Variables
+rg=nva
+location=westeurope
+vnet_name=hub
+vnet_prefix=10.13.76.0/24
+gw_subnet_name=GatewaySubnet
+gw_subnet_prefix=10.13.76.0/27
+vpngw_asn=65501
+rs_subnet_name=RouteServersubnet
+rs_subnet_prefix=10.13.76.32/27
+nva_subnet_name=nva
+nva_subnet_prefix=10.13.76.64/28        # 11 possible IP addresses, ARS can have a maximum of 8 peers configured
+vm_subnet_name=vm
+vm_subnet_prefix=10.13.76.80/28
+vm_size=Standard_B1s
+publisher=Canonical
+offer=UbuntuServer
+sku=18.04-LTS
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
+nva_asn=65001
+nva_name=nva
+nva_pip=${nva_name}-pip
+nva_cloudinit_file=/tmp/nva_cloudinit.txt
+azurevm_name=azurevm
+azurevm_pip_name="${azurevm_name}-pip"
+lb_name=$nva_name
+lb_probe_name=$nva_name
+
+# Auxiliary function to add a number to an IP address
+function increment_ip(){
+    ip=$1
+    increment=$2
+    if [[ -z "$increment" ]]; then
+        increment=1
+    fi
+    IP=$(echo $ip | cut -d/ -f 1)  # In case the IP is given in CIDR format
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + $increment ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
+
+# Auxiliary function to get the first IP of a subnet (default gateway)
+function first_ip(){
+    echo "$(increment_ip $1 1)"
+}
+
+# Auxiliary function to get the last IP of a subnet (right before the broadcast address)
+function last_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    MASK=$(echo $subnet | cut -d/ -f 2)
+    OFFSET=$((2 ** (32 - $MASK) - 2))
+    echo "$(increment_ip $IP $OFFSET)"
+}
+
+# Auxiliary function to get the first usable IP of a subnet (subnet address + 4)
+function first_usable(){
+    echo "$(increment_ip $1 4)"
+}
+
+# Create VNets and subnets
+echo "Creating VNets..."
+az group create -n $rg -l $location -o none --only-show-errors
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix -o none --only-show-errors
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $gw_subnet_name --address-prefix $gw_subnet_prefix -o none --only-show-errors
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $rs_subnet_name --address-prefix $rs_subnet_prefix -o none --only-show-errors
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $nva_subnet_name --address-prefix $nva_subnet_prefix -o none --only-show-errors
+
+# Configure a RT in the NVA subnet so that it doesnt learn its own routes
+echo "Creating Route Tables..."
+nva_rt_name=nva
+az network route-table create -n $nva_rt_name -g $rg -l $location --disable-bgp-route-propagation -o none --only-show-errors
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $nva_subnet_name --route-table $nva_rt_name -o none --only-show-errors
+
+# Configure a RT in the VM subnet to provide connectivity to the PC where these commands are running
+vm_rt_name=vm
+az network route-table create -n $vm_rt_name -g $rg -l $location -o none --only-show-errors
+myip=$(curl -s4 ifconfig.co) && echo $myip
+az network route-table route create --route-table-name $vm_rt_name -g $rg --address-prefix "${myip}/32" --name "TestPC"  --next-hop-type Internet -o none --only-show-errors
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table $vm_rt_name -o none --only-show-errors
+
+# NAT GW for the NVA subnet
+echo "Creating NAT Gateway..."
+az network public-ip create -n natgw-pip -g $rg -l $location --sku Standard -o none --only-show-errors
+az network nat gateway create -n natgw -g $rg --public-ip-addresses natgw-pip --location $location -o none --only-show-errors
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $nva_subnet_name --nat-gateway natgw -o none --only-show-errors
+
+# Deploy ARS (no --no-wait option)
+echo "Creating Route Server..."
+rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+rs_pip_name=rs-pip
+az network public-ip create -n $rs_pip_name -g $rg -l $location --sku Standard -o none --only-show-errors
+az network routeserver create -n rs -g $rg --hosted-subnet $rs_subnet_id -l $location --public-ip-address $rs_pip_name -o none --only-show-errors
+rs_asn=$(az network routeserver show -n rs -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
+rs_ip1=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
+rs_ip2=$(az network routeserver show -n rs -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
+
+# Configure 8 ARS peerings with the first IP addresses of the NVA subnet
+peering_ip=$(first_usable $nva_subnet_prefix)
+for i in {0..7}; do
+    echo "Creating ARS peering nva-$i..."
+    az network routeserver peering create -n nva-$i -g $rg --routeserver rs --peer-asn $nva_asn --peer-ip $peering_ip -o none --only-show-errors
+    peering_ip=$(increment_ip $peering_ip)
+done
+
+# Create VM for testing purposes
+echo "Creating Azure VM..."
+az network nsg create -n "${azurevm_name}-nsg" -g $rg -o none --only-show-errors
+az network nsg rule create -n SSH --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none --only-show-errors
+az network nsg rule create -n ICMP --nsg-name "${azurevm_name}-nsg" -g $rg --priority 1030 --destination-port-ranges '*' --access Allow --protocol Icmp -o none --only-show-errors
+az vm create -n $azurevm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${azurevm_name}-nsg" \
+    --public-ip-address $azurevm_pip_name --vnet-name $vnet_name --size $vm_size --subnet $vm_subnet_name -o none --only-show-errors
+azurevm_pip_ip=$(az network public-ip show -n $azurevm_pip_name --query ipAddress -o tsv -g $rg) && echo $azurevm_pip_ip
+azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+azurevm_private_ip=$(az network nic show --ids $azurevm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $azurevm_private_ip
+
+# Create NSG for NVA
+echo "Creating NSG for NVA..."
+az network nsg create -n "${nva_name}-nsg" -g $rg -o none --only-show-errors
+az network nsg rule create -n SSH --nsg-name "${nva_name}-nsg" -g $rg --priority 1000 --destination-port-ranges 22 --access Allow --protocol Tcp -o none --only-show-errors
+az network nsg rule create -n IKE --nsg-name "${nva_name}-nsg" -g $rg --priority 1010 --destination-port-ranges 4500 --access Allow --protocol Udp -o none --only-show-errors
+az network nsg rule create -n IPsec --nsg-name "${nva_name}-nsg" -g $rg --priority 1020 --destination-port-ranges 500 --access Allow --protocol Udp -o none --only-show-errors
+az network nsg rule create -n ICMP --nsg-name "${nva_name}-nsg" -g $rg --priority 1030 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp -o none --only-show-errors
+az network nsg rule create -n Webin --nsg-name "${nva_name}-nsg" -g $rg --priority 1040 --source-address-prefixes 'VirtualNetwork' --destination-port-ranges 80 443 --access Allow --protocol Tcp -o none --only-show-errors
+az network nsg rule create -n ICMPout --nsg-name "${nva_name}-nsg" -g $rg --priority 1130 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges '*' --access Allow --protocol Icmp  --direction Outbound -o none --only-show-errors
+az network nsg rule create -n Webout --nsg-name "${nva_name}-nsg" -g $rg --priority 1140 --source-address-prefixes '*' --destination-address-prefixes '*' --destination-port-ranges 80 443 --access Allow --protocol Tcp --direction Outbound -o none --only-show-errors
+
+# Create Azure NVA with Bird and StrongSwan (only Bird is required for this scenario)
+nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
+cat <<EOF > $nva_cloudinit_file
+#cloud-config
+packages:
+  - bird
+runcmd:
+  - sysmtemctl restart bird
+write_files:
+- content: |
+    log syslog all;
+    protocol device {
+            scan time 10;
+    }
+    protocol direct {
+        disabled;
+    }
+    protocol kernel {
+        preference 254;
+        learn;
+        merge paths on;
+        import filter {
+            reject;
+        };
+        export filter {
+            reject;
+        };
+    }
+    protocol static {
+        import all;
+        # Default route
+        route $route_to_inject via $nva_default_gw;
+        # Vnet prefix to cover the RS' IPs
+        route $vnet_prefix via $nva_default_gw;
+    }
+    filter TO_RS {
+        # Reject VNet route
+        if net = $vnet_prefix then { reject; }
+        # Set next hop
+        else {
+                bgp_next_hop = $route_next_hop;
+                accept;
+        }
+    }
+    protocol bgp rs0 {
+        description "RouteServer instance 0";
+        multihop;
+        local as $nva_asn;
+        neighbor $rs_ip1 as $rs_asn;
+            import filter {accept;};
+            export filter TO_RS;
+    }
+    protocol bgp rs1 {
+        description "Route Server instance 1";
+        multihop;
+        local as $nva_asn;
+        neighbor $rs_ip2 as $rs_asn;
+            import filter {accept;};
+            export filter TO_RS;
+    }
+  path: /etc/bird/bird.conf
+EOF
+
+# Create Azure LB for monitoring and assign the last IP address in the subnet
+echo "Creating internal Azure LB..."
+nva_subnet_id=$(az network vnet subnet show -n $nva_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az network lb create -n $lb_name -g $rg  --sku Standard -o none  --subnet $nva_subnet_id --private-ip-address $(last_ip $nva_subnet_prefix) --only-show-errors
+az network lb probe create -n $lb_probe_name --lb-name $lb_name -g $rg --protocol Tcp --port 179 --interval 5 --threshold 3 -o none --only-show-errors
+
+# Create a VMSS (in 2 steps, because setting the autorepair extension at creation time gives an error, )
+echo "Creating VMSS..."
+az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
+    --zones 1 2 3 --vnet-name $vnet_name --subnet $nva_subnet_name -o none --only-show-errors \
+    --load-balancer $lb_name \
+    --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1
+echo "Creating LB rule (prerequisite for autorepair extension to use the probe)..."
+lb_frontend_name=$(az network lb frontend-ip list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
+lb_backend_name=$(az network lb address-pool list --lb-name $lb_name -g $rg --query '[0].name' -o tsv)
+az network lb rule create -n port179 --lb-name $lb_name -g $rg -o none --only-show-errors \
+    --protocol tcp --frontend-port 179 --backend-port 179 --frontend-ip-name $lb_frontend_name --backend-pool-name $lb_backend_name --probe-name $lb_probe_name
+echo "Configuring autorepair extension with LB probe..."
+lb_probe_id=$(az network lb probe show -n $lb_probe_name --lb-name $lb_name -g $rg --query id -o tsv)
+az vmss update -n $nva_name -g $rg --set "virtualMachineProfile.networkProfile.healthProbe={\"id\": \"$lb_probe_id\"}" -o none --only-show-errors
+az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none --only-show-errors
+az vmss update -n $nva_name -g $rg --enable-automatic-repairs true --automatic-repairs-grace-period 10 -o none --only-show-errors
+az vmss update-instances -n $nva_name -g $rg --instance-ids '*' -o none --only-show-errors
+
+
+###############
+#    Tests    #
+###############
+
+# Scale NVA VMSS in and out
+az vmss scale -n $nva_name -g $rg --new-capacity 2 -o none --only-show-errors
+
+# Break first NVA instance
+azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+azurevm_pip=$(az network public-ip show -n $azurevm_pip_name -g $rg --query ipAddress -o tsv)
+instance_id=$(az vmss list-instances -n $nva_name -g $rg --query '[0].instanceId' -o tsv)
+instance_ip=$(az vmss nic list-vm-nics --vmss-name "$nva_name" -g "$rg" -o jsonc --instance-id $instance_id -o tsv --query '[].ipConfigurations[0].privateIPAddress')
+date "+%F %T$(echo ': Breaking first NVA instance...')"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $azurevm_pip $instance_ip "sudo systemctl stop bird" >/dev/null 2>&1
+
+# Loop until the route in the effective routes is gone
+echo "Waiting for the route to disappear from the effective routes..."
+interval=1
+effective_routes=$(az network nic show-effective-route-table --ids $azurevm_nic_id -o table | grep $route_to_inject | wc -l)
+until [[ "$effective_routes" == "0" ]]; do
+    sleep $interval
+    effective_routes=$(az network nic show-effective-route-table --ids $azurevm_nic_id -o table | grep $route_to_inject | wc -l)
+done
+date "+%F %T$(echo : Route $route_to_inject is gone from effective routes)"
+
+# Loop until the route in the effective routes is back
+echo "Waiting for the route to be back in the effective routes..."
+interval=10
+effective_routes=$(az network nic show-effective-route-table --ids $azurevm_nic_id -o table | grep $route_to_inject | wc -l)
+until [[ "$effective_routes" == "1" ]]; do
+    sleep $interval
+    effective_routes=$(az network nic show-effective-route-table --ids $azurevm_nic_id -o table | grep $route_to_inject | wc -l)
+done
+date "+%F %T$(echo : Route $route_to_inject is back in the effective routes)"
+
+
+# Autorepair test results
+# - Healthcheck probe at 30sec, around 7:40 until an instance is recovered
+# - Healthcheck probe at 5sec, around ??? until an instance is recovered
+
+###############
+# Diagnostics #
+###############
+
+# VMSS
+az vmss list-instances -n $nva_name -g $rg -o table
+az vmss reimage -n $nva_name -g $rg -o none --only-show-errors
+
+# LB
+az network lb probe list --lb-name $lb_name -g $rg -o table
+
+# Effective routes
+azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $azurevm_nic_id -o table
+
+# Route server
+az network routeserver peering list --routeserver rs -g $rg -o table
+
+# See BGP adjacencies in NVA VMSS
+azurevm_pip=$(az network public-ip show -n $azurevm_pip_name -g $rg --query ipAddress -o tsv)
+instance_list=$(az vmss list-instances -n $nva_name -g $rg --query '[].instanceId' -o tsv)
+while IFS= read -r instance_id; do
+    echo "Getting IP address of VMSS instance $instance_id..."
+    instance_ip=$(az vmss nic list-vm-nics --vmss-name "$nva_name" -g "$rg" -o jsonc --instance-id $instance_id -o tsv --query '[].ipConfigurations[0].privateIPAddress')
+    echo "Getting BGP adjacencies of VMSS instance $instance_id on IP address $instance_ip..."
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J $azurevm_pip $instance_ip "sudo birdc show protocols"
+done <<< "$instance_list"
+
+# SSH to first VMSS instance
+azurevm_pip=$(az network public-ip show -n $azurevm_pip_name -g $rg --query ipAddress -o tsv)
+instance_id=$(az vmss list-instances -n $nva_name -g $rg --query '[0].instanceId' -o tsv)
+instance_ip=$(az vmss nic list-vm-nics --vmss-name "$nva_name" -g "$rg" -o jsonc --instance-id $instance_id -o tsv --query '[].ipConfigurations[0].privateIPAddress')
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no -J $azurevm_pip $instance_ip
+
+# See routes learned by ARS
+instance_list=$(az vmss list-instances -n $nva_name -g $rg --query '[].instanceId' -o tsv)
+while IFS= read -r instance_id; do
+    echo "Getting IP address of VMSS instance $instance_id..."
+    instance_ip=$(az vmss nic list-vm-nics --vmss-name "$nva_name" -g "$rg" -o jsonc --instance-id $instance_id -o tsv --query '[].ipConfigurations[0].privateIPAddress')
+    peering_name=$(az network routeserver peering list --routeserver rs -g $rg -o tsv --query "[?peerIp=='$instance_ip'].name")
+    echo "VMSS instance $instance_id with IP address $instance_ip is BGP $peering_name. Getting Route Server learned routes..."
+    az network routeserver peering list-learned-routes -n $peering_name --routeserver rs -g $rg --query 'RouteServiceRole_IN_1' -o table
+done <<< "$instance_list"
+
+# See effective routes in VM
+azurevm_nic_id=$(az vm show -n $azurevm_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $azurevm_nic_id -o table
+
+
+###############
+# Danger Zone #
+###############
+
+az vmss delete -n $nva_name -g $rg
+az network lb delete -n $lb_name -g $rg
+# az group delete -y --no-wait -n $rg
