@@ -11,7 +11,7 @@
 ##############################################################
 
 # Control
-route_to_inject='1.1.1.1/32'
+route_to_inject='0.0.0.0/0'
 route_next_hop='10.13.76.78'
 
 # Variables
@@ -33,6 +33,8 @@ publisher=Canonical
 offer=UbuntuServer
 sku=18.04-LTS
 version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv 2>/dev/null)
+# image_urn="${publisher}:${offer}:${sku}:${version}"
+image_urn='Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest'
 nva_asn=65001
 nva_name=nva
 nva_pip=${nva_name}-pip
@@ -149,7 +151,7 @@ cat <<EOF > $nva_cloudinit_file
 packages:
   - bird
 runcmd:
-  - sysmtemctl restart bird
+  - systemctl restart bird
 write_files:
 - content: |
     log syslog all;
@@ -211,9 +213,10 @@ nva_subnet_id=$(az network vnet subnet show -n $nva_subnet_name --vnet-name $vne
 az network lb create -n $lb_name -g $rg  --sku Standard -o none  --subnet $nva_subnet_id --private-ip-address $(last_ip $nva_subnet_prefix) --only-show-errors
 az network lb probe create -n $lb_probe_name --lb-name $lb_name -g $rg --protocol Tcp --port 179 --interval 5 --threshold 3 -o none --only-show-errors
 
+
 # Create a VMSS (in 2 steps, because setting the autorepair extension at creation time gives an error, )
 echo "Creating VMSS..."
-az vmss create -n $nva_name -g $rg -l $location --image "${publisher}:${offer}:${sku}:${version}" --generate-ssh-keys \
+az vmss create -n $nva_name -g $rg -l $location --image "$image_urn" --generate-ssh-keys \
     --zones 1 2 3 --vnet-name $vnet_name --subnet $nva_subnet_name -o none --only-show-errors \
     --load-balancer $lb_name \
     --vm-sku ${vm_size} --custom-data "$nva_cloudinit_file" --nsg "${nva_name}-nsg" --instance-count 1

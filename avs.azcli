@@ -13,6 +13,7 @@ create_2nd_region=no
 #############
 # Variables #
 #############
+
 rg=avstest
 er_circuit_sku=Standard
 er_provider=Megaport
@@ -105,6 +106,46 @@ subnet2_name=vm2
 subnet2_prefix='192.168.22.0/24'
 attachment2_name=attachment2
 router2_name=router2
+
+
+####################
+#   AVS commands   #
+####################
+
+# AVS variables
+rg=contoso-gwc-avs-rg
+private_cloud=contoso-gwc-avs-sddc01
+
+# List private clouds
+az vmware private-cloud list -g $rg -o table --query '[].{Name:name,ProvisioningState:provisioningState,Location:location,NetworkBlock:networkBlock,Internet:internet}'
+
+# List GR
+az vmware global-reach-connection list -g $rg -c $private_cloud -o table --query '[].{Name:name,ProvisioningState:provisioningState}'
+
+# Create GR
+gr_name=testgr
+er_auth_key=blah
+er_circuit_id=fasel
+az vmware global-reach-connection create -n $gr_name -g $rg -c $private_cloud \
+    --authorization-key $er_auth_key --express-route-id $er_circuit_id -o none
+
+# Delete GR
+gr_name=testgr
+az vmware global-reach-connection delete -n $gr_name -g $rg -c $private_cloud -o none
+
+# Create authorization
+auth_name=testauthjose
+az vmware authorization create -n $auth_name -g $rg -c $private_cloud -o none
+
+# Get auth key and circuit ID
+auth_name=testauthjose
+az vmware authorization list -g $rg -c $private_cloud -o table --query '[].{Name:name,ProvisioningState:provisioningState}'
+er_auth_key=$(az vmware authorization show -n $auth_name -g $rg -c $private_cloud --query 'expressRouteAuthorizationKey' -o tsv) && echo $er_auth_key
+er_circuit_id=$(az vmware authorization show -n $auth_name -g $rg -c $private_cloud --query 'expressRouteId' -o tsv) && echo $er_circuit_id
+
+# Delete authorization
+az vmware authorization delete -n $auth_name -g $rg -c $private_cloud -o none
+
 
 
 #############
