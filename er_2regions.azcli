@@ -1,0 +1,415 @@
+#################################
+# Commands to test ExpressRoute
+# It includes VNet Flow Logs
+#
+# Jose Moreno, July 2023
+#################################
+
+# Control
+location1=eastus2euap
+location2=centraluseuap
+er1_location=$location1
+er1_pop='Washington DC'
+er2_location=$location1
+er2_pop='Dallas'
+er_circuit_sku=Standard  # other values: Local, Premium
+er_circuit_family=MeteredData  # other values: MeteredData, UnlimitedData
+er_circuit_bw=50
+create_spokes=no
+number_of_spokes=1
+simulate_onprem=no
+vnet_flow_logs=yes
+
+# Other possible pop/region combinations with megaport:
+# location=southcentralus
+# er_location=southcentralus
+# er_pop=Dallas
+# location=germanywestcentral
+# er_location=germanywestcentral
+# er_pop=Frankfurt
+# location=southcentralus
+# er_location=southcentralus
+# er_pop=Dallas
+# location=australiaeast
+# er_location=australiaeast
+# er_pop=Sydney
+
+# Variables
+rg=ertest
+er_provider=Megaport
+vm_size=Standard_B1s
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+er1_circuit_name="er1"
+ergw1_name="ergw1"
+ergw1_pip="${ergw1_name}-pip"
+vnet1_name="hub1"
+vnet1_prefix=192.168.64.0/23
+vm1_subnet_name=vm
+vm1_subnet_prefix=192.168.64.64/26
+gw1_subnet_prefix=192.168.64.0/27
+vm1_name="vm-${vnet1_name}"
+vm1_pip_name="${vm1_name}-pip"
+mcr1_asn=65001
+er2_circuit_name="er2"
+ergw2_name="ergw2"
+ergw2_pip="${ergw2_name}-pip"
+vnet2_name="hub2"
+vnet2_prefix=192.168.66.0/23
+vm2_subnet_name=vm
+vm2_subnet_prefix=192.168.66.64/26
+gw2_subnet_prefix=192.168.66.0/27
+vm2_name="vm-${vnet2_name}"
+vm2_pip_name="${vm2_name}-pip"
+mcr2_asn=65002
+# gcloud (to simulate onprem ER)
+project_name=cci-sandbox-jomore
+project_id=cci-sandbox-jomore
+machine_type=e2-micro
+gcp_asn=16550
+region=us-east1  # other values: europe-west3, australia-southeast1, us-east1
+zone=us-east1-c  # other values: europe-west3-b, australia-southeast1-b, us-east1-c
+gcp_vm_name=vm
+gcp_vpc_name=vpc
+gcp_subnet_name=vm
+gcp_subnet_prefix='10.4.2.0/24'
+attachment_name=attachment
+router_name=router
+
+# Create RG
+echo "Creating resource group..."
+az group create -n $rg -l $location1 -o none
+
+# Create ER circuit in location 1
+if [[ "$er_circuit_sku" == "Local" ]]; then
+    er_circuit_family="UnlimitedData"
+    er_circuit_bw="1000"
+fi
+echo "Creating ER circuits..."
+az network express-route create -n $er1_circuit_name --peering-location $er1_pop -g $rg -o none --only-show-errors \
+    --bandwidth $er_circuit_bw Mbps --provider $er_provider -l $er1_location --sku-family $er_circuit_family --sku-tier $er_circuit_sku
+er1_service_key=$(az network express-route show -n $er1_circuit_name -g $rg --query serviceKey -o tsv)
+
+# Provision Megaport MCR in location1
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+if [[ -e "$megaport_script_path" ]]
+then
+    echo "Creating Megaport Cloud Router and configuring circuit..."
+    $megaport_script_path -s=jomore-${er1_circuit_name} -a=create_mcr -k=$er1_service_key --asn=$mcr1_asn
+    sleep 60  # Wait 1 minute before creating the connections. This could be replaced with a loop checking ./megaport.sh -a=list_live
+    $megaport_script_path -s=jomore-${er1_circuit_name} -a=create_vxc -k=$er1_service_key
+else
+    echo "Sorry, I cannot seem to find the script $megaport_script_path to interact with the Megaport API"
+fi
+
+# To Do: circuit and MCR in location 2
+
+# Create VNet and test VM
+echo "Creating hub VNet and VM in $location1..."
+az network vnet create -g $rg -n $vnet1_name --address-prefix $vnet1_prefix --subnet-name $vm1_subnet_name --subnet-prefix $vm1_subnet_prefix -l $location1 -o none
+az vm create -n $vm1_name -g $rg -l $location1 --image ubuntuLTS --generate-ssh-keys --nsg "${vm1_name}-nsg" -o none \
+    --public-ip-address $vm1_pip_name --vnet-name $vnet1_name --size $vm_size --subnet $vm1_subnet_name -l $location1 --no-wait
+echo "Creating hub VNet and VM in $location2..."
+az network vnet create -g $rg -n $vnet2_name --address-prefix $vnet2_prefix --subnet-name $vm2_subnet_name --subnet-prefix $vm2_subnet_prefix -l $location2 -o none
+az vm create -n $vm2_name -g $rg -l $location2 --image ubuntuLTS --generate-ssh-keys --nsg "${vm2_name}-nsg" -o none \
+    --public-ip-address $vm2_pip_name --vnet-name $vnet2_name --size $vm_size --subnet $vm2_subnet_name -l $location2 --no-wait
+
+# Create ER Gateways
+echo "Creating ER Gateway in $location1..."
+az network vnet subnet create -g $rg --vnet-name $vnet1_name -n GatewaySubnet --address-prefix $gw1_subnet_prefix -o none
+az network public-ip create -g $rg -n $ergw1_pip --allocation-method Dynamic --sku Basic -l $location1 -o none
+az network vnet-gateway create -g $rg -n $ergw1_name --gateway-type ExpressRoute --sku Standard -l $location1 --vnet $vnet1_name --public-ip-addresses $ergw1_pip -o none --no-wait
+echo "Creating ER Gateway in $location2..."
+az network vnet subnet create -g $rg --vnet-name $vnet2_name -n GatewaySubnet --address-prefix $gw2_subnet_prefix -o none
+az network public-ip create -g $rg -n $ergw2_pip --allocation-method Dynamic --sku Basic -l $location2 -o none
+az network vnet-gateway create -g $rg -n $ergw2_name --gateway-type ExpressRoute --sku Standard -l $location2 --vnet $vnet2_name --public-ip-addresses $ergw2_pip -o none --no-wait
+
+# Connecting ER gateways to circuit 1
+echo "Connecting ER Gateway to circuit $er1_circuit_name..."
+circuit1_id=$(az network express-route show -n $er1_circuit_name -g $rg -o tsv --query id)
+echo "Connecting ER Gateway to circuit $circuit1_id..."
+az network express-route update -n "$er_circuit1_name" -g $rg -o none    # sometimes you need to refresh the circuit
+az network vpn-connection create -n "${ergw1_name}" -g $rg -l $location1 --vnet-gateway1 $ergw1_name --express-route-circuit2 $circuit1_id -o none
+az network vpn-connection create -n "${ergw2_name}" -g $rg -l $location2 --vnet-gateway1 $ergw2_name --express-route-circuit2 $circuit1_id -o none
+
+# Optional: create VNet Flow Logs in VNets
+if [[ "$vnet_flow_logs" == "yes" ]]; then
+    echo "Creating storage accounts..."
+    storage_account1_name="vnetflowlogs1$RANDOM"
+    storage_account2_name="vnetflowlogs2$RANDOM"
+    echo "Trying to find an existing log analytics workspace..."
+    logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+    if [[ -z "$logws_name" ]]
+    then
+        logws_name=vwanlogs$RANDOM
+        echo "Creating log analytics workspace $logws_name..."
+        az monitor log-analytics workspace create -n $logws_name -g $rg -l eastus2 -o none          # WARNING: location hardcoded because I am testing with EUAP regions
+    else
+        echo "Found log analytics workspace $logws_name"
+    fi
+    logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+    logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+    az storage account create -n $storage_account1_name -g $rg -l $location1 --sku Standard_LRS -o none
+    az storage account create -n $storage_account2_name -g $rg -l $location2 --sku Standard_LRS -o none
+    az network watcher flow-log create -l $location1 -g $rg --name flowlog1 --vnet $vnet1_name --storage-account $storage_account1_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
+    az network watcher flow-log create -l $location2 -g $rg --name flowlog2 --vnet $vnet2_name --storage-account $storage_account2_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
+fi
+
+# Optional: create spoke associated to the previous VNet and configure the Hub VM as NVA
+if [[ "$create_spokes" == "yes" ]]; then
+    # IP fwding in hub VM
+    for hub_id in {1..2}; do
+        if [[ "$hub_id" == "1" ]]; then
+            location=$location1
+        else
+            location=$location2
+        fi
+        vnet_name=hub${hub_id}
+        vm_name="vm-hub${hub_id}"
+        vm_pip_name="${vm_name}-pip"
+        echo "Getting information from hub VM..."
+        hub_vm_pip=$(az network public-ip show -n $vm_pip_name --query ipAddress -o tsv -g $rg) && echo $hub_vm_pip
+        hub_vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        hub_vm_ip=$(az network nic show --ids $hub_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub_vm_ip
+        echo "Enabling IP forwarding in hub VM..."
+        az network nic update --ids $hub_vm_nic_id --ip-forwarding -o none
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm_pip "sudo sysctl -w net.ipv4.ip_forward=1"
+        # Route table for spokes
+        myip=$(curl -s4 ifconfig.co)
+        rt_name="spokes-hub${hub_id}"
+        az network route-table create -n "spokes-hub${hub_id}" -g $rg -l $location --disable-bgp-route-propagation -o none
+        az network route-table route create --route-table-name "spokes-hub${hub_id}" -g $rg --address-prefix "0.0.0.0/0" --name default --next-hop-type VirtualAppliance --next-hop-ip-address "$hub_vm_ip" -o none
+        az network route-table route create --route-table-name "spokes-hub${hub_id}" -g $rg --address-prefix "${myip}/32" --name mypc --next-hop-type Internet -o none
+        # Route table for hub VM (empty)
+        az network route-table create -n hub-${er_pop} -g $rg -l $location -o none
+        az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table hub-${er_pop} -o none
+        # Route table for hub GatewaySubnet??
+        az network route-table create -n vng-${er_pop} -g $rg -l $location -o none
+        az network vnet subnet update -g $rg --vnet-name $vnet_name -n GatewaySubnet --route-table vng-${er_pop} -o none
+        # Create spokes
+        for spoke_id in {1..$number_of_spokes}; do
+            spoke_vnet_name="spoke${hub_id}${spoke_id}"
+            spoke_vm_name="vm-${spoke_vnet_name}"
+            spoke_vnet_prefix=10.${hub_id}.${spoke_id}.0/24
+            spoke_vm_subnet_name=vm
+            spoke_vm_subnet_prefix=10.${hub_id}.${spoke_id}.64/26
+            spoke_vm_pip_name="${spoke_vm_name}-pip"
+            # Create VNet, VNet peerings and VM
+            echo "Creating spoke ${spoke_vnet_name}..."
+            az network vnet create -g $rg -n $spoke_vnet_name --address-prefix $spoke_vnet_prefix --subnet-name $spoke_vm_subnet_name --subnet-prefix $spoke_vm_subnet_prefix -l $location -o none
+            az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${spoke_vm_name}-nsg" --public-ip-sku Standard \
+                --public-ip-address $spoke_vm_pip_name --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_vm_subnet_name -l $location --no-wait -o none
+            az network vnet peering create -n "hub${hub_id}tospoke${hub_id}${spoke_id}" -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
+            az network vnet peering create -n "spoke${hub_id}${spoke_id}tohub${hub_id}" -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
+            # Verify spoke VM (before applying RT)
+            # spoke_vm_nic_id=$(az vm show -n $spoke_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+            # az network nic show-effective-route-table --ids $spoke_vm_nic_id -o table
+            # echo "Verifying VM ${spoke_vm_name}..."
+            # spoke_vm_pip=$(az network public-ip show -n $spoke_vm_pip_name --query ipAddress -o tsv -g $rg) && echo $spoke_vm_pip
+            # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke_vm_pip "ip a"
+            # Attach RT to VM subnet
+            az network vnet subnet update -g $rg --vnet-name $spoke_vnet_name -n $spoke_vm_subnet_name --route-table "spokes-hub${hub_id}" -o none
+            # Update the VNG route table
+            az network route-table route create --route-table-name vng-${er_pop} -g $rg --address-prefix $spoke_vnet_prefix --name $spoke_vnet_name --next-hop-type VirtualAppliance --next-hop-ip-address "$hub_vm_ip" -o none
+        done
+    done
+fi
+
+##############################################################
+# Optional: Create GlobalReach connection between 2 circuits #
+##############################################################
+
+circuit1_name=er-Frankfurt
+circuit2_name=er-Dallas
+circuit2_id=$(az network express-route show -n $circuit2_name -g $rg -o tsv --query id)
+ip_range=172.16.31.0/29
+az network express-route peering connection create -g $rg --circuit-name $circuit1_name --peering-name AzurePrivatePeering \
+    -n "${circuit1_name}-to-${circuit2_name}" --peer-circuit $circuit2_id --address-prefix $ip_range
+# az network express-route peering connection delete -n "${circuit1_name}-to-${circuit2_name}" -g $rg --circuit-name $circuit1_name --peering-name AzurePrivatePeering
+
+###################################################
+# Optional: create second Vnet to simulate onprem #
+###################################################
+
+if [[ "$simulate_onprem" == "yes" ]]
+then
+    # Variables
+    onprem_er_location=germanywestcentral
+    onprem_er_pop=Frankfurt
+    onprem_er_provider=Megaport
+    onprem_er_circuit_name=onpremer
+    onprem_vnet_name=onprem
+    onprem_vnet_prefix=172.16.0.0/16
+    onprem_ergw_name=onpremergw
+    onprem_ergw_pip="${onprem_ergw_name}-pip"
+    onprem_vm_subnet_name=vm
+    onprem_vm_subnet_prefix=172.16.1.0/24
+    onprem_gw_subnet_prefix=172.16.0.0/24
+    onprem_vm_name=onpremvm
+    onprem_vm_pip_name="${onprem_vm_name}-pip"
+    onprem_vm_size=Standard_B1s
+
+    # Create ER circuit
+    az network express-route create -n $onprem_er_circuit_name --peering-location $onprem_er_pop -g $rg \
+        --bandwidth 50 Mbps --provider $onprem_er_provider -l $onprem_er_location --sku-family MeteredData --sku-tier Standard -o none
+    onprem_service_key=$(az network express-route show -n $onprem_er_circuit_name -g $rg --query serviceKey -o tsv)
+
+    # Provision additional VXCs to existing MCR
+    if [[ -e "$megaport_script_path" ]]
+    then
+        $megaport_script_path -q -s=jomore -a=create_vxc -k=$onprem_service_key -n=onprem
+    else
+        echo "Sorry, I cannot seem to find the script megaport.sh to interact with the Megaport API"
+    fi
+
+    # Create VNet and test VM
+    az network vnet create -g $rg -n $onprem_vnet_name --address-prefix $onprem_vnet_prefix --subnet-name $onprem_vm_subnet_name --subnet-prefix $onprem_vm_subnet_prefix
+    az vm create -n $onprem_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${onprem_vm_name}-nsg" \
+        --public-ip-address $onprem_vm_pip_name --vnet-name $onprem_vnet_name --size $onprem_vm_size --subnet $onprem_vm_subnet_name -o none
+
+    # Create ER Gateway and connect it to circuit
+    az network vnet subnet create -g $rg --vnet-name $onprem_vnet_name -n GatewaySubnet --address-prefix $onprem_gw_subnet_prefix -o none
+    az network public-ip create -g $rg -n $onprem_ergw_pip --allocation-method Dynamic --sku Basic -o none
+    az network vnet-gateway create -g $rg -n $onprem_ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $onprem_vnet_name --public-ip-addresses $onprem_ergw_pip -o none
+    onprem_circuit_id=$(az network express-route show -n $onprem_er_circuit_name -g $rg -o tsv --query id) && echo $onprem_circuit_id
+    az network vpn-connection create -n onpremcx -g $rg -l $location --vnet-gateway1 $onprem_ergw_name --express-route-circuit2 $onprem_circuit_id -o none
+fi
+
+#################################################################
+# Optional: time how long it takes to create/delete connections #
+#################################################################
+
+# Find out how many spokes are peered with the hub
+spokes=$(az network vnet peering list -g $rg --vnet-name $vnet_name -o tsv | wc -l)
+# Deleting connection
+echo "Deleting the connection with $spokes spokes configured..."
+time az network vpn-connection delete -n "${ergw_name}-${er_pop}" -g $rg -o none
+# Creating connection
+echo "Creating the connection with $spokes spokes configured..."
+time az network vpn-connection create -n "${ergw_name}-${er_pop}" -g $rg -l $location --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id -o none
+
+# Results
+# No of spokes    Deletion time     Creation time
+# ============    =============     =============
+#            0             2:22              2:33
+#           10             6:22              4:03
+#           20             8:03              6:03
+#           30             8:02              8:34
+#           40            11:22             12:34
+#           50            13:03             11:35
+#           60            14:43             15:04
+#           70            19.44             19,35
+#           90            28.04             24,05
+#          110            29.46             29,07
+#          130            
+#          150            
+
+#####################
+#    Diagnostics    #
+#####################
+
+# Megaport
+./megaport.sh -q -s=jomore -a=list_live
+# Resources created
+az network expressroute list -g $rg -o table
+az network gateway list -g $rg -o table
+az network vnet list -g $rg -o table
+az network route-table list -g $rg -o table
+# Effective routes - Hub1
+vm_nic_id=$(az vm show -n vm-hub1 -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $vm_nic_id -o table
+# Effective routes - Spoke
+spoke1_vm_nic_id=$(az vm show -n "vm-spoke11" -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke1_vm_pip_address=$(az network public-ip show -n "vm-spoke11-pip" -g $rg --query ipAddress -o tsv)
+spoke1_vm_private_ip=$(az vm show -g $rg -n "vm-spoke11" -d --query privateIps -o tsv)
+spoke2_vm_nic_id=$(az vm show -n "vm-spoke21" -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke2_vm_pip_address=$(az network public-ip show -n "vm-spoke21-pip" -g $rg --query ipAddress -o tsv)
+spoke2_vm_private_ip=$(az vm show -g $rg -n "vm-spoke21" -d --query privateIps -o tsv)
+az network nic show-effective-route-table --ids $spoke1_vm_nic_id -o table
+az network nic show-effective-route-table --ids $spoke2_vm_nic_id -o table
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm_pip_address "ping -c 5 $spoke2_vm_private_ip"
+# Enable/disable BGP route propagation at the spokes
+az network route-table update -n spoke-${er_pop} -g $rg --disable-bgp-route-propagation false -o none
+az network route-table update -n spoke-${er_pop} -g $rg --disable-bgp-route-propagation true -o none
+# Effective routes - Onprem
+onprem_vm_nic_id=$(az vm show -n $onprem_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+az network nic show-effective-route-table --ids $onprem_vm_nic_id -o table
+vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
+onprem_vm_private_ip=$(az vm show -g $rg -n $onprem_vm_name -d --query privateIps -o tsv) && echo $onprem_vm_private_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ping -c 5 $onprem_vm_private_ip"
+# ER circuit
+az network express-route show -n $er1_circuit_name -g $rg -o table
+az network express-route update -n $er1_circuit_name -g $rg
+az network express-route show -n $er1_circuit_name -g $rg --query 'peerings' -o table
+az network express-route get-stats -n $er1_circuit_name -g $rg -o table
+az network express-route update -n $er1_circuit_name -g $rg  # Refresh
+az network express-route peering list --circuit-name $er1_circuit_name -g $rg -o table  # Not working before refreshing
+az network express-route peering connection list -g $rg -o table --peering-name AzurePrivatePeering --circuit-name $er_circuit_name
+az network express-route list-route-tables-summary -g $rg -n $er1_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $er1_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network vpn-connection list -g $rg -o table
+# ER circuit (onprem)
+az network express-route show -n $onprem_er_circuit_name -g $rg -o table
+az network express-route update -n $onprem_er_circuit_name -g $rg
+az network express-route show -n $onprem_er_circuit_name -g $rg --query 'peerings' -o table
+az network express-route get-stats -n $onprem_er_circuit_name -g $rg -o table
+az network express-route update -n $onprem_er_circuit_name -g $rg -o none # Refresh
+az network express-route peering list --circuit-name $onprem_er_circuit_name -g $rg -o table  # Not working before refreshing
+az network express-route peering connection list -g $rg -o table --peering-name AzurePrivatePeering --circuit-name $onprem_er_circuit_name
+az network express-route list-route-tables-summary -g $rg -n $onprem_er_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network express-route list-route-tables -g $rg -n $onprem_er_circuit_name --path primary --peering-name AzurePrivatePeering --query value -o table
+az network vpn-connection list -g $rg -o table
+# VNG
+az network vnet-gateway list-bgp-peer-status -n $ergw_name -g $rg -o table
+az network vnet-gateway list-learned-routes -n $ergw_name -g $rg -o table
+az network vnet-gateway list-learned-routes -n $ergw_name -g $rg --query 'value[].{LocalAddress:localAddress, Peer:sourcePeer, Network:network, NextHop:nextHop, ASPath: asPath, Origin:origin, Weight:weight}' -o table
+az network vnet-gateway list-advertised-routes -n $ergw_name -g $rg -o table --peer 192.168.1.4
+# Onprem VNG (if simulating onprem with another VNet/VNG)
+az network vnet-gateway list-bgp-peer-status -n $onprem_ergw_name -g $rg -o table
+az network vnet-gateway list-learned-routes -n $onprem_ergw_name -g $rg -o table
+az network vnet-gateway list-learned-routes -n $onprem_ergw_name -g $rg --query 'value[].{LocalAddress:localAddress, Peer:sourcePeer, Network:network, NextHop:nextHop, ASPath: asPath, Origin:origin, Weight:weight}' -o table
+az network vnet-gateway list-advertised-routes -n $onprem_ergw_name -g $rg -o table
+# Route server (if there is one, not covered by this script)
+rs_name=$(az network routeserver list -g $rg --query '[0].name' -o tsv) && echo $rs_name
+nva_private_ip=$(az vm show -g $rg -n "$vm_name" -d --query privateIps -o tsv) && echo $nva_private_ip
+az network routeserver peering list --routeserver $rs_name -g $rg -o table
+rs_peer_name=$(az network routeserver peering list --routeserver $rs_name -g $rg -o tsv --query '[0].name') && echo $rs_peer_name
+az network routeserver peering list-learned-routes -n $rs_peer_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+az network routeserver peering list-advertised-routes -n $rs_peer_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+# Flip b2b in the RS
+az network routeserver update -n $rs_name -g $rg --allow-b2b-traffic false -o none
+az network routeserver update -n $rs_name -g $rg --allow-b2b-traffic true -o none
+
+#######################
+#  Cleanup - Danger!  #
+#######################
+
+# Delete all VMs
+function delete_vm() {
+    vm_name=$1
+    disk_id=$(az vm show -n $vm_name -g $rg --query storageProfile.osDisk.managedDisk.id -o tsv)
+    nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    pip_id=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+    nsg_id=$(az network nic show --ids $nic_id --query networkSecurityGroup.id -o tsv)
+    echo "Deleting VM $vm_name..."
+    az vm delete -n $vm_name -g $rg -y
+    echo "Deleting disk $disk_id..."
+    az disk delete --ids $disk_id -y
+    echo "Deleting NIC $nic_id..."
+    az network nic delete --ids $nic_id
+    echo "Deleting public IP $pip_id..."
+    az network public-ip delete --ids $pip_id
+    # echo "Deleting NSG $nsg_id..."
+    # az network nsg delete --ids $nsg_id
+}
+vm_list=$(az vm list -g $rg --query '[].name' -o tsv)
+while IFS= read -r vm; do
+    delete_vm $vm
+done <<< "$vm_list"
+
+
+# Remove MCR from Megaport
+megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+$megaport_script_path -q -s=jomore -a=delete_mcr
+
+# Delete RG
+az group delete -n $rg -y --no-wait

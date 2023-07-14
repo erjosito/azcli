@@ -124,14 +124,20 @@ az vmware global-reach-connection list -g $rg -c $private_cloud -o table --query
 
 # Create GR
 gr_name=testgr
+er_id='/subscriptions/06f677fc-7d25-4ac5-b705-42afe8be8e27/resourceGroups/tnt25-cust-p02-germanywestcentral/providers/Microsoft.Network/expressRouteCircuits/tnt25-cust-p02-germanywestcentral-er'
 er_auth_key=blah
 er_circuit_id=fasel
-az vmware global-reach-connection create -n $gr_name -g $rg -c $private_cloud \
-    --authorization-key $er_auth_key --express-route-id $er_circuit_id -o none
+# er_auth_key=$(az network express-route show -n $er_circuit_name -g $rg --query serviceKey -o tsv) && echo $er_auth_key
+# er_circuit_id=$(az network express-route show -n $er_circuit_name -g $rg --query id -o tsv) && echo $er_circuit_id
+az vmware global-reach-connection create -n $gr_name -g $rg -c $private_cloud -o none \
+    --authorization-key $er_auth_key --express-route-id $er_id --peer-express-route-circuit $er_circuit_id
 
 # Delete GR
 gr_name=testgr
 az vmware global-reach-connection delete -n $gr_name -g $rg -c $private_cloud -o none
+
+# List authorizations
+az vmware authorization list -g $rg -c $private_cloud -o table
 
 # Create authorization
 auth_name=testauthjose
