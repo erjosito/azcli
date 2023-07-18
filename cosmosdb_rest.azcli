@@ -1,0 +1,31 @@
+# This is a way to use the REST API to get the data from Cosmos DB
+# For more info: https://learn.microsoft.com/rest/api/cosmos-db/access-control-on-cosmosdb-resources
+
+# Variables
+rg=translation
+cosmosdb="reviewchecklist"
+dbname=checklist
+baseUrl="https://$cosmosdb.documents.azure.com/"
+verb="get"
+resourceType="colls"   # 'dbs' or 'colls' or 'docs'
+resourceLink="dbs/$dbname/colls"      # 'dbs' or 'dbs/$dbname/colls' or 'dbs/$dbname/colls/$collname/docs'
+resourceId=""
+
+# Main
+masterKey=$(az cosmosdb keys list --name $cosmosdb -g $rg --query primaryMasterKey --output tsv)
+echo "Masterkey: $masterKey"
+now=$(env LANG=en_US TZ=GMT date '+%a, %d %b %Y %T %Z')
+echo "Date: " $now
+signature="$(printf "%s" "$verb\n$resourceType\n$resourceId\n$now" | tr '[A-Z]' '[a-z]')\n\n"
+echo "Signature: $signature"
+hexKey=$(printf "$masterKey" | base64 --decode | hexdump -v -e '/1 "%02x"')
+echo "Hex key: " $hexKey
+hashedSignature=$(printf "$signature" | openssl dgst -sha256 -mac hmac -macopt hexkey:$hexKey -binary | base64)
+echo "Hashed signature: $hashedSignature"
+authString="type=master&ver=1.0&sig=$hashedSignature"
+echo "Auth string: $authString"
+urlEncodedAuthString=$(printf "$authString" | sed 's/=/%3d/g' | sed 's/&/%26/g' | sed 's/+/%2b/g' | sed 's/\//%2f/g')
+echo "URL encoded auth string: $urlEncodedAuthString"
+url="$baseUrl$resourceLink"
+echo "URL: $url"
+curl --request $verb -H "x-ms-date: $now" -H "x-ms-version: 2018-12-31" -H "x-ms-documentdb-isquery: true" -H "Content-Type: application/query+json" -H "Authorization: $urlEncodedAuthString" $url
