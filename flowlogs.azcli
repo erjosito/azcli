@@ -1,6 +1,6 @@
 ########################################################
 # Script to deploy VMs and generate traffic between them.
-# NSG flow logs and Traffic Analytics can be used to 
+# NSG/VNet flow logs and Traffic Analytics can be used to 
 #    explore the traffic flows
 #
 # Jose Moreno
@@ -8,13 +8,15 @@
 ########################################################
 
 # Control
-create_azfw=yes
+create_azfw=no
 create_adx=yes
-create_elk=yes
+create_elk=no
+flowlog_type=vnet
 
 # Variables
 rg=flowlogs
-location=eastus2
+location=eastus2euap
+ws_location=eastus2
 vnet_name=flowlogs
 vnet_prefix=192.168.0.0/16
 subnet0_name=vm0
@@ -37,7 +39,7 @@ azfw_pip_name=myazfw-pip
 adx_sku='Dev(No SLA)_Standard_E2a_v4'
 adx_tier='Basic'     # Not able to make it work with other values such as Developer/Basic
 adx_capacity=1
-adx_name='nwlogs$RANDOM'
+adx_name=nwlogs$RANDOM
 adx_fwlogs_table=FirewallLogs
 adx_flowlogs_table=FlowLogs
 
@@ -126,7 +128,7 @@ logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o
 if [[ -z "$logws_name" ]]
 then
     logws_name=log$RANDOM
-    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+    az monitor log-analytics workspace create -n $logws_name -g $rg -l $ws_location -o none
 fi
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
@@ -140,9 +142,14 @@ then
 fi
 
 # Enable flow logs
-az network watcher flow-log create -l $location -n "flowlog-$location" -g $rg \
-    --nsg $nsg_name --storage-account $storage_account_name --log-version 2 --retention 7 \
-    --workspace $logws_id --interval 10 --traffic-analytics true -o none
+if [[ "$flowlog_type" == "nsg" ]]; then
+    az network watcher flow-log create -l $location -n "flowlog-$location" -g $rg \
+        --nsg $nsg_name --storage-account $storage_account_name --log-version 2 --retention 7 \
+        --workspace $logws_id --interval 10 --traffic-analytics true -o none
+else
+    az network watcher flow-log create -l $location -g $rg --name "flowlog-$location" --vnet $vnet_name \
+        --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
+fi
 
 # Generate cloudinit file to create VMs
 cat <<EOF > $cloudinit_file
@@ -259,9 +266,10 @@ function add_extension() {
 if [[ "$create_adx" == "yes" ]]; then
     # Create ADX cluster
     add_extension kusto
-    az kusto cluster create -n $adx_name --sku "name=$adx_sku" "tier=$adx_tier" "capacity=$adx_capacity" -g $rg -l $location -o none
-    az kusto database create --cluster-name $adx_name --database-name $adx_name -g $rg --read-write-database soft-delete-period=P365D hot-cache-period=P31D location=$location -o none
+    az kusto cluster create -n $adx_name --sku "name=$adx_sku" "tier=$adx_tier" "capacity=$adx_capacity" -g $rg -l $ws_location -o none
+    az kusto database create --cluster-name $adx_name --database-name $adx_name -g $rg --read-write-database soft-delete-period=P365D hot-cache-period=P31D location=$ws_location -o none
     adx_id=$(az kusto cluster show -n $adx_name -g $rg --query id -o tsv)
+    az kusto cluster update -n $adx_name -g $rg --type SystemAssigned -o none
     adx_principal_id=$(az kusto cluster show -n $adx_name -g $rg --query 'identity.principalId' -o tsv)
     # Create event grid (required for storage integration in ADX)
     add_extension eventgrid
@@ -270,17 +278,32 @@ if [[ "$create_adx" == "yes" ]]; then
     eg_name=$storage_account_name
     az eventgrid system-topic create -n $eg_name -g $rg -l $location --topic-type microsoft.storage.storageaccounts --source $storage_account_id -o none
     eg_id=$(az eventgrid system-topic show -n $eg_name -g $rg --query id -o tsv)
+    # Create event hub (required for storage integration in ADX)
+    eh_ns=ehns$RANDOM
+    eh_hub=$storage_account_name
+    az eventhubs namespace create -n $eh_ns -g $rg -l $location -o none
+    az eventhubs eventhub create --name $eh_hub --namespace-name $eh_ns -g $rg -o none
+    eh_hub_id=$(az eventhubs eventhub show --name $eh_hub --namespace-name $eh_ns -g $rg --query id -o tsv)
+    az eventgrid event-subscription create -n eg2eh --source-resource-id $eg_id --endpoint-type eventhub --endpoint $eh_hub_id -o none
+    # It fails with:
+    # Message: This event subscription operation is not supported using this API call. Please use the proper API and try again. # WTF!?!?!??!
+    # Create role assignments
     az role assignment create --scope $eg_id --assignee $adx_principal_id --role 'EventGrid EventSubscription Reader' -o none
+    az role assignment create --scope $eg_id --assignee $adx_principal_id --role 'Azure Event Hubs Data Receiver' -o none           # This goes to the EH, but so far I dont have any EH created!
     az role assignment create --scope $storage_account_id --assignee $adx_principal_id --role 'Storage Blob Data Contributor' -o none
-    kql_query='.create table TestTable (TimeStamp: datetime, Value: string, Source:string)'
-    az kusto script create --cluster-name $adx_name -g $rg --database-name $adx_name --continue-on-errors true -n createTable --script-content "$kql_query" -o none
-    kql_query=".create table TestTable ingestion json mapping 'TestMapping' '[{\"column\":\"Records\",\"path\":\"$.records\"},{\"column\":\"Value\",\"path\":\"$.Value\"},{\"column\":\"Source\",\"path\":\"$.Source\"}]'"
-    az kusto script create --cluster-name $adx_name -g $rg --database-name $adx_name --continue-on-errors true -n createTable --script-content "$kql_query" -o none
+    # In https://learn.microsoft.com/en-us/azure/data-explorer/create-event-grid-connection?tabs=arm-template%2Cazure-blob-storage they provide the EH ID!!!
     az kusto data-connection event-grid create --cluster-name $adx_name -n $eg_name --database-name $adx_name -l $location \
-         --event-grid-resource-id $eg_id --blob-storage-event-type 'Microsoft.Storage.BlobCreated' --storage-account-resource-id $storage_account_id \
-         --data-format JSON --table-name flowlogs --managed-identity-resource-id $adx_id -g $rg -o none
-    az kusto data-connection event-hub create --cluster-name $adx_name -n $eh_name --database-name $adx_name -l $location \
-         --consumer-group '$Default' --event-hub-resource-id $eh_id --managed-identity-resource-id $adx_id -g $rg -o none
+         --event-grid-resource-id $eg_id  --event-hub-resource-id $eh_hub_id \
+         --blob-storage-event-type 'Microsoft.Storage.BlobCreated' --storage-account-resource-id $storage_account_id \
+         --data-format JSON --table-name rawFlowLogs --managed-identity-resource-id $adx_id -g $rg -o none
+    # It fails with: Message: Event grid properties must contain consumerGroup
+    # az kusto data-connection event-hub create --cluster-name $adx_name -n $eh_name --database-name $adx_name -l $location \
+    #      --consumer-group '$Default' --event-hub-resource-id $eh_id --managed-identity-resource-id $adx_id -g $rg -o none
+    # No way I know to send remote KQL queries to ADX
+    # kql_query='.create table TestTable (TimeStamp: datetime, Value: string, Source:string)'
+    # az kusto script create --cluster-name $adx_name -g $rg --database-name $adx_name --continue-on-errors true -n createTable --script-content "$kql_query" -o none
+    # kql_query=".create table TestTable ingestion json mapping 'TestMapping' '[{\"column\":\"Records\",\"path\":\"$.records\"},{\"column\":\"Value\",\"path\":\"$.Value\"},{\"column\":\"Source\",\"path\":\"$.Source\"}]'"
+    # az kusto script create --cluster-name $adx_name -g $rg --database-name $adx_name --continue-on-errors true -n createTable --script-content "$kql_query" -o none
 
     # Configure firewall logs to ADX via events hub
     if [[ "$create_azfw" == "yes" ]]; then

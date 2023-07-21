@@ -1,0 +1,48 @@
+# NSPs with REST API
+# https://learn.microsoft.com/en-us/rest/api/networkmanager/network-security-perimeters
+# Jose Moreno, July 2023
+
+# Variables
+rg=nsp
+location=eastus2euap
+nsp_api_version=2021-02-01-preview
+nsp_name=nsp01
+# JSON templates
+nsp_json='{location: $location}'
+subscription_id=$(az account show --query id -o tsv)
+
+# Register feature
+function enableNetworkFeature () {
+    feature_name=$1
+    state=$(az feature list -o table --query "[?contains(name, '$feature_name')].properties.state" -o tsv)
+    if [[ "$state" == "Registered" ]]
+    then
+        echo "$feature_name is already registered"
+    else
+        echo "Registering feature $feature_name..."
+        az feature register --name "$feature_name" --namespace microsoft.network -o none --only-show-errors
+        state=$(az feature list -o table --query "[?contains(name, '$feature_name')].properties.state" -o tsv)
+        echo "Waiting for feature $feature_name to finish registering..."
+        wait_interval=15
+        until [[ "$state" == "Registered" ]]
+        do
+            sleep $wait_interval
+            state=$(az feature list -o table --query "[?contains(name, '$feature_name')].properties.state" -o tsv)
+            echo "Current registration status for feature $feature_name is $state"
+        done
+        echo "Registering resource provider Microsoft.network now..."
+        az provider register --namespace Microsoft.Network
+    fi
+}
+enableNetworkFeature "AllowNetworkSecurityPerimeter"
+
+# Main
+az group create -n $rg -l $location -o none --only-show-errors
+
+# Create NSP
+nsp_json_string=$(jq -n \
+    --arg location "$location" \
+    "$nsp_json")
+nsp_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.Network/networkSecurityPerimeters/$nsp_name?api-version=$nsp_api_version"
+echo "Creating NSP $nsp_name in $location..."
+az rest --method put --uri $nsp_uri --body $nsp_json_string -o none --only-show-errors

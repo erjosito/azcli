@@ -1,0 +1,122 @@
+# AGICv2 (aka kubic, aka traffic controller, aka AppGW for containers)
+
+# Variables
+rg=agicv2
+location=eastus2
+aks_name=agicv2
+aks_node_size=Standard_B2ms
+vnet_name=aksVnet
+vnet_prefix=10.13.0.0/16
+aks_subnet_name=aks1stpool
+aks_subnet_prefix=10.13.76.0/24  # Min /25 with Azure CNI!
+pod_subnet_name=pods
+pod_subnet_prefix=10.13.80.0/24
+aks_service_cidr=10.0.0.0/16
+aks_id_name=aksid
+alb_id_name=albid
+alb_ns_name=azure-alb-test
+agfc_name=appgw4c
+agfc_frontend_name=test-frontend
+agfc_subnet_name=subnet-alb
+agfc_subnet_prefix=10.13.100.0/24
+
+ # Register required resource providers on Azure.
+ az provider register --namespace Microsoft.ContainerService
+ az provider register --namespace Microsoft.Network
+ az provider register --namespace Microsoft.NetworkFunction
+ az provider register --namespace Microsoft.ServiceNetworking
+
+ # Install Azure CLI extensions.
+ az extension add --name alb
+
+# Create RG and VNets
+az group create -n $rg -l $location -o none --only-show-errors
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location -o none
+az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix -o none --only-show-errors
+az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix -o none --only-show-errors
+aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+
+# Create identity for AKS
+id_id=$(az identity show -n $aks_id_name -g $rg --query id -o tsv 2>/dev/null)
+if [[ -z "$id_id" ]]
+then
+    echo "Identity $aks_id_name not found, creating a new one..."
+    az identity create -n $aks_id_name -g $rg -o none
+    id_id=$(az identity show -n $aks_id_name -g $rg --query id -o tsv)
+else
+    echo "Identity $aks_id_name found with ID $id_id"
+fi
+id_principal_id=$(az identity show -n $aks_id_name -g $rg --query principalId -o tsv)
+vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+sleep 15 # Time for creation to propagate
+az role assignment create --scope $vnet_id --assignee $id_principal_id --role Contributor -o none
+
+# Create AKS cluster with workload identity enabled.
+az aks create -g $rg -n $aks_name -l $location -o none \
+    --enable-oidc-issuer --enable-workload-identity \
+    -c 1 -s $aks_node_size --generate-ssh-keys -u $(whoami) \
+    --enable-managed-identity --assign-identity $id_id \
+    --network-plugin azure --vnet-subnet-id $aks_subnet_id --pod-subnet-id $pod_subnet_id --service-cidr $aks_service_cidr \
+    --network-policy azure \
+    --load-balancer-sku Standard \
+    --node-resource-group "$aks_name"-iaas-"$RANDOM"
+
+# Create identity for AGICv2
+node_rg=$(az aks show -n $aks_name -g $rg --query "nodeResourceGroup" -o tsv)
+echo "Creating identity $alb_id_name in resource group $rg"
+az identity create -n $alb_id_name -g $rg -o none --only-show-errors
+alb_id_principal_id="$(az identity show -n $alb_id_name -g $rg --query principalId -o tsv)"
+echo "Waiting 15 seconds to allow for replication of the identity..."
+sleep 15
+echo "Apply Reader role to the AKS managed cluster resource group for the newly provisioned identity"
+reader_role=acdd72a7-3385-48ef-bd42-f606fba81ae7
+az role assignment create --assignee-object-id $alb_id_principal_id -g $node_rg --role $reader_role -o none --only-show-errors
+echo "Set up federation with AKS OIDC issuer"
+aks_oidc_issuer="$(az aks show -n "$aks_name" -g "$rg" --query "oidcIssuerProfile.issuerUrl" -o tsv)"
+az identity federated-credential create -n $alb_id_name -g $rg -o none --only-show-errors \
+    --identity-name $alb_id_name --issuer "$aks_oidc_issuer" --subject "system:serviceaccount:azure-alb-system:alb-controller-sa"
+
+# Deploy Helm chart
+az aks get-credentials -n $aks_name -g $rg --overwrite-existing
+helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller \
+      --version 0.4.023901 \
+      --set albController.podIdentity.clientID=$(az identity show -g $rg -n $alb_id_name --query clientId -o tsv)
+
+# Verify
+kubectl get pods -n azure-alb-system
+kubectl get gatewayclass azure-alb-external -o yaml
+
+# Create AppGW for containers
+az network alb create -g $rg -n $agfc_name -o none --only-show-errors
+az network alb frontend create -g $rg --alb-name $agfc_name -n $agfc_frontend_name -o none --only-show-errors
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $agfc_subnet_name --address-prefix $agfc_subnet_prefix --delegations 'Microsoft.ServiceNetworking/trafficControllers' -o none --only-show-errors
+agfc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $agfc_subnet_name --query id --output tsv)
+
+# Delegate roles to the ALB identity
+rg_id=$(az group show --name $rg --query id -otsv)
+az role assignment create --assignee-object-id $alb_id_principal_id --scope $rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
+az role assignment create --assignee-object-id $alb_id_principal_id --scope $agfc_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none # Network Contributor
+
+# Associate the AppGW4C with the subnet
+association_name='AppGW4Cassociation'
+az network alb association create -g $rg -n $association_name --alb-name $agfc_name --subnet $agfc_subnet_id -o none --only-show-errors
+
+# Configure ALB
+kubectl create ns $alb_ns_name
+kubectl apply -f - <<EOF
+apiVersion: alb.networking.azure.io/v1
+kind: ApplicationLoadBalancer
+metadata:
+  name: $agfc_name
+  namespace: $alb_ns_name
+spec:
+  associations:
+  - $agfc_subnet_id
+EOF
+kubectl get ApplicationLoadBalancer
+
+
+# Sample workload in the cluster
+kubectl create deployment yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
+kubectl expose deploy yadaapi --port=80 --target-port=8080
