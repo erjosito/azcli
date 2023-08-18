@@ -18,21 +18,21 @@
 ###############
 
 # Control
-no_of_hubs=2         # 1 or 2 hubs
+no_of_hubs=1         # 1 or 2 hubs
 hrp=ASPath           # Can be ASPath, ExpressRoute or VPN
-no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
-secure_hub=no        # Whether firewalls are provisioned in the hubs
+no_of_spokes=3       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
+secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
 create_custom_rt=no  # Whether a custom RT for VNets will be created
-indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
+indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
 redundant_nva=no     # Whether the NVA in the last spoke is redundant (2nd VM in the same subnet)
 nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet' (if 'vnet', $create_custom_rt must be yes)
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none' (if 'vnet', $create_custom_rt must be yes)
-nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
+nva_in_hub1=yes      # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
-deploy_vpngw=yes     # Whether VPN GWs should be deployed
+deploy_vpngw=no      # Whether VPN GWs should be deployed
 branch5=no           # Whether a 2nd S2S branch in hub1 should be deployed
 deploy_er=no         # Whether ER should be provided (note you need an account with a provider such as Megaport)
 deploy_gcp=no        # Whether an onprem location to be connected over ER should be deployed in Google Cloud
@@ -58,6 +58,8 @@ vm_size=Standard_B1s
 nva_size=Standard_B2ms
 wait_interval=15
 azfw_policy_name=vwanfwpolicy
+nsg1_name=vm-nsg-$location1
+nsg2_name=vm-nsg-$location2
 # Branches
 publisher=cisco
 offer=cisco-csr-1000v
@@ -1104,7 +1106,6 @@ fi
 
 # Create NSGs to be used by VMs
 echo "Creating NSGs for Virtual Machines..."
-nsg1_name=vm-nsg-$location1
 az network nsg create -n $nsg1_name -g $rg -l $location1 -o none
 az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_SSH --priority 1000 \
     --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
@@ -1137,7 +1138,6 @@ az network watcher flow-log create -l $location1 -n flowlog-$location1 -g $rg \
 # Hub2
 if [[ "$no_of_hubs" == "2" ]]
 then
-    nsg2_name=vm-nsg-$location2
     if [[ "$location1" != "$location2" ]]
     then
         az network nsg create -n $nsg2_name -g $rg -l $location2 -o none

@@ -2,14 +2,22 @@
 # Script to deploy VMs and generate traffic between them.
 # NSG/VNet flow logs and Traffic Analytics can be used to 
 #    explore the traffic flows
+# Optionall create some elements to inspect VNet flow logs:
+#  - Azure Firewall
+#  - Azure Application Gateway
+#  - Azure VPN Gateway
 #
 # Jose Moreno
 # May 2021
 ########################################################
 
 # Control
-create_azfw=no
-create_adx=yes
+intra_vnet_vms=no
+sample_app=yes
+create_azfw=yes
+create_vpn=yes
+create_appgw=yes
+create_adx=no
 create_elk=no
 flowlog_type=vnet
 
@@ -29,11 +37,47 @@ vm_size=Standard_B1s
 no_of_vms=4
 flows="1;2:3;4:1433:1000,1:2:80:100,3:4:443:100"  # Syntax: src:dst:port:kb/min
 
+# App VM
+app_subnet_name=app
+app_subnet_prefix=192.168.2.0/24
+appvm_name=appvm
+appvm_pip_name=appvm-pip
+appvm_nsg_name=appvm-nsg
+appvm_sku=Standard_B1s
+appvm_cloudinit_filename=/tmp/cloudinit-whoami.txt
+
 # AzFW variables
 azfw_subnet_prefix=192.168.10.0/24
 azfw_name=myazfw
 azfw_policy_name=myazfwpolicy
 azfw_pip_name=myazfw-pip
+
+# AppGW variables
+appgw_subnet_name=ApplicationGatewaySubnet
+appgw_subnet_prefix=192.168.200.0/24
+appgw_name=appgw
+appgw_pip_name=appgw-pip
+appgw_sku=Standard_v2
+appgw_cookie=Disabled
+
+# VPNGW variables
+vng_subnet_prefix=192.168.254.0/24
+vng_name=vpngw
+vng_pipa_name=vpngw-pip-a
+vng_pipb_name=vpngw-pip-b
+vng_asn=65001
+publisher=cisco
+offer=cisco-csr-1000v
+sku=16_12-byol
+nva_size=Standard_B2ms
+version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+branch_prefix=172.16.200.0/24
+branch_subnet=172.16.200.0/26
+branch_gateway=172.16.200.1
+branch_bgp_ip=172.16.200.11
+branch_asn=65500
+username=$(whoami)
+psk='Microsoft123!'
 
 # ADX variables
 adx_sku='Dev(No SLA)_Standard_E2a_v4'
@@ -151,37 +195,61 @@ else
         --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
 fi
 
-# Generate cloudinit file to create VMs
-cat <<EOF > $cloudinit_file
+# Create a set of VMs that will generate traffic to each other
+if [[ "$intra_vnet_vms" == "yes" ]]; then
+    # Generate cloudinit file to create VMs
+    cat <<EOF > $cloudinit_file
 #cloud-config
 packages:
   - jq
   - pv
 EOF
+    # Create VMs spread over two subnets
+    for i in {1..$no_of_vms}
+    do
+        vm_name="vm$(printf "%02d" i)"
+        subnet_index=$(expr $i % 2)
+        az vm create -n $vm_name -g $rg --image Ubuntu2204 --generate-ssh-keys --size $vm_size \
+        --vnet-name $vnet_name --subnet "vm${subnet_index}" --public-ip-address "${vm_name}-pip" --nsg $nsg_name \
+        --custom-data $cloudinit_file -l $location --public-ip-sku Standard --no-wait
+    done
 
-# Create VMs spread over two subnets
-for i in {1..$no_of_vms}
-do
-    vm_name="vm$(printf "%02d" i)"
-    subnet_index=$(expr $i % 2)
-    az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_size \
-    --vnet-name $vnet_name --subnet "vm${subnet_index}" --public-ip-address "${vm_name}-pip" --nsg $nsg_name \
-    --custom-data $cloudinit_file -l $location --public-ip-sku Standard --no-wait
-done
+    # Wait some seconds and create JSON with required IPs
+    sleep 60
+    ip_json=$(az vm list-ip-addresses -g $rg -o json)
 
-# Wait some seconds and create JSON with required IPs
-sleep 60
-ip_json=$(az vm list-ip-addresses -g $rg -o json)
+    # Get the private IP of a specific VM out of the output of the command "az vm list-ip-addresses"
+    function get_private_ip () {
+        echo $1 | jq -r '.[] | select(.virtualMachine.name == "'$2'") | .virtualMachine.network.privateIpAddresses[0]'
+    }
 
-# Get the private IP of a specific VM out of the output of the command "az vm list-ip-addresses"
-function get_private_ip () {
-    echo $1 | jq -r '.[] | select(.virtualMachine.name == "'$2'") | .virtualMachine.network.privateIpAddresses[0]'
-}
+    # Get the public IP of a specific VM out of the output of the command "az vm list-ip-addresses"
+    function get_public_ip () {
+        echo $1 | jq -r '.[] | select(.virtualMachine.name == "'$2'") | .virtualMachine.network.publicIpAddresses[0].ipAddress'
+    }
+fi
 
-# Get the public IP of a specific VM out of the output of the command "az vm list-ip-addresses"
-function get_public_ip () {
-    echo $1 | jq -r '.[] | select(.virtualMachine.name == "'$2'") | .virtualMachine.network.publicIpAddresses[0].ipAddress'
-}
+# Sample (web) app running on a VM
+if [[ "$sample_app" == "yes" ]]; then
+    az network vnet subnet create -n $app_subnet_name --vnet-name $vnet_name -g $rg --address-prefixes $app_subnet_prefix -o none
+    az network public-ip create -g $rg -n $appvm_pip_name --sku standard --allocation-method static -l $location -o none
+    az network nsg create -n $appvm_nsg_name -g $rg -o none
+    az network nsg rule create -n ssh --nsg-name $appvm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp -o none
+    az network nsg rule create -n web --nsg-name $appvm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp -o none
+    az network nsg rule create -n https --nsg-name $appvm_nsg_name -g $rg --priority 520 --destination-port-ranges 443 --access Allow --protocol Tcp -o none
+    cat <<EOF > $appvm_cloudinit_filename
+#cloud-config
+runcmd:
+- apt update && apt install -y python3-pip
+- pip3 install flask
+- wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
+- python3 /root/myip.py >/root/myip.log 2>&1 &
+EOF
+    az vm create -n $appvm_name -g $rg --image Ubuntu2204 --generate-ssh-keys --size $appvm_sku \
+        --vnet-name $vnet_name --subnet $app_subnet_name --nsg $appvm_nsg_name --public-ip-address $appvm_pip_name \
+        --custom-data $appvm_cloudinit_filename -o none
+    appvm_private_ip=$(az vm show -g $rg -n $appvm_name -d --query privateIps -o tsv) && echo $appvm_private_ip
+fi
 
 # Azure Firewall
 if [[ "$create_azfw" == "yes" ]]; then
@@ -189,30 +257,30 @@ if [[ "$create_azfw" == "yes" ]]; then
     az network vnet subnet create --vnet-name $vnet_name --name AzureFirewallSubnet -g $rg --address-prefixes $azfw_subnet_prefix -o none
     az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location -o none
     azfw_ip=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
-    az network firewall policy create -n $azfw_policy_name -g $rg
-    az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000
+    az network firewall policy create -n $azfw_policy_name -g $rg -o none
+    az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
     # Allow SSH and HTTP for connection monitor (uses TCP9 too)
     echo "Creating rule to allow SSH and HTTP..."
-    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg -o none \
         --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "TCP 22" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols TCP --destination-ports 9 22 80 -o none
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols TCP --destination-ports 9 22 80 8080 -o none
     # Allow ICMP
     echo "Creating rule to allow ICMP..."
-    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg -o none \
         --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
-        --destination-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --source-addresses 10.0.0.0/8 172.16.0.0/12 20.0.0.0/6 --ip-protocols ICMP --destination-ports "1-65535" >/dev/null
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols ICMP --destination-ports "1-65535"
     # Allow NTP
     echo "Creating rule to allow NTP..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
-        --destination-addresses '*' --source-addresses "10.0.0.0/8" "20.0.0.0/6" --ip-protocols UDP --destination-ports "123" -o none
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "192.168.0.0/16" --ip-protocols UDP --destination-ports "123" -o none
     # Example application collection with 2 rules (ipconfig.co, api.ipify.org)
     echo "Creating rule to allow ifconfig.co and api.ipify.org..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
-        --target-fqdns "ifconfig.co" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 -o none
+        --target-fqdns "ifconfig.me" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --protocols Http=80 Https=443 -o none
     az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
-        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "20.0.0.0/6" --protocols Http=80 Https=443 --rule-type ApplicationRule -o none
+        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --protocols Http=80 Https=443 --rule-type ApplicationRule -o none
     # Example application collection with wildcards (*.ubuntu.com)
     echo "Creating rule to allow *.ubuntu.com..."
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
@@ -236,13 +304,163 @@ if [[ "$create_azfw" == "yes" ]]; then
     az network firewall update -n $azfw_name -g $rg -o none
     azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo "$azfw_private_ip"
     # Create route tables
-    az network route-table create --name subnet0 --resource-group "$rg" --location "$location" -o none
-    az network route-table route create --route-table-name subnet0 -g $rg --address-prefix $subnet1_prefix --name subnet1 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
-    az network vnet subnet update --name $subnet0_name --route-table subnet0 --vnet-name $vnet_name --resource-group $rg -o none
-    az network route-table create --name subnet1 --resource-group "$rg" --location "$location" -o none
-    az network route-table route create  --route-table-name subnet1 -g $rg --address-prefix $subnet0_prefix --name subnet0 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
-    az network vnet subnet update --name $subnet1_name --route-table subnet1 --vnet-name $vnet_name --resource-group $rg -o none
+    if [[ "$intra_vnet_vms" == "yes" ]]; then
+        az network route-table create --name subnet0 --resource-group "$rg" --location "$location" -o none
+        az network route-table route create --route-table-name subnet0 -g $rg --address-prefix $subnet1_prefix --name subnet1 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+        az network vnet subnet update --name $subnet0_name --route-table subnet0 --vnet-name $vnet_name --resource-group $rg -o none
+        az network route-table create --name subnet1 --resource-group "$rg" --location "$location" -o none
+        az network route-table route create  --route-table-name subnet1 -g $rg --address-prefix $subnet0_prefix --name subnet0 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+        az network vnet subnet update --name $subnet1_name --route-table subnet1 --vnet-name $vnet_name --resource-group $rg -o none
+    fi
+    # Create DNAT to sample app
+    if [[ "$sample_app" == "yes" ]]; then
+        azfw_pip_address=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
+        echo "Firewall's public IP is $azfw_pip_address"
+        az network firewall policy rule-collection-group collection add-nat-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+            --name NAT8080 --collection-priority 110 --action DNAT --rule-name DnatSSL --description "Sample application DNAT" \
+            --source-addresses '*' --destination-addresses "$azfw_pip_address" --destination-ports 8080 --ip-protocols TCP \
+            --translated-address "$appvm_private_ip" --translated-port 8080 -o none
+    fi
+fi
 
+# Optionally, create App GW to expose the sample app
+if [[ "$create_appgw" == "yes" ]]; then
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $appgw_subnet_name --address-prefixes $appgw_subnet_prefix -o none
+    az network public-ip create -g $rg -n $appgw_pip_name --sku standard --allocation-method static -l $location -o none
+    appgw_pip_address=$(az network public-ip show -g $rg -n $appgw_pip_name --query ipAddress -o tsv)
+    az network application-gateway create -g $rg -n $appgw_name --capacity 2 --sku $appgw_sku \
+        --frontend-port 8080 --routing-rule-type basic --priority 100 \
+        --servers $appvm_private_ip --http-settings-port 8080 --http-settings-protocol Http \
+        --sku Standard_v2 --min-capacity 1 --max-capacity 2 \
+        --public-ip-address $appgw_pip_name --vnet-name $vnet_name --subnet $appgw_subnet_name -o none
+    # Add custom probe (with path /api/healthcheck) to initial config (port 8080)
+    echo "Creating custom probe for port 8080..."
+    az network application-gateway probe create -g "$rg" --gateway-name "$appgw_name" \
+    --name vmprobe8080 --protocol Http --host-name-from-http-settings --match-status-codes 200-399 --port 8080 --path "/api/healthcheck" -o none
+    http_settings_name=$(az network application-gateway http-settings list -g $rg --gateway-name $appgw_name -o tsv --query '[0].name')
+    az network application-gateway http-settings update -g $rg --gateway-name $appgw_name -n $http_settings_name --probe vmprobe8080 --host-name-from-backend-pool -o none
+    # Connect app gw to Azure Monitor
+    appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
+    az monitor diagnostic-settings create -n "mydiag$RANDOM" --resource $appgw_id --workspace $logws_id -o none \
+        --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+        --logs '[{"category": "ApplicationGatewayAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "ApplicationGatewayPerformanceLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "ApplicationGatewayFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+fi
+
+# Optionally, create a VPN GW and connect it to a simulated branch office (CSR)
+if [[ "$create_vpngw" == "yes" ]]; then
+    # Create VPN GW
+    az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name $vnet_name --address-prefix $vng_subnet_prefix -o none --only-show-errors
+    az network public-ip create -g $rg -n $vng_pipa_name -o none --only-show-errors
+    az network public-ip create -g $rg -n $vng_pipb_name -o none --only-show-errors
+    az network vnet-gateway create -g $rg --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet $vnet_name -n $vng_name --asn $vng_asn --public-ip-address $vng_pipa_name $vng_pipb_name -o none --only-show-errors
+    # Create CSR to simulate a branch
+    az vm create -n branch-nva1 -g $rg -l $location --size $nva_size --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys \
+        --public-ip-address branch-pip --public-ip-address-allocation static --public-ip-sku Standard \
+        --vnet-name branch --vnet-address-prefix $branch_prefix --subnet nva --subnet-address-prefix $branch_subnet --private-ip-address $branch_bgp_ip -o none
+    branch_ip=$(az network public-ip show -n branch-pip -g $rg --query ipAddress -o tsv) && echo $branch_ip
+    # Create LNG and connection
+    az network local-gateway create -g $rg -n branch --gateway-ip-address $branch_ip --local-address-prefixes "${branch_bgp_ip}/32" --asn $branch_asn --bgp-peering-address $branch_bgp_ip --peer-weight 0 -l $location -o none
+    az network vpn-connection create -g $rg --shared-key $psk --enable-bgp -n branch --vnet-gateway1 $vng_name --local-gateway2 branch -l $location -o none
+    # Get VNG data required to configure CSR
+    vpngw_pip_0=$(az network vnet-gateway show -n $vng_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_pip_0
+    vpngw_private_ip_0=$(az network vnet-gateway show -n $vng_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_0
+    vpngw_pip_1=$(az network vnet-gateway show -n $vng_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_pip_1
+    vpngw_private_ip_1=$(az network vnet-gateway show -n $vng_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_1
+    vpngw_asn=$(az network vnet-gateway show -n $vng_name -g $rg --query 'bgpSettings.asn' -o tsv) && echo $vpngw_asn
+    # Configure CSR (active/active VNG)
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch_ip <<EOF
+config t
+    crypto ikev2 proposal azure-proposal
+        encryption aes-cbc-256 aes-cbc-128 3des
+        integrity sha1
+        group 2
+        exit
+    !
+    crypto ikev2 policy azure-policy
+        proposal azure-proposal
+        exit
+    !
+    crypto ikev2 keyring azure-keyring
+    peer $vpngw_pip_0
+        address $vpngw_pip_0
+        pre-shared-key $psk
+        exit
+    peer $vpngw_pip_1
+        address $vpngw_pip_1
+        pre-shared-key $psk
+        exit
+    exit
+    !
+    crypto ikev2 profile azure-profile
+        match address local interface GigabitEthernet1
+        match identity remote address $vpngw_pip_0 255.255.255.255
+        match identity remote address $vpngw_pip_1 255.255.255.255
+        authentication remote pre-share
+        authentication local pre-share
+        keyring local azure-keyring
+    exit
+    !
+    crypto ipsec transform-set azure-ipsec-proposal-set esp-aes 256 esp-sha-hmac
+        mode tunnel
+    exit
+
+    crypto ipsec profile azure-vti
+        set transform-set azure-ipsec-proposal-set
+        set ikev2-profile azure-profile
+        set security-association lifetime kilobytes 102400000
+        set security-association lifetime seconds 3600 
+    exit
+    !
+    interface Tunnel0
+        ip unnumbered GigabitEthernet1 
+        ip tcp adjust-mss 1350
+        tunnel source GigabitEthernet1
+        tunnel mode ipsec ipv4
+        tunnel destination $vpngw_pip_0
+        tunnel protection ipsec profile azure-vti
+    interface Tunnel1
+        ip unnumbered GigabitEthernet1 
+        ip tcp adjust-mss 1350
+        tunnel source GigabitEthernet1
+        tunnel mode ipsec ipv4
+        tunnel destination $vpngw_pip_1
+        tunnel protection ipsec profile azure-vti
+    exit
+    !
+    router bgp $branch_asn
+        bgp router-id interface GigabitEthernet1
+        bgp log-neighbor-changes
+        neighbor $vpngw_private_ip_0 remote-as $vpngw_asn
+        neighbor $vpngw_private_ip_0 ebgp-multihop 5
+        neighbor $vpngw_private_ip_0 update-source GigabitEthernet1
+        neighbor $vpngw_private_ip_1 remote-as $vpngw_asn
+        neighbor $vpngw_private_ip_1 ebgp-multihop 5
+        neighbor $vpngw_private_ip_1 update-source GigabitEthernet1
+    !
+    ip route $vpngw_private_ip_0 255.255.255.255 Tunnel0
+    ip route $vpngw_private_ip_1 255.255.255.255 Tunnel1
+!
+end
+!
+wr mem
+EOF
+    # Verify tunnel status and BGP
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch_ip "show ip int brief"
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch_ip "show ip bgp summary"
+    # Confige an IP SLA test
+    if [[ "$sample_app" == "yes" ]]; then
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch_ip <<EOF
+config t
+    ip sla 1
+        http get http://${appvm_private_ip}:8080/api/ip
+        frequency 60
+    ip sla schedule 1 life forever start-time now
+end
+wr mem
+EOF
+    fi
 fi
 
 # Aux function to add/update extension
@@ -376,7 +594,7 @@ runcmd:
 - systemctl start kibana
 EOF
     echo "Creating Elastic Stack VM..."
-    az vm create -n $elk_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${elk_vm_name}-nsg" -o none \
+    az vm create -n $elk_vm_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys --nsg "${elk_vm_name}-nsg" -o none \
         --custom-data $elk_cloudinit_file --public-ip-sku Standard --public-ip-address "${elk_vm_name}-pip" \
         --vnet-name $vnet_name --size $elk_vm_size --subnet $elk_subnet_name -l $location
     # Make sure to reset the elastic user's password with elasticsearch-setup-password or elasticsearch-reset-password !!!!
@@ -483,57 +701,82 @@ EOF
 fi
 
 # Start traffic generation
-flows_array=($(convert_string_to_array $flows ','))
-for flow in "${flows_array[@]}"
-do
-    # echo "Processing flow $flow..."
-    sources=$(echo $flow | cut -d':' -f 1)
-    destinations=$(echo $flow | cut -d':' -f 2)
-    port=$(echo $flow | cut -d':' -f 3)
-    kb_min=$(echo $flow | cut -d':' -f 4)
-    src_array=($(convert_string_to_array $sources ';'))
-    dst_array=($(convert_string_to_array $destinations ';'))
-    for dst in $dst_array; do
-        # Start nc listening on port for destination
-        dst_vm_name="vm$(printf "%02d" $dst)"
-        dst_pip=$(get_public_ip $ip_json "$dst_vm_name")
-        dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
-        echo "Running \"nc -dlk -p ${port}\" on ${dst_vm_name}, ${dst_pip}"
-        ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "nc -dlk -p $port > /dev/null &"
-        for src in $src_array; do
-            # Configure crontab entry to send traffic every minute
-            src_vm_name="vm$(printf "%02d" $src)"
-            src_pip=$(get_public_ip $ip_json "$src_vm_name")
-            cmd='(crontab -l 2>/dev/null; echo "* * * * * dd if=/dev/urandom bs=1000 count='${kb_min}' | pv -L 10M | nc '${dst_ip}' '${port}'") | crontab -'
-            echo "Adding crontab entry for ${src_vm_name}, ${src_pip}"
-            ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "$cmd"
+if [[ "$intra_vnet_vms" == "yes" ]]; then
+    flows_array=($(convert_string_to_array $flows ','))
+    for flow in "${flows_array[@]}"
+    do
+        # echo "Processing flow $flow..."
+        sources=$(echo $flow | cut -d':' -f 1)
+        destinations=$(echo $flow | cut -d':' -f 2)
+        port=$(echo $flow | cut -d':' -f 3)
+        kb_min=$(echo $flow | cut -d':' -f 4)
+        src_array=($(convert_string_to_array $sources ';'))
+        dst_array=($(convert_string_to_array $destinations ';'))
+        for dst in $dst_array; do
+            # Start nc listening on port for destination
+            dst_vm_name="vm$(printf "%02d" $dst)"
+            dst_pip=$(get_public_ip $ip_json "$dst_vm_name")
+            dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
+            echo "Running \"nc -dlk -p ${port}\" on ${dst_vm_name}, ${dst_pip}"
+            ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "nc -dlk -p $port > /dev/null &"
+            for src in $src_array; do
+                # Configure crontab entry to send traffic every minute
+                src_vm_name="vm$(printf "%02d" $src)"
+                src_pip=$(get_public_ip $ip_json "$src_vm_name")
+                cmd='(crontab -l 2>/dev/null; echo "* * * * * dd if=/dev/urandom bs=1000 count='${kb_min}' | pv -L 10M | nc '${dst_ip}' '${port}'") | crontab -'
+                echo "Adding crontab entry for ${src_vm_name}, ${src_pip}"
+                ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "$cmd"
+            done
         done
     done
-done
+fi
 
 # Diagnostics
-az network watcher flow-log list -o table -l $location
-src_vm_name=vm01
-dst_vm_name=vm03
-port=1433
-src_pip=$(get_public_ip $ip_json "$src_vm_name")
-dst_pip=$(get_public_ip $ip_json "$dst_vm_name")
-dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
-ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "crontab -l | grep \"$dst_ip $port\""
-ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "nc -vz $dst_ip $port"
-ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "ps -ef | grep \"nc -dlk -p $port\" | grep -v grep"
-ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "sudo netstat -tunlp | grep \":$port\""
+if [[ "$intra_vnet_vms" == "yes" ]]; then
+    az network watcher flow-log list -o table -l $location
+    src_vm_name=vm01
+    dst_vm_name=vm03
+    port=1433
+    src_pip=$(get_public_ip $ip_json "$src_vm_name")
+    dst_pip=$(get_public_ip $ip_json "$dst_vm_name")
+    dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
+    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "crontab -l | grep \"$dst_ip $port\""
+    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "nc -vz $dst_ip $port"
+    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "ps -ef | grep \"nc -dlk -p $port\" | grep -v grep"
+    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$dst_pip" "sudo netstat -tunlp | grep \":$port\""
+fi
 
 # Simulate port scan
-src_vm_name=vm01
-port=22
-src_pip=$(get_public_ip $ip_json "$src_vm_name") && echo $src_pip
-for i in {1..$no_of_vms}
-do
-    dst_vm_name="vm$(printf "%02d" i)"
-    dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
-    ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "nc -vz $dst_ip $port"
-done
+if [[ "$intra_vnet_vms" == "yes" ]]; then
+    src_vm_name=vm01
+    port=22
+    src_pip=$(get_public_ip $ip_json "$src_vm_name") && echo $src_pip
+    for i in {1..$no_of_vms}
+    do
+        dst_vm_name="vm$(printf "%02d" i)"
+        dst_ip=$(get_private_ip $ip_json "$dst_vm_name")
+        ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$src_pip" "nc -vz $dst_ip $port"
+    done
+fi
+
+# Test sample app
+if [[ "$sample_app" == "yes" ]]; then
+    appvm_ip=$(az network public-ip show -n $appvm_pip_name -g $rg --query ipAddress -o tsv)
+    curl "${appvm_ip}:8080/api/ip"
+fi
+
+# Traffic over the firewall
+if [[ "$sample_app" == "yes" ]]; then
+    azfw_ip=$(az network public-ip show -n $azfw_pip_name -g $rg --query ipAddress -o tsv)
+    curl "${azfw_ip}:8080/api/ip"
+fi
+
+# Traffic over the App Gateway
+if [[ "$sample_app" == "yes" ]]; then
+    appgw_ip=$(az network public-ip show -n $appgw_pip_name -g $rg --query ipAddress -o tsv)
+    curl "${appgw_ip}:8080/api/ip"
+fi
+
 
 # ADX
 az kusto cluster list -g $rg -o table
@@ -543,6 +786,69 @@ az kusto data-connection list --cluster-name $adx_name --database-name $adx_name
 az eventgrid system-topic list -g $rg -o table
 # List tables
 kql_query='.show tables details'
+
+#############################
+# Traffic Analytics queries #
+#############################
+
+# Inspect log categories
+query="AzureDiagnostics
+| distinct Category"
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
+# VNet Flow Logs
+src_ip=$(curl -s4 ifconfig.me)    # Other values: $appvm_private_ip, $branch_bgp_ip, $(curl -s4 ifconfig.me)
+dst_ip=$azfw_ip  # Other values: $appvm_private_ip, $azfw_ip, $appgw_ip
+query="NTANetAnalytics
+//| where TimeGenerated > ago(1h)
+| where SubType == \"FlowLog\"
+| where SrcIp == \"${src_ip}\"
+| where ipv4_is_in_range(SrcIp, \"${azfw_subnet_prefix}\")
+| where DestIp == \"${dst_ip}\"
+| where DestPort == 8080
+| where FlowStatus == \"Allowed\"
+| summarize BytesSrc2Dst=sum(BytesSrcToDest), BytesDst2Src=sum(BytesDestToSrc) by MacAddress, SrcIp, SourceSystem, L4Protocol, DestIp, DestPort, ConnectionType, DestApplicationGateway, DestLocalNetworkGateway"
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
+# AppGW: Frontend and backend (healthchecks included too :( )
+my_ip=$(curl -s4 ifconfig.me)    # Other values: $appvm_private_ip, $branch_bgp_ip, $(curl -s4 ifconfig.me)
+query="NTANetAnalytics
+| where TimeGenerated > ago(1h)
+| where SubType == \"FlowLog\"
+| where (SrcIp == \"${my_ip}\" and DestIp == \"${appgw_ip}\") or ipv4_is_in_range(SrcIp, \"${appgw_subnet_prefix}\")
+| where DestPort == 8080
+| where FlowStatus == \"Allowed\"
+| summarize BytesSrc2Dst=sum(BytesSrcToDest), BytesDst2Src=sum(BytesDestToSrc) by MacAddress, SrcIp, SourceSystem, L4Protocol, DestIp, DestPort, ConnectionType, DestApplicationGateway, DestLocalNetworkGateway"
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
+# AzFW: Frontend and backend (healthchecks included too :( )
+my_ip=$(curl -s4 ifconfig.me)    # Other values: $appvm_private_ip, $branch_bgp_ip, $(curl -s4 ifconfig.me)
+query="NTANetAnalytics
+| where TimeGenerated > ago(1h)
+| where SubType == \"FlowLog\"
+| where (SrcIp == \"${my_ip}\" and DestIp == \"${azfw_ip}\") or ipv4_is_in_range(SrcIp, \"${azfw_subnet_prefix}\")
+| where DestPort == 8080
+| where FlowStatus == \"Allowed\"
+| summarize BytesSrc2Dst=sum(BytesSrcToDest), BytesDst2Src=sum(BytesDestToSrc) by MacAddress, SrcIp, SourceSystem, L4Protocol, DestIp, DestPort, ConnectionType, DestApplicationGateway, DestLocalNetworkGateway"
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
+# AzFW Fat Flow logs
+src_ip=$(curl -s4 ifconfig.me)    # Other values: $appvm_private_ip, $branch_bgp_ip, $(curl -s4 ifconfig.me)
+query="AzureDiagnostics
+| where Category == \"AZFWFatFlow\"
+//| where DestinationPort_d == 8080
+//| summarize count()
+| where SourceIP == \"${src_ip}\"
+| project TimeGenerated, FlowRate_s, Protocol_s, SourceIP"
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
+# AzFW NAT Logs
+src_ip=$(curl -s4 ifconfig.me)    # Other values: $appvm_private_ip, $branch_bgp_ip, $(curl -s4 ifconfig.me)
+query="AzureDiagnostics
+| where Category == \"AZFWNatRule\"
+| where SourceIP == \"${src_ip}\"
+| project TimeGenerated, SourceIP, SourcePort_d, DestinationIp_s, DestinationPort_d, TranslatedIp_s, TranslatedPort_d"
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
 
 
 ##############
@@ -617,4 +923,5 @@ function start_lab() {
 ###########
 # Cleanup #
 ###########
-az network watcher flow-log delete -l $location -n 
+# WIP!
+# az network watcher flow-log delete -l $location -n 

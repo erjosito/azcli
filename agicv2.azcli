@@ -102,21 +102,85 @@ az role assignment create --assignee-object-id $alb_id_principal_id --scope $agf
 association_name='AppGW4Cassociation'
 az network alb association create -g $rg -n $association_name --alb-name $agfc_name --subnet $agfc_subnet_id -o none --only-show-errors
 
-# Configure ALB
-kubectl create ns $alb_ns_name
-kubectl apply -f - <<EOF
-apiVersion: alb.networking.azure.io/v1
-kind: ApplicationLoadBalancer
-metadata:
-  name: $agfc_name
-  namespace: $alb_ns_name
-spec:
-  associations:
-  - $agfc_subnet_id
-EOF
-kubectl get ApplicationLoadBalancer
+# Configure ALB (NOTE: this is only for managed ALB, not for BYO ALB)
+# kubectl create ns $alb_ns_name
+# kubectl apply -f - <<EOF
+# apiVersion: alb.networking.azure.io/v1
+# kind: ApplicationLoadBalancer
+# metadata:
+#   name: $agfc_name
+#   namespace: $alb_ns_name
+# spec:
+#   associations:
+#   - $agfc_subnet_id
+# EOF
+# kubectl get ApplicationLoadBalancer
 
+# Create Gateway in k8s
+alb_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
+alb_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
+alb_frontend_name=$(az network alb frontend list -g $rg --alb-name $alb_name --query '[0].name' -o tsv)
+echo "Creating Gateway in k8s associated to ALB ID $alb_id and frontend $alb_frontend_name..."
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: Gateway
+metadata:
+  name: $alb_name
+  annotations:
+    alb.networking.azure.io/alb-id: $alb_id
+spec:
+  gatewayClassName: azure-alb-external
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+  addresses:
+  - type: alb.networking.azure.io/alb-frontend
+    value: $alb_frontend_name
+EOF
 
 # Sample workload in the cluster
 kubectl create deployment yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
-kubectl expose deploy yadaapi --port=80 --target-port=8080
+kubectl expose deploy yadaapi --port=8080 --target-port=8080
+
+# HTTP route
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: HTTPRoute
+metadata:
+  name: yadaapi
+spec:
+  parentRefs:
+  - name: $alb_name
+  rules:
+  - backendRefs:
+    - name: yadaapi
+      port: 8080
+EOF
+
+# Test
+fqdn=$(kubectl get gateway $alb_name -o jsonpath='{.status.addresses[0].value}') && echo $fqdn
+curl "$fqdn/api/healthcheck"
+
+#################
+#  Diagnostics  #
+#################
+
+# Check the agic pods
+kubectl get pods -n azure-alb-system
+# Verify the ALB in Azure
+az network alb list -g $rg -o table
+alb_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
+az network alb frontend list -g $rg --alb-name $alb_name -o table
+# Verify the ALB in k8s
+k get applicationLoadBalancer
+# Verify the gatewayclass
+kubectl get gatewayclass azure-alb-external -o yaml
+# Gateways
+k get gateway
+k describe gateway
+# HTTP routes
+k get httproute
