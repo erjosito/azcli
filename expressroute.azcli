@@ -211,6 +211,33 @@ then
 fi
 
 #################################################################
+# Optional: logs                                                #
+#################################################################
+
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    logws_name=erlogs$RANDOM
+    echo "Creating log analytics workspace $logws_name..."
+    az monitor log-analytics workspace create -n $logws_name -g $rg -l $location -o none
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+gw_id_list=$(az network vnet-gateway list -g $rg --query '[].id' -o tsv)
+while IFS= read -r gw_id; do
+    echo "Creating diagnostic settings for $gw_id..."
+    az monitor diagnostic-settings create -n mydiag$RANDOM --resource $gw_id --workspace $logws_id \
+        --metrics "[{category:AllMetrics,enabled:true,retentionPolicy:{days:0,enabled:false}}]" \
+        --logs '[{"category": "RouteDiagnosticLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+done <<< "$gw_id_list"
+circuit_id_list=$(az network express-route list -g $rg --query '[].id' -o tsv)
+while IFS= read -r circuit_id; do
+    echo "Creating diagnostic settings for $gw_id..."
+    az monitor diagnostic-settings create -n mydiag$RANDOM --resource $gw_id --workspace $logws_id \
+        --metrics "[{category:AllMetrics,enabled:true,retentionPolicy:{days:0,enabled:false}}]" \
+        --logs '[{"category": "PeeringRouteTableLogs", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+done <<< "$circuit_id_list"
+#################################################################
 # Optional: time how long it takes to create/delete connections #
 #################################################################
 
