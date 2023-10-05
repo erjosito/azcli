@@ -1,0 +1,166 @@
+#################################################
+# AzCLI commands to test NSP functionality
+#
+# Jose Moreno, October, 2023
+#################################################
+
+# Variables
+rg=nsptest
+location=northcentralus
+nsp_name=nsp01
+suffix=$RANDOM
+storage_account_name="nsptest${suffix}"
+sql_server_name="nsptest${suffix}"
+akv_name="nsptest${suffix}"
+vnet_name=vnet01
+vnet_prefix=10.13.76.0/24
+subnet_name=vm
+subnet_prefix=10.13.76.0/28
+vm_size=Standard_B1s
+vm_name=vm01
+vm_pip_name="${vm_name}-pip"
+vm_nsg_name="${vm_name}-nsg"
+
+# Make sure you have the NSP extension
+extension_name=nsp
+echo "Checking if you have the Azure CLI '$extension_name' extension installed..."
+extension_output=$(az extension show --name "$extension_name" 2>&1)
+if echo $extension_output | grep -q "not installed"; then
+    echo "Adding extension $extension_name..."
+    az extension add --name "$extension_name" -o none
+else
+    echo "Updating extension $extension_name..."
+    az extension update --name "$extension_name" -o none
+fi
+echo ""
+
+# Create resource group
+echo "Creating resource group..."
+az group create --name $rg --location $location -o none --only-show-errors
+
+# Create NSP and profiles
+echo "Creating NSP..."
+az network perimeter create -n $nsp_name -g $rg -l $location -o none --only-show-errors
+az network perimeter profile create -n profile00 -g $rg --perimeter-name $nsp_name -o none --only-show-errors
+az network perimeter profile create -n profile01 -g $rg --perimeter-name $nsp_name -o none --only-show-errors
+
+# Create Diagnostic settings for NSP
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    logws_name="nsplog${suffix}"
+    echo "INFO: Creating log analytics workspace ${logws_name}..."
+    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+else
+    echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+nsp_id=$(az network perimeter show -n $nsp_name -g $rg --query id -o tsv)
+echo "Creating diagnostic settings for NSP ID $nsp_id..."
+# az monitor diagnostic-settings create -n "diag$suffix" --resource $nsp_id --workspace $logws_id \
+#     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }]' \
+#     --logs '[{"category": "allLogs", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+az monitor diagnostic-settings create -n "diag$suffix" --resource $nsp_id --workspace $logws_id -o none \
+    --logs '[{categoryGroup:allLogs,enabled:true,retentionPolicy:{days:0,enabled:false}}]'
+
+# Create storage account
+echo "Creating storage account $storage_account_name..."
+az storage account create -n $storage_account_name -g $rg -l $location --sku Standard_LRS -o none --only-show-errors
+storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
+
+az storage container create -n "container01" --account-name $storage_account_name --account-key $storage_account_key  -o none --only-show-errors
+echo "This is a test file" > /tmp/test.txt
+az storage blob upload -f "/tmp/test.txt" -c "container01" -n "test.txt" --account-name $storage_account_name --account-key $storage_account_key -o none --only-show-errors
+sas_end_date=$(date -u -d "30 days" '+%Y-%m-%dT%H:%MZ')
+blob_sas=$(az storage blob generate-sas -c "container01" -n "test.txt" --account-name $storage_account_name --account-key $storage_account_key --permissions r --expiry $sas_end_date -o tsv)
+storage_account_url=$(az storage account show -n $storage_account_name -g $rg --query 'primaryEndpoints.blob' -o tsv)
+blob_url="${storage_account_url}container01/test.txt?${blob_sas}"
+echo "Associating storage account $storage_account_name with NSP $nsp_name and profile00..."
+profile_name=profile00
+profile_id=$(az network perimeter profile show -n $profile_name --perimeter-name $nsp_name -g $rg --query id -o tsv)
+storage_account_id=$(az storage account show -n $storage_account_name -g $rg --query id -o tsv)
+az network perimeter association create -n $storage_account_name --perimeter-name $nsp_name -g $rg -o none\
+     --access-mode Learning --private-link-resource "{id:$storage_account_id}" --profile "{id:$profile_id}"
+
+# Create AKV
+echo "Creating AKV $akv_name..."
+az keyvault create -n "$akv_name" -g $rg -l $location -o none --only-show-errors
+echo "Adding test secret to AKV..."
+az keyvault secret set --vault-name $akv_name -n testsecret --value 'HelloWorld' -o none --only-show-errors
+echo "Adding test key to AKV..."
+az keyvault key set --vault-name $akv_name -n testkey --kty RSA -o none --only-show-errors
+echo "Adding AKV to NSP..."
+profile_name=profile00
+profile_id=$(az network perimeter profile show -n $profile_name --perimeter-name $nsp_name -g $rg --query id -o tsv)
+akv_id=$(az keyvault show -n $akv_name -g $rg --query id -o tsv)
+az network perimeter association create -n $akv_name --perimeter-name $nsp_name -g $rg -o none\
+     --access-mode Learning --private-link-resource "{id:$akv_id}" --profile "{id:$profile_id}"
+
+
+# Create Azure SQL Server and database
+az sql server create -n $sql_server_name -g $rg -l $location -o none --only-show-errors
+az sql db create -n "db01" -s $sql_server_name -g $rg -o none --only-show-errors --no-wait
+
+# Create sample workload in VNet
+az vm create -n $vm_name -g $rg --image Ubuntu2204 --size $vm_size --admin-username $(whoami) --generate-ssh-keys \
+    --vnet-name $vnet_name  --vnet-address-prefix $vnet_prefix --subnet $subnet_name --subnet-address-prefix $subnet_prefix \
+    --public-ip-address $vm_pip_name --public-ip-sku Standard --nsg $vm_nsg_name \
+    -o none --only-show-errors --no-wait
+
+# Create rules (WIP)
+# - Inbound from IP addresses
+az network perimeter profile access-rule create -n rule01 --profile-name profile00 --perimeter-name $nsp_name -g $rg --address-prefixes "['10.11.0.0/16', '10.10.0.0/16']" -o none
+# - Inbound from other NSPs
+# az network perimeter profile access-rule create -n rule02 --profile-name profile00 --perimeter-name $nsp_name -g $rg --nsp "[{id:<NSP_ARM_ID>}]" -o none
+# - Inbound from subscriptions
+subscription_id=$(az account show --query id -o tsv)
+az network perimeter profile access-rule create -n rule04 --profile-name profile00 --perimeter-name $nsp_name -g $rg --subscriptions "[{id:${subscription_id}}]" -o none
+# - Outbound to FQDNs
+az network perimeter profile access-rule create -n rule03 --profile-name profile00 --perimeter-name $nsp_name -g $rg --fqdn "['www.abc.com', 'www.google.com']" --direction "Outbound" -o none
+# az network perimeter profile access-rule create -n rule05 --profile-name profile00 --perimeter-name $nsp_name -g $rg --subscriptions [0].id="${subscription_id}" -o none
+# - Outbound to email addresses
+az network perimeter profile access-rule create --name rule06 --profile-name profile00 --perimeter-name $nsp_name --resource-group $rg --email-addresses "[\'abc@microsoft.com\', \'bcd@microsoft.com\']" --direction "Outbound"
+# - Outbound to phone numbers
+az network perimeter profile access-rule create --name rule07 --profile-name profile00 --perimeter-name $nsp_name --resource-group $rg --phone-numbers "[\'+919898989898\', \'+929898989898\']" --direction "Outbound" 
+
+# Test access to storage account from local machine
+if [[ -f "/tmp/test2.txt" ]]; then
+    rm /tmp/test2.txt
+fi
+echo "Trying to download file with Azure CLI..."
+az storage blob download -c "container01" -n "test.txt" -f "/tmp/test2.txt" --account-name $storage_account_name --account-key $storage_account_key -o none --only-show-errors
+cat /tmp/test2.txt
+echo "Trying to download file with curl and SAS..."
+curl $blob_url
+
+# Enable storage encryption with AKV's key when AKV is in/out the NSP??
+# https://learn.microsoft.com/en-us/azure/storage/common/customer-managed-keys-overview
+# https://learn.microsoft.com/en-us/azure/storage/common/customer-managed-keys-configure-existing-account?tabs=azure-portal
+# az storage account update --encryption-key-source Microsoft.KeyVault --encryption-key-name --encryption-key-source --key-vault-user-identity-id
+storage_id_name="nsptest${suffix}-id"
+echo "Creating identity $storage_id_name..."
+az identity create -n $storage_id_name -g $rg -l $location -o none --only-show-errors
+storage_id_id=$(az identity show -n $storage_id_name -g $rg --query id -o tsv)
+storage_id_principal=$(az identity show -n $storage_id_name -g $rg --query principalId -o tsv)
+akv_id=$(az keyvault show -n $akv_name -g $rg --query id -o tsv)
+echo "Granting key permissions to identity $storage_id_name..."
+az role assignment create --assignee-object-id $storage_id_principal --role "Key Vault Crypto Service Encryption User" --scope $akv_id --assignee-principal-type ServicePrincipal -o none
+echo "Configuring customer-managed SSE on storage account $storage_account_name..."
+akv_uri=$(az keyvault show -n $akv_name -g $rg --query properties.vaultUri -o tsv)
+az storage account update -n $storage_account_name -g $rg -o none --only-show-errors \
+    --encryption-key-vault $akv_uri --encryption-key-name testkey --encryption-key-source Microsoft.Keyvault \
+    --key-vault-user-identity-id $storage_id_id --identity-type UserAssigned --user-identity-id $storage_id_id
+# Message: The operation failed because of authentication issue on the keyvault. For more information, see - https://aka.ms/storagekeyvaultaccesspolicy
+
+#################
+#  Diagnostics  #
+#################
+
+az network perimeter list -g $rg -o table
+az network perimeter profile list --perimeter-name $nsp_name -g $rg -o table
+az network perimeter onboarded-resources list -l $location -o table
+az network perimeter profile access-rule list --profile-name profile00 --perimeter-name $nsp_name -g $rg -o table
+az network perimeter association list --perimeter-name $nsp_name -g $rg -o table
+az network perimeter association list --perimeter-name $nsp_name -g $rg --query '[].{Name:name, AccessMode:properties.accessMode, Resource:properties.privateLinkResource.id, Profile:properties.profile.id}' -o table
+
