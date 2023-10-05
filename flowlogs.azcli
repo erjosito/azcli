@@ -821,15 +821,15 @@ query="NTANetAnalytics
 | summarize BytesSrc2Dst=sum(BytesSrcToDest), BytesDst2Src=sum(BytesDestToSrc) by MacAddress, SrcIp, SourceSystem, L4Protocol, DestIp, DestPort, ConnectionType, DestApplicationGateway, DestLocalNetworkGateway"
 az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
 
-# AzFW: Frontend and backend (healthchecks included too :( )
+# AzFW: Frontend and backend
 my_ip=$(curl -s4 ifconfig.me)    # Other values: $appvm_private_ip, $branch_bgp_ip, $(curl -s4 ifconfig.me)
 query="NTANetAnalytics
 | where TimeGenerated > ago(1h)
 | where SubType == \"FlowLog\"
-| where (SrcIp == \"${my_ip}\" and DestIp == \"${azfw_ip}\") or ipv4_is_in_range(SrcIp, \"${azfw_subnet_prefix}\")
+| where (SrcIp == \"${my_ip}\" and DestIp == \"${azfw_ip}\") or (SrcIp == \"${azfw_ip}\" and DestIp == \"${my_ip}\") or ipv4_is_in_range(SrcIp, \"${azfw_subnet_prefix}\") or ipv4_is_in_range(DestIp, \"${azfw_subnet_prefix}\")
 | where DestPort == 8080
 | where FlowStatus == \"Allowed\"
-| summarize BytesSrc2Dst=sum(BytesSrcToDest), BytesDst2Src=sum(BytesDestToSrc) by MacAddress, SrcIp, SourceSystem, L4Protocol, DestIp, DestPort, ConnectionType, DestApplicationGateway, DestLocalNetworkGateway"
+| project TimeGenerated, MacAddress, SrcIp, SourceSystem, L4Protocol, DestIp, DestPort, ConnectionType, DestApplicationGateway, DestLocalNetworkGateway"
 az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
 
 # AzFW Fat Flow logs
@@ -895,6 +895,12 @@ function stop_lab() {
     stop_vms
     stop_firewall
     stop_adx
+    if [[ "$create_appgw" == "yes" ]]; then
+        az network application-gateway start -n $appgw_name -g $rg --no-wait -o none
+    fi
+    if [[ "$create_vpn" == "yes" ]]; then
+        # Delete VPN GW?
+    fi
 }
 function stop_vms() {
     vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
@@ -917,6 +923,12 @@ function start_lab() {
     fi
     if [[ "$create_adx" == "yes" ]]; then
         start_adx
+    fi
+    if [[ "$create_appgw" == "yes" ]]; then
+        az network application-gateway start -n $appgw_name -g $rg --no-wait -o none
+    fi
+    if [[ "$create_vpn" == "yes" ]]; then
+        # Create VPN from scratch?
     fi
 }
 
