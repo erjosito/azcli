@@ -1,14 +1,27 @@
+#######################################################
+# Deploy AppGW with VNet-integrated ACIs or VMs
+#     as backend.
+#
+#######################################################
+
+# Control
+appgw_use_nsg=no
+sku=Standard_v2
+aci_image=erjosito/yadaapi:1.0
+# aci_image=gcr.io/kuar-demo/kuard-amd64:1
+backend_count=2
+backend_type=aci  # aci or vm
+
 # Variables
 rg=appgw
-location=eastus
+location=eastus2
 appgw_pipname=appgwpip
-dnsname=kuardgw
+dnsname=myapp
 dnszone=cloudtrooper.net
 dnsrg=dns
 appgw_name=appgw
-sku=Standard_v2
 cookie=Disabled
-backenddnsname=kuard
+backenddnsname=myapp
 backendfqdn="$backenddnsname"."$dnszone"
 vnet_name=appgw
 vnet_prefix=10.0.0.0/16
@@ -16,6 +29,7 @@ appgw_subnet_name=AppGateway
 appgw_subnet_prefix=10.0.0.0/24
 aci_subnet_name=aci
 aci_subnet_prefix=10.0.1.0/24
+aci_name=backendaci
 vm_subnet_name=vm
 vm_subnet_prefix=10.0.2.0/24
 vm_name=testvmlinux
@@ -26,7 +40,6 @@ vm_cloudinit_url=https://raw.githubusercontent.com/erjosito/azcli/master/cloudin
 vm_rt_name=vm
 vm_nsg_name=vm-nsg
 appgw_nsg_name=appgw
-appgw_use_nsg=no
 log_storage_account=appgwlog$RANDOM
 
 ####################
@@ -97,10 +110,9 @@ function wait_until_finished {
 ##########
 
 # Create RG
-az group create -n $rg -l $location
-
-# Create vnet
-az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix --subnet-name $appgw_subnet_name --subnet-prefix $appgw_subnet_prefix
+echo "Creating RG and VNet..."
+az group create -n $rg -l $location -o none --only-show-errors
+az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix --subnet-name $appgw_subnet_name --subnet-prefix $appgw_subnet_prefix -o none --only-show-errors
 
 # Create Log Analytics Workspace
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
@@ -108,7 +120,7 @@ if [[ -z "$logws_name" ]]
 then
     echo "Creating new Log Analytics workspace"
     logws_name=log$RANDOM
-    az monitor log-analytics workspace create -n $logws_name -g $rg
+    az monitor log-analytics workspace create -n $logws_name -g $rg -o none --only-show-errors
 else
     echo "Log Analytics workspace $logws_name found"
 fi
@@ -118,77 +130,85 @@ logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg
 # Optionally, create NSG and attach it to the subnet
 if [[ "$appgw_use_nsg" == "yes" ]]
 then
-    az network nsg create -n $appgw_nsg_name -g $rg
+    echo "Creating NSG for App Gateway..."
+    az network nsg create -n $appgw_nsg_name -g $rg -o none --only-show-errors
     # Inbound
     az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_GWM_In' -g $rg \
         --description 'Required for Microsoft to manage the service' \
         --priority 100 --access Allow --direction Inbound --protocol '*' \
-        --destination-port-ranges 65200-65535 --source-address-prefixes 'GatewayManager'
+        --destination-port-ranges 65200-65535 --source-address-prefixes 'GatewayManager' -o none --only-show-errors
     az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_ALB_In' -g $rg \
         --description 'Required for ALB healthchecks to work' \
         --priority 110 --access Allow  --direction Inbound --protocol '*' \
-        --source-address-prefixes 'AzureLoadBalancer' --destination-port-ranges '*'
+        --source-address-prefixes 'AzureLoadBalancer' --destination-port-ranges '*' -o none --only-show-errors
     az network nsg rule create --nsg-name $appgw_nsg_name -n 'Deny_Internet_in' -g $rg \
         --description 'Default deny' \
         --priority 1000 --access Deny  --direction Inbound --protocol '*' \
-        --source-address-prefixes 'Internet' --destination-port-ranges '*'
+        --source-address-prefixes 'Internet' --destination-port-ranges '*' -o none --only-show-errors
     # Outbound
     # az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_GWM_Out' -g $rg \
     #     --priority 100 --access Allow  --direction Outbound --protocol '*' \
-    #     --destination-address-prefixes 'GatewayManager' --destination-port-ranges '*'
+    #     --destination-address-prefixes 'GatewayManager' --destination-port-ranges '*' -o none --only-show-errors
     # az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_AzMonitor_Out' -g $rg \
     #     --description 'Required for sending metrics/logs to AzMonitor' \
     #     --priority 110 --access Allow  --direction Outbound --protocol '*' \
-    #     --destination-address-prefixes 'AzureMonitor' --destination-port-ranges '*'
+    #     --destination-address-prefixes 'AzureMonitor' --destination-port-ranges '*' -o none --only-show-errors
     # az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_AKV_Out' -g $rg \
     #     --description 'Required for accessing AKV to get certificates' \
     #     --priority 120 --access Allow  --direction Outbound --protocol '*' \
-    #     --destination-address-prefixes 'AzureKeyVault' --destination-port-ranges '*'
+    #     --destination-address-prefixes 'AzureKeyVault' --destination-port-ranges '*' -o none --only-show-errors
     # az network nsg rule create --nsg-name $appgw_nsg_name -n 'Allow_AAD_Out' -g $rg \
     #     --description 'Required for authenticating to AKV' \
     #     --priority 130 --access Allow  --direction Outbound --protocol '*' \
-    #     --destination-address-prefixes 'AzureActiveDirectory' --destination-port-ranges '*'
+    #     --destination-address-prefixes 'AzureActiveDirectory' --destination-port-ranges '*' -o none --only-show-errors
     # az network nsg rule create --nsg-name $appgw_nsg_name -n 'Deny_Internet_Out' -g $rg \
     #     --description 'Default deny' \
     #     --priority 1000 --access Deny  --direction Outbound --protocol '*' \
-    #     --destination-address-prefixes 'Internet' --destination-port-ranges '*'
+    #     --destination-address-prefixes 'Internet' --destination-port-ranges '*' -o none --only-show-errors
     # Configure NSG flow logging 
+    echo "Configuring NSG flow logging for NSG..."
     az storage account create -n $log_storage_account -g $rg --sku Standard_LRS --kind StorageV2
     az network watcher flow-log create -l $location -n flowlog-$location -g $rg \
         --nsg $appgw_nsg_name --storage-account $log_storage_account --log-version 2 --retention 7 \
-        --workspace $logws_id --interval 10 --traffic-analytics true
+        --workspace $logws_id --interval 10 --traffic-analytics true -o none --only-show-errors
     flowlog_id=$(az network nsg show -n $appgw_nsg_name -g $rg --query 'flowLogs[0].id' -o tsv)
     az resource show --id $flowlog_id --query properties
     # Attach NSG to subnet
-    az network vnet subnet update --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --nsg $appgw_nsg_name
+    az network vnet subnet update --vnet-name $vnet_name --name $appgw_subnet_name -g $rg --nsg $appgw_nsg_name -o none --only-show-errors
 fi
 
 ##############
 # Create ACI #
 ##############
 
-# Create ACI instance in the vnet
-echo "Creating ACI..."
-az network vnet subnet create -g $rg --vnet-name $vnet_name -n $aci_subnet_name --address-prefix $aci_subnet_prefix
-vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
-aci_subnet_id=$(az network vnet subnet show -n $aci_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-az container create -n kuard -g $rg --image gcr.io/kuar-demo/kuard-amd64:1 --ip-address private --ports 8080 --vnet $vnet_id --subnet $aci_subnet_id
-aci_ip=$(az container show -n kuard -g $rg --query 'ipAddress.ip' -o tsv)
-echo "ACI created with IP $aci_ip"
+# Create ACI instances in the vnet with a loop
+if [[ $backend_type == "aci" ]]; then
+    echo "Creating subnet for ACIs..."
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $aci_subnet_name --address-prefix $aci_subnet_prefix -o none --only-show-errors
+    vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+    aci_subnet_id=$(az network vnet subnet show -n $aci_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+    for i in $(seq 1 $backend_count)
+    do
+        echo "Creating ACI $i..."
+        az container create -n ${aci_name}-$i -g $rg --image $aci_image --ip-address private --ports 8080 --vnet $vnet_id --subnet $aci_subnet_id -o none --only-show-errors
+        aci_ip=$(az container show -n ${aci_name}-$i -g $rg --query 'ipAddress.ip' -o tsv)
+        echo "ACI $i created with IP $aci_ip"
+    done
+fi
 
 ###############
 #  Create VM  #
 ###############
 
 # Deploy a Linux VM with a troubleshooting web page
-az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location
-az network nsg create -n $vm_nsg_name -g $rg
-az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
-az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp
-az network nsg rule create -n web80 --nsg-name $vm_nsg_name -g $rg --priority 515 --destination-port-ranges 80 --access Allow --protocol Tcp
-az network nsg rule create -n https --nsg-name $vm_nsg_name -g $rg --priority 520 --destination-port-ranges 443 --access Allow --protocol Tcp
-#wget $vm_cloudinit_url -O $vm_cloudinit_filename
-cat <<EOF > $vm_cloudinit_filename
+if [[ $backend_type == "vm" ]]; then
+    az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location -o none --only-show-errors
+    az network nsg create -n $vm_nsg_name -g $rg -o none --only-show-errors
+    az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp -o none --only-show-errors
+    az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 8080 --access Allow --protocol Tcp -o none --only-show-errors
+    az network nsg rule create -n web80 --nsg-name $vm_nsg_name -g $rg --priority 515 --destination-port-ranges 80 --access Allow --protocol Tcp -o none --only-show-errors
+    az network nsg rule create -n https --nsg-name $vm_nsg_name -g $rg --priority 520 --destination-port-ranges 443 --access Allow --protocol Tcp -o none --only-show-errors
+    cat <<EOF > $vm_cloudinit_filename
 #cloud-config
 runcmd:
   - apt update && apt install -y python3-pip
@@ -196,29 +216,29 @@ runcmd:
   - wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
   - python3 /root/myip.py &
 EOF
-az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
-   --vnet-name $vnet_name --subnet $vm_subnet_name --subnet-address-prefix $vm_subnet_prefix \
-   --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
-   --custom-data $vm_cloudinit_filename
-vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv) && echo $vm_private_ip
+    az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
+      --vnet-name $vnet_name --subnet $vm_subnet_name --subnet-address-prefix $vm_subnet_prefix \
+      --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
+      --custom-data $vm_cloudinit_filename -o none --only-show-errors
+    vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv) && echo $vm_private_ip
 
-# Verify Linux VM deployed correctly and SSH is working fine
-vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
-curl ${vm_pip_address}:8080/api/healthcheck
-curl ${vm_pip_address}:8080/api/ip
+    # Verify Linux VM deployed correctly and SSH is working fine
+    vm_pip_address=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv) && echo $vm_pip_address
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "ip a"
+    curl ${vm_pip_address}:8080/api/healthcheck
+    curl ${vm_pip_address}:8080/api/ip
 
-# If required (for example because you restarted the VM), restart the python app
-# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo python3 /root/myip.py &"
+    # If required (for example because you restarted the VM), restart the python app
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo python3 /root/myip.py &"
 
-# Create DNS record
-vm_fqdn=$(create_dns "vm" "$vm_pip_address") && echo $vm_fqdn
-curl "http://${vm_fqdn}:8080/api/healthcheck"
+    # Create DNS record
+    vm_fqdn=$(create_dns "vm" "$vm_pip_address") && echo $vm_fqdn
+    curl "http://${vm_fqdn}:8080/api/healthcheck"
 
-# Install nginx for SSL termination
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo apt install -y nginx"
-nginx_config_file=/tmp/nginx.conf
-cat <<EOF > $nginx_config_file
+    # Install nginx for SSL termination
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo apt install -y nginx"
+    nginx_config_file=/tmp/nginx.conf
+    cat <<EOF > $nginx_config_file
 worker_processes auto;
 events {
   worker_connections 1024;
@@ -256,50 +276,65 @@ http {
     }
 }
 EOF
-scp "$nginx_config_file" "${vm_pip_address}:~/"
+    scp "$nginx_config_file" "${vm_pip_address}:~/"
 
-# Put public certs in NGINX. Note: you need to have some public certs in advance
-cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper_chain.pem"
-key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper.key"
-scp "$cert_file" "${vm_pip_address}:~/ssl.crt"
-scp "$key_file" "${vm_pip_address}:~/ssl.key"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo mv ./* /etc/nginx/"
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo systemctl restart nginx"
+    # Put public certs in NGINX. Note: you need to have some public certs in advance
+    cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper_chain.pem"
+    key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper.key"
+    scp "$cert_file" "${vm_pip_address}:~/ssl.crt"
+    scp "$key_file" "${vm_pip_address}:~/ssl.key"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo mv ./* /etc/nginx/"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo systemctl restart nginx"
 
-# Verify nginx is working fine
-ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "systemctl status nginx"
-curl "https://${vm_fqdn}/api/healthcheck"
-curl "http://${vm_fqdn}/api/healthcheck"
+    # Verify nginx is working fine
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "systemctl status nginx"
+    curl "https://${vm_fqdn}/api/healthcheck"
+    curl "http://${vm_fqdn}/api/healthcheck"
+fi
 
 #################
 # Create App GW #
 #################
 
 # Create PIP
+echo "Creating PIP for App GW..."
 allocation_method=Static
-az network public-ip create -g $rg -n $appgw_pipname --sku Standard --allocation-method $allocation_method
+az network public-ip create -g $rg -n $appgw_pipname --sku Standard --allocation-method $allocation_method -l $location -o none --only-show-errors
 #fqdn=$(az network public-ip show -g $rg -n $appgw_pipname --query dnsSettings.fqdn -o tsv)
 
+# Variable with backend IPs
+if [[ "$backend_type" == "vm" ]]; then
+    backend_ips=$vm_private_ip
+else
+    backend_ips=""
+    for i in $(seq 1 $backend_count)
+    do
+        aci_ip=$(az container show -n ${aci_name}-$i -g $rg --query 'ipAddress.ip' -o tsv)
+        backend_ips="$backend_ips $aci_ip"
+    done
+fi
+
 # Create GW with sample config for port 80
+echo "Creating App GW..."
 az network application-gateway create -g $rg -n $appgw_name --sku $sku \
     --min-capacity 1 --max-capacity 2 \
     --frontend-port 80 --routing-rule-type basic \
-    --http-settings-port 8080 --http-settings-protocol Http \
+    --http-settings-port 8080 --http-settings-protocol Http --priority 1001 \
     --public-ip-address $appgw_pipname --vnet-name $vnet_name --subnet $appgw_subnet_name \
-    --servers "$vm_private_ip" \
-    --no-wait
+    --servers ${(z)backend_ips} -o none --only-show-errors
 
 # If using a DNS entry, create A record pointing to the PIP
-appgw_pip=$(az network public-ip show -g $rg -n $appgw_pipname --query ipAddress -o tsv) && echo $appgw_pip
-appgw_fqdn=$(create_dns "appgw" "$appgw_pip") && echo $appgw_fqdn
+appgw_pip=$(az network public-ip show -g $rg -n $appgw_pipname --query ipAddress -o tsv) && echo "App Gw's public IP is $appgw_pip"
+appgw_fqdn=$(create_dns "appgw" "$appgw_pip") && echo "You can access App GW's public IP with FQDN $appgw_fqdn"
 
-# Wait for GW to be created
-appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
-wait_until_finished $appgw_id
+# Wait for GW to be created (only needed if using --no-wait when created the appgw)
+# appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
+# wait_until_finished $appgw_id
 
 # Add diagnostic setting
 appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
-az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace $logws_id \
+echo "Adding diagnostic settings to App GW..."
+az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace $logws_id -o none --only-show-errors \
     --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
     --logs '[{"category": "ApplicationGatewayAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
         {"category": "ApplicationGatewayPerformanceLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
@@ -307,11 +342,11 @@ az monitor diagnostic-settings create -n mydiag --resource $appgw_id --workspace
 
 
 # Add healthcheck probe with custom path to existing settings
+echo "Adding custom healthcheck probe to App GW..."
 az network application-gateway probe create -g "$rg" --gateway-name "$appgw_name" \
---name testvmprobe8080 --protocol Http --host-name-from-http-settings --match-status-codes 200-399 --port 8080 --path /api/healthcheck
-default_settings_name=$(az network application-gateway http-settings list -g "$rg" --gateway-name "$appgw_name" --query '[0].name' -o tsv) && echo $default_settings_name
-az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" -n $default_settings_name \
---host-name ${vm_fqdn} --probe testvmprobe8080 
+--name probe8080 --protocol Http --host-name-from-http-settings --match-status-codes 200-399 --port 8080 --path /api/healthcheck -o none --only-show-errors
+default_settings_name=$(az network application-gateway http-settings list -g "$rg" --gateway-name "$appgw_name" --query '[0].name' -o tsv)
+az network application-gateway http-settings update -g "$rg" --gateway-name "$appgw_name" -n $default_settings_name --probe probe8080 --host-name-from-backend-pool -o none --only-show-errors
 
 # Test app
 curl "http://${appgw_fqdn}/api/healthcheck"
@@ -320,26 +355,26 @@ curl "http://${appgw_fqdn}/api/healthcheck"
 # ACI app #
 ###########
 
-# Create backend
-az network application-gateway address-pool create -n kuardpool -g $rg --gateway-name $appgw_name --servers $aci_ip
+# # Create backend
+# az network application-gateway address-pool create -n kuardpool -g $rg --gateway-name $appgw_name --servers $aci_ip
 
-# Create probe and HTTP settings
-az network application-gateway probe create -g $rg --gateway-name $appgw_name \
-  --name kuardprobe --protocol Http --host-name-from-http-settings \
-  --match-status-codes 200-399 --port 8080
-az network application-gateway http-settings create -g $rg --gateway-name $appgw_name \
-  --name kuardsettings --protocol http --port 8080 --host-name-from-backend-pool \
-  --probe kuardprobe
+# # Create probe and HTTP settings
+# az network application-gateway probe create -g $rg --gateway-name $appgw_name \
+#   --name kuardprobe --protocol Http --host-name-from-http-settings \
+#   --match-status-codes 200-399 --port 8080
+# az network application-gateway http-settings create -g $rg --gateway-name $appgw_name \
+#   --name kuardsettings --protocol http --port 8080 --host-name-from-backend-pool \
+#   --probe kuardprobe
 
-# Create HTTP listener
-frontend_name=$(az network application-gateway frontend-ip list -g $rg --gateway-name $appgw_name --query '[0].name' -o tsv)
-az network application-gateway http-listener create -n kuardlistener -g $rg --gateway-name $appgw_name \
-  --frontend-port 80 --frontend-ip $frontend_name --host-name $dnsname.$dnszone
+# # Create HTTP listener
+# frontend_name=$(az network application-gateway frontend-ip list -g $rg --gateway-name $appgw_name --query '[0].name' -o tsv)
+# az network application-gateway http-listener create -n kuardlistener -g $rg --gateway-name $appgw_name \
+#   --frontend-port 80 --frontend-ip $frontend_name --host-name $dnsname.$dnszone
 
-# Create rule
-az network application-gateway rule create -g $rg --gateway-name $appgw_name \
-  -n kuardrule --http-listener kuardlistener --rule-type Basic \
-  --address-pool kuardpool --http-settings kuardsettings
+# # Create rule
+# az network application-gateway rule create -g $rg --gateway-name $appgw_name \
+#   -n kuardrule --http-listener kuardlistener --rule-type Basic \
+#   --address-pool kuardpool --http-settings kuardsettings
 
 #######
 # SSL #

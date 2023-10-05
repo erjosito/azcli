@@ -1,0 +1,189 @@
+#######################################
+# Code to test integration between
+#    AKV and IaaS VMs
+#
+# Jose Moreno, September 2023
+#######################################
+
+# Variables
+rg=akvvm
+location=eastus2
+akv_name=akv-vm
+cert_name=nginxcert
+vnet_name=akv-vnet
+vnet_prefix=10.13.76.0/24
+subnet_name=vm
+subnet_prefix=10.13.76.0/26
+vm_name=vm-nginx
+vm_image=Ubuntu2204 # UbuntuLTS, Ubuntu2204
+vm_size=Standard_B1s
+vm_id_name=${akv_name}-id
+cloudinit_file=/tmp/nginx-cloud-init.txt
+akv_extension_config=/tmp/akv-extension-config.json
+nsg_name=${vm_name}-nsg
+
+# Create resource group and VNet
+echo "Creating RG and VNet..."
+az group create -n $rg -l $location -o none
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -o none
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_name --address-prefix $subnet_prefix -o none
+
+# Create AKV and certificate
+echo "Creating AKV..."
+az keyvault create -g $rg -n $akv_name -l $location -o none
+az keyvault certificate create --vault-name $akv_name --name $cert_name --policy "$(az keyvault certificate get-default-policy)" -o none
+
+# Create identity for VM and grant read permissions to AKV secrets
+echo "Creating VM identity and granting permissions to AKV..."
+az identity create -g $rg -n $vm_id_name -o none
+vm_id_id=$(az identity show -g $rg -n $vm_id_name --query id -o tsv)
+vm_id_principalid=$(az identity show -g $rg -n $vm_id_name --query principalId -o tsv)
+az keyvault set-policy -g $rg -n $akv_name --object-id $vm_id_principalid --secret-permissions get list --certificate-permissions get list -o none
+
+# Create VM with nginx installed and configured via cloud init
+echo "Creating VM $vm_name..."
+cat <<EOF > $cloudinit_file
+#cloud-config
+package_upgrade: true
+packages:
+  - nginx
+write_files:
+  - owner: www-data:www-data
+    path: /etc/nginx/sites-available/secure-server
+    content: |
+      server {
+        listen 443 ssl http2;
+        ssl_certificate /etc/nginx/ssl/$cert_name.crt;
+        ssl_certificate_key /etc/nginx/ssl/$cert_name.key;
+      }
+      server {
+            listen 80;
+      }
+  - owner: root:root
+    path: /root/convert_akv_cert.sh
+    permissions: "0755"
+    content: |
+        #!/bin/bash
+        # Ideally this should be run as crontab entry, with the same frequency as the polling of the AKV extension
+        # Wait until the AKV extension downloads the cert (a max counter to make sure this doesnt run forever would be nice)
+        echo "Waiting for cert to be downloaded from AKV..."
+        while [ ! -f /etc/nginx/ssl/${akv_name}.${cert_name} ] ; do
+            sleep 5
+        done
+        # Split the file in two (cert and key)
+        echo "Creating .key file with private key..."
+        openssl rsa -outform pem -in /etc/nginx/ssl/${akv_name}.${cert_name} -out /etc/nginx/ssl/${cert_name}.key
+        echo "Creating .crt file with certificate..."
+        openssl x509 -outform pem -in /etc/nginx/ssl/${akv_name}.${cert_name} -out /etc/nginx/ssl/${cert_name}.crt
+runcmd:
+  - mkdir /etc/nginx/ssl
+  - ln -s /etc/nginx/sites-available/secure-server /etc/nginx/sites-enabled/
+  - rm /etc/nginx/sites-enabled/default
+  - bash /root/convert_akv_cert.sh
+  - (crontab -l 2>/dev/null; echo "0 * * * * /root/convert_akv_cert.sh") | crontab -
+  - service nginx restart
+EOF
+az vm create -g $rg -n $vm_name --image $vm_image --generate-ssh-keys --size $vm_size \
+    --assign-identity $vm_id_id --custom-data $cloudinit_file \
+    --vnet-name $vnet_name --subnet $subnet_name --nsg $nsg_name -o none
+
+# Add inbound rule to NSG to allow HTTPS traffic
+echo "Adding inbound rule to NSG $nsg_name..."
+az network nsg rule create -g $rg --nsg-name $nsg_name -n allow-https --priority 110 --destination-port-ranges 443 --access Allow --protocol Tcp -o none
+
+# AKV extension for VM
+extension_id=$(az vm extension show --vm-name $vm_name -g $rg -n "KeyVaultForLinux" --query id -o tsv 2>/dev/null)
+if [ -n "$extension_id" ]; then
+    echo "Deleting AKV extension from "VM $vm_name"..."
+    az vm extension delete --ids $extension_id -o none
+fi
+# az vm extension delete --ids $(az resource list --query "[?contains(name,'KeyVaultForLinux')].id" -o tsv) -o none
+echo "Deploying AKV extension for VM $vm_name to retrieve cert $cert_name from AKV $akv_name..."
+cert_id=$(az keyvault certificate show --vault-name $akv_name --name $cert_name --query sid -o tsv)
+akv_settings="{\"secretsManagementSettings\": { \"pollingIntervalInS\": \"3600\", \"certificateStoreLocation\": \"/etc/nginx/ssl\", \"observedCertificates\": [\"$cert_id\"] }}"
+az vm extension set -g $rg --vm-name $vm_name -n "KeyVaultForLinux" --publisher Microsoft.Azure.KeyVault --version 2.0 --enable-auto-upgrade true --settings $akv_settings -o none
+
+###############
+# Diagnostics #
+###############
+
+# Get VM's public IP
+nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+nic_name=$(echo $nic_id | cut -d'/' -f9)
+ipconfig_name=$(az network nic show --id $nic_id --query 'ipConfigurations[0].id' -o tsv | cut -d'/' -f11)
+pip_id=$(az network nic ip-config show -n $ipconfig_name --nic-name $nic_name -g $rg --query publicIPAddress.id -o tsv)
+pip=$(az network public-ip show --ids $pip_id --query ipAddress -o tsv)
+
+# Verify that the certs are retrieved successfully by the AKV extension into the right directory
+ssh -n -o StrictHostKeyChecking=no $pip "ls -al /etc/nginx/ssl"
+# There is one file and a symbolic link (akv_name.cert_name):
+# root@vm-nginx:/etc/nginx/ssl# ls -al
+# total 16
+# drwx------ 2 root root 4096 Sep 15 14:20 .
+# drwxr-xr-x 9 root root 4096 Sep 15 13:41 ..
+# lrwxrwxrwx 1 root root   90 Sep 15 14:20 akv-vm.nginxcert -> /etc/nginx/ssl/akv-vm.nginxcert.b876d86056d1410f869bc126e9062ca4.1694784287.1726407287.PEM
+# -rw------- 1 root root 2896 Sep 15 14:20 akv-vm.nginxcert.b876d86056d1410f869bc126e9062ca4.1694784287.1726407287.PEM
+# The file contains both the cert and the key, but nginx expects them in separate files!
+# root@vm-nginx:/etc/nginx/ssl# cat akv-vm.nginxcert | grep BEGIN
+# -----BEGIN PRIVATE KEY-----
+# -----BEGIN CERTIFICATE-----
+
+
+# Get logs for AKV extension
+folder_name=/var/log/azure/Microsoft.Azure.KeyVault.KeyVaultForLinux
+ssh -n -o StrictHostKeyChecking=no $pip "ls -al $folder_name"
+ssh -n -o StrictHostKeyChecking=no $pip "cat $folder_name/CommandExecution.log"
+log_file_name=$(ssh -n -o StrictHostKeyChecking=no $pip "ls -Art $folder_name/akvvm* | tail -1")
+ssh -n -o StrictHostKeyChecking=no $pip "cat $log_file_name"
+# The log folder contains these files ('akvvm' is probably AKV's name without non-alphanumeric characters):
+# jose@vm-nginx:/var/log/azure/Microsoft.Azure.KeyVault.KeyVaultForLinux$ ls -al
+# total 68
+# drwxr-xr-x 3 root root  4096 Sep 15 14:20 .
+# drwxr-xr-x 3 root root  4096 Sep 15 13:47 ..
+# -rw-r--r-- 1 root root 19468 Sep 15 14:20 CommandExecution.log
+# -rw-r--r-- 1 root root   394 Sep 15 13:47 akvvm_service_2023-09-15_13-47-38.0.log
+# -rw-r--r-- 1 root root   394 Sep 15 13:47 akvvm_service_2023-09-15_13-47-38.1.log
+# -rw-r--r-- 1 root root   394 Sep 15 13:47 akvvm_service_2023-09-15_13-47-38.2.log
+# -rw-r--r-- 1 root root   394 Sep 15 13:47 akvvm_service_2023-09-15_13-47-38.3.log
+# -rw-r--r-- 1 root root   394 Sep 15 13:47 akvvm_service_2023-09-15_13-47-39.4.log
+# -rw-r--r-- 1 root root  1584 Sep 15 14:13 akvvm_service_2023-09-15_14-10-46.5.log
+# -rw-r--r-- 1 root root  2681 Sep 15 14:19 akvvm_service_2023-09-15_14-16-31.6.log
+# -rw-r--r-- 1 root root  3103 Sep 15 14:20 akvvm_service_2023-09-15_14-20-35.7.log
+# drwx------ 2 root root  4096 Sep 15 13:47 events
+# Sample successful download log:
+# jose@vm-nginx:/var/log/azure/Microsoft.Azure.KeyVault.KeyVaultForLinux$ cat akvvm_service_2023-09-15_14-20-35.7.log
+# 2023-09-15 14:20:35: <debug> [Global]   logFolder: /var/log/azure/Microsoft.Azure.KeyVault.KeyVaultForLinux
+# 2023-09-15 14:20:35: <debug> [Global]   Starting akvvm_service
+# 2023-09-15 14:20:35: <info> [VMExtension]       Starting extension
+# 2023-09-15 14:20:35: <debug> [CertificateManagementConfiguration]       Found v1.x configuration                                                                                                                                            2023-09-15 14:20:35: <info> [CertificateManagementConfiguration]        Defaulting to MSI authentication.                                                                                                                                   2023-09-15 14:20:35: <info> [KVUnixService]     Checking Linux distribution and version
+# 2023-09-15 14:20:35: <info> [KVUnixService]     OS info: ubuntu 22.04                                                                                                                                                                       2023-09-15 14:20:35: <info> [KVUnixService]     Service Running...                                                                                                                                                                          2023-09-15 14:20:35: <info> [CertificateManager]        Entering worker loop..
+# 2023-09-15 14:20:35: <debug> [CertificateManager]       MIN_POLLING_INTERVAL_SEC: 1, RandomMS: 0              
+# 2023-09-15 14:20:35: <info> [CertificateManager]        Starting refreshing observed certificates...
+# 2023-09-15 14:20:35: <info> [CertificateManager]        Beginning refresh for: https://akv-vm.vault.azure.net/secrets/nginxcert/b876d86056d1410f869bc126e9062ca4
+# 2023-09-15 14:20:35: <info> [KeyVaultClient]    Getting new auth challenge
+# 2023-09-15 14:20:35: <debug> [UnixKeyVaultHttpClient]   Using CAfile for TLS: /etc/ssl/certs/ca-certificates.crt
+# 2023-09-15 14:20:35: <debug> [UnixKeyVaultHttpClient]   Using CApath for TLS: /etc/ssl/certs
+# 2023-09-15 14:20:35: <debug> [AuthClient]       AcquireTokenCallback invoked
+# 2023-09-15 14:20:35: <debug> [AuthClient]       acquiring token
+# 2023-09-15 14:20:35: <debug> [MSIAuthClient]    acquiring token via MSI
+# 2023-09-15 14:20:35: <debug> [MSIHttpClient]    MSI URL: http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&authority=https://login.microsoftonline.com/ecd38d6d-544b-494c-9b29-ff3d6a31c040&resource=https://vault.azure.net
+# 2023-09-15 14:20:35: <debug> [UnixKeyVaultHttpClient]   Using CAfile for TLS: /etc/ssl/certs/ca-certificates.crt
+# 2023-09-15 14:20:35: <debug> [UnixKeyVaultHttpClient]   Using CApath for TLS: /etc/ssl/certs
+# 2023-09-15 14:20:35: <info> [UnixCertificateStore]      attempting to open store '/etc/nginx/ssl'
+# 2023-09-15 14:20:35: <info> [CertificateManager]        Installing latest version of 'https://akv-vm.vault.azure.net/secrets/nginxcert/b876d86056d1410f869bc126e9062ca4'.
+# 2023-09-15 14:20:35: <info> [UnixCertificateStore]      certificate file name: '/etc/nginx/ssl/akv-vm.nginxcert.b876d86056d1410f869bc126e9062ca4.1694784287.1726407287.PEM'
+# 2023-09-15 14:20:35: <info> [UnixCertificateStore]      certificate link name: '/etc/nginx/ssl/akv-vm.nginxcert'
+# 2023-09-15 14:20:35: <info> [UnixCertificateStore]      No intermediate/root certificate exist or it's a self-signed certificate.
+# 2023-09-15 14:20:35: <debug> [CertificateManager]       Added ACL to certificate: https://akv-vm.vault.azure.net/secrets/nginxcert/b876d86056d1410f869bc126e9062ca4
+# 2023-09-15 14:20:35: <info> [CertificateManager]        Completed refreshing observed certificates.
+# 2023-09-15 14:20:35: <info> [CertificateManager]        Successfully started Key Vault extension service. 2023-09-15T14:20:35Z
+# 2023-09-15 14:20:35: <info> [UnixCertificateManager]    Checking state of termination event with a timeout of 3600000
+
+# Verify that nginx is up and running
+ssh -n -o StrictHostKeyChecking=no $pip "systemctl status nginx"
+
+# Other
+ssh -n -o StrictHostKeyChecking=no $pip "crontab -l"
+
+# Test app
+curl -k "https://$pip"

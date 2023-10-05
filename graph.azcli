@@ -67,10 +67,12 @@ query="Resources | where type=~'microsoft.containerservice/managedclusters' | pr
 query="resources | where type contains 'microsoft.network' | distinct type"
 # Misc
 query="where type=='microsoft.network/routetables' | where properties.disableBgpRoutePropagation==true | distinct name,resourceGroup"
+query="resources | where type=='microsoft.network/routetables' | mvexpand properties.routes | summarize routeCount = count() by id | extend compliant = (routeCount < 360) | distinct id,compliant"
 query="where type=='microsoft.network/virtualnetworkgateways' | where tolower(properties.gatewayType) == 'vpn' | project  name,resourceGroup,ipcount=array_length(properties.ipConfigurations) | where ipcount==1"
 query="where type=='microsoft.network/networksecuritygroups'"
 query="resources | where type == 'microsoft.network/virtualnetworks' | extend addressSpace = todynamic(properties.addressSpace) | extend addressPrefix = todynamic(properties.addressSpace.addressPrefixes) | mvexpand addressSpace | mvexpand addressPrefix | project name, id, location, resourceGroup, subscriptionId, cidr = addressPrefix | extend compliant = (cidr matches regex @'^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')  | project id, compliant, cidr"
 query="resources | where type == 'microsoft.network/virtualnetworks' | mvexpand properties.virtualNetworkPeerings | project id, peeringName=properties_virtualNetworkPeerings.name, compliant = (properties_virtualNetworkPeerings.properties.allowVirtualNetworkAccess == True)"
+query="resources | where type == 'microsoft.network/virtualnetworks' | mvexpand properties.virtualNetworkPeerings | summarize peeringcount = count() by id | extend compliant = (peeringcount < 450) | distinct id,compliant"
 # - AZ-redundant VNGs
 query="resources | where type=='microsoft.network/virtualnetworkgateways' | where properties.gatewayType == 'Vpn' | extend compliant = (not (tolower(properties.sku.name) contains 'az')) | distinct id, compliant"
 # - Check "disable gateway propagation for RTs attached to GatewaySubnet"
