@@ -10,7 +10,10 @@ location=northcentralus
 nsp_name=nsp01
 suffix=$RANDOM
 storage_account_name="nsptest${suffix}"
+storage_id_name="nsptest${suffix}-id"
+storage2_account_name="nonsptest${suffix}"
 sql_server_name="nsptest${suffix}"
+sql_server_user=$(whoami)
 akv_name="nsptest${suffix}"
 vnet_name=vnet01
 vnet_prefix=10.13.76.0/24
@@ -20,6 +23,20 @@ vm_size=Standard_B1s
 vm_name=vm01
 vm_pip_name="${vm_name}-pip"
 vm_nsg_name="${vm_name}-nsg"
+ep_subnet_name=ep
+ep_subnet_prefix=10.13.76.32/27
+# Second VM to test access over service endpoints
+vm2_name=vm02
+vm2_pip_name="${vm2_name}-pip"
+vm2_nsg_name="${vm2_name}-nsg"
+vnet2_name=vnet02
+vnet2_prefix=10.13.77.0/24
+subnet2_name=vm2
+subnet2_prefix=10.13.77.16/28
+
+
+# Get default password to use in examples
+default_password=$(az keyvault secret show --vault-name "erjositoKeyvault" -n "defaultpassword" --query value -o tsv)
 
 # Make sure you have the NSP extension
 extension_name=nsp
@@ -68,7 +85,6 @@ az monitor diagnostic-settings create -n "diag$suffix" --resource $nsp_id --work
 echo "Creating storage account $storage_account_name..."
 az storage account create -n $storage_account_name -g $rg -l $location --sku Standard_LRS -o none --only-show-errors
 storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
-
 az storage container create -n "container01" --account-name $storage_account_name --account-key $storage_account_key  -o none --only-show-errors
 echo "This is a test file" > /tmp/test.txt
 az storage blob upload -f "/tmp/test.txt" -c "container01" -n "test.txt" --account-name $storage_account_name --account-key $storage_account_key -o none --only-show-errors
@@ -83,13 +99,20 @@ storage_account_id=$(az storage account show -n $storage_account_name -g $rg --q
 az network perimeter association create -n $storage_account_name --perimeter-name $nsp_name -g $rg -o none\
      --access-mode Learning --private-link-resource "{id:$storage_account_id}" --profile "{id:$profile_id}"
 
+# Create 2nd storage account outside of the NSP
+echo "Creating storage account $storage2_account_name..."
+az storage account create -n $storage2_account_name -g $rg -l $location --sku Standard_LRS -o none --only-show-errors
+storage2_account_key=$(az storage account keys list -n $storage2_account_name -g $rg --query '[0].value' -o tsv)
+
 # Create AKV
 echo "Creating AKV $akv_name..."
 az keyvault create -n "$akv_name" -g $rg -l $location -o none --only-show-errors
+user=$(az ad signed-in-user show --query userPrincipalName -o tsv)
+az keyvault set-policy -n $akv_name --upn $user --secret-permissions all --key-permissions all --certificate-permissions all -o none --only-show-errors
 echo "Adding test secret to AKV..."
 az keyvault secret set --vault-name $akv_name -n testsecret --value 'HelloWorld' -o none --only-show-errors
 echo "Adding test key to AKV..."
-az keyvault key set --vault-name $akv_name -n testkey --kty RSA -o none --only-show-errors
+az keyvault key create --vault-name $akv_name -n testkey --kty RSA --size 4096 -o none --only-show-errors
 echo "Adding AKV to NSP..."
 profile_name=profile00
 profile_id=$(az network perimeter profile show -n $profile_name --perimeter-name $nsp_name -g $rg --query id -o tsv)
@@ -99,32 +122,78 @@ az network perimeter association create -n $akv_name --perimeter-name $nsp_name 
 
 
 # Create Azure SQL Server and database
-az sql server create -n $sql_server_name -g $rg -l $location -o none --only-show-errors
+az sql server create -n $sql_server_name -g $rg -l $location -u $(whoami) -p $default_password -o none --only-show-errors
 az sql db create -n "db01" -s $sql_server_name -g $rg -o none --only-show-errors --no-wait
 
-# Create sample workload in VNet
-az vm create -n $vm_name -g $rg --image Ubuntu2204 --size $vm_size --admin-username $(whoami) --generate-ssh-keys \
+# Create sample workload in VNet1 for direct access / access over private link
+echo "Creating VM1..."
+az vm create -n $vm_name -g $rg --image Ubuntu2204 --size $vm_size --admin-username $(whoami) --generate-ssh-keys -l $location \
     --vnet-name $vnet_name  --vnet-address-prefix $vnet_prefix --subnet $subnet_name --subnet-address-prefix $subnet_prefix \
     --public-ip-address $vm_pip_name --public-ip-sku Standard --nsg $vm_nsg_name \
     -o none --only-show-errors --no-wait
 
-# Create rules (WIP)
+# Create sample workload in VNet2 for access over vnet service endpoint
+echo "Creating VM2..."
+az vm create -n $vm2_name -g $rg --image Ubuntu2204 --size $vm_size --admin-username $(whoami) --generate-ssh-keys -l $location \
+    --vnet-name $vnet2_name  --vnet-address-prefix $vnet2_prefix --subnet $subnet2_name --subnet-address-prefix $subnet2_prefix \
+    --public-ip-address $vm2_pip_name --public-ip-sku Standard --nsg $vm2_nsg_name \
+    -o none --only-show-errors
+az network vnet subnet update -n $subnet2_name --vnet-name $vnet2_name -g $rg --service-endpoints Microsoft.Storage -o none --only-show-errors
+
+# Create private endpoint for Azure Storage
+echo "Creating private endpoint for Azure Storage..."
+ep_name=blobendpoint
+az network vnet subnet create -n $ep_subnet_name --vnet-name $vnet_name -g $rg --address-prefix $ep_subnet_prefix -o none --only-show-errors
+storage_account_id=$(az storage account show -n $storage_account_name -g $rg --query id -o tsv)
+az network private-endpoint create -n $ep_name -g $rg --vnet-name $vnet_name --subnet $ep_subnet_name --private-connection-resource-id $storage_account_id --group-id blob --connection-name blob -o none --only-show-errors
+dns_zone_name=privatelink.blob.core.windows.net
+az network private-dns zone create -n $dns_zone_name -g $rg -o none --only-show-errors
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n $vnet_name --virtual-network $vnet_name --registration-enabled false -o none --only-show-errors
+# az network private-endpoint dns-zone-group delete --endpoint-name $ep_name -n deployedByPolicy -g $rg -o none --only-show-errors
+az network private-endpoint dns-zone-group create --endpoint-name $ep_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none --only-show-errors
+
+# Create private endpoint for Azure SQL
+echo "Creating private endpoint for Azure SQL..."
+ep_name=sqlendpoint
+sql_server_id=$(az sql server show -n $sql_server_name -g $rg --query id -o tsv)
+az network private-endpoint create -n $ep_name -g $rg --vnet-name $vnet_name --subnet $ep_subnet_name --private-connection-resource-id $sql_server_id --group-id sqlServer --connection-name sql -o none --only-show-errors
+dns_zone_name=privatelink.database.windows.net
+az network private-dns zone create -n $dns_zone_name -g $rg -o none --only-show-errors
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n $vnet_name --virtual-network $vnet_name --registration-enabled false -o none --only-show-errors
+# az network private-endpoint dns-zone-group delete --endpoint-name $ep_name -n deployedByPolicy -g $rg -o none --only-show-errors
+az network private-endpoint dns-zone-group create --endpoint-name $ep_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none --only-show-errors
+
+# Create NSP rules
 # - Inbound from IP addresses
-az network perimeter profile access-rule create -n rule01 --profile-name profile00 --perimeter-name $nsp_name -g $rg --address-prefixes "['10.11.0.0/16', '10.10.0.0/16']" -o none
+az network perimeter profile access-rule create -n rule01 --profile-name profile00 --perimeter-name $nsp_name -g $rg --address-prefixes "['$vnet_prefix']" -o none
 # - Inbound from other NSPs
 # az network perimeter profile access-rule create -n rule02 --profile-name profile00 --perimeter-name $nsp_name -g $rg --nsp "[{id:<NSP_ARM_ID>}]" -o none
 # - Inbound from subscriptions
 subscription_id=$(az account show --query id -o tsv)
 az network perimeter profile access-rule create -n rule04 --profile-name profile00 --perimeter-name $nsp_name -g $rg --subscriptions "[{id:${subscription_id}}]" -o none
+# az network perimeter profile access-rule create -n rule05 --profile-name profile00 --perimeter-name $nsp_name -g $rg --subscriptions [0].id="${subscription_id}" -o none
 # - Outbound to FQDNs
 az network perimeter profile access-rule create -n rule03 --profile-name profile00 --perimeter-name $nsp_name -g $rg --fqdn "['www.abc.com', 'www.google.com']" --direction "Outbound" -o none
-# az network perimeter profile access-rule create -n rule05 --profile-name profile00 --perimeter-name $nsp_name -g $rg --subscriptions [0].id="${subscription_id}" -o none
 # - Outbound to email addresses
 az network perimeter profile access-rule create --name rule06 --profile-name profile00 --perimeter-name $nsp_name --resource-group $rg --email-addresses "[\'abc@microsoft.com\', \'bcd@microsoft.com\']" --direction "Outbound"
 # - Outbound to phone numbers
 az network perimeter profile access-rule create --name rule07 --profile-name profile00 --perimeter-name $nsp_name --resource-group $rg --phone-numbers "[\'+919898989898\', \'+929898989898\']" --direction "Outbound" 
 
-# Test access to storage account from local machine
+# Test access to storage account from local machine and switch between Learning and Enforced
+echo "Switching NSP association to 'Learning'"
+az network perimeter association update -n $storage_account_name --perimeter-name $nsp_name -g $rg --access-mode Learning -o none
+sleep 15  # Takes some seconds to propagate
+if [[ -f "/tmp/test2.txt" ]]; then
+    rm /tmp/test2.txt
+fi
+echo "Trying to download file with Azure CLI..."
+az storage blob download -c "container01" -n "test.txt" -f "/tmp/test2.txt" --account-name $storage_account_name --account-key $storage_account_key -o none --only-show-errors
+cat /tmp/test2.txt
+echo "Trying to download file with curl and SAS..."
+curl $blob_url
+echo "Switching NSP association to 'Enforced'"
+az network perimeter association update -n $storage_account_name --perimeter-name $nsp_name -g $rg --access-mode Enforced -o none
+sleep 15  # Takes some seconds to propagate
 if [[ -f "/tmp/test2.txt" ]]; then
     rm /tmp/test2.txt
 fi
@@ -134,24 +203,64 @@ cat /tmp/test2.txt
 echo "Trying to download file with curl and SAS..."
 curl $blob_url
 
+# Reset SSH keys (if required)
+az vm user update -g $rg -u $(whoami) --ssh-key-value "$(< ~/.ssh/id_rsa.pub)" -o none -n $vm_name -o none
+az vm user update -g $rg -u $(whoami) --ssh-key-value "$(< ~/.ssh/id_rsa.pub)" -o none -n $vm2_name -o none
+
+# Test access to storage account from Azure VMs
+vm1_pip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+vm2_pip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+echo "Switching NSP association to 'Learning'"
+az network perimeter association update -n $storage_account_name --perimeter-name $nsp_name -g $rg --access-mode Learning -o none
+sleep 15  # Takes some seconds to propagate
+echo "Trying to download file from VM using a private endpoint..."
+ssh -n -o StrictHostKeyChecking=no $vm1_pip "curl -s \"$blob_url\""
+echo "Trying to download file from VM using a service endpoint..."
+ssh -n -o StrictHostKeyChecking=no $vm2_pip "curl -s \"$blob_url\""
+echo "Switching NSP association to 'Enforced'"
+az network perimeter association update -n $storage_account_name --perimeter-name $nsp_name -g $rg --access-mode Enforced -o none
+sleep 15  # Takes some seconds to propagate
+echo "Trying to download file from VM using a private endpoint..."
+ssh -n -o StrictHostKeyChecking=no $vm1_pip "curl -s \"$blob_url\""
+echo "Trying to download file from VM using a service endpoint..."
+ssh -n -o StrictHostKeyChecking=no $vm2_pip "curl -s \"$blob_url\""
+echo "Now removing NSP rule01 and trying again..."
+az network perimeter profile access-rule delete -n rule01 --profile-name profile00 --perimeter-name $nsp_name -g $rg -y -o none --only-show-errors
+sleep 15  # Takes some seconds to propagate
+echo "Trying to download file from VM using a private endpoint..."
+ssh -n -o StrictHostKeyChecking=no $vm1_pip "curl -s \"$blob_url\""
+echo "Trying to download file from VM using a service endpoint..."
+ssh -n -o StrictHostKeyChecking=no $vm2_pip "curl -s \"$blob_url\""
+
+#############
+#    WIP    #
+#############
+
 # Enable storage encryption with AKV's key when AKV is in/out the NSP??
 # https://learn.microsoft.com/en-us/azure/storage/common/customer-managed-keys-overview
 # https://learn.microsoft.com/en-us/azure/storage/common/customer-managed-keys-configure-existing-account?tabs=azure-portal
 # az storage account update --encryption-key-source Microsoft.KeyVault --encryption-key-name --encryption-key-source --key-vault-user-identity-id
-storage_id_name="nsptest${suffix}-id"
 echo "Creating identity $storage_id_name..."
 az identity create -n $storage_id_name -g $rg -l $location -o none --only-show-errors
 storage_id_id=$(az identity show -n $storage_id_name -g $rg --query id -o tsv)
 storage_id_principal=$(az identity show -n $storage_id_name -g $rg --query principalId -o tsv)
+storage_id_client=$(az identity show -n $storage_id_name -g $rg --query clientId -o tsv)
 akv_id=$(az keyvault show -n $akv_name -g $rg --query id -o tsv)
+az storage account update -n $storage_account_name -g $rg --user-identity-id $storage_id_id -o none --only-show-errors
 echo "Granting key permissions to identity $storage_id_name..."
 az role assignment create --assignee-object-id $storage_id_principal --role "Key Vault Crypto Service Encryption User" --scope $akv_id --assignee-principal-type ServicePrincipal -o none
+az keyvault set-policy -n $akv_name --key-permissions list encrypt decrypt get getrotationpolicy wrapKey unwrapKey --spn "${storage_id_client}" -o none
 echo "Configuring customer-managed SSE on storage account $storage_account_name..."
 akv_uri=$(az keyvault show -n $akv_name -g $rg --query properties.vaultUri -o tsv)
+# For storage account in NSP
 az storage account update -n $storage_account_name -g $rg -o none --only-show-errors \
     --encryption-key-vault $akv_uri --encryption-key-name testkey --encryption-key-source Microsoft.Keyvault \
     --key-vault-user-identity-id $storage_id_id --identity-type UserAssigned --user-identity-id $storage_id_id
 # Message: The operation failed because of authentication issue on the keyvault. For more information, see - https://aka.ms/storagekeyvaultaccesspolicy
+# For storage account outside of NSP
+az storage account update -n $storage2_account_name -g $rg -o none --only-show-errors \
+    --encryption-key-vault $akv_uri --encryption-key-name testkey --encryption-key-source Microsoft.Keyvault \
+    --key-vault-user-identity-id $storage_id_id --identity-type UserAssigned --user-identity-id $storage_id_id
 
 #################
 #  Diagnostics  #
@@ -162,5 +271,39 @@ az network perimeter profile list --perimeter-name $nsp_name -g $rg -o table
 az network perimeter onboarded-resources list -l $location -o table
 az network perimeter profile access-rule list --profile-name profile00 --perimeter-name $nsp_name -g $rg -o table
 az network perimeter association list --perimeter-name $nsp_name -g $rg -o table
-az network perimeter association list --perimeter-name $nsp_name -g $rg --query '[].{Name:name, AccessMode:properties.accessMode, Resource:properties.privateLinkResource.id, Profile:properties.profile.id}' -o table
+subscription_id=$(az account show --query id -o tsv)
+az network perimeter association list --perimeter-name $nsp_name -g $rg --query '[].{Name:name, AccessMode:properties.accessMode, Resource:properties.privateLinkResource.id, Profile:properties.profile.id}' -o table | awk '{ gsub(/\/subscriptions\/'$subscription_id'\/resourceGroups\/'$rg'\/providers\/Microsoft/,""); print }'
 
+az network perimeter profile access-rule list --profile-name profile00 --perimeter-name $nsp_name -g $rg -o table
+az network perimeter profile access-rule list --profile-name profile00 --perimeter-name $nsp_name -g $rg -o table --query '[].{Name:name, Direction:properties.direction, Addresses:properties.addressPrefixes[0], Emails:properties.emailAddresses[0], FQDNs:properties.fullyQualifiedDomainNames[0], Phones:properties.phones[0], Subscriptions:properties.subscriptions[0]}'
+
+################
+#     Logs     #
+################
+
+# NSP access logs categories
+query='NSPAccessLogs
+| where TimeGenerated > ago(1d)
+| distinct Category'
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
+# NSP allowed by resource rules
+query='NSPAccessLogs
+| where TimeGenerated > ago(1h)
+| where Category == "NspPublicInboundResourceRulesAllowed"
+| project TimeGenerated, OperationName, Profile, MatchedRule, SourceIpAddress'
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
+# NSP denied by perimeter rules
+query='NSPAccessLogs
+| where TimeGenerated > ago(1h)
+| where Category == "NspPublicInboundPerimeterRulesDenied"
+| project TimeGenerated, OperationName, Profile, MatchedRule, SourceIpAddress'
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
+# Access allowed coming from private
+query='NSPAccessLogs
+| where TimeGenerated > ago(1h)
+| where Category == "NspPrivateInboundAllowed"
+| project TimeGenerated, OperationName, Profile, MatchedRule, SourceIpAddress'
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
