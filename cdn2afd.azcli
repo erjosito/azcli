@@ -1,19 +1,158 @@
+###############################################################################
 # Sample to move a custom domain from Azure CDN to AFD Standard/Premium
 #
 # Jose Moreno, 2023
+###############################################################################
+
 
 # Variables
 rg=afdtest
 fqdn=api.cloudtrooper.net
 cdn_name=migrationtest
 afd_name=migrationtestafd
+cdn_test_prot=http
+afd_test_prot=https
+test_path=/api/healthcheck
+akv_name=erjositoKeyvault
+secret_name=cloudtroopernet
+dns_zone_name=cloudtrooper.net
+wait_interval=5
 
 # We assume that both Azure CDN and AFD are created
-afd_id=$(az afd profile show --profile-name $afd_name -g $rg --query id -o tsv)
-cdn_id=$(az cdn profile show -n $cdn_name -g $rg -o tsv --query id)
+echo "Finding out information. CDN and AFD IDs:"
+afd_id=$(az afd profile show --profile-name $afd_name -g $rg --query id -o tsv) && echo $afd_id
+cdn_id=$(az cdn profile show -n $cdn_name -g $rg -o tsv --query id) && echo $cdn_id
 
 # Getting custom domains for Azure CDN
 cdn_endpoint=$(az cdn endpoint list -g $rg --profile-name $cdn_name --query '[0].name' -o tsv)
-echo "Endpoint $cdn_endpoint found in CDN $cdn_name"
+echo "Endpoint '$cdn_endpoint' found in CDN '$cdn_name'"
+cdn_endpoint_fqdn=$(az cdn endpoint show -n $cdn_endpoint -g $rg --profile-name $cdn_name --query hostName -o tsv)
+echo "Hostname for endpoint '$cdn_endpoint' is '$cdn_endpoint_fqdn'"
+custom_domain_id=$(az cdn custom-domain list -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name --query "[?hostName=='$fqdn'].id" -o tsv)
+custom_domain_name=$(az cdn custom-domain list -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name --query "[?hostName=='$fqdn'].name" -o tsv)
+echo "Custom domain $custom_domain_name found for FQDN $fqdn"
+
+# Getting info from AFD
+afd_endpoint_name=$(az afd endpoint list -g $rg --profile-name $afd_name --query '[0].name' -o tsv)
+echo "Endpoint '$afd_endpoint_name' found in AFD profile '$afd_name'"
+afd_endpoint_fqdn=$(az afd endpoint show --endpoint-name $afd_endpoint_name --profile-name $afd_name -g $rg --query hostName -o tsv)
+echo "Endpoint '$afd_endpoint_name' has hostname '$afd_endpoint_fqdn'"
+afd_route_name=$(az afd route list --profile-name $afd_name -g $rg --endpoint-name $afd_endpoint_name -o tsv --query '[0].name')
+echo "Route '$afd_route_name' found in AFD profile '$afd_name', endpoint '$afd_endpoint_name'"
 fqdn_dash=$(echo $fqdn | tr "." "-")
-az cdn custom-domain show -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name -n $fqdn_dash
+
+# Making sure secret exists in AFD
+afd_secret_id=$(az afd secret show -g $rg --profile-name $afd_name --secret-name $secret_name --query id -o tsv)
+if [[ -z "$afd_secret_id" ]]; then
+    echo "Secret $secret_name not found in AFD $afd_name. Creating it..."
+    subscription_id=$(az account show --query id -o tsv)
+    akv_secret_id="/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.KeyVault/vaults/$akv_name/secrets/$akv_secret_name"
+    az afd secret create -g $rg --profile-name $afd_name --secret-name $secret_name --use-latest-version --secret-source $akv_secret_id -o none
+    afd_secret_id=$(az afd secret show -g $rg --profile-name $afd_name --secret-name $secret_name --query id -o tsv)
+else
+    echo "Secret '$secret_name' found in AFD '$afd_name'"
+fi
+
+# The test function expects the test protocol (http/https) as parameter
+def test_app() {
+    test_prot=$1
+    url="${test_prot}://${fqdn}${test_path}"
+    curl -o /dev/null -s -w "%{http_code}\n" $url
+}
+
+# Verify existing app through CDN
+return_code=$(test_app $cdn_test_prot)
+if [[ "$return_code" -ne "200" ]]; then
+    echo "Error testing app. Exiting..."
+    exit 1
+else
+    echo "App tested successfully, return code is $return_code"
+fi
+
+###################
+# Migration start #
+###################
+
+# Changing DNS
+start_time=`date +%s`
+echo "Starting migration at $(date)"
+echo "Changing DNS to point to AFD (from '$cdn_endpoint_fqdn' to '$afd_endpoint_fqdn')..."
+dns_rg=$(az network dns zone list --query "[?name=='$dns_zone_name'].resourceGroup" -o tsv)
+host=$(echo $fqdn | cut -d. -f1)
+az network dns record-set cname remove-record -g $dns_rg -z $dns_zone_name -n $host -c $cdn_endpoint_fqdn --keep-empty-record-set -o none
+az network dns record-set cname set-record -g $dns_rg -z $dns_zone_name -n $host -c $afd_endpoint_fqdn --ttl 3600 -o none
+echo "DNS changed to '$afd_endpoint_fqdn'. Time elapsed: $((`date +%s` - $start_time)) seconds"
+
+# Delete custom domain from CDN
+echo "Deleting custom domain $custom_domain_name from CDN. This will not work until the DNS change is propagated."
+custom_domain_id=$(az cdn custom-domain show -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name -n $fqdn_dash --query id -o tsv)
+try_count=0
+until [[ -z "$custom_domain_id" ]]
+do
+    ((try_count++))
+    echo "Trying to delete CDN custom domain (try $try_count). Time elapsed: $((`date +%s` - $start_time)) seconds..."
+    az cdn custom-domain delete -n $custom_domain_name -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name -o none 2>/dev/null
+    sleep $wait_interval
+    custom_domain_id=$(az cdn custom-domain show -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name -n $fqdn_dash --query id -o tsv 2>/dev/null)
+done
+echo "Custom domain deleted from CDN. Time elapsed: $((`date +%s` - $start_time)) seconds"
+
+# Add custom domain to AFD
+echo "Adding custom domain $fqdn to AFD $afd_name. This will not work if the custom domain is still active in Azure CDN."
+state=''
+try_count=0
+until [[ "$state" == "Succeeded" ]]
+do
+    ((try_count++))
+    echo "Trying to create custom domain $fqdn_dash in AFD $afd_name (try $try_count). Time elapsed $((`date +%s` - $start_time)) seconds..."
+    az afd custom-domain create -g $rg --profile-name $afd_name --custom-domain-name $fqdn_dash --host-name $fqdn --certificate-type CustomerCertificate --secret $secret_name --minimum-tls-version TLS12 -o none
+    sleep $wait_interval
+    state=$(az afd custom-domain show -g $rg --profile-name $afd_name --custom-domain-name $fqdn_dash --query deploymentStatus -o tsv)
+done
+echo "Custom domain added to AFD, state is '$state'. Adding custom domain to AFD route '$afd_route_name'..."
+az afd route update -g $rg --profile-name $afd_name --endpoint-name $afd_endpoint_name --route-name $afd_route_name --custom-domains $fqdn_dash -o none
+echo "Custom domain added to AFD route. Time elapsed: $((`date +%s` - $start_time)) seconds"
+
+# Testing app
+return_code=$(test_app $afd_test_prot)
+try_count=0
+until [[ "$return_code" == "200" ]]
+do
+    ((try_count++))
+    echo "Testing app (try $try_count). Return code: $return_code. Time elapsed: $((`date +%s` - $start_time)) seconds..."
+    sleep $wait_interval
+    return_code=$(test_app $afd_test_prot)
+done
+run_time=$(expr `date +%s` - $start_time)
+((minutes=${run_time}/60))
+((seconds=${run_time}%60))
+echo "Application working successfully on AFD now! Total time elapsed: $minutes minutes and $seconds seconds"
+
+######################
+# Revert back to CDN #
+######################
+
+echo "Reverting DNS..."
+az network dns record-set cname remove-record -g $dns_rg -z $dns_zone_name -n $host -c $afd_endpoint_fqdn --keep-empty-record-set -o none
+az network dns record-set cname set-record -g $dns_rg -z $dns_zone_name -n $host -c $cdn_endpoint_fqdn --ttl 3600 -o none
+echo "Removing custom domain from AFD..."
+az afd custom-domain create -g $rg --profile-name $afd_name --custom-domain-name dummy --host-name "dummy.${dns_zone_name}" --certificate-type CustomerCertificate --secret $secret_name --minimum-tls-version TLS12 -o none
+az afd route update -g $rg --profile-name $afd_name --endpoint-name $afd_endpoint_name --route-name $afd_route_name --custom-domains dummy -o none
+az afd custom-domain delete -g $rg --profile-name $afd_name --custom-domain-name $fqdn_dash -y -o none
+echo "Creating custom domain in CDN..."
+custom_domain_id=''
+until [[ -n "$custom_domain_id" ]]
+do
+    echo "Attempting to create CDN custom domain..."
+    az cdn custom-domain create -n $fqdn_dash -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name --hostname $fqdn -o none
+    sleep $wait_interval
+    custom_domain_id=$(az cdn custom-domain show -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name -n $fqdn_dash --query id -o tsv 2>/dev/null)
+done
+echo "Custom domain added to CDN"
+return_code=$(test_app $cdn_test_prot)
+if [[ "$return_code" -ne "200" ]]; then
+    echo "Error testing app. Exiting..."
+    exit 1
+else
+    echo "App tested successfully back on CDN, return code is $return_code"
+fi
