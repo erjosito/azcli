@@ -126,7 +126,7 @@ done
 run_time=$(expr `date +%s` - $start_time)
 ((minutes=${run_time}/60))
 ((seconds=${run_time}%60))
-echo "Application working successfully on AFD now! Total time elapsed: $minutes minutes and $seconds seconds"
+echo "Application working successfully on AFD now (return code $return_code)! Total time elapsed: $minutes minutes and $seconds seconds"
 
 ######################
 # Revert back to CDN #

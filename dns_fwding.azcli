@@ -13,6 +13,8 @@ create_azfw=yes         # Whether an AzFW is created in the hub with DNS configu
 create_onpremdns=yes    # Whether a dnsmasq server is configured to simulate an onprem server
 create_spokes=yes       # Create spokes
 create_onprem=yes       # Create VPN GW and simulate onprem
+autoreg=true            # Whether the private DNS zone is configured with autoregistration
+config=ruleset          # Can be either 'ruleset' or 'endpoint': how the VNets are configured to send DNS requests to the private resolver
 
 # Variables
 # Note: '10.0.1.0/24;10.0.2.0/24;10.0.3.0/24' are reserved IPs!!!!!
@@ -176,11 +178,14 @@ fi
 # Private DNS Zone
 echo "Creating private DNS Zone..."
 az network private-dns zone create -n $private_dns_zone -g $rg -o none
+az network private-dns record-set a create -g $rg -z $private_dns_zone -n $private_dns_host -o none
 az network private-dns record-set a add-record --record-set-name $private_dns_host -z $private_dns_zone -g $rg -a $private_dns_ip -o none
-az network private-dns link vnet create -g $rg -z $private_dns_zone -n $vnet_name --virtual-network $vnet_name --registration-enabled false -o none
-# Alternatively, create the link with autoregistration
-# az network private-dns link vnet delete -g $rg -z $private_dns_zone -n $vnet_name -y -o none
-# az network private-dns link vnet create -g $rg -z $private_dns_zone -n $vnet_name --virtual-network $vnet_name --registration-enabled true -o none
+az network private-dns link vnet create -g $rg -z $private_dns_zone -n $vnet_name --virtual-network $vnet_name --registration-enabled $autoreg -o none
+if [[ "$create_spokes" == "yes" ]]
+then
+    az network private-dns link vnet create -g $rg -z $private_dns_zone -n $spoke1_vnet_name --virtual-network $spoke1_vnet_name --registration-enabled $autoreg -o none
+    az network private-dns link vnet create -g $rg -z $private_dns_zone -n $spoke2_vnet_name --virtual-network $spoke2_vnet_name --registration-enabled $autoreg -o none
+fi
 
 # Create Azure Firewall
 if [[ "$create_azfw" == "yes" ]]
@@ -204,10 +209,10 @@ fi
 
 # DNS server VM in hub to simulate onprem DNS (to test fwding from Azure DNS Resolver)
 # Deploy in the hub only if not simulating onprem with S2S
-if [[ "$create_onpremdns" == "yes" ]] && [[ "$create_onprem" == "no" ]]
-then
+# This is required to created the fwding ruleset in the private resolver
+if [[ "$create_onpremdns" == "yes" ]] && [[ "$create_onprem" == "no" ]]; then
     echo "Creating DNS server VM..."
-    az vm create -n $dns_vm_name -g $rg --vnet-name $vnet_name --subnet $dns_subnet_name --public-ip-address $dns_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
+    az vm create -n $dns_vm_name -g $rg --vnet-name $vnet_name --subnet $dns_subnet_name --public-ip-address $dns_vm_pip_name --generate-ssh-keys --image Ubuntu2204 --size $vm_size -o none
     dns_vm_pip=$(az network public-ip show -n $dns_vm_pip_name -g $rg --query ipAddress -o tsv)
     dns_vm_nic_id=$(az vm show -n $dns_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
     dns_vm_privateip=$(az network nic show --ids $dns_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
@@ -215,18 +220,24 @@ then
     echo "Installing dnsmasq"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo apt update -y && sudo apt -y install dnsmasq"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo sed -i '$ a\log-queries' /etc/dnsmasq.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl disable systemd-resolved"
+    # From now on commands will be very slow, as DNS is not working
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$dns_vm_pip" "sudo sed -i \"\$ a 8.8.8.8 dnsserver\" /etc/hosts"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl stop systemd-resolved"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo unlink /etc/resolv.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "echo nameserver 8.8.8.8 | sudo tee /etc/resolv.conf"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl restart dnsmasq"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl enable dnsmasq"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl status dnsmasq"
     echo "Adding sample DNS name $sample_fqdn with IP $sample_ip..."
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$dns_vm_pip" "sudo sed -i \"\$ a $sample_ip $sample_fqdn\" /etc/hosts"
     dns_vm_nic_id=$(az vm show -n $dns_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    dns_vm_privateip=$(az network nic show --ids $dns_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-
+    dns_vm_privateip=$(az network nic show --ids $dns_vm_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
 fi
 
 # Client VM (hub)
 echo "Creating client VM in hub VNet..."
-az vm create -n $client_vm_name -g $rg --vnet-name $vnet_name --subnet $client_subnet_name --public-ip-address $client_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
+az vm create -n $client_vm_name -g $rg --vnet-name $vnet_name --subnet $client_subnet_name --public-ip-address $client_vm_pip_name --public-ip-sku Standard --generate-ssh-keys --image Ubuntu2204 --size $vm_size -o none --only-show-errors
 client_vm_pip=$(az network public-ip show -n $client_vm_pip_name -g $rg --query ipAddress -o tsv)
 client_vm_nic_id=$(az vm show -n $client_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
 client_vm_privateip=$(az network nic show --ids $client_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
@@ -236,7 +247,7 @@ echo "Client VM deployed to $client_vm_privateip, $client_vm_pip"
 if [[ "$create_spokes" == "yes" ]]
 then
     echo "Creating client VM in spoke1 VNet ${spoke1_vnet_name}..."
-    az vm create -n $spoke1_vm_name -g $rg --vnet-name $spoke1_vnet_name --subnet $spoke1_subnet_name --public-ip-address $spoke1_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
+    az vm create -n $spoke1_vm_name -g $rg --vnet-name $spoke1_vnet_name --subnet $spoke1_subnet_name --public-ip-address $spoke1_vm_pip_name --public-ip-sku Standard --generate-ssh-keys --image Ubuntu2204 --size $vm_size -o none  --only-show-errors
     spoke1_vm_pip=$(az network public-ip show -n $spoke1_vm_pip_name -g $rg --query ipAddress -o tsv)
     spoke1_vm_nic_id=$(az vm show -n $spoke1_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
     spoke1_vm_privateip=$(az network nic show --ids $spoke1_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
@@ -247,7 +258,7 @@ fi
 if [[ "$create_spokes" == "yes" ]]
 then
     echo "Creating client VM in spoke2 VNet ${spoke2_vnet_name}..."
-    az vm create -n $spoke2_vm_name -g $rg --vnet-name $spoke2_vnet_name --subnet $spoke2_subnet_name --public-ip-address $spoke2_vm_pip_name --generate-ssh-keys --image ubuntuLTS --size $vm_size -o none
+    az vm create -n $spoke2_vm_name -g $rg --vnet-name $spoke2_vnet_name --subnet $spoke2_subnet_name --public-ip-address $spoke2_vm_pip_name --public-ip-sku Standard --generate-ssh-keys --image Ubuntu2204 --size $vm_size -o none  --only-show-errors
     spoke2_vm_pip=$(az network public-ip show -n $spoke2_vm_pip_name -g $rg --query ipAddress -o tsv)
     spoke2_vm_nic_id=$(az vm show -n $spoke2_vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
     spoke2_vm_privateip=$(az network nic show --ids $spoke2_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
@@ -305,36 +316,38 @@ out_ep_config="[{private-ip-address:'',private-ip-allocation-method:'Dynamic',id
 echo "Creating DNS Private Resolver..."
 vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
 az dns-resolver create -n $resolver_name  --id $vnet_id -g $rg -o none
-az dns-resolver inbound-endpoint create --dns-resolver-name $resolver_name --name $in_ep_name \
-        --ip-configurations $in_ep_config -g $rg -o none
-az dns-resolver outbound-endpoint create --dns-resolver-name $resolver_name --name $out_ep_name \
-        --id $out_ep_subnet_id -g $rg -o none
+az dns-resolver inbound-endpoint create --dns-resolver-name $resolver_name --name $in_ep_name --ip-configurations $in_ep_config -g $rg -o none
+az dns-resolver outbound-endpoint create --dns-resolver-name $resolver_name --name $out_ep_name --id $out_ep_subnet_id -g $rg -o none
 in_ep_id=$(az dns-resolver inbound-endpoint show --dns-resolver-name $resolver_name --name $in_ep_name -g $rg --query id -o tsv)
 out_ep_id=$(az dns-resolver outbound-endpoint show --dns-resolver-name $resolver_name --name $out_ep_name -g $rg --query id -o tsv)
-az dns-resolver forwarding-ruleset create -n $fwd_ruleset_name -g $rg \
-        --outbound-endpoints "[{'id': '$out_ep_id'}]"
-az dns-resolver forwarding-rule create --ruleset-name $fwd_ruleset_name -n $fwd_rule_name \
-        --domain-name "${sample_domain}." --forwarding-rule-state "Enabled" \
-        --target-dns-servers "[{ip-address:'$dns_vm_privateip',port:53}]" -g $rg -o none
-spoke1_vnet_id=$(az network vnet show -n $spoke1_vnet_name -g $rg --query id -o tsv)
-az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name \
-        --id "$spoke1_vnet_id" -g $rg --name $spoke1_vnet_name -o none
-spoke2_vnet_id=$(az network vnet show -n $spoke2_vnet_name -g $rg --query id -o tsv)
-az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name \
-        --id "$spoke2_vnet_id" -g $rg --name $spoke2_vnet_name -o none
-hub_vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
-az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name \
-        --id "$hub_vnet_id" -g $rg --name $vnet_name -o none
+az dns-resolver forwarding-ruleset create -n $fwd_ruleset_name -g $rg --outbound-endpoints "[{'id': '$out_ep_id'}]"
+az dns-resolver forwarding-rule create --ruleset-name $fwd_ruleset_name -n $fwd_rule_name --domain-name "${sample_domain}." --forwarding-rule-state "Enabled" --target-dns-servers "[{ip-address:'$dns_vm_privateip',port:53}]" -g $rg -o none
 
-# Set the hub and spoke VNets to the inbound endpoint of the hub resolver
-hub_resolver_ip=$(az dns-resolver inbound-endpoint show --dns-resolver-name $resolver_name --name $in_ep_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
-echo "Setting VNets to use the hub DNS Resolver IP $hub_resolver_ip..."
-az network vnet update -n $vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
-if [[ "$create_spokes" == "yes" ]]
-then
-    az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
-    az network vnet update -n $spoke2_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+# Configure VNets to send requests to resolvers
+if [[ "$config" == "endpoint" ]]; then
+    # Set the hub and spoke VNets to the inbound endpoint of the hub resolver
+    hub_resolver_ip=$(az dns-resolver inbound-endpoint show --dns-resolver-name $resolver_name --name $in_ep_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+    echo "Setting VNets to use the hub DNS Resolver IP $hub_resolver_ip..."
+    az network vnet update -n $vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+    if [[ "$create_spokes" == "yes" ]]; then
+        az network vnet update -n $spoke1_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+        az network vnet update -n $spoke2_vnet_name -g $rg --dns-servers $hub_resolver_ip -o none
+    fi
+else
+    # Link the fwding ruleset with the VNets
+    echo "Linking the private resolver's forwarding ruleset with the VNets..."
+    hub_vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+    az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name --id "$hub_vnet_id" -g $rg --name $vnet_name -o none
+    if [[ "$create_spokes" == "yes" ]]; then
+        # sleep 30  # There seem to be some errors here when the commands are run too fast
+        spoke1_vnet_id=$(az network vnet show -n $spoke1_vnet_name -g $rg --query id -o tsv)
+        az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name --id "$spoke1_vnet_id" -g $rg --name $spoke1_vnet_name -o none
+        # sleep 30  # There seem to be some errors here when the commands are run too fast
+        spoke2_vnet_id=$(az network vnet show -n $spoke2_vnet_name -g $rg --query id -o tsv)
+        az dns-resolver vnet-link create --ruleset-name $fwd_ruleset_name --id "$spoke2_vnet_id" -g $rg --name $spoke2_vnet_name -o none
+    fi
 fi
+
 # Refresh DNS lease VM
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "sudo systemctl restart systemd-networkd"
 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$client_vm_pip" "netplan ip leases eth0 | grep DNS"
@@ -385,7 +398,7 @@ runcmd:
 EOF
     # VM for NVA
     echo "Creating VM $nva_name..."
-    az vm create -n $nva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    az vm create -n $nva_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys \
         --public-ip-address $nva_pip_name --public-ip-sku Standard --vnet-name $onprem_vnet_name --size $nva_vm_size --subnet $nva_subnet_name \
         --custom-data $linuxnva_cloudinit_file --nsg "${nva_name}-nsg" -o none
     nva_nic_id=$(az vm show -n $nva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)

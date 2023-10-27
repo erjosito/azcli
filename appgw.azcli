@@ -10,7 +10,8 @@ sku=Standard_v2
 aci_image=erjosito/yadaapi:1.0
 # aci_image=gcr.io/kuar-demo/kuard-amd64:1
 backend_count=2
-backend_type=aci  # aci or vm
+backend_type=vm  # aci or vm
+dualstack=yes
 
 # Variables
 rg=appgw
@@ -25,13 +26,17 @@ backenddnsname=myapp
 backendfqdn="$backenddnsname"."$dnszone"
 vnet_name=appgw
 vnet_prefix=10.0.0.0/16
+vnet_prefix_v6=ace:cab:deca::/48
 appgw_subnet_name=AppGateway
 appgw_subnet_prefix=10.0.0.0/24
+appgw_subnet_prefix_v6=ace:cab:deca:10::/64
 aci_subnet_name=aci
 aci_subnet_prefix=10.0.1.0/24
+aci_subnet_prefix_v6=ace:cab:deca:11::/64
 aci_name=backendaci
 vm_subnet_name=vm
 vm_subnet_prefix=10.0.2.0/24
+vm_subnet_prefix_v6=ace:cab:deca:12::/64
 vm_name=testvmlinux
 vm_pip_name=testvmlinux-pip
 vm_sku=Standard_B1s
@@ -53,16 +58,22 @@ function create_dns(){
     ip_address=$2
     public_domain=cloudtrooper.net
     public_dns_rg=$(az network dns zone list --query "[?name=='$public_domain'].resourceGroup" -o tsv)
+    if [[ "$ip_address" == *':'* ]]; then
+        record_type="aaaa"
+    else
+        record_type="a"
+    fi
+    echo "Setting record-type to $record_type..." 1>&2
     if [[ -z "$public_dns_rg" ]]
     then
       echo "ERROR: I could not find the public DNS zone $public_domain in subscription $sub_name" 1>&2
     else
       # First, remove any existing A-record if already exists
-      a_record_set=$(az network dns record-set a show -n "$dns_name" -z "$public_domain" -g "$public_dns_rg" -o tsv --query id 2>/dev/null)
+      a_record_set=$(az network dns record-set $record_type show -n "$dns_name" -z "$public_domain" -g "$public_dns_rg" -o tsv --query id 2>/dev/null)
       if [[ -n "$a_record_set" ]]
       then
-        echo "Deleting existing A record for ${dns_name}.${public_domain}..." 1>&2
-        az network dns record-set a delete -n "$dns_name" -z "$public_domain" -g "$public_dns_rg" -y -o none
+        echo "Deleting existing $record_type record for ${dns_name}.${public_domain}..." 1>&2
+        az network dns record-set $record_type delete -n "$dns_name" -z "$public_domain" -g "$public_dns_rg" -y -o none
       else
         # Delete any existing CNAME-record if already exists
         cname_record_set=$(az network dns record-set cname show -n "$dns_name" -z "$public_domain" -g "$public_dns_rg" -o tsv --query id 2>/dev/null)
@@ -71,12 +82,13 @@ function create_dns(){
           echo "Deleting existing CNAME record for ${dns_name}.${public_domain}..." 1>&2
           az network dns record-set cname delete -n "$dns_name" -z "$public_domain" -g "$public_dns_rg" -y -o none
         else
-          echo "No conflicting A or CNAME records found in ${public_domain}" 1>&2
+          echo "No conflicting $record_type or CNAME records found in ${public_domain}" 1>&2
         fi
       fi
       # Now create new A record
-      az network dns record-set a create -g $public_dns_rg -z cloudtrooper.net -n $dns_name -o none
-      az network dns record-set a add-record -g $public_dns_rg -z cloudtrooper.net -n $dns_name -a $ip_address -o none
+      echo "Creating $record_type record for ${dns_name}.${public_domain}..." 1>&2
+      az network dns record-set $record_type create -g $public_dns_rg -z cloudtrooper.net -n $dns_name -o none
+      az network dns record-set $record_type add-record -g $public_dns_rg -z cloudtrooper.net -n $dns_name -a $ip_address -o none
     fi
     fqdn="${dns_name}.${public_domain}" && echo $fqdn
 }
@@ -105,6 +117,36 @@ function wait_until_finished {
      fi
 }
 
+###################
+# Enable features #
+###################
+
+function enableNetworkFeature () {
+    feature_name=$1
+    state=$(az feature list -o table --query "[?contains(name, 'Microsoft.Network/$feature_name')].properties.state" -o tsv)
+    if [[ "$state" == "Registered" ]]
+    then
+        echo "$feature_name is already registered"
+    else
+        echo "Registering feature $feature_name..."
+        az feature register --name "$feature_name" --namespace Microsoft.Network
+        state=$(az feature list -o table --query "[?contains(name, 'Microsoft.Network/$feature_name')].properties.state" -o tsv)
+        echo "Waiting for feature $feature_name to finish registering..."
+        wait_interval=15
+        until [[ "$state" == "Registered" ]]
+        do
+            sleep $wait_interval
+            state=$(az feature list -o table --query "[?contains(name, 'Microsoft.Network/$feature_name')].properties.state" -o tsv)
+            echo "Current registration status for feature $feature_name is $state"
+        done
+        echo "Registering resource provider Microsoft.Network now..."
+        az provider register --namespace Microsoft.Network
+    fi
+}
+
+enableNetworkFeature "AllowApplicationGatewayIpv6"
+
+
 ##########
 #  Main  #
 ##########
@@ -112,7 +154,11 @@ function wait_until_finished {
 # Create RG
 echo "Creating RG and VNet..."
 az group create -n $rg -l $location -o none --only-show-errors
-az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix --subnet-name $appgw_subnet_name --subnet-prefix $appgw_subnet_prefix -o none --only-show-errors
+if [[ "$dualstack" == "no" ]]; then
+    az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix --subnet-name $appgw_subnet_name --subnet-prefix $appgw_subnet_prefix -o none --only-show-errors
+else
+    az network vnet create -n $vnet_name -g $rg --address-prefixes $vnet_prefix $vnet_prefix_v6 --subnet-name $appgw_subnet_name --subnet-prefixes $appgw_subnet_prefix $appgw_subnet_prefix_v6 -o none --only-show-errors
+fi
 
 # Create Log Analytics Workspace
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
@@ -182,6 +228,7 @@ fi
 ##############
 
 # Create ACI instances in the vnet with a loop
+# No IPv6 supported
 if [[ $backend_type == "aci" ]]; then
     echo "Creating subnet for ACIs..."
     az network vnet subnet create -g $rg --vnet-name $vnet_name -n $aci_subnet_name --address-prefix $aci_subnet_prefix -o none --only-show-errors
@@ -202,6 +249,11 @@ fi
 
 # Deploy a Linux VM with a troubleshooting web page
 if [[ $backend_type == "vm" ]]; then
+    if [[ "$dualstack" == "no" ]]; then
+        az network vnet subnet create -g $rg --vnet-name $vnet_name -n $vm_subnet_name --address-prefix $vm_subnet_prefix -o none --only-show-errors
+    else
+        az network vnet subnet create -g $rg --vnet-name $vnet_name -n $vm_subnet_name --address-prefixes $vm_subnet_prefix $vm_subnet_prefix_v6 -o none --only-show-errors
+    fi
     az network public-ip create -g $rg -n $vm_pip_name --sku standard --allocation-method static -l $location -o none --only-show-errors
     az network nsg create -n $vm_nsg_name -g $rg -o none --only-show-errors
     az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp -o none --only-show-errors
@@ -216,8 +268,8 @@ runcmd:
   - wget https://raw.githubusercontent.com/erjosito/azcli/master/myip.py -O /root/myip.py
   - python3 /root/myip.py &
 EOF
-    az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku \
-      --vnet-name $vnet_name --subnet $vm_subnet_name --subnet-address-prefix $vm_subnet_prefix \
+    az vm create -n $vm_name -g $rg --image Ubuntu2204 --generate-ssh-keys --size $vm_sku \
+      --vnet-name $vnet_name --subnet $vm_subnet_name \
       --nsg $vm_nsg_name --public-ip-address $vm_pip_name \
       --custom-data $vm_cloudinit_filename -o none --only-show-errors
     vm_private_ip=$(az vm show -g $rg -n $vm_name -d --query privateIps -o tsv) && echo $vm_private_ip
@@ -248,6 +300,7 @@ http {
     server {
         listen [::]:443 ssl;
         listen 443 ssl;
+        listen [::]:80;
         listen 80;
         server_name localhost;
         ssl_protocols              TLSv1.2;
@@ -279,17 +332,32 @@ EOF
     scp "$nginx_config_file" "${vm_pip_address}:~/"
 
     # Put public certs in NGINX. Note: you need to have some public certs in advance
-    cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper_chain.pem"
-    key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2021/cloudtrooper.key"
+    cert_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2023/star_cloudtrooper_net_fullchain.pem"
+    key_file="${HOME}/onedrive/Admin/Certs/cloudtrooper.net/2023/CSR/star_cloudtrooper_net.key"
     scp "$cert_file" "${vm_pip_address}:~/ssl.crt"
     scp "$key_file" "${vm_pip_address}:~/ssl.key"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo mv ./* /etc/nginx/"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo systemctl restart nginx"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo systemctl enable nginx"
 
     # Verify nginx is working fine
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "systemctl status nginx"
     curl "https://${vm_fqdn}/api/healthcheck"
     curl "http://${vm_fqdn}/api/healthcheck"
+    if [[ "$dualstack" == "yes" ]]; then
+        az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --address-prefixes $vm_subnet_prefix $vm_subnet_prefix_v6 -o none --only-show-errors
+        echo "Adding IPv6 configuration to VM..."
+        az network public-ip create -n "${vm_pip_name}-v6" -g $rg --sku Standard --version IPv6 -o none --only-show-errors
+        vm_pip_address_v6=$(az network public-ip show -n "${vm_pip_name}-v6" -g $rg --query ipAddress -o tsv) && echo $vm_pip_address_v6
+        nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        nic_name=$(echo $nic_id | cut -d'/' -f9)
+        az network nic ip-config create -n myIPv6config -g $rg --nic-name $nic_name --private-ip-address-version IPv6 --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address "${vm_pip_name}-v6" -o none --only-show-errors
+        vm_private_ipv6=$(az network nic ip-config show -n myIPv6config -g $rg --nic-name $nic_name --query privateIPAddress -o tsv)
+        az vm restart -n $vm_name -g $rg -o none
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo python3 /root/myip.py &"
+        vm_fqdn_v6=$(create_dns "vmv6" "$vm_pip_address_v6") && echo $vm_fqdn_v6
+        curl "http://${vm_fqdn_v6}/api/healthcheck"
+    fi
 fi
 
 #################
@@ -297,14 +365,21 @@ fi
 #################
 
 # Create PIP
-echo "Creating PIP for App GW..."
+echo "Creating PIP(s) for App GW..."
 allocation_method=Static
 az network public-ip create -g $rg -n $appgw_pipname --sku Standard --allocation-method $allocation_method -l $location -o none --only-show-errors
+if [[ "$dualstack" == "yes" ]]; then
+    az network public-ip create -g $rg -n "${appgw_pipname}-v6" --sku Standard --allocation-method $allocation_method -l $location --version IPv6 -o none --only-show-errors
+fi
 #fqdn=$(az network public-ip show -g $rg -n $appgw_pipname --query dnsSettings.fqdn -o tsv)
 
 # Variable with backend IPs
 if [[ "$backend_type" == "vm" ]]; then
-    backend_ips=$vm_private_ip
+    if [[ "$dualstack" == "no" ]]; then
+        backend_ips=$vm_private_ip
+    else
+        backend_ips=$vm_private_ipv6
+    fi
 else
     backend_ips=""
     for i in $(seq 1 $backend_count)
@@ -320,7 +395,7 @@ az network application-gateway create -g $rg -n $appgw_name --sku $sku \
     --min-capacity 1 --max-capacity 2 \
     --frontend-port 80 --routing-rule-type basic \
     --http-settings-port 8080 --http-settings-protocol Http --priority 1001 \
-    --public-ip-address $appgw_pipname --vnet-name $vnet_name --subnet $appgw_subnet_name \
+    --public-ip-address "${appgw_pipname}" --vnet-name $vnet_name --subnet $appgw_subnet_name \
     --servers ${(z)backend_ips} -o none --only-show-errors
 
 # If using a DNS entry, create A record pointing to the PIP
