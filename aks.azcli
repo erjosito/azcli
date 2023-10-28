@@ -6,8 +6,8 @@
 #################################
 
 # Variables
-rg=wl-akstest
-location=westcentralus
+rg=akstest
+location=eastus2
 wait_interval=5s
 use_msi=yes
 # AKS
@@ -16,8 +16,8 @@ aks_rbac=yes
 aks_service_cidr=10.0.0.0/16
 vm_size=Standard_B2ms         # Some possible values: Standard_B2ms, Standard_D2_v3
 preview_version=yes
-network_plugin=azure_cilium   # azure/kubenet/none/azure_overlay/azure_cilium
-network_policy=calico         # azure/calico/cilium/none
+network_plugin=azure_overlay   # azure/kubenet/none/azure_overlay/azure_cilium
+network_policy=cilium          # azure/calico/cilium/none
 az_monitor=no
 # Vnet
 vnet_name=aksVnet
@@ -90,7 +90,7 @@ function enableAksFeature () {
         echo "$feature_name is already registered"
     else
         echo "Registering feature $feature_name..."
-        az feature register --name "$feature_name" --namespace microsoft.containerservice
+        az feature register --name "$feature_name" --namespace microsoft.containerservice -o none --only-show-errors
         state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
         echo "Waiting for feature $feature_name to finish registering..."
         wait_interval=15
@@ -101,7 +101,7 @@ function enableAksFeature () {
             echo "Current registration status for feature $feature_name is $state"
         done
         echo "Registering resource provider Microsoft.ContainerService now..."
-        az provider register --namespace Microsoft.ContainerService
+        az provider register --namespace Microsoft.ContainerService -o none --only-show-errors
     fi
 }
 
@@ -111,6 +111,7 @@ function enableAksFeature () {
 # enableAksFeature "PodSubnetPreview"
 # enableAksFeature "EnableAPIServerVnetIntegrationPreview"
 # enableAksFeature "CiliumDataplanePreview"
+enableAksFeature "AzureServiceMeshPreview"
 
 # Update extension
 echo "Updating aks-preview extension..."
@@ -123,8 +124,10 @@ az extension update -n aks-preview
 # Create RG, LA workspace, vnet, AKS
 echo "Creating RG and VNet..."
 az group create -n $rg -l $location -o none
-acr_rg=$(az acr list -o tsv --query "[?name=='$acr_name'].resourceGroup")
-acr_id=$(az acr show -n erjositoAcr -g $acr_rg --query id -o tsv)
+acr_rg=$(az acr list -o tsv --query "[?name=='$acr_name'].resourceGroup") && echo "ACR RG is '$acr_rg'"
+if [[ -n "$acr_rg" ]]; then
+    acr_id=$(az acr show -n erjositoAcr -g $acr_rg --query id -o tsv)
+fi
 az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location -o none
 az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix -o none
 az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix -o none
@@ -147,13 +150,13 @@ if [[ "$az_monitor" == 'yes' ]]; then
 fi
 
 # Get latest supported/preview version
-k8s_versions=$(az aks get-versions -l $location -o json)
+k8s_versions=$(az aks get-versions -l $location -o json --only-show-errors)
 if [[ "$preview_version" == "yes" ]]
 then
-    k8s_version=$(echo $k8s_versions | jq '.orchestrators[]' | jq -rsc 'sort_by(.orchestratorVersion) | reverse[0] | .orchestratorVersion')
+    k8s_version=$(echo $k8s_versions | jq -r '.values | map(select(.isPreview == true))[0] | .version')
     echo "Latest supported k8s version is $k8s_version (in preview)"
 else
-    k8s_version=$(echo $k8s_versions | jq '.orchestrators[] | select(.isPreview == null)' | jq -rsc 'sort_by(.orchestratorVersion) | reverse[0] | .orchestratorVersion')
+    k8s_version=$(echo $k8s_versions | jq -r '.values | map(select(.isPreview == null))[0] | .version')
     echo "Latest supported k8s version (not in preview) is $k8s_version"
 fi
 
@@ -202,11 +205,11 @@ fi
 
 # CNI options
 if [[ "$network_plugin" == 'azure' ]]; then
-    cni_options="--network-plugin azure"
+    cni_options="--network-plugin azure --pod-subnet-id $pod_subnet_id"
 elif [[ "$network_plugin" == 'kubenet' ]]; then
     cni_options="--network-plugin kubenet"
 elif [[ "$network_plugin" == 'azure_cilium' ]]; then
-    cni_options="--network-plugin azure --network-dataplane cilium"
+    cni_options="--network-plugin azure --network-dataplane cilium --pod-subnet-id $pod_subnet_id"
     if [[ "$network_policy" != "cilium" ]]; then
         echo "Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
         network_policy=cilium
@@ -222,11 +225,17 @@ else
     exit 1
 fi
 
+# Error control because the code to get the k8s version is broken
+if [[ -z "$k8s_version" ]]; then
+  k8s_version_options=""
+else
+  k8s_version_options="-k $k8s_version"
+fi
+
 # Create AKS
 echo "Deploying cluster..."
-az aks create -g $rg -n $aks_name -l $location -o none \
-    --pod-subnet-id $pod_subnet_id \
-    -c 1 -s $vm_size -k $k8s_version --generate-ssh-keys -u $(whoami) \
+az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
+    -c 1 -s $vm_size ${(z)k8s_version_options} --generate-ssh-keys -u $(whoami) \
     ${(z)identity_options} \
     ${(z)cni_options} \
     --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
@@ -404,6 +413,65 @@ root@aks-nodepool1-34838928-vmss000000:/home/cilium# cilium policy get k8s:io.ci
 root@aks-nodepool1-34838928-vmss000000:/home/cilium# cilium endpoint get 644 -o jsonpath='{range ..status.policy.realized.l4.egress[*].derived-from-rules}{@}{"\n"}{end}'|tr -d ']['
 "k8s:io.cilium.k8s.policy.derived-from=CiliumNetworkPolicy","k8s:io.cilium.k8s.policy.name=api-netpol","k8s:io.cilium.k8s.policy.namespace=default","k8s:io.cilium.k8s.policy.uid=ddd4a267-38c1-411a-883f-3f52a176cfc5"
 "k8s:io.cilium.k8s.policy.derived-from=CiliumNetworkPolicy","k8s:io.cilium.k8s.policy.name=api-netpol","k8s:io.cilium.k8s.policy.namespace=default","k8s:io.cilium.k8s.policy.uid=ddd4a267-38c1-411a-883f-3f52a176cfc5"
+
+#####################
+#       Istio       #
+#####################
+
+# Enable Istio
+echo "Enabling Istio addon..."
+az aks mesh enable -n $aks_name -g $rg -o none --only-show-errors
+kubectl get pods -n aks-istio-system
+
+# Enable ingress gateway
+az aks mesh enable-ingress-gateway -n $aks_name -g $rg --ingress-gateway-type external -o none --only-show-errors
+kubectl get svc aks-istio-ingressgateway-external -n aks-istio-ingress
+
+# Deploy ingress rule
+kubectl apply -f - <<EOF
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: bookinfo-gateway-external
+spec:
+  selector:
+    istio: aks-istio-ingressgateway-external
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "*"
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: bookinfo-vs-external
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - bookinfo-gateway-external
+  http:
+  - match:
+    - uri:
+        exact: /productpage
+    - uri:
+        prefix: /static
+    - uri:
+        exact: /login
+    - uri:
+        exact: /logout
+    - uri:
+        prefix: /api/v1/products
+    route:
+    - destination:
+        host: productpage
+        port:
+          number: 9080
+EOF
+
 
 #####################
 # Create Az Bastion #
@@ -643,7 +711,7 @@ az sql server firewall-rule create -g "$rg" -s "$sql_server_name" -n public_api_
 kubectl expose deploy yadaapi --port=80 --target-port=8080
 
 # Service
-app_name=sqlapi
+app_name=yadaapi
 yaml_file=/tmp/svc.yaml
 cat <<EOF > $yaml_file
 apiVersion: v1
@@ -651,7 +719,7 @@ kind: Service
 metadata:
   annotations:
     service.beta.kubernetes.io/azure-load-balancer-internal: "true"
-    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "akslb"
+    # service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "akslb"
   name: $app_name
 spec:
   type: ClusterIP
