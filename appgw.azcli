@@ -30,6 +30,8 @@ vnet_prefix_v6=ace:cab:deca::/48
 appgw_subnet_name=AppGateway
 appgw_subnet_prefix=10.0.0.0/24
 appgw_subnet_prefix_v6=ace:cab:deca:10::/64
+appgw_private_frontend_ip=10.0.0.254
+appgw_private_frontend_ip_v6=ace:cab:deca:10::ff
 aci_subnet_name=aci
 aci_subnet_prefix=10.0.1.0/24
 aci_subnet_prefix_v6=ace:cab:deca:11::/64
@@ -130,13 +132,13 @@ function enableNetworkFeature () {
     else
         echo "Registering feature $feature_name..."
         az feature register --name "$feature_name" --namespace Microsoft.Network
-        state=$(az feature list -o table --query "[?contains(name, 'Microsoft.Network/$feature_name')].properties.state" -o tsv)
+        state=$(az feature list --query "[?contains(name, 'Microsoft.Network/$feature_name')].properties.state" -o tsv)
         echo "Waiting for feature $feature_name to finish registering..."
         wait_interval=15
         until [[ "$state" == "Registered" ]]
         do
             sleep $wait_interval
-            state=$(az feature list -o table --query "[?contains(name, 'Microsoft.Network/$feature_name')].properties.state" -o tsv)
+            state=$(az feature list --query "[?contains(name, 'Microsoft.Network/$feature_name')].properties.state" -o tsv)
             echo "Current registration status for feature $feature_name is $state"
         done
         echo "Registering resource provider Microsoft.Network now..."
@@ -145,7 +147,7 @@ function enableNetworkFeature () {
 }
 
 enableNetworkFeature "AllowApplicationGatewayIpv6"
-
+enableNetworkFeature "EnableApplicationGatewayNetworkIsolation"
 
 ##########
 #  Main  #
@@ -280,6 +282,24 @@ EOF
     curl ${vm_pip_address}:8080/api/healthcheck
     curl ${vm_pip_address}:8080/api/ip
 
+#     # Create service to automatically run the script on startup
+#     # Goes to /etc/systemd/system/myip.service
+#     cat <<EOF > /tmp/run_app.sh
+# [unit]
+# Description=Test app
+# [service]
+# ExecStart=/usr/bin/python3 /root/myip.py &
+# EOF
+#     cat <<EOF > /tmp/run_app.sh
+# #!/bin/bash
+# /usr/bin/python3 /root/myip.py &
+# EOF
+#     user=$(whoami)
+#     scp /tmp/run_app.sh "${vm_pip_address}:/home/${user}/" && rm /tmp/run_app.sh
+#     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "chmod +x /home/${user}/run_app.sh"
+#     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo cp /home/${user}/run_app.sh /etc/init.d/"
+#     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo update-rc.d run_app.sh defaults"
+
     # If required (for example because you restarted the VM), restart the python app
     # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip_address "sudo python3 /root/myip.py &"
 
@@ -364,6 +384,25 @@ fi
 # Create App GW #
 #################
 
+# Override subnet if required
+appgw_name=appg21
+appgw_subnet_name=appgw21
+appgw_subnet_prefix=10.0.21.0/24
+appgw_subnet_prefix_v6=ace:cab:deca:21::/64
+appgw_pipname=${appgw_name}-pip
+
+# Verify appgw_subnet exists
+appgw_subnet_id=$(az network vnet subnet show -n $appgw_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+if [[ -z "$appgw_subnet_id" ]]; then
+    if [[ "$dualstack" == "yes" ]]; then
+        echo "Creating subnet $appgw_subnet_name with prefixes $appgw_subnet_prefix and $appgw_subnet_prefix_v6..."
+        az network vnet subnet create -g $rg --vnet-name $vnet_name -n $appgw_subnet_name --address-prefixes $appgw_subnet_prefix $appgw_subnet_prefix_v6 -o none --only-show-errors
+    else
+        echo "Creating subnet $appgw_subnet_name with prefix $appgw_subnet_prefix..."
+        az network vnet subnet create -g $rg --vnet-name $vnet_name -n $appgw_subnet_name --address-prefix $appgw_subnet_prefix -o none --only-show-errors
+    fi
+fi
+
 # Create PIP
 echo "Creating PIP(s) for App GW..."
 allocation_method=Static
@@ -378,7 +417,8 @@ if [[ "$backend_type" == "vm" ]]; then
     if [[ "$dualstack" == "no" ]]; then
         backend_ips=$vm_private_ip
     else
-        backend_ips=$vm_private_ipv6
+        # backend_ips=$vm_private_ipv6          # Not working the appgw creation command errors out when supplying an IPv6 address as backend server
+        backend_ips=$vm_private_ip
     fi
 else
     backend_ips=""
@@ -398,9 +438,32 @@ az network application-gateway create -g $rg -n $appgw_name --sku $sku \
     --public-ip-address "${appgw_pipname}" --vnet-name $vnet_name --subnet $appgw_subnet_name \
     --servers ${(z)backend_ips} -o none --only-show-errors
 
-# If using a DNS entry, create A record pointing to the PIP
+# If dual stack, add IPv6 frontend
+if [[ "$dualstack" == "yes" ]]; then
+    az network application-gateway frontend-ip create -g $rg --gateway-name $appgw_name -n FrontendPIPv6 --public-ip-address "${appgw_pipname}-v6" -o none --only-show-errors
+    # We can add a private IPv4 and try to remove the public IPv4
+    az network application-gateway frontend-ip create --gateway-name $appgw_name -g $rg -n FrontendIPv4 --private-ip-address $appgw_private_frontend_ip --subnet $appgw_subnet_name --vnet-name $vnet_name -o none --only-show-errors
+    listener_name=$(az network application-gateway http-listener list --gateway-name $appgw_name -g $rg --query '[0].name' -o tsv)
+    az network application-gateway http-listener update --gateway-name $appgw_name -g $rg -n $listener_name --frontend-ip FrontendPIPv6 -o none --only-show-errors
+    az network application-gateway frontend-ip delete --gateway-name $appgw_name -g $rg -n appGatewayFrontendIP -o none --only-show-errors
+    # And now that we are at it, we can add a private IPv6 frontend
+    az network application-gateway frontend-ip create --gateway-name $appgw_name -g $rg -n FrontendIPv6 --private-ip-address $appgw_private_frontend_ip_v6 --subnet $appgw_subnet_name --vnet-name $vnet_name -o none --only-show-errors
+fi
+
+# If dual stack, add IPv6 backend pool
+if [[ "$dualstack" == "yes" ]]; then
+    address_pool_name=$(az network application-gateway address-pool list --gateway-name $appgw_name -g $rg --query '[0].name' -o tsv)
+    address_pool_v6_name="${address_pool_name}-v6"
+    az network application-gateway address-pool create --gateway-name $appgw_name -g $rg -n $address_pool_v6_name --servers $vm_private_ipv6 -o none --only-show-errors
+fi
+
+# If using a DNS entry, create A record(s) pointing to the PIP
 appgw_pip=$(az network public-ip show -g $rg -n $appgw_pipname --query ipAddress -o tsv) && echo "App Gw's public IP is $appgw_pip"
 appgw_fqdn=$(create_dns "appgw" "$appgw_pip") && echo "You can access App GW's public IP with FQDN $appgw_fqdn"
+if [[ "$dualstack" == "yes" ]]; then
+    appgw_pip_v6=$(az network public-ip show -g $rg -n "${appgw_pipname}-v6" --query ipAddress -o tsv) && echo "App Gw's public IPv6 is $appgw_pip_v6"
+    appgw_fqdn_v6=$(create_dns "appgwv6" "$appgw_pip_v6") && echo "You can access App GW's public IPv6 with FQDN $appgw_fqdn_v6"
+fi
 
 # Wait for GW to be created (only needed if using --no-wait when created the appgw)
 # appgw_id=$(az network application-gateway show -n $appgw_name -g $rg --query id -o tsv)
@@ -476,19 +539,19 @@ akv_azure_rbac=$(az keyvault show -n $keyvault_name --query properties.enableRba
 if [[ "$akv_azure_rbac" == "true" ]]
 then
     keyvault_id=$(az keyvault show -n $keyvault_name --query id -o tsv)
-    az role assignment create --scope $keyvault_id --role "Key Vault Secrets User" --assignee $id_principal_id
+    az role assignment create --scope $keyvault_id --role "Key Vault Secrets User" --assignee $id_principal_id -o none
 else
-    az keyvault set-policy -n "$keyvault_name" --object-id "$id_principal_id" \
+    az keyvault set-policy -n "$keyvault_name" --object-id "$id_principal_id" -o none \
       --secret-permissions get list \
       --certificate-permissions get list
 fi
 id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
-az network application-gateway identity assign --gateway-name $appgw_name -g $rg --identity $id_id
+az network application-gateway identity assign --gateway-name $appgw_name -g $rg --identity $id_id -o none
 
 # Import cert from AKV
 cert_sid=$(az keyvault certificate show --vault-name $keyvault_name -n $cert_name --query sid -o tsv) && echo $cert_sid
 # az network application-gateway ssl-cert delete -n $cert_name -g $rg --gateway-name $appgw_name  # In case the certificate already existed
-az network application-gateway ssl-cert create -n $cert_name -g $rg --gateway-name $appgw_name --key-vault-secret-id $cert_sid
+az network application-gateway ssl-cert create -n $cert_name -g $rg --gateway-name $appgw_name --key-vault-secret-id $cert_sid -o none
 
 # Check certs in appgw
 az network application-gateway ssl-cert list -g $rg --gateway-name $appgw_name -o table
@@ -499,23 +562,23 @@ az network application-gateway ssl-cert list -g $rg --gateway-name $appgw_name -
 
 # Configure AppGw for end-to-end SSL
 # HTTP Settings and probe
-echo "Creating probe and HTTP settings..."
+echo "Creating SSL probe and HTTP settings..."
 az network application-gateway probe create -g "$rg" --gateway-name "$appgw_name" \
---name sslprobe --protocol Https --host-name-from-http-settings --match-status-codes 200-399 --port 443 --path /api/healthcheck
+--name sslprobe --protocol Https --host-name-from-http-settings --match-status-codes 200-399 --port 443 --path /api/healthcheck -o none
 az network application-gateway http-settings create -g "$rg" --gateway-name "$appgw_name" --port 443 \
---name sslsettings --protocol https --host-name ${vm_fqdn} --probe sslprobe
+--name sslsettings --protocol https --host-name ${vm_fqdn} --probe sslprobe -o none
 # Create rule (using url-path-maps to make it more exciting)
 default_address_pool_name=$(az network application-gateway address-pool list -g $rg --gateway-name $appgw_name -o tsv --query '[0].name') && echo $default_address_pool_name
 default_frontend_name=$(az network application-gateway frontend-ip list -g "$rg" --gateway-name "$appgw_name" --query '[0].name' -o tsv) && echo $default_frontend_name
-az network application-gateway frontend-port create -n sslport -g "$rg" --gateway-name "$appgw_name" --port 443
+az network application-gateway frontend-port create -n sslport -g "$rg" --gateway-name "$appgw_name" --port 443 -o none
 az network application-gateway http-listener create -n ssllistener -g "$rg" --gateway-name "$appgw_name" \
-  --frontend-port sslport --frontend-ip "$default_frontend_name" --ssl-cert "$cert_name"
+  --frontend-port sslport --frontend-ip "$default_frontend_name" --ssl-cert "$cert_name" -o none
 az network application-gateway url-path-map create --gateway-name $appgw_name -g $rg -n sslpathmap \
   --rule-name rule01 --paths '/api/*' --address-pool $default_address_pool_name --http-settings sslsettings \
-  --default-address-pool $default_address_pool_name --default-http-settings sslsettings
+  --default-address-pool $default_address_pool_name --default-http-settings sslsettings -o none
 az network application-gateway rule create -g "$rg" --gateway-name "$appgw_name" -n sslrule \
-  --url-path-map sslpathmap --rule-type PathBasedRouting \
-  --http-listener ssllistener --address-pool $default_address_pool_name --http-settings sslsettings
+  --url-path-map sslpathmap --rule-type PathBasedRouting --priority 1010 \
+  --http-listener ssllistener --address-pool $default_address_pool_name --http-settings sslsettings -o none
 
 # Verify
 curl -vvl "https://${appgw_fqdn}/api/healthcheck"

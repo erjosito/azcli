@@ -18,13 +18,13 @@
 ###############
 
 # Control
-no_of_hubs=1         # 1 or 2 hubs
+no_of_hubs=2         # 1 or 2 hubs
 hrp=ASPath           # Can be ASPath, ExpressRoute or VPN
-no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
+no_of_spokes=2       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
 create_custom_rt=no  # Whether a custom RT for VNets will be created
-indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
+indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
 redundant_nva=no     # Whether the NVA in the last spoke is redundant (2nd VM in the same subnet)
 nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
@@ -434,7 +434,7 @@ function create_spoke() {
         exit
     fi
     echo "Creating VM spoke${spoke_id}-vm in VNet spoke${spoke_id}-$location..."
-    az vm create -n spoke${spoke_id}-vm -g $rg -l $location --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    az vm create -n spoke${spoke_id}-vm -g $rg -l $location --image Ubuntu2204 --admin-username $username --generate-ssh-keys \
         --public-ip-address spoke${spoke_id}-pip --public-ip-sku Standard --vnet-name spoke${spoke_id}-$location --nsg $nsg_name --size $vm_size \
         --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file -o none
     echo "Installing Network Watcher extension in VM spoke${spoke_id}-vm..."
@@ -513,7 +513,7 @@ EOF
     #     --nsg ${onprem_linuxnva_name}-nsg --storage-account $storage_account_name --log-version 2 --retention 7 -o none
     # VM for onprem NVA
     echo "Creating VM $onprem_linuxnva_name..."
-    az vm create -n $onprem_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    az vm create -n $onprem_linuxnva_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys \
         --public-ip-address $onprem_linuxnva_pip --public-ip-sku Standard --vnet-name $onprem_vnet_name --size $vm_size --subnet $onprem_nva_subnet_name \
         --custom-data $linuxnva_cloudinit_file --private-ip-address "$onprem_linuxnva_ip" --nsg "${onprem_linuxnva_name}-nsg" -o none
     onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
@@ -1776,13 +1776,13 @@ then
     # If redundant NVAs, create second VM in each NVA spoke
     if [[ "$redundant_nva" == "yes" ]]; then
         echo "Creating second NVA VM in spoke 1${indirect_spoke_id}..."
-        az vm create -n spoke1${indirect_spoke_id}-vm2 -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+        az vm create -n spoke1${indirect_spoke_id}-vm2 -g $rg -l $location1 --image Ubuntu2204 --admin-username $username --generate-ssh-keys \
             --public-ip-address spoke1${indirect_spoke_id}-pip2 --public-ip-sku Standard --vnet-name spoke1${indirect_spoke_id}-$location1 --nsg "vm-nsg-${location1}" --size $vm_size \
             --subnet vm --custom-data $cloudinit_file -o none
         if [[ "$no_of_hubs" == "2" ]]
         then
             echo "Creating second NVA VM in spoke 2${indirect_spoke_id}..."
-            az vm create -n spoke2${indirect_spoke_id}-vm2 -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+            az vm create -n spoke2${indirect_spoke_id}-vm2 -g $rg -l $location2 --image Ubuntu2204 --admin-username $username --generate-ssh-keys \
                 --public-ip-address spoke2${indirect_spoke_id}-pip2 --public-ip-sku Standard --vnet-name spoke2${indirect_spoke_id}-$location2 --nsg "vm-nsg-${location2}" --size $vm_size \
                 --subnet vm --custom-data $cloudinit_file -o none
         fi
@@ -1865,7 +1865,7 @@ fi
 if [[ "$deploy_vpngw" == "yes" ]]
 then
     # VM in branch1
-    az vm create -n branch1-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    az vm create -n branch1-vm -g $rg -l $location1 --image Ubuntu2204 --admin-username $username --generate-ssh-keys \
         --public-ip-address branch1-vm-pip --public-ip-sku Standard --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
         --subnet vm --subnet-address-prefix $branch1_vm_subnet --custom-data $cloudinit_file -o none
     az vm extension set --vm-name branch1-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4 -o none
@@ -1878,7 +1878,7 @@ then
     az network vnet subnet update -n vm --vnet-name branch1 -g $rg --route-table branch1vm-$location1 -o none
     # VM in branch5
     if [[ "$branch5" == "yes" ]]; then
-        az vm create -n branch5-vm -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+        az vm create -n branch5-vm -g $rg -l $location1 --image Ubuntu2204 --admin-username $username --generate-ssh-keys \
             --public-ip-address branch5-vm-pip --public-ip-sku Standard --vnet-name branch5 --nsg $nsg1_name --size $vm_size \
             --subnet vm --subnet-address-prefix $branch5_vm_subnet --custom-data $cloudinit_file -o none --only-show-errors
         az vm extension set --vm-name branch5-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4 -o none
@@ -1893,7 +1893,7 @@ then
     # VM in branch2
     if [[ "$no_of_hubs" == "2" ]]
     then
-        az vm create -n branch2-vm -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+        az vm create -n branch2-vm -g $rg -l $location2 --image Ubuntu2204 --admin-username $username --generate-ssh-keys \
             --public-ip-address branch2-vm-pip --public-ip-sku Standard --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
             --subnet vm --subnet-address-prefix $branch2_vm_subnet --custom-data $cloudinit_file -o none
         az vm extension set --vm-name branch2-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4 -o none
@@ -2140,7 +2140,7 @@ then
     new_subnet_name=public
     vm_name=branch1-vm2
     az network vnet update -n branch1 -g $rg --address-prefixes $branch1_prefix $new_subnet
-    az vm create -n $vm_name -g $rg -l $location1 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    az vm create -n $vm_name -g $rg -l $location1 --image Ubuntu2204 --admin-username $username --generate-ssh-keys \
         --public-ip-address ${vm_name}-pip --public-ip-sku Standard --vnet-name branch1 --nsg $nsg1_name --size $vm_size \
         --subnet $new_subnet_name --subnet-address-prefix $new_subnet --custom-data $cloudinit_file
     az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
@@ -2161,7 +2161,7 @@ EOF
     new_subnet_name=public
     vm_name=branch2-vm2
     az network vnet update -n branch2 -g $rg --address-prefixes $branch2_prefix $new_subnet
-    az vm create -n $vm_name -g $rg -l $location2 --image ubuntuLTS --admin-username $username --generate-ssh-keys \
+    az vm create -n $vm_name -g $rg -l $location2 --image Ubuntu2204 --admin-username $username --generate-ssh-keys \
         --public-ip-address ${vm_name}-pip --public-ip-sku Standard --vnet-name branch2 --nsg $nsg2_name --size $vm_size \
         --subnet $new_subnet_name --subnet-address-prefix $new_subnet --custom-data $cloudinit_file
     az vm extension set --vm-name $vm_name -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4
