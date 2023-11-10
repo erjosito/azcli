@@ -385,11 +385,11 @@ fi
 #################
 
 # Override subnet if required
-appgw_name=appg21
-appgw_subnet_name=appgw21
-appgw_subnet_prefix=10.0.21.0/24
-appgw_subnet_prefix_v6=ace:cab:deca:21::/64
-appgw_pipname=${appgw_name}-pip
+# appgw_name=appg21
+# appgw_subnet_name=appgw21
+# appgw_subnet_prefix=10.0.21.0/24
+# appgw_subnet_prefix_v6=ace:cab:deca:21::/64
+# appgw_pipname=${appgw_name}-pip
 
 # Verify appgw_subnet exists
 appgw_subnet_id=$(az network vnet subnet show -n $appgw_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
@@ -430,6 +430,7 @@ else
 fi
 
 # Create GW with sample config for port 80
+# To create private GW, add --private-ip-address <ip_address>
 echo "Creating App GW..."
 az network application-gateway create -g $rg -n $appgw_name --sku $sku \
     --min-capacity 1 --max-capacity 2 \
@@ -526,8 +527,8 @@ keyvault_name=erjositoKeyvault
 cert_name=cloudtroopernet
 
 # Option 2: upload a cert to AKV
-cert_name=selfsigned01
-az keyvault certificate create --vault-name $keyvault_name -n $cert_name -p "$(az keyvault certificate get-default-policy)"
+# cert_name=selfsigned01
+# az keyvault certificate create --vault-name $keyvault_name -n $cert_name -p "$(az keyvault certificate get-default-policy)"
 
 # Create Identity to access the AKV
 id_name=appgwid

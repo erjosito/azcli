@@ -1,0 +1,511 @@
+# Create a 2-region hub and spoke environment with AzFW as NVA
+# Region 1 will be 10.1.x, region 2 will be 10.2.x
+# The hub will be .0.0/24, the spokes will be .1.0/24, .2.0/24, etc
+
+# Control
+create_vpn=no           # yes/no, whether VPN GW with branch is created
+create_er=no            # yes/no, whether ER GW is created
+create_fw=yes           # yes/no, whether AzFW is created
+
+# Variables
+rg=hns
+location1=eastus2
+location2=southcentralus
+username=$(whoami)
+vm_size=Standard_B1s
+nsg1_name=vm-nsg-$location1
+nsg2_name=vm-nsg-$location2
+cloudinit_file=/tmp/cloudinit.txt
+nva_size=Standard_B2ms
+s2s_psk='Microsoft123!'
+
+######################
+#  Helper functions  #
+######################
+
+function create_vnet() {
+    region=$1
+    spoke=$2
+    if [[ -z "$region" ]] || [[ -z "$spoke" ]]; then
+        echo "You need to provide a region ID and a spoke ID"
+        exit
+    fi
+    spoke_id="${hub}${spoke}"
+    hub_name="hub${region}"
+    vnet_prefix="10.${region}.${spoke}.0/24"
+    subnet_prefix="10.${region}.${spoke}.0/26"
+    if [[ "$region" == "1" ]]; then
+        location="$location1"
+        nsg_name="$nsg1_name"
+    elif [[ "$region" == "2" ]]; then
+        location="$location2"
+        nsg_name="$nsg2_name"
+    else
+        echo "ERROR: $region is not a valid region ID"
+        exit
+    fi
+    if [[ "$spoke" == "0" ]]; then      # Hub
+        vnet_name="hub${region}"
+    else                                # Spoke
+        vnet_name="spoke${region}${spoke}"
+    fi
+    vnet_prefix="10.${region}.${spoke}.0/24"
+    subnet_prefix="10.${region}.${spoke}.0/28"
+    echo "Creating VM ${vnet_name}-vm in VNet ${vnet_name}..."
+    az vm create -n ${vnet_name}-vm -g $rg -l $location --image Ubuntu2204 --admin-username $username --generate-ssh-keys \
+        --public-ip-address ${vnet_name}-pip --public-ip-sku Standard --vnet-name ${vnet_name} --nsg $nsg_name --size $vm_size \
+        --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file -o none
+    echo "Installing Network Watcher extension in VM ${vnet_name}-vm..."
+    az vm extension set --vm-name ${vnet_name}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4 -o none
+    if [[ "$spoke" != "0" ]]; then      # Peerings to hub needed!
+        echo "Peering VNet ${vnet_name}-$location to hub${region}..."
+        if [[ "$create_vpn" == "no" ]] && [[ "$create_er" == "no" ]]; then
+            az network vnet peering create -n "${vnet_name}tohub${region}" -g $rg --vnet-name ${vnet_name} --remote-vnet hub${region} --allow-forwarded-traffic --allow-vnet-access -o none
+            az network vnet peering create -n "hub${region}to${vnet_name}" -g $rg --vnet-name hub${region} --remote-vnet ${vnet_name} --allow-forwarded-traffic --allow-vnet-access -o none
+        else
+            az network vnet peering create -n "${vnet_name}tohub${region}" -g $rg --vnet-name ${vnet_name} --remote-vnet hub${region} --allow-forwarded-traffic --allow-vnet-access --use-remote-gateways -o none
+            az network vnet peering create -n "hub${region}to${vnet_name}" -g $rg --vnet-name hub${region} --remote-vnet ${vnet_name} --allow-forwarded-traffic --allow-vnet-access --allow-gateway-transit -o none
+        fi
+    else
+        echo "Skipping peering for hub${region}"
+    fi
+}
+
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
+function create_vpn_csr() {
+    # Variables
+    region=$1
+    if [[ -z "$region" ]]; then
+        echo "You need to provide a region ID"
+        exit
+    fi
+    publisher=cisco
+    offer=cisco-csr-1000v
+    sku=16_12-byol
+    nva_size=Standard_B2ms
+    version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+    branch_prefix=10.$region.101.0/24
+    branch_subnet=10.$region.101.0/26
+    branch_gateway=10.$region.101.1
+    branch_bgp_ip=10.$region.101.11
+    branch_asn=6550$region
+    username=$(whoami)
+    if [[ "$region" == "1" ]]; then
+        location="$location1"
+        nsg_name="$nsg1_name"
+    elif [[ "$region" == "2" ]]; then
+        location="$location2"
+        nsg_name="$nsg2_name"
+    else
+        echo "ERROR: $region is not a valid region ID"
+        exit
+    fi
+    # Create CSR to simulate an IPsec branch
+    echo "Creating CSR in region $location..."
+    az vm create -n "branch${region}-nva" -g $rg -l $location --size $nva_size --image ${publisher}:${offer}:${sku}:${version} --admin-username "$username" --generate-ssh-keys \
+        --public-ip-address "branch${region}-pip" --public-ip-address-allocation static --public-ip-sku Standard \
+        --vnet-name branch${region} --vnet-address-prefix $branch_prefix --subnet nva --subnet-address-prefix $branch_subnet --private-ip-address $branch_bgp_ip -o none
+    echo "Getting NVA's public IP..."
+    branch_ip=$(az network public-ip show -n "branch${region}-pip" -g $rg --query ipAddress -o tsv) && echo $branch_ip
+    # Create LNG and connection
+    echo "Creating LNG and connection for VPN GW vpngw${region}..."
+    az network local-gateway create -g $rg -n "branch${region}" --gateway-ip-address $branch_ip --local-address-prefixes "${branch_bgp_ip}/32" --asn $branch_asn --bgp-peering-address $branch_bgp_ip --peer-weight 0 -l $location -o none
+    az network vpn-connection create -g $rg --shared-key $s2s_psk --enable-bgp -n "branch${region}" --vnet-gateway1 vpngw${region} --local-gateway2 branch${region} -l $location -o none
+    # Get VPNGW config data
+    gw_name="vpngw${region}"
+    echo "Getting config data for $gw_name..."
+    vpngw_pip_0=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_pip_0
+    vpngw_private_ip_0=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_0
+    vpngw_pip_1=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]' -o tsv) && echo $vpngw_pip_1
+    vpngw_private_ip_1=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]' -o tsv) && echo $vpngw_private_ip_1
+    vpngw_asn=$(az network vnet-gateway show -n $gw_name -g $rg --query 'bgpSettings.asn' -o tsv) && echo $vpngw_asn
+    # Configure CSR (active/active VNG)
+    echo "Sending configuration to CSR..."
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no $branch_ip <<EOF
+    config t
+    crypto ikev2 proposal azure-proposal
+        encryption aes-cbc-256 aes-cbc-128 3des
+        integrity sha1
+        group 2
+        exit
+    !
+    crypto ikev2 policy azure-policy
+        proposal azure-proposal
+        exit
+    !
+    crypto ikev2 keyring azure-keyring
+    peer $vpngw_pip_0
+        address $vpngw_pip_0
+        pre-shared-key $psk
+        exit
+    peer $vpngw_pip_1
+        address $vpngw_pip_1
+        pre-shared-key $s2s_psk
+        exit
+    exit
+    !
+    crypto ikev2 profile azure-profile
+        match address local interface GigabitEthernet1
+        match identity remote address $vpngw_pip_0 255.255.255.255
+        match identity remote address $vpngw_pip_1 255.255.255.255
+        authentication remote pre-share
+        authentication local pre-share
+        keyring local azure-keyring
+    exit
+    !
+    crypto ipsec transform-set azure-ipsec-proposal-set esp-aes 256 esp-sha-hmac
+        mode tunnel
+    exit
+    crypto ipsec profile azure-vti
+        set transform-set azure-ipsec-proposal-set
+        set ikev2-profile azure-profile
+        set security-association lifetime kilobytes 102400000
+        set security-association lifetime seconds 3600 
+    exit
+    !
+    interface Tunnel0
+        ip unnumbered GigabitEthernet1 
+        ip tcp adjust-mss 1350
+        tunnel source GigabitEthernet1
+        tunnel mode ipsec ipv4
+        tunnel destination $vpngw_pip_0
+        tunnel protection ipsec profile azure-vti
+    interface Tunnel1
+        ip unnumbered GigabitEthernet1 
+        ip tcp adjust-mss 1350
+        tunnel source GigabitEthernet1
+        tunnel mode ipsec ipv4
+        tunnel destination $vpngw_pip_1
+        tunnel protection ipsec profile azure-vti
+    exit
+    !
+    router bgp $branch_asn
+        bgp router-id interface GigabitEthernet1
+        bgp log-neighbor-changes
+        neighbor $vpngw_private_ip_0 remote-as $vpngw_asn
+        neighbor $vpngw_private_ip_0 ebgp-multihop 5
+        neighbor $vpngw_private_ip_0 update-source GigabitEthernet1
+        neighbor $vpngw_private_ip_1 remote-as $vpngw_asn
+        neighbor $vpngw_private_ip_1 ebgp-multihop 5
+        neighbor $vpngw_private_ip_1 update-source GigabitEthernet1
+    !
+    ip route $vpngw_private_ip_0 255.255.255.255 Tunnel0
+    ip route $vpngw_private_ip_1 255.255.255.255 Tunnel1
+!
+end
+!
+wr mem
+EOF
+    # Verify tunnel status
+    echo "CSR interface status:"
+    ssh -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o BatchMode=yes -o StrictHostKeyChecking=no $branch_ip "show ip int b"
+    echo "BGP neighbors:"
+    ssh -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o BatchMode=yes -o StrictHostKeyChecking=no $branch_ip "show ip bgp summ"
+}
+
+##########
+#  Main  #
+##########
+
+# Create environment
+echo "Creating RG and VNets..."
+az group create -n $rg -l $location1 -o none
+
+# Create NSGs to be used by VMs
+echo "Creating NSGs for Virtual Machines..."
+az network nsg create -n $nsg1_name -g $rg -l $location1 -o none
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_SSH --priority 1000 \
+    --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges 22 -o none
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_HTTP --priority 1010 --direction Inbound \
+    --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' \
+    --destination-address-prefixes '*' --destination-port-ranges 9 80 443 -o none
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
+    --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges 500 4500 -o none
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_NTP --priority 1030 \
+    --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges 123 -o none
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Inbound_Icmp --priority 1040 \
+    --access Allow --protocol Icmp --source-address-prefixes '*' --direction Inbound \
+    --destination-address-prefixes '*' --destination-port-ranges '*' -o none
+az network nsg rule create --nsg-name $nsg1_name -g $rg -n Allow_Outbound_All --priority 1000 \
+    --access Allow --protocol '*' --source-address-prefixes '*' --direction Outbound \
+    --destination-address-prefixes '*' --destination-port-ranges '*' -o none
+# Configure NSG flow logs
+echo "Configuring NSG flow logs..."
+storage_account1_name=vwan$RANDOM$location1
+az storage account create -n $storage_account1_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location1 -o none
+az network watcher flow-log create -l $location1 -n flowlog-$location1 -g $rg \
+    --nsg $nsg1_name --storage-account $storage_account1_name --log-version 2 --retention 7 -o none
+# Create NSG in 2nd location
+if [[ "$location1" != "$location2" ]]; then
+    az network nsg create -n $nsg2_name -g $rg -l $location2 -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_SSH --priority 1000 \
+        --access Allow --protocol Tcp --source-address-prefixes '*' --direction Inbound \
+        --destination-address-prefixes '*' --destination-port-ranges 22 -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_HTTP --priority 1010 \
+        --access Allow --protocol Tcp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' \
+        --destination-address-prefixes '*' --destination-port-ranges 9 80 443 -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_IPsec --priority 1020 \
+        --access Allow --protocol Udp --source-address-prefixes 'Internet' --direction Inbound \
+        --destination-address-prefixes '*' --destination-port-ranges 500 4500 -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_NTP --priority 1030 \
+        --access Allow --protocol Udp --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' --direction Inbound \
+        --destination-address-prefixes '*' --destination-port-ranges 123 -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Inbound_Icmp --priority 1040 \
+        --access Allow --protocol Icmp --source-address-prefixes '*' --direction Inbound \
+        --destination-address-prefixes '*' --destination-port-ranges '*' -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n Allow_Outbound_All --priority 1000 \
+        --access Allow --protocol '*' --source-address-prefixes '*' --direction Outbound \
+        --destination-address-prefixes '*' --destination-port-ranges '*' -o none
+    storage_account2_name=vwan$RANDOM$location2
+    az storage account create -n $storage_account2_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location2 -o none
+    az network watcher flow-log create -l $location2 -n flowlog-$location2 -g $rg --nsg $nsg2_name --storage-account $storage_account2_name --log-version 2 --retention 7 -o none
+fi
+
+# Create cloud-init file for VMs
+# - Installing apache to use to verify TCP on port 80
+# - Enabling OS IP fwding everywhere, even if it is not really needed
+cat <<EOF > $cloudinit_file
+#cloud-config
+package_upgrade: true
+packages:
+  - apache2
+runcmd:
+  - sysctl -w net.ipv4.ip_forward=1
+EOF
+
+
+# Create VNets and VMs (1 hub and 2 spokes in each region)
+create_vnet 1 0
+create_vnet 1 1
+create_vnet 1 2
+create_vnet 2 0
+create_vnet 2 1
+create_vnet 2 2
+
+# Peer the hubs
+az network vnet peering create -n "hub1tohub2" -g $rg --vnet-name hub1 --remote-vnet hub2 --allow-forwarded-traffic --allow-vnet-access -o none
+az network vnet peering create -n "hub2tohub1" -g $rg --vnet-name hub2 --remote-vnet hub1 --allow-forwarded-traffic --allow-vnet-access -o none
+
+# Azure Firewall Policy
+if [[ "$create_fw" == "yes" ]]; then
+    azfw_policy_name="hns-azfw-policy"
+    echo "Creating Azure Firewall Policy $azfw_policy_name..."
+    az network firewall policy create -n $azfw_policy_name -g $rg -o none
+    az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
+    # Allow SSH and HTTP for connection monitor
+    echo "Creating rule to allow SSH and HTTP..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name mgmt --collection-priority 101 --action Allow --rule-name allowSSHnHTTP --rule-type NetworkRule --description "SSH and HTTP" \
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols TCP --destination-ports 9 22 80 -o none
+    # Allow ICMP
+    echo "Creating rule to allow ICMP..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name icmp --collection-priority 102 --action Allow --rule-name allowICMP --rule-type NetworkRule --description "ICMP traffic" \
+        --destination-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --source-addresses 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 --ip-protocols ICMP --destination-ports "1-65535" -o none
+    # Allow NTP
+    echo "Creating rule to allow NTP..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ntp --collection-priority 103 --action Allow --rule-name allowNTP --rule-type NetworkRule --description "Egress NTP traffic" \
+        --destination-addresses '*' --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --ip-protocols UDP --destination-ports "123" -o none
+    # Example application collection with 2 rules (ipconfig.co, api.ipify.org)
+    echo "Creating rule to allow ifconfig.co and api.ipify.org..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ifconfig --collection-priority 201 --action Allow --rule-name allowIfconfig --rule-type ApplicationRule --description "ifconfig" \
+        --target-fqdns "ifconfig.co" "ifconfig.me" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --protocols Http=80 Https=443 -o none
+    az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 --collection-name ifconfig \
+        --name ipify --target-fqdns "api.ipify.org" --source-addresses "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" --protocols Http=80 Https=443 --rule-type ApplicationRule -o none
+    # Example application collection with wildcards (*.ubuntu.com)
+    echo "Creating rule to allow *.ubuntu.com..."
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name ubuntu --collection-priority 202 --action Allow --rule-name repos --rule-type ApplicationRule --description "ubuntucom" \
+        --target-fqdns 'ubuntu.com' '*.ubuntu.com' --source-addresses '*' --protocols Http=80 Https=443 -o none
+    # Mgmt traffic to Azure
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name azure --collection-priority 203 --action Allow --rule-name azmonitor --rule-type ApplicationRule --description "Azure Monitor" \
+        --target-fqdns '*.opinsights.azure.com' '*.azure-automation.net' --source-addresses '*' --protocols Https=443 -o none
+fi
+
+# Azure Firewalls
+if [[ "$create_fw" == "yes" ]]; then
+    echo "Creating AzFW1..."
+    az network vnet subnet create -n AzureFirewallSubnet --vnet-name hub1 -g $rg --address-prefixes 10.1.0.192/26 -o none
+    az network public-ip create -g $rg -n azfw1-pip --sku standard --allocation-method static -l $location1 -o none
+    az network firewall create -n azfw1 -g $rg --policy $azfw_policy_name -l $location1 -o none
+    az network firewall ip-config create -f azfw1 -n azfw1-ipconfig -g $rg --public-ip-address azfw1-pip --vnet-name hub1 -o none
+    az network firewall update -n azfw1 -g $rg -o none
+    echo "Creating AzFW2..."
+    az network vnet subnet create -n AzureFirewallSubnet --vnet-name hub2 -g $rg --address-prefixes 10.2.0.192/26 -o none
+    az network public-ip create -g $rg -n azfw2-pip --sku standard --allocation-method static -l $location2 -o none
+    az network firewall create -n azfw2 -g $rg --policy $azfw_policy_name -l $location2 -o none
+    az network firewall ip-config create -f azfw2 -n azfw2-ipconfig -g $rg --public-ip-address azfw2-pip --vnet-name hub2 -o none
+    az network firewall update -n azfw2 -g $rg -o none
+fi
+
+# UDRs
+echo "Getting AzFW1's private IP..."
+azfw1_private_ip=$(az network firewall show -n azfw1 -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo "$azfw1_private_ip"
+echo "Getting AzFW2's private IP..."
+azfw2_private_ip=$(az network firewall show -n azfw2 -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo "$azfw2_private_ip"
+echo "Creating UDRs for spokes in $location1..."
+az network route-table create -n spokes-$location1 -g $rg -l $location1 --disable-bgp-route-propagation -o none
+az network route-table route create -n default -g $rg --route-table-name spokes-$location1 --address-prefix 0.0.0.0/0 --next-hop-ip-address $azfw1_private_ip --next-hop-type VirtualAppliance -o none
+az network vnet subnet update -n vm --vnet-name spoke11 -g $rg --route-table spokes-$location1 -o none
+az network vnet subnet update -n vm --vnet-name spoke12 -g $rg --route-table spokes-$location1 -o none
+echo "Creating UDRs for spokes in $location2..."
+az network route-table create -n spokes-$location2 -g $rg -l $location2 --disable-bgp-route-propagation -o none
+az network route-table route create -n default -g $rg --route-table-name spokes-$location2 --address-prefix 0.0.0.0/0 --next-hop-ip-address $azfw2_private_ip --next-hop-type VirtualAppliance -o none
+az network vnet subnet update -n vm --vnet-name spoke21 -g $rg --route-table spokes-$location2 -o none
+az network vnet subnet update -n vm --vnet-name spoke22 -g $rg --route-table spokes-$location2 -o none
+echo "Creating UDRs for hub in $location1..."
+az network route-table create -n hub-$location1 -g $rg -l $location1 -o none
+az network route-table route create -n region2 -g $rg --route-table-name hub-$location1 --address-prefix 10.2.0.0/16 --next-hop-ip-address $azfw2_private_ip --next-hop-type VirtualAppliance -o none
+az network route-table route create -n default -g $rg --route-table-name hub-$location1 --address-prefix 0.0.0.0/0 --next-hop-type Internet -o none
+az network vnet subnet update -n AzureFirewallSubnet --vnet-name hub1 -g $rg --route-table hub-$location1 -o none
+az network vnet subnet update -n vm --vnet-name hub1 -g $rg --route-table hub-$location1 -o none
+echo "Creating UDRs for hub in $location2..."
+az network route-table create -n hub-$location2 -g $rg -l $location2 -o none
+az network route-table route create -n region1 -g $rg --route-table-name hub-$location2 --address-prefix 10.1.0.0/16 --next-hop-ip-address $azfw1_private_ip --next-hop-type VirtualAppliance -o none
+az network route-table route create -n default -g $rg --route-table-name hub-$location2 --address-prefix 0.0.0.0/0 --next-hop-type Internet -o none
+az network vnet subnet update -n AzureFirewallSubnet --vnet-name hub2 -g $rg --route-table hub-$location2 -o none
+az network vnet subnet update -n vm --vnet-name hub2 -g $rg --route-table hub-$location2 -o none
+
+# VPN GWs
+if [[ "$create_vpn" == "yes" ]]; then
+    echo "Creating VPN GWs..."
+    az network public-ip create -g $rg -n vpngw1a -l $location1 -o none --only-show-errors
+    az network public-ip create -g $rg -n vpngw1b -l $location1 -o none --only-show-errors
+    az network vnet subnet create -n GatewaySubnet --vnet-name hub1 -g $rg --address-prefixes 10.1.0.160/27 -o none
+    az network vnet-gateway create -g $rg -l $location1 --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet hub1 -n vpngw1 --asn 65001 --public-ip-address vpngw1a vpngw1b --no-wait -o none --only-show-errors
+    az network public-ip create -g $rg -n vpngw2a -l $location2 -o none --only-show-errors
+    az network public-ip create -g $rg -n vpngw2b -l $location2 -o none --only-show-errors
+    az network vnet subnet create -n GatewaySubnet --vnet-name hub2 -g $rg --address-prefixes 10.2.0.160/27 -o none
+    az network vnet-gateway create -g $rg -l $location2 --sku VpnGw1 --gateway-type Vpn --vpn-type RouteBased --vnet hub2 -n vpngw2 --asn 65002 --public-ip-address vpngw2a vpngw2b --no-wait -o none --only-show-errors
+    vpngw1_id=$(az network vnet-gateway show -n vpngw1 -g $rg -o tsv --query id)
+    vpngw2_id=$(az network vnet-gateway show -n vpngw2 -g $rg -o tsv --query id)
+    wait_until_finished $vpngw1_id
+    wait_until_finished $vpngw2_id
+    # Create CSRs
+    create_vpn_csr 1
+    create_vpn_csr 2
+    # Routes for the GW Subnet
+    echo "Creating routes for the GatewaySubnet..."
+    az network route-table create -n vng-$location1 -g $rg -l $location1 -o none
+    az network route-table route create -n spoke11 -g $rg --route-table-name vng-$location1 --address-prefix 10.1.1.0/24 --next-hop-ip-address $azfw1_private_ip --next-hop-type VirtualAppliance -o none
+    az network route-table route create -n spoke12 -g $rg --route-table-name vng-$location1 --address-prefix 10.1.2.0/24 --next-hop-ip-address $azfw1_private_ip --next-hop-type VirtualAppliance -o none
+    az network vnet subnet update -n GatewaySubnet --vnet-name hub1 -g $rg --route-table vng-$location1 -o none
+    az network route-table create -n vng-$location2 -g $rg -l $location2 -o none
+    az network route-table route create -n spoke21 -g $rg --route-table-name vng-$location2 --address-prefix 10.2.1.0/24 --next-hop-ip-address $azfw2_private_ip --next-hop-type VirtualAppliance -o none
+    az network route-table route create -n spoke22 -g $rg --route-table-name vng-$location2 --address-prefix 10.2.2.0/24 --next-hop-ip-address $azfw2_private_ip --next-hop-type VirtualAppliance -o none
+    az network vnet subnet update -n GatewaySubnet --vnet-name hub2 -g $rg --route-table vng-$location2 -o none
+
+fi
+
+
+######################
+# Connection Monitor #
+######################
+
+# Get all VMs containing the string "vm" (that excludes the NVAs)
+vm_list=$(az vm list -g $rg --query "[?contains(name,'vm')].name" -o tsv | sort -u)
+# Build an associative array with all VM IDs
+declare -A vm_id_list
+echo "Getting VM IDs..."
+while IFS= read -r vm_name
+do
+    vm_id=$(az vm show -g $rg --query id -o tsv -n $vm_name)
+    vm_id_list+=([$vm_name]="$vm_id")
+done <<< "$vm_list"
+
+# Create connection monitors
+while IFS= read -r src_vm
+do
+    test_name="${src_vm}"
+    location=$(az vm show -n $src_vm -g $rg --query location -o tsv)
+    monitor_name="${src_vm}-${location}"
+    echo "Creating connection monitor for source $src_vm in $location..."
+    # The monitor is created with an HTTP config to ubuntu.com
+    az network watcher connection-monitor create -n $monitor_name -g $rg -l $location \
+        --test-group-name $test_name --endpoint-source-type AzureVM --endpoint-dest-type ExternalAddress \
+        --endpoint-source-resource-id "$vm_id_list[$src_vm]" --endpoint-source-name $src_vm \
+        --endpoint-dest-address "ubuntu.com" --endpoint-dest-name ubuntucom \
+        --test-config-name Http --protocol Http --http-method GET --https-prefer false -o none --only-show-errors
+    # An ICMP config is added
+    echo "Adding ICMP config to connection monitor $monitor_name..."
+    az network watcher connection-monitor test-configuration add --connection-monitor $monitor_name -l $location \
+        -n Icmp --protocol Icmp --icmp-disable-trace-route false --test-groups $test_name --frequency 30 -o none --only-show-errors
+    # Plus the rest of the VMs are added as targets
+    while IFS= read -r dst_vm
+    do
+        if [[ "$src_vm" != "$dst_vm" ]]
+        then
+            echo "Adding destination $dst_vm to connection monitor $monitor_name..."
+            az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location \
+                --resource-id "$vm_id_list[$dst_vm]" --name $dst_vm --type AzureVM --dest-test-groups $test_name -o none --only-show-errors
+        fi
+    done <<< "$vm_list"
+done <<< "$vm_list"
+
+# Update created monitors with NVAs' IP addresses as external endpoints to simulate traffic to onprem
+if [[ "$create_vpn" == "yes" ]]; then
+    branch1_bgp_ip=10.1.101.11
+    branch2_bgp_ip=10.2.101.11
+    while IFS= read -r src_vm
+    do
+        test_name="${src_vm}"
+        location=$(az vm show -n $src_vm -g $rg --query location -o tsv)
+        monitor_name="${src_vm}-${location}"
+        echo "Adding endpoint branch1 with IP address ${branch1_bgp_ip} to connection monitor $monitor_name..."
+        az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location \
+            --address "$branch1_bgp_ip" --name branch1 --type ExternalAddress --dest-test-groups $test_name -o none --only-show-errors
+        echo "Adding endpoint branch2 with IP address ${branch2_bgp_ip} to connection monitor $monitor_name..."
+        az network watcher connection-monitor endpoint add --connection-monitor $monitor_name -l $location \
+            --address "$branch2_bgp_ip" --name branch2 --type ExternalAddress --dest-test-groups $test_name -o none --only-show-errors
+    done <<< "$vm_list"
+fi
+
+#################
+#  Diagnostics  #
+#################
+
+az network nic show-effective-route-table -n spoke11-vmVMNic -g $rg -o table
+az network nic show-effective-route-table -n spoke21-vmVMNic -g $rg -o table
+
+###########
+# Cleanup #
+###########
+
+# az group delete -y -n $rg --no-wait
+
+# locations=($location1 $location2)
+# for location in ${locations[@]}; do
+#     monitor_list=$(az network watcher connection-monitor list -l $location --query '[].name' -o tsv)
+#     while IFS= read -r monitor_name; do
+#         echo "Deleting connection monitor $monitor_name in $location..."
+#         az network watcher connection-monitor delete -n $monitor_name -l $location -o none
+#     done <<< "$monitor_list"
+# done

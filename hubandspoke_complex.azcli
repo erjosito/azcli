@@ -238,11 +238,11 @@ for spoke_id in {1..$no_of_spokes}; do
             spoke_vm_name="spoke${spoke_id}-${subnet_id}-vm-${vm_id}"
             if [[ "$per_vm_nsg" == "yes" ]]; then
                 echo "Creating VM ${spoke_vm_name} in subnet ${spoke_subnet_name} in VNet ${spoke_vnet_name} with a dedicated NSG..."
-                az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg "${spoke_vm_name}-nsg" \
+                az vm create -n $spoke_vm_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys -o none --public-ip-sku Standard --nsg "${spoke_vm_name}-nsg" \
                     --public-ip-address '' --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
             else
                 echo "Creating VM ${spoke_vm_name} in subnet ${spoke_subnet_name} in VNet ${spoke_vnet_name} with no NSG..."
-                az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg '' \
+                az vm create -n $spoke_vm_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys -o none --public-ip-sku Standard --nsg '' \
                     --public-ip-address '' --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
             fi
         done
@@ -275,7 +275,7 @@ if [[ "$shared_services_spoke" == "yes" ]]; then
         for vm_id in {1..$no_of_vms_per_subnet}; do
             spoke_vm_name="SharedServices-${subnet_id}-vm-${vm_id}"
             echo "Creating VM ${spoke_vm_name} in subnet ${spoke_subnet_name} in VNet ${ss_vnet_name} with no NSG..."
-            az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys -o none --public-ip-sku Standard --nsg '' \
+            az vm create -n $spoke_vm_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys -o none --public-ip-sku Standard --nsg '' \
                 --public-ip-address '' --vnet-name $ss_vnet_name --size $vm_size --subnet $spoke_subnet_name -o none --only-show-errors --no-wait
         done
     done

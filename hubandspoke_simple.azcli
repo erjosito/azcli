@@ -5,13 +5,13 @@
 rg=ftalive
 location=westeurope
 hub_vnet_name=hubvnet
-hub_vnet_prefix=192.168.0.0/24
+hub_vnet_prefix=10.1.0.0/24
 hub_subnet_name=vm
-hub_subnet_prefix=192.168.0.0/26
+hub_subnet_prefix=10.1.0.0/26
 spoke_vnet_name=spokevnet
-spoke_vnet_prefix=192.168.1.0/24
+spoke_vnet_prefix=10.1.1.0/24
 spoke_subnet_name=vm
-spoke_subnet_prefix=192.168.1.0/26
+spoke_subnet_prefix=10.1.1.0/26
 vm_size=Standard_B1s
 hub_vm_name=hubvm
 spoke_vm_name=spokevm
