@@ -49,8 +49,8 @@ function connect_gws {
 az group create -n $rg -l $location -o none --only-show-errors
 
 # Create VPN GW in one vnet
-create_gw 1 1   # active/passive
-# create_gw 1 2   # active/active
+# create_gw 1 1   # active/passive
+create_gw 1 2   # active/active
 
 
 # Create test VM
@@ -58,7 +58,7 @@ azurevm_name=testvm
 azurevm_pip_name="${azurevm_name}-pip"
 vm_size=Standard_B1s
 az network nsg create -n "${azurevm_name}-nsg" -g $rg -o none --only-show-errors
-az vm create -n $azurevm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+az vm create -n $azurevm_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys \
     --public-ip-address $azurevm_pip_name --vnet-name vnet1 --size $vm_size --subnet vm -o none --only-show-errors
 
 # Connection between Azure VNGs

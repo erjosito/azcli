@@ -11,12 +11,12 @@
 
 # Control
 nva_type=linux          # can be csr or linux
-redundant_nva=no        # this script only supports the CSR for redundant CSRs
+redundant_nva=yes       # this script only supports the CSR for redundant CSRs
 create_spokes=no        # can be yes or no
 create_remote_spoke=no  # create a spoke in a remote region
 vpn_branch=no           # whether simulating a VPN branch
 onprem_nva_type=linux   # for the onprem NVA, whether Linux or CSR
-er_branch=yes           # whether simulating an ER branch
+er_branch=no            # whether simulating an ER branch
 
 # Variables
 rg=routeserver
@@ -170,11 +170,11 @@ rs_ip2=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIp
 rs_asn=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
 
 # Create test VM in hub
-az vm create -n hubvm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+az vm create -n hubvm -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys \
     --public-ip-address hubvm-pip --vnet-name $vnet_name --size Standard_B1s --subnet $hub_vm_subnet_name -o none
 hub_vm_ip=$(az network public-ip show -n hubvm-pip --query ipAddress -o tsv -g $rg) && echo $hub_vm_ip
 hub_vm_nic_id=$(az vm show -n hubvm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv) && echo $hub_vm_nic_id
-hub_vm_private_ip=$(az network nic show --ids $hub_vm_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub_vm_private_ip
+hub_vm_private_ip=$(az network nic show --ids $hub_vm_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo $hub_vm_private_ip
 
 ####################
 #       CSR        #
@@ -484,22 +484,22 @@ if [[ "$create_spokes" == "yes" ]]; then
     # az network vnet peering delete -n spoke1tohub -g $rg --vnet-name $spoke1_name
     az network vnet peering create -n hubtospoke1 -g $rg --vnet-name $vnet_name --remote-vnet $spoke1_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
     az network vnet peering create -n spoke1tohub -g $rg --vnet-name $spoke1_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
-    az vm create -n spoke1-vm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    az vm create -n spoke1-vm -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys \
         --public-ip-address spoke1-vm-pip --vnet-name $spoke1_name --size Standard_B1s --subnet $spoke1_vm_subnet_name -o none
     spoke1_ip=$(az network public-ip show -n spoke1-vm-pip --query ipAddress -o tsv -g $rg) && echo $spoke1_ip
     spoke1_nic_id=$(az vm show -n spoke1-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    spoke1_private_ip=$(az network nic show --ids $spoke1_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke1_private_ip
+    spoke1_private_ip=$(az network nic show --ids $spoke1_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo $spoke1_private_ip
     # Spoke 2 with Ubuntu VM
     echo "Creating spoke 2..."
     az network vnet create -g $rg -n $spoke2_name --address-prefix $spoke2_prefix --subnet-name $spoke2_vm_subnet_name --subnet-prefix $spoke2_vm_subnet_prefix -l $location -o none
     az network vnet subnet update -g $rg --vnet-name $spoke2_name -n $spoke2_vm_subnet_name --route-table spokevmrt -o none
     az network vnet peering create -n hubtospoke2 -g $rg --vnet-name $vnet_name --remote-vnet $spoke2_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
     az network vnet peering create -n spoke2tohub -g $rg --vnet-name $spoke2_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
-    az vm create -n spoke2-vm -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    az vm create -n spoke2-vm -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys \
         --public-ip-address spoke2-vm-pip --vnet-name $spoke2_name --size Standard_B1s --subnet $spoke2_vm_subnet_name -o none
     spoke2_ip=$(az network public-ip show -n spoke2-vm-pip --query ipAddress -o tsv -g $rg) && echo $spoke2_ip
     spoke2_nic_id=$(az vm show -n spoke2-vm -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    spoke2_private_ip=$(az network nic show --ids $spoke2_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke2_private_ip
+    spoke2_private_ip=$(az network nic show --ids $spoke2_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo $spoke2_private_ip
     # Effective routes
     az network nic show-effective-route-table --ids $spoke1_nic_id -o table
     az network nic show-effective-route-table --ids $spoke2_nic_id -o table
@@ -515,7 +515,7 @@ if [[ "$create_spokes" == "yes" ]]; then
         az network vnet subnet update -g $rg --vnet-name $spoke3_name -n $spoke3_vm_subnet_name --route-table remotespokevmrt -o none
         az network vnet peering create -n hubtospoke3 -g $rg --vnet-name $vnet_name --remote-vnet $spoke3_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
         az network vnet peering create -n spoke3tohub -g $rg --vnet-name $spoke3_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
-        az vm create -n spoke3-vm -g $rg -l $remote_location --image ubuntuLTS --generate-ssh-keys \
+        az vm create -n spoke3-vm -g $rg -l $remote_location --image Ubuntu2204 --generate-ssh-keys \
             --public-ip-address spoke3-vm-pip --vnet-name $spoke3_name --size Standard_B1s --subnet $spoke3_vm_subnet_name -o none
     fi
 
@@ -567,7 +567,7 @@ end
 wr mem
 EOF
     # Add BGP peering to ARS
-    spoke1_csr_private_ip=$(az network nic show -n "${spoke1_csr_name}-nic0" -g $rg  --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $spoke1_csr_private_ip
+    spoke1_csr_private_ip=$(az network nic show -n "${spoke1_csr_name}-nic0" -g $rg  --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo $spoke1_csr_private_ip
     az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $spoke1_csr_private_ip --peer-asn $spoke1_csr_asn -n $spoke1_csr_name -o none
 
     # Since the NVA is in spoke1, you want to vnet-peer spoke1 and spoke2, otherwise the effective route in spoke2 would show up as none
@@ -580,38 +580,44 @@ fi
 # Linux NVA in hub #
 ####################
 
-if [[ "$nva_type" == "linux" ]]; then
-    # Cloud init file to install StrongSwan (not used in this lab) and BIRD 1.6
-    cat <<EOF > $hub_linuxnva_cloudinit_file
+if [[ "$redundant_nva" == "yes" ]]; then
+    nva_no=2
+else
+    nva_no=1
+fi
+for nva_id in $(seq 1 $nva_no); do
+    if [[ "$nva_type" == "linux" ]]; then
+        # Cloud init file to install StrongSwan (not used in this lab) and BIRD 1.6
+        cat <<EOF > $hub_linuxnva_cloudinit_file
 #cloud-config
 runcmd:
-  - apt update && apt install -y bird strongswan libcharon-extra-plugins strongswan-pki
+  - apt update && apt install -y bird strongswan libcharon-extra-plugins strongswan-pki net-tools
   - sysctl -w net.ipv4.ip_forward=1
   - sudo iptables -t nat -A POSTROUTING ! -d '10.0.0.0/8' -o eth0 -j MASQUERADE
 EOF
-    echo "Creating Linux NVA..."
-    az network vnet subnet create --vnet-name $vnet_name --name $hub_linuxnva_subnet_name -g $rg --address-prefixes $hub_linuxnva_subnet_prefix -o none
-    az network route-table create -n hublinuxnva -g $rg -l $location --disable-bgp-route-propagation -o none
-    az network vnet subnet update -g $rg --vnet-name $vnet_name -n $hub_linuxnva_subnet_name --route-table hublinuxnva -o none
-    az vm create -n $hub_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
-        --public-ip-address $hub_linuxnva_pip_name --vnet-name $vnet_name --size Standard_B1s --subnet $hub_linuxnva_subnet_name \
-        --custom-data $hub_linuxnva_cloudinit_file -o none
-    hub_linuxnva_nic_id=$(az vm show -n $hub_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
-    az network nic update --ids $hub_linuxnva_nic_id --ip-forwarding -o none
-    hub_linuxnva_pip_ip=$(az network public-ip show -n $hub_linuxnva_pip_name -g $rg --query ipAddress -o tsv) && echo $hub_linuxnva_pip_ip
-    hub_linuxnva_private_ip=$(az network nic show --ids $hub_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $hub_linuxnva_private_ip
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "ip a"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
-    hub_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $hub_linuxnva_default_gw
+        echo "Creating Linux NVA ${hub_linuxnva_subnet_name}-${nva_id}..."
+        az network vnet subnet create --vnet-name $vnet_name --name $hub_linuxnva_subnet_name -g $rg --address-prefixes $hub_linuxnva_subnet_prefix -o none
+        az network route-table create -n hublinuxnva -g $rg -l $location --disable-bgp-route-propagation -o none
+        az network vnet subnet update -g $rg --vnet-name $vnet_name -n $hub_linuxnva_subnet_name --route-table hublinuxnva -o none
+        az vm create -n "${hub_linuxnva_subnet_name}-${nva_id}" -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys \
+            --public-ip-address "${hub_linuxnva_subnet_name}-${nva_id}-pip" --vnet-name $vnet_name --size Standard_B1s --subnet $hub_linuxnva_subnet_name \
+            --custom-data $hub_linuxnva_cloudinit_file -o none
+        hub_linuxnva_nic_id=$(az vm show -n "${hub_linuxnva_subnet_name}-${nva_id}" -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        az network nic update --ids $hub_linuxnva_nic_id --ip-forwarding -o none
+        hub_linuxnva_pip_ip=$(az network public-ip show -n "${hub_linuxnva_subnet_name}-${nva_id}-pip" -g $rg --query ipAddress -o tsv) && echo $hub_linuxnva_pip_ip
+        hub_linuxnva_private_ip=$(az network nic show --ids $hub_linuxnva_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo $hub_linuxnva_private_ip
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "ip a"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
+        hub_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $hub_linuxnva_default_gw
 
-    # RS adjacency
-    echo "Connecting Linux NVA to ARS..."
-    az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $hub_linuxnva_private_ip --peer-asn $hub_linuxnva_asn -n $hub_linuxnva_name -o none
+        # RS adjacency
+        echo "Connecting Linux NVA "${hub_linuxnva_subnet_name}-${nva_id}" on $hub_linuxnva_private_ip to ARS..."
+        az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $hub_linuxnva_private_ip --peer-asn $hub_linuxnva_asn -n "${hub_linuxnva_subnet_name}-${nva_id}" -o none
 
-    # Bird config file
-    bird_config_file=/tmp/bird.conf
-    cat <<EOF > $bird_config_file
+        # Bird config file
+        bird_config_file=/tmp/bird.conf
+        cat <<EOF > $bird_config_file
 log syslog all;
 router id $hub_linuxnva_private_ip;
 protocol device {
@@ -651,20 +657,22 @@ protocol bgp rs1 {
           export filter {accept;};
 }
 EOF
-    hub_linuxnva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "whoami") && echo $hub_linuxnva_user
-    scp $bird_config_file "${hub_linuxnva_pip_ip}:/home/${hub_linuxnva_user}/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo mv /home/${hub_linuxnva_user}/bird.conf /etc/bird/bird.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo systemctl restart bird"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show status"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols all"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs0"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs1"
+        echo "Configuring BIRD in Linux NVA "${hub_linuxnva_subnet_name}-${nva_id}" on public IP $hub_linuxnva_pip_ip..."
+        hub_linuxnva_user=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "whoami") && echo "User: $hub_linuxnva_user"
+        scp $bird_config_file "${hub_linuxnva_pip_ip}:/home/${hub_linuxnva_user}/bird.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo mv /home/${hub_linuxnva_user}/bird.conf /etc/bird/bird.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo systemctl restart bird"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "systemctl status bird"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show status"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show route"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols all"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs0"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_linuxnva_pip_ip "sudo birdc show protocols rs1"
 
-    # Routes advertised to ARS
-    az network routeserver peering list-learned-routes -n $hub_linuxnva_name --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
-fi
+        # Routes advertised to ARS
+        az network routeserver peering list-learned-routes -n "${hub_linuxnva_subnet_name}-${nva_id}" --routeserver $rs_name -g $rg --query 'RouteServiceRole_IN_0' -o table
+    fi
+done
 
 #################################
 # Onprem simulation with VPN/ER #
@@ -733,13 +741,13 @@ runcmd:
   - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
   - sysctl -w net.ipv4.conf.all.send_redirects = 0
 EOF
-    az vm create -n $onprem_linuxnva_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys \
+    az vm create -n $onprem_linuxnva_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys \
         --public-ip-address $onprem_linuxnva_pip --vnet-name $onprem_vnet_name --size Standard_B1s --subnet $onprem_nva_subnet_name \
         --custom-data $onprem_linuxnva_cloudinit_file --private-ip-address "$onprem_linuxnva_ip"
     onprem_linuxnva_nic_id=$(az vm show -n $onprem_linuxnva_name -g "$rg" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
     az network nic update --ids $onprem_linuxnva_nic_id --ip-forwarding
     onprem_linuxnva_pip_ip=$(az network public-ip show -n $onprem_linuxnva_pip -g $rg --query ipAddress -o tsv) && echo $onprem_linuxnva_pip_ip
-    onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $onprem_linuxnva_private_ip
+    onprem_linuxnva_private_ip=$(az network nic show --ids $onprem_linuxnva_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo $onprem_linuxnva_private_ip
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "ip a"
     onprem_linuxnva_default_gw=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip netstat -rnv | awk '$1 == "0.0.0.0" {print $2}') && echo $onprem_linuxnva_default_gw
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_linuxnva_pip_ip "systemctl status bird"

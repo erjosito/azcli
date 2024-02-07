@@ -8,6 +8,7 @@
 # Variables
 rg=afdtest
 fqdn=api.cloudtrooper.net
+host=$(echo $fqdn | cut -d. -f1)
 cdn_name=migrationtest
 afd_name=migrationtestafd
 cdn_test_prot=http
@@ -30,7 +31,12 @@ cdn_endpoint_fqdn=$(az cdn endpoint show -n $cdn_endpoint -g $rg --profile-name 
 echo "Hostname for endpoint '$cdn_endpoint' is '$cdn_endpoint_fqdn'"
 custom_domain_id=$(az cdn custom-domain list -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name --query "[?hostName=='$fqdn'].id" -o tsv)
 custom_domain_name=$(az cdn custom-domain list -g $rg --endpoint-name $cdn_endpoint --profile-name $cdn_name --query "[?hostName=='$fqdn'].name" -o tsv)
-echo "Custom domain $custom_domain_name found for FQDN $fqdn"
+if [[ -z "$custom_domain_name" ]]; then
+    echo "Custom domain $custom_domain_name not found for FQDN $fqdn. Exiting..."
+    exit 1
+else
+    echo "Custom domain $custom_domain_name found for FQDN $fqdn"
+fi
 
 # Getting info from AFD
 afd_endpoint_name=$(az afd endpoint list -g $rg --profile-name $afd_name --query '[0].name' -o tsv)
@@ -40,6 +46,12 @@ echo "Endpoint '$afd_endpoint_name' has hostname '$afd_endpoint_fqdn'"
 afd_route_name=$(az afd route list --profile-name $afd_name -g $rg --endpoint-name $afd_endpoint_name -o tsv --query '[0].name')
 echo "Route '$afd_route_name' found in AFD profile '$afd_name', endpoint '$afd_endpoint_name'"
 fqdn_dash=$(echo $fqdn | tr "." "-")
+# Get the domain name from AFD if not found in the CDN
+if [[ -z "$custom_domain_name" ]]; then
+    custom_domain_name=$(az afd custom-domain list -g $rg --profile-name $afd_name -o tsv --query "[?hostName=='$fqdn'].name")
+    custom_domain_id=$(az afd custom-domain list -g $rg --profile-name $afd_name -o tsv --query "[?hostName=='$fqdn'].id")
+    echo "Custom domain $custom_domain_name found for FQDN $fqdn"
+fi
 
 # Making sure secret exists in AFD
 afd_secret_id=$(az afd secret show -g $rg --profile-name $afd_name --secret-name $secret_name --query id -o tsv)
@@ -53,6 +65,15 @@ else
     echo "Secret '$secret_name' found in AFD '$afd_name'"
 fi
 
+# Get RG for DNS zone
+dns_rg=$(az network dns zone list --query "[?name=='$dns_zone_name'].resourceGroup" -o tsv)
+if [[ -z "$dns_rg" ]]; then
+    echo "DNS zone $dns_zone_name not found. Exiting..."
+    # exit 1
+else
+    echo "DNS zone $dns_zone_name found in resource group $dns_rg"
+fi
+
 # The test function expects the test protocol (http/https) as parameter
 def test_app() {
     test_prot=$1
@@ -64,7 +85,7 @@ def test_app() {
 return_code=$(test_app $cdn_test_prot)
 if [[ "$return_code" -ne "200" ]]; then
     echo "Error testing app. Exiting..."
-    exit 1
+    # exit 1
 else
     echo "App tested successfully, return code is $return_code"
 fi
@@ -77,8 +98,6 @@ fi
 start_time=`date +%s`
 echo "Starting migration at $(date)"
 echo "Changing DNS to point to AFD (from '$cdn_endpoint_fqdn' to '$afd_endpoint_fqdn')..."
-dns_rg=$(az network dns zone list --query "[?name=='$dns_zone_name'].resourceGroup" -o tsv)
-host=$(echo $fqdn | cut -d. -f1)
 az network dns record-set cname remove-record -g $dns_rg -z $dns_zone_name -n $host -c $cdn_endpoint_fqdn --keep-empty-record-set -o none
 az network dns record-set cname set-record -g $dns_rg -z $dns_zone_name -n $host -c $afd_endpoint_fqdn --ttl 3600 -o none
 echo "DNS changed to '$afd_endpoint_fqdn'. Time elapsed: $((`date +%s` - $start_time)) seconds"
@@ -152,7 +171,7 @@ echo "Custom domain added to CDN"
 return_code=$(test_app $cdn_test_prot)
 if [[ "$return_code" -ne "200" ]]; then
     echo "Error testing app. Exiting..."
-    exit 1
+    # exit 1
 else
     echo "App tested successfully back on CDN, return code is $return_code"
 fi

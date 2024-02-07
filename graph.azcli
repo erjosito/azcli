@@ -76,15 +76,7 @@ query="resources | where type == 'microsoft.network/virtualnetworks' | mvexpand 
 # - AZ-redundant VNGs
 query="resources | where type=='microsoft.network/virtualnetworkgateways' | where properties.gatewayType == 'Vpn' | extend compliant = (not (tolower(properties.sku.name) contains 'az')) | distinct id, compliant"
 # - Check "disable gateway propagation for RTs attached to GatewaySubnet"
-query="Resources | where type=='microsoft.network/virtualnetworks' 
-| project id,resourceGroup,name,subnets=properties.subnets 
-| mv-expand subnets
-| project id,resourceGroup,name,subnetName=tostring(subnets.name),routeTableId=tostring(subnets.properties.routeTable.id)
-| where subnetName == 'GatewaySubnet'
-| join (Resources | where type == 'microsoft.network/routetables' 
-| project routeTableName=name,routeTableId=id, disableBgpRoutePropagation=properties.disableBgpRoutePropagation
-) on routeTableId
-| project id,compliant = (disableBgpRoutePropagation == False)"
+query="resources | where type=='microsoft.network/virtualnetworks' | project id,resourceGroup,name,subnets=properties.subnets | mv-expand subnets | project id,resourceGroup,name,subnetName=tostring(subnets.name),routeTableId=tostring(subnets.properties.routeTable.id) | where subnetName == 'GatewaySubnet' | join kind=leftouter (Resources | where type == 'microsoft.network/routetables' | project routeTableName=name,routeTableId=id, disableBgpRoutePropagation=properties.disableBgpRoutePropagation) on routeTableId | project id,compliant = (disableBgpRoutePropagation == False or isnull(disableBgpRoutePropagation))"
 # Inbound deny-any in NSGs
 query="where type=='microsoft.network/networksecuritygroups' | mvexpand properties.securityRules | project id,name,ruleAction=properties_securityRules.properties.access,rulePriority=properties_securityRules.properties.priority,ruleDst=properties_securityRules.properties.destinationAddressPrefix,ruleSrc=properties_securityRules.properties.sourceAddressPrefix,ruleProt=properties_securityRules.properties.protocol,ruleDirection=properties_securityRules.properties.direction,rulePort=properties_securityRules.properties.destinationPortRange | summarize StarDenies=countif(ruleAction=='Deny' and ruleDst=='*' and ruleSrc=='*' and ruleProt=='*' and rulePort=='*') by id,tostring(ruleDirection) | where ruleDirection == 'Inbound' | project id,compliant=(StarDenies>0)"
 # NSGs with custom rules (not relying on default config)
@@ -130,6 +122,7 @@ query="resources | where type=='microsoft.network/applicationgateways' | extend 
 query="resources | where type=='microsoft.network/applicationgateways' | extend compliant = (isnotnull(properties.autoscaleConfiguration)) | distinct id,compliant"
 query="resources | where type=='microsoft.network/applicationgateways' | extend subnetId = tostring(properties.gatewayIPConfigurations[0].properties.subnet.id) | project id, subnetId | join (resources | where type=='microsoft.network/virtualnetworks' | project id,subnets=properties.subnets | mv-expand subnets | project id, subnetId = tostring(subnets.id), subnetPrefixLength = split(subnets.properties.addressPrefix, '/')[1]) on subnetId | extend compliant = (subnetPrefixLength <= 26) | distinct id,compliant"
 query="resources | where type=='microsoft.network/virtualnetworks' | project id,subnets=properties.subnets | mv-expand subnets | project id, subnetId = subnets.id, subnetPrefix = subnets.properties.addressPrefix"
+query="resources | where type=='microsoft.network/applicationgateways' | mvexpand properties.backendAddressPools | project name, bepoolName=tostring(properties_backendAddressPools.name), backends=properties_backendAddressPools.properties.backendAddresses | mv-expand backends | summarize backendCount=count() by name,bepoolName | where backendCount==1"
 # Load balancers
 query="resources | where type=='microsoft.network/loadbalancers' | extend countOutRules=array_length(properties.outboundRules) | extend compliant = (countOutRules == 0) | distinct id,compliant"
 # ExpressRoute

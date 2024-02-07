@@ -16,8 +16,9 @@ aks_rbac=yes
 aks_service_cidr=10.0.0.0/16
 vm_size=Standard_B2ms         # Some possible values: Standard_B2ms, Standard_D2_v3
 preview_version=yes
-network_plugin=azure_overlay   # azure/kubenet/none/azure_overlay/azure_cilium
+network_plugin=azure_cilium    # azure/kubenet/none/azure_overlay/azure_cilium
 network_policy=cilium          # azure/calico/cilium/none
+azure_cni_pod_subnet=no        # yes/no
 az_monitor=no
 # Vnet
 vnet_name=aksVnet
@@ -200,12 +201,16 @@ fi
 
 # Change network policy format if none specified
 if [[ "$network_policy" == 'none' ]]; then
-    network_policy=''
+    network_policy="''"
 fi
 
 # CNI options
 if [[ "$network_plugin" == 'azure' ]]; then
-    cni_options="--network-plugin azure --pod-subnet-id $pod_subnet_id"
+    if [[ "$azure_cni_pod_subnet" == "yes" ]]; then
+      cni_options="--network-plugin azure --pod-subnet-id $pod_subnet_id"
+    else
+      cni_options="--network-plugin azure"
+    fi
 elif [[ "$network_plugin" == 'kubenet' ]]; then
     cni_options="--network-plugin kubenet"
 elif [[ "$network_plugin" == 'azure_cilium' ]]; then
@@ -235,7 +240,7 @@ fi
 # Create AKS
 echo "Deploying cluster..."
 az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
-    -c 1 -s $vm_size ${(z)k8s_version_options} --generate-ssh-keys -u $(whoami) \
+    -c 1 -s $vm_size --generate-ssh-keys -u $(whoami) \
     ${(z)identity_options} \
     ${(z)cni_options} \
     --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
@@ -245,6 +250,7 @@ az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
     --dns-name-prefix cloudtrooper --no-wait
 
 # Other options you can use in the previous command
+    # ${(z)k8s_version_options} \
     # --enable-private-cluster --private-dns-zone none --disable-public-fqdn \
     # --enable-apiserver-vnet-integration \
     # --enable-cilium-dataplane  \   # https://techcommunity.microsoft.com/t5/azure-networking-blog/azure-cni-powered-by-cilium-for-azure-kubernetes-service-aks/ba-p/3662341
@@ -413,6 +419,137 @@ root@aks-nodepool1-34838928-vmss000000:/home/cilium# cilium policy get k8s:io.ci
 root@aks-nodepool1-34838928-vmss000000:/home/cilium# cilium endpoint get 644 -o jsonpath='{range ..status.policy.realized.l4.egress[*].derived-from-rules}{@}{"\n"}{end}'|tr -d ']['
 "k8s:io.cilium.k8s.policy.derived-from=CiliumNetworkPolicy","k8s:io.cilium.k8s.policy.name=api-netpol","k8s:io.cilium.k8s.policy.namespace=default","k8s:io.cilium.k8s.policy.uid=ddd4a267-38c1-411a-883f-3f52a176cfc5"
 "k8s:io.cilium.k8s.policy.derived-from=CiliumNetworkPolicy","k8s:io.cilium.k8s.policy.name=api-netpol","k8s:io.cilium.k8s.policy.namespace=default","k8s:io.cilium.k8s.policy.uid=ddd4a267-38c1-411a-883f-3f52a176cfc5"
+
+#####################
+#   Egress Gateway  #
+#####################
+
+az aks nodepool add --cluster-name $aks_name -g $rg -n egressgws --node-count 1 -s $vm_size --mode User \
+    --node-taints "kubeegressgateway.azure.com/mode=true:NoSchedule" --labels "kubeegressgateway.azure.com/mode=true" -o none
+
+# Prepare Helm chart values file (using MSI created for the cluster)
+config_file='/tmp/azure_config.yaml'
+
+# Config file for MSI
+url=https://raw.githubusercontent.com/Azure/kube-egress-gateway/main/docs/samples/sample_azure_config_msi.yaml
+# config:
+#   azureCloudConfig:
+#     cloud: "AzurePublicCloud"
+#     tenantId: "<tenant ID>"
+#     subscriptionId: "<subscription ID>"
+#     useManagedIdentityExtension: true
+#     userAssignedIdentityID: "<user assigned msi clientID>"
+#     userAgent: "kube-egress-gateway-controller"
+#     resourceGroup: "<resource group name>"
+#     location: "<resource group location>"
+#     gatewayLoadBalancerName: "kubeegressgateway-ilb"
+#     loadBalancerResourceGroup: ""
+#     vnetName: "<virtual network name>"
+#     vnetResourceGroup: ""
+#     subnetName: "<subnet name>"
+wget $url -q -O $config_file
+tenant_id=$(az account show -o tsv --query tenantId)
+subscription_id=$(az account show --query id -o tsv)
+id_id=$(az identity show -g $rg -n $id_name -o tsv --query id)
+sed -i "s|<tenant ID>|${tenant_id}|g" $config_file
+sed -i "s|<subscription ID>|${subscription_id}|g" $config_file
+sed -i "s|<resource group name>|${rg}|g" $config_file
+sed -i "s|<virtual network name>|${vnet_name}|g" $config_file
+sed -i "s|<subnet name>|${aks_subnet_name}|g" $config_file
+sed -i "s|<user assigned msi clientID>|${id_id}|g" $config_file
+sed -i "s|<resource group location>|${location}|g" $config_file
+
+# Config file for SP
+url=https://raw.githubusercontent.com/Azure/kube-egress-gateway/main/docs/samples/sample_azure_config_sp.yaml
+# config:
+#   azureCloudConfig:
+#     cloud: "AzurePublicCloud"
+#     tenantId: "<tenant ID>"
+#     subscriptionId: "<subscription ID>"
+#     useManagedIdentityExtension: false
+#     aadClientId: "<sp clientID>"
+#     aadClientSecret: "<sp secret>"
+#     userAgent: "kube-egress-gateway-controller"
+#     resourceGroup: "<resource group name>"
+#     location: "<resource group location>"
+#     gatewayLoadBalancerName: "kubeegressgateway-ilb"
+#     loadBalancerResourceGroup: ""
+#     vnetName: "<virtual network name>"
+#     vnetResourceGroup: ""
+#     subnetName: "<subnet name>"
+app_name=egressgwsp
+rg_id=$(az group show -n $rg -o tsv --query id)
+sp_output=$(az ad sp create-for-rbac -n $app_name --role Contributor --scopes $rg_id)
+sp_appid=$(echo $sp_output | jq -r '.appId')
+sp_password=$(echo $sp_output | jq -r '.password')
+wget $url -q -O $config_file
+tenant_id=$(az account show -o tsv --query tenantId)
+subscription_id=$(az account show --query id -o tsv)
+id_id=$(az identity show -g $rg -n $id_name -o tsv --query id)
+sed -i "s|<sp clientID>|${sp_appid}|g" $config_file
+sed -i "s|<sp secret>|${sp_password}|g" $config_file
+sed -i "s|<tenant ID>|${tenant_id}|g" $config_file
+sed -i "s|<subscription ID>|${subscription_id}|g" $config_file
+sed -i "s|<resource group name>|${rg}|g" $config_file
+sed -i "s|<virtual network name>|${vnet_name}|g" $config_file
+sed -i "s|<subnet name>|${aks_subnet_name}|g" $config_file
+sed -i "s|<resource group location>|${location}|g" $config_file
+
+
+# Helm chart install
+git clone https://github.com/Azure/kube-egress-gateway.git
+helm delete -n kube-egress-gateway-system kube-egress-gateway     # In case you are re-installing the helm chart
+helm install kube-egress-gateway ./kube-egress-gateway/helm/kube-egress-gateway \
+  --namespace kube-egress-gateway-system \
+  --create-namespace \
+  --set "common.imageRepository=mcr.microsoft.com/aks" --set "common.imageTag=v0.0.1" \
+  --values "$config_file"
+
+# Deploy Gateway config
+# https://github.com/azure/kube-egress-gateway
+kubectl apply -f - <<EOF
+apiVersion: egressgateway.kubernetes.azure.com/v1alpha1
+kind: StaticGatewayConfiguration
+metadata:
+  name: mystaticegressgateway
+  namespace: default
+spec:
+  gatewayVmssProfile:
+    vmssResourceGroup: $rg
+    vmssName: myGatewayPool
+    publicIpPrefixSize: 31
+  provisionPublicIps: true
+EOF
+
+# Create pod
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: yadaapi
+  labels:
+    app: yadaapi
+  annotations:
+    kubernetes.azure.com/static-gateway-configuration: mystaticegressgateway
+spec:
+  containers:
+  - name: yadaapi
+    image: erjosito/yadaapi:1.0
+    ports:
+    - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yadapi
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8080
+  selector:
+    app: yada
+EOF
+
 
 #####################
 #       Istio       #
