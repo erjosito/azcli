@@ -89,20 +89,20 @@ curl -s ${vm_pip_ip}:8080/api/printenv
 sql_endpoint_name=sqlep
 sql_server_id=$(az sql server show -n $sql_server_name -g $rg -o tsv --query id)
 # az network vnet subnet update -n $subnet_sql_name -g $rg --vnet-name $vnet_name --disable-private-endpoint-network-policies true
-az network private-endpoint create -n $sql_endpoint_name -g $rg --vnet-name $vnet_name --subnet $subnet_sql_name --private-connection-resource-id $sql_server_id --group-id sqlServer --connection-name sqlConnection
+az network private-endpoint create -n $sql_endpoint_name -g $rg --vnet-name $vnet_name --subnet $subnet_sql_name --private-connection-resource-id $sql_server_id --group-id sqlServer --connection-name sqlConnection -l $location -o none
 sql_nic_id=$(az network private-endpoint show -n $sql_endpoint_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
-sql_endpoint_ip=$(az network nic show --ids $sql_nic_id --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+sql_endpoint_ip=$(az network nic show --ids $sql_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
 echo "Private IP address for SQL server ${sql_server_name}: ${sql_endpoint_ip}"
 nslookup ${sql_server_fqdn}
 nslookup ${sql_server_name}.privatelink.database.windows.net
 
 # Create private DNS zone
 dns_zone_name=privatelink.database.windows.net
-az network private-dns zone create -n $dns_zone_name -g $rg
-az network private-dns link vnet create -g $rg -z $dns_zone_name -n $vnet_name --virtual-network $vnet_name --registration-enabled false
+az network private-dns zone create -n $dns_zone_name -g $rg -o none
+az network private-dns link vnet create -g $rg -z $dns_zone_name -n $vnet_name --virtual-network $vnet_name --registration-enabled false -l $location -o none
 # az network private-dns record-set a create -n $sql_server_name -z $dns_zone_name -g $rg
 # az network private-dns record-set a add-record --record-set-name $sql_server_name -z $dns_zone_name -g $rg -a $sql_endpoint_ip
-az network private-endpoint dns-zone-group create --endpoint-name $sql_endpoint_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name
+az network private-endpoint dns-zone-group create --endpoint-name $sql_endpoint_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none
 
 # DNS resolution verification (DNS TTL might take some minutes to expire)
 curl -s "http://${vm_pip_ip}:8080/api/dns?fqdn=${sql_server_fqdn}"

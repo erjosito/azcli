@@ -14,6 +14,7 @@ er_circuit_bw=50
 create_spokes=no
 number_of_spokes=2
 simulate_onprem=no
+create_ars=yes
 
 # Other possible pop/region combinations with megaport:
 # location=southcentralus
@@ -45,13 +46,16 @@ vm_pip_name="${vm_name}-pip"
 vm_size=Standard_B1s
 mcr_asn=65002
 megaport_script_path="/home/jose/repos/azcli/megaport.sh"
+ars_name=ars
+ars_subnet_prefix=192.168.64.32/27
+ars_pip_name="${ars_name}-pip"
 # gcloud (to simulate onprem ER)
-project_name=cci-sandbox-jomore
-project_id=cci-sandbox-jomore
+project_name=onprem
+project_id=onprem$RANDOM
 machine_type=e2-micro
 gcp_asn=16550
-region=us-east1  # other values: europe-west3, australia-southeast1, us-east1
-zone=us-east1-c  # other values: europe-west3-b, australia-southeast1-b, us-east1-c
+region=australia-southeast1  # other values: europe-west3, australia-southeast1, us-east1
+zone=australia-southeast1-b  # other values: europe-west3-b, australia-southeast1-b, us-east1-c
 gcp_vm_name=vm
 gcp_vpc_name=vpc
 gcp_subnet_name=vm
@@ -88,13 +92,13 @@ fi
 # Create VNet and test VM
 echo "Creating VNet and VM..."
 az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix --subnet-name $vm_subnet_name --subnet-prefix $vm_subnet_prefix -l $location -o none
-az vm create -n $vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" -o none \
+az vm create -n $vm_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys --nsg "${vm_name}-nsg" -o none \
     --public-ip-address $vm_pip_name --vnet-name $vnet_name --size $vm_size --subnet $vm_subnet_name -l $location
 
 # Create ER Gateway and connect it to circuit
 echo "Creating ER Gateway..."
 az network vnet subnet create -g $rg --vnet-name $vnet_name -n GatewaySubnet --address-prefix $gw_subnet_prefix -o none
-az network public-ip create -g $rg -n $ergw_pip --allocation-method Dynamic --sku Basic -l $location -o none
+az network public-ip create -g $rg -n $ergw_pip --allocation-method Static --sku Standard -l $location -o none
 az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location --vnet $vnet_name --public-ip-addresses $ergw_pip -o none
 circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id)
 echo "Connecting ER Gateway to circuit $circuit_id..."
@@ -148,6 +152,53 @@ if [[ "$create_spokes" == "yes" ]]; then
         # Update the VNG route table
         az network route-table route create --route-table-name vng-${er_pop} -g $rg --address-prefix $spoke_vnet_prefix --name $spoke_vnet_name --next-hop-type VirtualAppliance --next-hop-ip-address "$hub_vm_ip" -o none
     done
+fi
+
+if [[ "$simulate_onprem" == "yes" ]]; then
+    # Create GCP environment to simulate onprem
+    # Get environment info
+    account=$(gcloud info --format json | jq -r '.config.account')
+    billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
+    billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
+    # Create project
+    gcloud projects create $project_id --name $project_name
+    gcloud config set project $project_id
+    gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
+    gcloud services enable compute.googleapis.com
+    # VPC and instance
+    gcloud compute networks create "$gcp_vpc_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
+    gcloud compute networks subnets create "$gcp_subnet_name" --network "$gcp_vpc_name" --range "$gcp_subnet_prefix" --region=$region
+    gcloud compute instances create "$gcp_vm_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc_name" --subnet "$gcp_subnet_name" --zone "$zone"
+    gcloud compute firewall-rules create "${gcp_vpc_name}-allow-icmp" --network "$gcp_vpc_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute firewall-rules create "${gcp_vpc_name}-allow-ssh" --network "$gcp_vpc_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
+    gcloud compute firewall-rules create "${gcp_vpc_name}-allow-web" --network "$gcp_vpc_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
+    # gcloud compute ssh $gcp_vm_name --zone=$zone --command="ip a"    # This command will pause the script if the key file is password-protected
+    # Create interconnect
+    gcloud compute routers create $router_name --project=$project_id --network=$gcp_vpc_name --asn=$gcp_asn --region=$region
+    gcloud compute interconnects attachments partner create $attachment_name --region $region --router $router_name --edge-availability-domain availability-domain-1
+    pairing_key=$(gcloud compute interconnects attachments describe $attachment_name --region $region --format json | jq -r '.pairingKey')
+    # Create VXC in Megaport
+    $megaport_script_path -g -s=jomore-${er_pop} -a=create_vxc -k=$pairing_key
+    # Activate attachment
+    # wait_for_gcp_attachment_ready $attachment_name $region1
+    sleep 120
+    gcloud compute interconnects attachments partner update $attachment_name --region $region --admin-enabled
+fi
+
+#######################################
+# Optional: Create Azure Route Server #
+#######################################
+
+if [[ "$create_ars" == "yes" ]]; then
+    # Create subnet for ARS
+    echo "Creating subnet and PIP for ARS..."
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n RouteServerSubnet --address-prefix $ars_subnet_prefix -o none
+    ars_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n RouteServerSubnet --query id -o tsv)
+    # Create PIP
+    az network public-ip create -g $rg -n $ars_pip_name --allocation-method Static --sku Standard -l $location -o none
+    # Create ARS
+    echo "Creating ARS..."
+    az network routeserver create -n $ars_name -g $rg -l $location --hosted-subnet $ars_subnet_id --public-ip-address $ars_pip_name -o none
 fi
 
 ##############################################################
@@ -373,6 +424,12 @@ done <<< "$vm_list"
 # Remove MCR from Megaport
 megaport_script_path="/home/jose/repos/azcli/megaport.sh"
 $megaport_script_path -q -s=jomore -a=delete_mcr
+
+# Google cloud
+if [[ "$simulate_onprem" == "yes" ]]; then
+    gcloud projects delete "$project_id"
+    gcloud projects list
+fi
 
 # Delete RG
 az group delete -n $rg -y --no-wait

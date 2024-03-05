@@ -222,10 +222,10 @@ if [[ "$create_onpremdns" == "yes" ]] && [[ "$create_onprem" == "no" ]]; then
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo sed -i '$ a\log-queries' /etc/dnsmasq.conf"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl disable systemd-resolved"
     # From now on commands will be very slow, as DNS is not working
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$dns_vm_pip" "sudo sed -i \"\$ a 8.8.8.8 dnsserver\" /etc/hosts"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$dns_vm_pip" "sudo sed -i \"\$ a 168.63.129.16 dnsserver\" /etc/hosts"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl stop systemd-resolved"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo unlink /etc/resolv.conf"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "echo nameserver 8.8.8.8 | sudo tee /etc/resolv.conf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "echo nameserver 168.63.129.16 | sudo tee /etc/resolv.conf"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl restart dnsmasq"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl enable dnsmasq"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $dns_vm_pip "sudo systemctl status dnsmasq"
