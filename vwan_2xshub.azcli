@@ -19,7 +19,7 @@
 
 # Control
 no_of_hubs=1         # 1 or 2 hubs
-hrp=ASPath           # Can be ASPath, ExpressRoute or VPN
+hrp=ExpressRotue     # Can be ASPath, ExpressRoute or VPN
 no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
@@ -32,15 +32,15 @@ vnet_ass=default     # Route table to associate VNet connections. Can be 'defaul
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none' (if 'vnet', $create_custom_rt must be yes)
 nva_in_hub1=no       # Whether a Linux NVA is deployed in hub1 (note you need to have a valid NVA image in the same subscription!)
 nva_in_hub2=no       # Whether a Linux NVA is deployed in hub2 (note you need to have a valid NVA image in the same subscription!)
-deploy_vpngw=no      # Whether VPN GWs should be deployed
+deploy_vpngw=yes     # Whether VPN GWs should be deployed
 branch5=no           # Whether a 2nd S2S branch in hub1 should be deployed
 deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
 deploy_gcp=yes       # Whether an onprem location to be connected over ER should be deployed in Google Cloud
 er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
 global_reach=yes     # If 2 hubs and ER, connect both circuits via GR
-routing_intent=no    # Whether RI is configured
-ri_policy=internet   # internet/private/both
+routing_intent=yes   # Whether RI is configured
+ri_policy=both       # internet/private/both
 private_link=no      # whether private endpoints will be created for the storage accounts in each region (in the first spoke, using the flow logs storage accounts)
 location1=northcentralus
 location2=westcentralus
@@ -62,9 +62,12 @@ nsg1_name=vm-nsg-$location1
 nsg2_name=vm-nsg-$location2
 # Branches
 publisher=cisco
-offer=cisco-csr-1000v
-sku=16_12-byol
-version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+# offer=cisco-csr-1000v
+# sku=16_12-byol
+# version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
+offer=cisco-c8000v-byol
+sku=17_13_01a-byol
+version=latest
 # Branch1 (VPN in hub1)
 branch1_prefix=10.4.1.0/24
 branch1_prefix_long="10.4.1.0 255.255.255.0"
@@ -1173,14 +1176,14 @@ fi
 
 # Create CSRs only if there are VPN Gateways
 
-# Create CSR to simulate branch1
+# Create CSR to simulate branch1/branch2
 if [[ "$deploy_vpngw" == "yes" ]]
 then
     # You might have to accept the CSR marketplace terms to deploy the image
     echo "Accepting the Cisco marketplace image for Cisco CSR..."
     az vm image terms accept -p $publisher -f $offer --plan $sku -o none
     echo "Creating NVAs..."
-    az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} \
+    az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} --security-type Standard \
         --generate-ssh-keys --admin-username $username --nsg $nsg1_name --size $nva_size --disable-integrity-monitoring \
         --public-ip-address branch1-pip --public-ip-address-allocation static --public-ip-sku Standard --private-ip-address $branch1_bgp_ip \
         --vnet-name branch1 --vnet-address-prefix $branch1_prefix --subnet nva --subnet-address-prefix $branch1_subnet -o none
@@ -1202,7 +1205,7 @@ then
     if [[ "$no_of_hubs" == "2" ]]
     then
         # Create CSR to simulate branch2
-        az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} \
+        az vm create -n branch2-nva -g $rg -l $location2 --image ${publisher}:${offer}:${sku}:${version} --security-type Standard \
             --generate-ssh-keys --admin-username $username --nsg $nsg2_name --size $nva_size --disable-integrity-monitoring \
             --public-ip-address branch2-pip --public-ip-address-allocation static --public-ip-sku Standard --private-ip-address $branch2_bgp_ip \
             --vnet-name branch2 --vnet-address-prefix $branch2_prefix --subnet nva --subnet-address-prefix $branch2_subnet -o none
@@ -1223,7 +1226,7 @@ if [[ "$deploy_vpngw" == "yes" ]] && [[ "$branch5" == "yes" ]]
 then
     # You might have to accept the CSR marketplace terms to deploy the image
     echo "Creating NVA branch5-nva..."
-    az vm create -n branch5-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} \
+    az vm create -n branch5-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} --security-type Standard \
         --generate-ssh-keys --admin-username $username --nsg $nsg1_name --size $nva_size --disable-integrity-monitoring \
         --public-ip-address branch5-pip --public-ip-address-allocation static --public-ip-sku Standard --private-ip-address $branch5_bgp_ip \
         --vnet-name branch5 --vnet-address-prefix $branch5_prefix --subnet nva --subnet-address-prefix $branch5_subnet -o none
@@ -1238,7 +1241,6 @@ fi
 
 
 # Configure branches (CSRs)
-
 # Get parameters for VPN GW in hub1
 if [[ "$deploy_vpngw" == "yes" ]]
 then
@@ -1268,11 +1270,11 @@ then
     wait_interval_csr=30
     echo "Waiting until CSR in branch${branch_id} is reachable..."
     command="sho ver | i uptime"
-    command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "$command")
+    command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch1_ip "$command")
     until [[ -n "$command_output" ]]
     do
         sleep $wait_interval_csr
-        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "$command")
+        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch1_ip "$command")
     done
     echo $command_output
 
@@ -1287,19 +1289,19 @@ then
     sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw1_gw0_pip}|g" $config_file_local
     sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw1_gw1_pip}|g" $config_file_local
     sed -i "s|\*\*BGP_ID\*\*|${branch1_asn}|g" $config_file_local
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip <<EOF
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch1_ip <<EOF
   config t
     file prompt quiet
 EOF
-    scp -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $config_file_local ${branch1_ip}:/${config_file_csr}
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "copy bootflash:${config_file_csr} running-config"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "wr mem"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "sh ip int b"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip "sh ip bgp summary"
+    scp -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $config_file_local ${branch1_ip}:/${config_file_csr}
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch1_ip "copy bootflash:${config_file_csr} running-config"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch1_ip "wr mem"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch1_ip "sh ip int b"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch1_ip "sh ip bgp summary"
     myip=$(curl -s4 ifconfig.co)
     loopback_ip=10.11.11.11
     default_gateway=$branch1_gateway
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch1_ip <<EOF
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch1_ip <<EOF
 config t
     username $username password 0 $password
     no ip domain lookup
@@ -1326,11 +1328,11 @@ EOF
         wait_interval_csr=30
         echo "Waiting until CSR in branch${branch_id} is reachable..."
         command="sho ver | i uptime"
-        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "$command")
+        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch2_ip "$command")
         until [[ -n "$command_output" ]]
         do
             sleep $wait_interval_csr
-            command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "$command")
+            command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch2_ip "$command")
         done
         echo $command_output
 
@@ -1345,19 +1347,19 @@ EOF
         sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw2_gw0_pip}|g" $config_file_local
         sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw2_gw1_pip}|g" $config_file_local
         sed -i "s|\*\*BGP_ID\*\*|${branch2_asn}|g" $config_file_local
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip <<EOF
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch2_ip <<EOF
   config t
     file prompt quiet
 EOF
-        scp -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $config_file_local ${branch2_ip}:/${config_file_csr}
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "copy bootflash:${config_file_csr} running-config"
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "wr mem"
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "sh ip int b"
-        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip "sh ip bgp summary"
+        scp -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $config_file_local ${branch2_ip}:/${config_file_csr}
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch2_ip "copy bootflash:${config_file_csr} running-config"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch2_ip "wr mem"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch2_ip "sh ip int b"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch2_ip "sh ip bgp summary"
         myip=$(curl -s4 ifconfig.co)
         loopback_ip=10.22.22.22
         default_gateway=$branch2_gateway
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch2_ip <<EOF
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch2_ip <<EOF
 config t
     username $username password 0 $password
     no ip domain lookup
@@ -1424,11 +1426,11 @@ then
     wait_interval_csr=30
     echo "Waiting until CSR in branch${branch_id} is reachable..."
     command="sho ver | i uptime"
-    command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "$command")
+    command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch5_ip "$command")
     until [[ -n "$command_output" ]]
     do
         sleep $wait_interval_csr
-        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "$command")
+        command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch5_ip "$command")
     done
     echo $command_output
 
@@ -1443,19 +1445,19 @@ then
     sed -i "s|\*\*GW0_Public_IP\*\*|${vpngw1_gw0_pip}|g" $config_file_local
     sed -i "s|\*\*GW1_Public_IP\*\*|${vpngw1_gw1_pip}|g" $config_file_local
     sed -i "s|\*\*BGP_ID\*\*|${branch5_asn}|g" $config_file_local
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip <<EOF
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch5_ip <<EOF
   config t
     file prompt quiet
 EOF
-    scp -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $config_file_local ${branch5_ip}:/${config_file_csr}
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "copy bootflash:${config_file_csr} running-config"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "wr mem"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "sh ip int b"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "sh ip bgp summary"
+    scp -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $config_file_local ${branch5_ip}:/${config_file_csr}
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch5_ip "copy bootflash:${config_file_csr} running-config"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch5_ip "wr mem"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch5_ip "sh ip int b"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch5_ip "sh ip bgp summary"
     myip=$(curl -s4 ifconfig.co)
     loopback_ip=10.55.55.55
     default_gateway=$branch5_gateway
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip <<EOF
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch5_ip <<EOF
 config t
     username $username password 0 $password
     no ip domain lookup
@@ -1475,7 +1477,7 @@ config t
 end
 write mem
 EOF
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1 $branch5_ip "sh ip int b"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch5_ip "sh ip int b"
 fi  # if $deploy_vpngw == yes
 
 # Configure VPN gateways to log to Azure Monitor
