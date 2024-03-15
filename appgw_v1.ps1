@@ -61,8 +61,28 @@ if (Get-InstalledScript -Name "AzureAppGWMigration") {
 # Get some values first
 az network vnet subnet create --vnet-name $vnet_name -n $subnetv2_name --address-prefixes $subnetv2_prefix -g $rg -o none
 $appgw = Get-AzApplicationGateway -Name $appgw_name -ResourceGroupName $rg
+
+# Create PIP
+$appgw2_pip_name = "appgw2-pip"
+$ip = @{
+    Name = $appgw2_pip_name
+    ResourceGroupName = $rg
+    Location = $location
+    Sku = 'Standard'
+    AllocationMethod = 'Static'
+    IpAddressVersion = 'IPv4'
+    Zone = 1,2,3
+}
+$appgw2_pip = New-AzPublicIpAddress @ip
+
+
 # https://learn.microsoft.com/en-us/azure/application-gateway/migrate-v1-v2
-AzureAppGWMigration -resourceId $appgw.Id -subnetAddressRange $subnetv2_prefix -appgwName $appgwv2_name -AppGwResourceGroupName $rg -validateMigration -enableAutoScale
+AzureAppGWMigration -resourceId $appgw.Id `
+                    -subnetAddressRange $subnetv2_prefix `
+                    -PublicIpResourceId $appgw2_pip.Id `
+                    -appgwName $appgwv2_name `
+                    -AppGwResourceGroupName $rg `
+                    -validateMigration -enableAutoScale
 
 # Errors:
 # 1. Az.Resources missing

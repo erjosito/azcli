@@ -64,6 +64,7 @@ nsg2_name=vm-nsg-$location2
 publisher=cisco
 # offer=cisco-csr-1000v
 # sku=16_12-byol
+# sku=17_3_4a-byol
 # version=$(az vm image list -p $publisher -f $offer -s $sku --all --query '[0].version' -o tsv)
 offer=cisco-c8000v-byol
 sku=17_13_01a-byol
@@ -1241,6 +1242,13 @@ fi
 
 
 # Configure branches (CSRs)
+
+# License has to be enabled!
+# 1. conf t
+# 2. license boot level network-premier addon dna-premier
+# 3. wr
+# 4. reload
+
 # Get parameters for VPN GW in hub1
 if [[ "$deploy_vpngw" == "yes" ]]
 then
