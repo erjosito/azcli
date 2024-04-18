@@ -112,7 +112,8 @@ function enableAksFeature () {
 # enableAksFeature "PodSubnetPreview"
 # enableAksFeature "EnableAPIServerVnetIntegrationPreview"
 # enableAksFeature "CiliumDataplanePreview"
-enableAksFeature "AzureServiceMeshPreview"
+# enableAksFeature "AzureServiceMeshPreview"
+enableAksFeature "NetworkObservabilityPreview"
 
 # Update extension
 echo "Updating aks-preview extension..."
@@ -151,15 +152,15 @@ if [[ "$az_monitor" == 'yes' ]]; then
 fi
 
 # Get latest supported/preview version
-k8s_versions=$(az aks get-versions -l $location -o json --only-show-errors)
-if [[ "$preview_version" == "yes" ]]
-then
-    k8s_version=$(echo $k8s_versions | jq -r '.values | map(select(.isPreview == true))[0] | .version')
-    echo "Latest supported k8s version is $k8s_version (in preview)"
-else
-    k8s_version=$(echo $k8s_versions | jq -r '.values | map(select(.isPreview == null))[0] | .version')
-    echo "Latest supported k8s version (not in preview) is $k8s_version"
-fi
+# k8s_versions=$(az aks get-versions -l $location -o json --only-show-errors)
+# if [[ "$preview_version" == "yes" ]]
+# then
+#     k8s_version=$(echo $k8s_versions | jq -r '.values | map(select(.isPreview == true))[0] | .version')
+#     echo "Latest supported k8s version is $k8s_version (in preview)"
+# else
+#     k8s_version=$(echo $k8s_versions | jq -r '.values | map(select(.isPreview == null))[0] | .version')
+#     echo "Latest supported k8s version (not in preview) is $k8s_version"
+# fi
 
 # Setting identity flags (managed identity or SP)
 if [[ "$use_msi" == no ]]
@@ -322,6 +323,74 @@ az aks update -g $rg -n $aks_name --enable-managed-identity -y
 # Update to new version
 new_aks_version=1.21.2
 az aks upgrade -n $aks_name -g $rg -k $new_aks_version -y
+
+################################
+#  Managed Prometheus/Grafana  #
+################################
+
+# Variables
+grafana_name="${aks_name}-grafana-${RANDOM}"
+monitor_ws_name="${aks_name}-monitor-${RANDOM}"
+
+# Create Grafana/Prometheus
+az grafana create -n $grafana_name -g $rg -o none
+az monitor account create -n $monitor_ws_name -g $rg -l $location -o none
+
+grafana_id=$(az grafana show -n $grafana_name -g $rg -o none --query id -o tsv)
+monitor_ws_id=$(az monitor account show -n $monitor_ws_name -g $rg -o none --query id -o tsv)
+az aks update --disable-azure-monitor-metrics -n $aks_name -g $rg -o none
+az aks update --enable-azure-monitor-metrics -n $aks_name -g $rg --azure-monitor-workspace-resource-id $monitor_ws_id --grafana-resource-id  $grafana_id -o none
+
+# Browse
+grafana_url=$(az grafana show -n $grafana_name -g $rg -o tsv --query properties.endpoint)
+echo "Grafana URL is $grafana_url"
+
+# Verify
+kubectl get po -owide -n kube-system | grep ama-
+kubectl get ds ama-metrics-node --namespace=kube-system
+
+##################
+#     Retina     #
+##################
+
+# https://retina.sh/docs/installation/setup
+
+# Basic
+VERSION=$( curl -sL https://api.github.com/repos/microsoft/retina/releases/latest | jq -r .name)
+helm upgrade --install retina oci://ghcr.io/microsoft/retina/charts/retina \
+    --version $VERSION \
+    --namespace kube-system \
+    --set image.tag=$VERSION \
+    --set operator.tag=$VERSION \
+    --set logLevel=info \
+    --set enabledPlugin_linux="\[dropreason\,packetforward\,linuxutil\,dns\]"
+
+# Advanced with local context (with capture support)
+VERSION=$( curl -sL https://api.github.com/repos/microsoft/retina/releases/latest | jq -r .name)
+helm upgrade --install retina oci://ghcr.io/microsoft/retina/charts/retina \
+    --version $VERSION \
+    --namespace kube-system \
+    --set image.tag=$VERSION \
+    --set operator.tag=$VERSION \
+    --set image.pullPolicy=Always \
+    --set logLevel=info \
+    --set os.windows=true \
+    --set operator.enabled=true \
+    --set operator.enableRetinaEndpoint=true \
+    --skip-crds \
+    --set enabledPlugin_linux="\[dropreason\,packetforward\,linuxutil\,dns\,packetparser\]" \
+    --set enablePodLevel=true \
+    --set enableAnnotations=true
+
+# Uninstall
+helm -n kube-system uninstall retina
+
+
+# Import Retina dashboard to grafana
+# dashboard_id=16611   # From https://learn.microsoft.com/en-us/azure/aks/network-observability-managed-cli?tabs=cilium#enable-visualization-on-grafana
+dashboard_id=18814    # From https://retina.sh/docs/installation/grafana
+az grafana dashboard import -g $rg -n $grafana_name --definition $dashboard_id -o none
+# 412 Client Error: Precondition Failed for url: https://aks-grafana-5436-bvh4e6hagxfka2h4.eus2.grafana.azure.com/api/dashboards/import
 
 ####################
 #  Install Cilium  #
