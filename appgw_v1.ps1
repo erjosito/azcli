@@ -71,7 +71,7 @@ $ip = @{
     Sku = 'Standard'
     AllocationMethod = 'Static'
     IpAddressVersion = 'IPv4'
-    Zone = 1,2,3
+    #Zone = 1,2,3
 }
 $appgw2_pip = New-AzPublicIpAddress @ip
 
