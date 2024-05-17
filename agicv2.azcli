@@ -62,8 +62,12 @@ az aks create -g $rg -n $aks_name -l $location -o none \
     --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM"
 
-# Create identity for AGICv2
+# For existing clusters
+# az aks update -g $rg -n $aks_name --enable-oidc-issuer --enable-workload-identity -o none
+
+# Create identity for AGC
 node_rg=$(az aks show -n $aks_name -g $rg --query "nodeResourceGroup" -o tsv)
+node_rg_id=$(az group show -n $node_rg --query id -o tsv)
 echo "Creating identity $alb_id_name in resource group $rg"
 az identity create -n $alb_id_name -g $rg -o none --only-show-errors
 alb_id_principal_id="$(az identity show -n $alb_id_name -g $rg --query principalId -o tsv)"
@@ -71,21 +75,82 @@ echo "Waiting 15 seconds to allow for replication of the identity..."
 sleep 15
 echo "Apply Reader role to the AKS managed cluster resource group for the newly provisioned identity"
 reader_role=acdd72a7-3385-48ef-bd42-f606fba81ae7
-az role assignment create --assignee-object-id $alb_id_principal_id -g $node_rg --role $reader_role -o none --only-show-errors
+az role assignment create --assignee-object-id $alb_id_principal_id --role $reader_role --scope $node_rg_id -o none --only-show-errors
 echo "Set up federation with AKS OIDC issuer"
 aks_oidc_issuer="$(az aks show -n "$aks_name" -g "$rg" --query "oidcIssuerProfile.issuerUrl" -o tsv)"
 az identity federated-credential create -n $alb_id_name -g $rg -o none --only-show-errors \
     --identity-name $alb_id_name --issuer "$aks_oidc_issuer" --subject "system:serviceaccount:azure-alb-system:alb-controller-sa"
 
+
 # Deploy Helm chart
 az aks get-credentials -n $aks_name -g $rg --overwrite-existing
 helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller \
-      --version 0.4.023901 \
+      --version 1.0.2 \
       --set albController.podIdentity.clientID=$(az identity show -g $rg -n $alb_id_name --query clientId -o tsv)
 
 # Verify
 kubectl get pods -n azure-alb-system
 kubectl get gatewayclass azure-alb-external -o yaml
+
+#############################
+#          Managed          #
+#############################
+
+# Create AppGW for containers
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $agfc_subnet_name --address-prefix $agfc_subnet_prefix --delegations 'Microsoft.ServiceNetworking/trafficControllers' -o none --only-show-errors
+agfc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $agfc_subnet_name --query id --output tsv)
+
+# Delegate roles to the ALB identity
+echo "Adding roles for ALB identity..."
+node_rg=$(az aks show -n $aks_name -g $rg --query "nodeResourceGroup" -o tsv)
+node_rg_id=$(az group show -n $node_rg --query id -o tsv)
+az role assignment create --assignee-object-id $alb_id_principal_id --scope $node_rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
+az role assignment create --assignee-object-id $alb_id_principal_id --scope $agfc_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none # Network Contributor
+
+# Configure ALB (NOTE: this is only for managed ALB, not for BYO ALB): this will create the ALB resource in Azure
+kubectl create ns $alb_ns_name
+kubectl apply -f - <<EOF
+apiVersion: alb.networking.azure.io/v1
+kind: ApplicationLoadBalancer
+metadata:
+  name: $agfc_name
+  namespace: $alb_ns_name
+spec:
+  associations:
+  - $agfc_subnet_id
+EOF
+kubectl get ApplicationLoadBalancer -n $alb_ns_name
+kubectl describe ApplicationLoadBalancer -n $alb_ns_name
+
+# Create Gateway in k8s: this will create the association and frontends in Azure
+alb_id=$(az network alb list -g $node_rg --query '[0].id' -o tsv)
+alb_name=$(az network alb list -g $node_rg --query '[0].name' -o tsv)
+echo "Creating Gateway in k8s associated to ALB ID $alb_id..."
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: Gateway
+metadata:
+  name: $alb_name
+  annotations:
+    alb.networking.azure.io/alb-namespace: $alb_ns_name
+    alb.networking.azure.io/alb-id: $alb_id
+spec:
+  gatewayClassName: azure-alb-external
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+EOF
+
+k get gateway
+
+
+#############################
+# Bring your own deployment #
+#############################
 
 # Create AppGW for containers
 az network alb create -g $rg -n $agfc_name -o none --only-show-errors
@@ -94,40 +159,31 @@ az network vnet subnet create -g $rg --vnet-name $vnet_name -n $agfc_subnet_name
 agfc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $agfc_subnet_name --query id --output tsv)
 
 # Delegate roles to the ALB identity
-rg_id=$(az group show --name $rg --query id -otsv)
+rg_id=$(az group show -n $rg --query id -o tsv)
 az role assignment create --assignee-object-id $alb_id_principal_id --scope $rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
 az role assignment create --assignee-object-id $alb_id_principal_id --scope $agfc_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none # Network Contributor
+
+# Create Gateway and frontend
+az network alb create -g $rg -n $agfc_name -o none --only-show-errors
+az network alb frontend create -g $rg --alb-name $agfc_name -n $agfc_frontend_name -o none --only-show-errors
 
 # Associate the AppGW4C with the subnet
 association_name='AppGW4Cassociation'
 az network alb association create -g $rg -n $association_name --alb-name $agfc_name --subnet $agfc_subnet_id -o none --only-show-errors
 
-# Configure ALB (NOTE: this is only for managed ALB, not for BYO ALB)
-# kubectl create ns $alb_ns_name
-# kubectl apply -f - <<EOF
-# apiVersion: alb.networking.azure.io/v1
-# kind: ApplicationLoadBalancer
-# metadata:
-#   name: $agfc_name
-#   namespace: $alb_ns_name
-# spec:
-#   associations:
-#   - $agfc_subnet_id
-# EOF
-# kubectl get ApplicationLoadBalancer
-
 # Create Gateway in k8s
-alb_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
-alb_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
-alb_frontend_name=$(az network alb frontend list -g $rg --alb-name $alb_name --query '[0].name' -o tsv)
-echo "Creating Gateway in k8s associated to ALB ID $alb_id and frontend $alb_frontend_name..."
+agfc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
+# agfc_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
+# agfc_frontend_name=$(az network alb frontend list --alb-name $agfc_name -g $rg --query '[0].name' -o tsv)
+echo "Creating Gateway in k8s associated to ALB ID $alb_id and frontend $agfc_frontend_name..."
 kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
 metadata:
-  name: $alb_name
+  name: $agfc_name
   annotations:
-    alb.networking.azure.io/alb-id: $alb_id
+    alb.networking.azure.io/alb-namespace: $alb_ns_name
+    alb.networking.azure.io/alb-id: $agfc_id
 spec:
   gatewayClassName: azure-alb-external
   listeners:
@@ -139,14 +195,20 @@ spec:
         from: Same
   addresses:
   - type: alb.networking.azure.io/alb-frontend
-    value: $alb_frontend_name
+    value: $agfc_frontend_name
 EOF
 
-# Sample workload in the cluster
+k get gateway
+
+##################################
+# Sample workload in the cluster #
+##################################
+
 kubectl create deployment yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
 kubectl expose deploy yadaapi --port=8080 --target-port=8080
 
 # HTTP route
+fqdn=$(kubectl get gateway $agfc_name -o jsonpath='{.status.addresses[0].value}') && echo $fqdn
 kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute
@@ -154,20 +216,34 @@ metadata:
   name: yadaapi
 spec:
   parentRefs:
-  - name: $alb_name
+  - name: $agfc_name
+  hostnames:
+  - "$fqdn"
   rules:
   - backendRefs:
     - name: yadaapi
       port: 8080
 EOF
 
+# Check
+k get httproute
+k describe httproute yadaapi
+
 # Test
-fqdn=$(kubectl get gateway $alb_name -o jsonpath='{.status.addresses[0].value}') && echo $fqdn
 curl "$fqdn/api/healthcheck"
 
-#################
-#  Diagnostics  #
-#################
+#####################
+# Azure Diagnostics #
+#####################
+
+az network alb list -g $node_rg -o table
+agfc_name=$(az network alb list -g $node_rg --query '[0].name' -o tsv)
+az network alb association list --alb-name $agfc_name -g $node_rg -o table
+az network alb frontend list --alb-name $agfc_name -g $node_rg -o table
+
+##########################
+# Kubernetes Diagnostics #
+##########################
 
 # Check the agic pods
 kubectl get pods -n azure-alb-system
