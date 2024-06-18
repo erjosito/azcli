@@ -18,8 +18,8 @@ action=list
 
 # Variables to get credentials
 akv_name="erjositoKeyvault"
-usr_secret_name="megaport-username"
-pwd_secret_name="megaport-password"
+usr_secret_name="megaport-api-key"
+pwd_secret_name="megaport-api-secret"
 mcr_asn=65001
 quiet=no
 
@@ -55,6 +55,10 @@ do
                name_suffix="${i#*=}"
                shift # past argument=value
                ;;
+          -m=*|--metro=*)
+               metro="${i#*=}"
+               shift # past argument=value
+               ;;
           --asn=*)
                mcr_asn="${i#*=}"
                shift # past argument=value
@@ -88,7 +92,7 @@ function get_mcr_name () {
     product_id=$1
     # Sending call to get product by UID
     products_url="${base_url}/v2/products"
-    products_json=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
+    products_json=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
     output=$(echo "$products_json" | jq -r "[ .data[] | select( .productUid | contains(\"${product_id}\")) | { productName } ] | .[].productName")
     echo $output
 }
@@ -98,11 +102,19 @@ function get_mcr_status () {
     product_id=$1
     # Sending call to get product by UID
     products_url="${base_url}/v2/products"
-    products_json=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
+    products_json=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
     output=$(echo "$products_json" | jq -r "[ .data[] | select( .productUid | contains(\"${product_id}\")) | { provisioningStatus } ] | .[].provisioningStatus")
     if [[ "$quiet" == "no" ]]; then
         echo $output
     fi
+}
+
+function list_locations () {
+    locations_url="${base_url}/v2/locations?locationStatuses=Active"
+    if [[ -n "$metro" ]]; then
+        locations_url="${locations_url}&metro=${metro}"
+    fi
+    locations_json=$(echo 2>/dev/null)
 }
 
 function list_products () {
@@ -110,7 +122,7 @@ function list_products () {
     status=$1
     # Sending call to get services, and associated VXCs
     products_url="${base_url}/v2/products"
-    products_json=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
+    products_json=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
     output=$(echo "$products_json" | jq -r "[ .data[] | select( .productName | contains(\"${product_string}\")) | { productName, productType, provisioningStatus, productUid, vxcs: [ .associatedVxcs[]? | { productName, productType, provisioningStatus, productUid }] } ]")
     # Only show products with a certain state
     if [[ -n "$status" ]]
@@ -156,7 +168,7 @@ function create_mcr () {
             --arg mcrProduct "$mcr_product" \
             "$buy_payload_template")
         # log_msg "Sending payload to REST API: $buy_payload..."
-        buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
+        buy_response=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
         if [[ "$quiet" == "no" ]]; then
             echo "$buy_response" | jq
         fi
@@ -172,7 +184,7 @@ function validate_key () {
     else
         validate_url="${base_url}/v2/secure/azure/${service_key}"
         log_msg "INFO: Sending request to URL $validate_url..."
-        validate_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" -X GET "$validate_url" 2>/dev/null)
+        validate_response=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" -X GET "$validate_url" 2>/dev/null)
         filtered_response=$(echo $validate_response | jq -r ".data | { bandwidth, service_key, ports: [ .megaports[]? | { name, locationId, productUid }] }")
         # Validate we have an output
         if [[ -n $filtered_response ]]
@@ -206,7 +218,7 @@ function create_vxc () {
         --arg erPort "$er_port" \
         --arg serviceKey "$service_key" \
         "$buy_payload_template")
-    buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
+    buy_response=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
     if [[ "$quiet" == "no" ]]; then
         echo "$buy_response" | jq
     fi
@@ -219,7 +231,7 @@ function validate_gcp_key () {
     else
         validate_url="${base_url}/v2/secure/google/${service_key}"
         log_msg "INFO: Sending request to URL $validate_url..."
-        validate_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" -X GET "$validate_url" 2>/dev/null)
+        validate_response=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" -X GET "$validate_url" 2>/dev/null)
         filtered_response=$(echo $validate_response | jq -r ".data | { ports: [ .megaports[0]? | { name, locationId, productId, productUid }] }")
         # Validate we have an output
         if [[ -n $filtered_response ]]
@@ -250,7 +262,7 @@ function create_gcp_vxc () {
         --arg portId "$port_id" \
         --arg serviceKey "$service_key" \
         "$buy_payload_template")
-    buy_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
+    buy_response=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
     echo "$buy_response" | jq
 
 }
@@ -260,7 +272,7 @@ function cancel_product () {
     product_id=$1
     cancel_url="${base_url}/v2/product/${product_id}/action/CANCEL_NOW" 
     log_msg "INFO: sending POST request to $cancel_url..."
-    cancel_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" -X POST "$cancel_url" 2>/dev/null)
+    cancel_response=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" -X POST "$cancel_url" 2>/dev/null)
     if [[ "$quiet" == "no" ]]; then
         echo "$cancel_response" | jq
     fi
@@ -312,26 +324,30 @@ else
     megaport_user=$(az keyvault secret show --vault-name $akv_name -n $usr_secret_name --query 'value' -o tsv 2>/dev/null)
     if [[ -z "$megaport_user" ]]
     then
-        read -p "I could not find any username in AKV $akv_name in the secret ${usr_secret_name}, please enter your Megaport user name to add it as secret: " megaport_user
+        read -p "I could not find any API key in AKV $akv_name in the secret ${usr_secret_name}, please enter your Megaport API key to add it to Azure Key Vault as secret: " megaport_user
         az keyvault secret set --vault-name $akv_name --name $usr_secret_name --value $megaport_user -o none
     else
-        log_msg "INFO: Megaport username successfully retrieved from Azure Key Vault $akv_name"
+        log_msg "INFO: Megaport API key successfully retrieved from Azure Key Vault $akv_name"
     fi
     megaport_password=$(az keyvault secret show --vault-name $akv_name -n $pwd_secret_name --query 'value' -o tsv 2>/dev/null)
     if [[ -z "$megaport_password" ]]
     then
-        read -sp "I could not find any username in AKV $akv_name, please enter your Megaport password to add it as secret: " megaport_password
+        read -sp "I could not find any API secret in AKV $akv_name, please enter your Megaport API secret to add it to Azure Key Vault as secret: " megaport_password
         az keyvault secret set --vault-name $akv_name --name $pwd_secret_name --value $megaport_password -o none
     else
-        log_msg "INFO: Megaport password successfully retrieved from Azure Key Vault $akv_name"
+        log_msg "INFO: Megaport API secret successfully retrieved from Azure Key Vault $akv_name"
     fi
 
     # Sending authentication call to Megaport
     echo "INFO: Authenticating to Megaport API..."
-    auth_url="${base_url}/v2/login"
-    auth_json=$(curl --data-urlencode "username=${megaport_user}" --data-urlencode "password=${megaport_password}" -H "Content-Type: application/x-www-form-urlencoded" -X POST "$auth_url" 2>/dev/null)
-    megaport_token=$(echo "$auth_json" | jq -r '.data.token')
-    if [[ -z $megaport_token ]]
+    # auth_url="${base_url}/v2/login"
+    # auth_json=$(curl --data-urlencode "username=${megaport_user}" --data-urlencode "password=${megaport_password}" -H "Content-Type: application/x-www-form-urlencoded" -X POST "$auth_url" 2>/dev/null)
+    # megaport_token=$(echo "$auth_json" | jq -r '.data.token')
+    auth_url=https://auth-m2m.megaport.com/oauth2/token
+    auth_json=$(curl -s -u "${megaport_user}:${megaport_password}" --data-urlencode 'grant_type=client_credentials' -H "Content-Type: application/x-www-form-urlencoded" -X POST "$auth_url")
+    megaport_token=$(echo "$auth_json" | jq -r '.access_token')
+
+    if [[ -z $megaport_token ]] || [[ "$megaport_token" == "null" ]]
     then
         echo "ERROR: Authentication failed"
         echo $auth_json | jq
@@ -361,6 +377,9 @@ case $action in
             done
         fi
         ;;
+    list_locations)
+        list_locations
+        ;;
     delete)
         cancel_product "$product_id"
         ;;
@@ -378,7 +397,11 @@ case $action in
                 log_msg "INFO: Location ID derived from the supplied service key: $location_id"
             fi
         fi
-        create_mcr
+        if [[ -z "$location_id" ]]; then
+            log_msg "ERROR: location ID couldn't be found, please specify it with -l or --location-id"
+        else
+            create_mcr
+        fi
         ;;
     delete_mcr)
         mcr_ids=$(list_products "LIVE" | jq -r '.[].productUid')
@@ -422,7 +445,7 @@ case $action in
         mcr_id=$(list_products "LIVE" | jq -r '.[].productUid')
         bgp_routes_url="${base_url}/v2/product/mcr2/${mcr_id}/diagnostics/routes/bgp"
         log_msg "INFO: Sending request to URL $bgp_routes_url..."
-        bgp_routes_response=$(curl -H "Content-Type: application/json" -H "X-Auth-Token: ${megaport_token}" -X GET "$bgp_routes_url" 2>/dev/null)
+        bgp_routes_response=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" -X GET "$bgp_routes_url" 2>/dev/null)
         echo $bgp_routes_response | jq
         ;;
     *)
