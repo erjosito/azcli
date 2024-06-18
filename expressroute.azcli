@@ -10,10 +10,10 @@ er_location=australiaeast
 er_pop=Sydney
 er_circuit_sku=Standard
 er_circuit_family=MeteredData  # other values: MeteredData, UnlimitedData
-er_circuit_bw=50
+er_circuit_bw=1000   # other values: 50, 100, 200, 500, 1000
 create_spokes=no
 number_of_spokes=2
-simulate_onprem=no
+simulate_onprem=yes
 create_ars=yes
 
 # Other possible pop/region combinations with megaport:

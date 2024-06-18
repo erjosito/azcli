@@ -266,6 +266,10 @@ function cancel_product () {
     fi
 }
 
+#############
+#   Start   #
+#############
+
 # Checking dependencies
 for binary in "az" "jq" "curl"
 do
@@ -323,6 +327,7 @@ else
     fi
 
     # Sending authentication call to Megaport
+    echo "INFO: Authenticating to Megaport API..."
     auth_url="${base_url}/v2/login"
     auth_json=$(curl --data-urlencode "username=${megaport_user}" --data-urlencode "password=${megaport_password}" -H "Content-Type: application/x-www-form-urlencoded" -X POST "$auth_url" 2>/dev/null)
     megaport_token=$(echo "$auth_json" | jq -r '.data.token')
@@ -332,7 +337,7 @@ else
         echo $auth_json | jq
         exit 1
     else
-        log_msg "INFO: Authentication successful"
+        log_msg "INFO: Authentication successful, token obtained"
     fi
 fi
 
