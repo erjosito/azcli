@@ -11,10 +11,13 @@ er_pop=Sydney
 er_circuit_sku=Standard
 er_circuit_family=MeteredData  # other values: MeteredData, UnlimitedData
 er_circuit_bw=1000   # other values: 50, 100, 200, 500, 1000
-create_spokes=no
+create_spokes=yes
 number_of_spokes=2
 simulate_onprem=yes
 create_ars=yes
+flowlogs=yes
+traffic_collector=yes
+tc_name=mytc
 
 # Other possible pop/region combinations with megaport:
 # location=southcentralus
@@ -105,6 +108,45 @@ echo "Connecting ER Gateway to circuit $circuit_id..."
 az network express-route update -n "$er_circuit_name" -g $rg -o none    # sometimes you need to refresh the circuit
 az network vpn-connection create -n "${ergw_name}-${er_pop}" -g $rg -l $location --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id -o none
 
+# Optional: configure flow logs on the Gateway Subnet
+if [[ "$flowlogs" == "yes" ]]; then
+    logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
+    if [[ -z "$logws_name" ]]
+    then
+        logws_name=log$RANDOM
+        echo "Creating log analytics workspace ${logws_name}..."
+        az monitor log-analytics workspace create -n $logws_name -g $rg -l $location -o none
+    fi
+    logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+    logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+    # Create storage account
+    storage_account_name=$(az storage account list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the storage account name if it already existed
+    if [[ -z "$storage_account_name" ]]
+    then
+        storage_account_name=log$RANDOM
+        echo "Creating storage account ${storage_account_name}..."
+        az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location -o none
+    fi
+    # Enable flow logs
+    echo "Enabling VNet Flow Logs on gateway subnet..."
+    az network watcher flow-log create -l $location -g $rg --name "flowlog-$location" --vnet $vnet_name --subnet GatewaySubnet \
+        --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
+fi
+
+# Optional: ER Traffic Collector
+if [[ "$traffic_collector" == "yes" ]]; then
+    echo "Creating ER Traffic Collector..."
+    extension_version=$(az extension show -n traffic-collector --query version -o tsv)
+    if [[ -z "$extension_version" ]]; then
+        echo "Installing traffic_collector CLI extension..."
+        az extension add --name traffic-collector
+    else
+        echo "Updating traffic_collector CLI extension..."
+        az extension update --name traffic-collector
+    fi
+    az network-function traffic-collector -n $tc_name -g $rg -o none
+fi
+
 # Optional: create spoke associated to the previous VNet and configure the Hub VM as NVA
 if [[ "$create_spokes" == "yes" ]]; then
     # IP fwding in hub VM
@@ -137,7 +179,7 @@ if [[ "$create_spokes" == "yes" ]]; then
         # Create VNet, VNet peerings and VM
         echo "Creating spoke ${spoke_vnet_name}..."
         az network vnet create -g $rg -n $spoke_vnet_name --address-prefix $spoke_vnet_prefix --subnet-name $spoke_vm_subnet_name --subnet-prefix $spoke_vm_subnet_prefix -l $location -o none
-        az vm create -n $spoke_vm_name -g $rg -l $location --image ubuntuLTS --generate-ssh-keys --nsg "${vm_name}-nsg" --public-ip-sku Standard \
+        az vm create -n $spoke_vm_name -g $rg -l $location --image Ubuntu2204 --generate-ssh-keys --nsg "${vm_name}-nsg" --public-ip-sku Standard \
             --public-ip-address $spoke_vm_pip_name --vnet-name $spoke_vnet_name --size $vm_size --subnet $spoke_vm_subnet_name -l $location --no-wait -o none
         az network vnet peering create -n "hubtospoke${spoke_id}" -g $rg --vnet-name $vnet_name --remote-vnet $spoke_vnet_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit -o none
         az network vnet peering create -n "spoke${spoke_id}tohub" -g $rg --vnet-name $spoke_vnet_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways -o none
@@ -161,11 +203,13 @@ if [[ "$simulate_onprem" == "yes" ]]; then
     billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
     billing_account_short=$(echo "$billing_account" | cut -f 2 -d/)
     # Create project
+    echo "Creating Google Cloud project..."
     gcloud projects create $project_id --name $project_name
     gcloud config set project $project_id
     gcloud beta billing projects link "$project_id" --billing-account "$billing_account_short"
     gcloud services enable compute.googleapis.com
     # VPC and instance
+    echo "Creating Google Cloud VPC, compute instance and firewall rules..."
     gcloud compute networks create "$gcp_vpc_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
     gcloud compute networks subnets create "$gcp_subnet_name" --network "$gcp_vpc_name" --range "$gcp_subnet_prefix" --region=$region
     gcloud compute instances create "$gcp_vm_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc_name" --subnet "$gcp_subnet_name" --zone "$zone"
@@ -174,14 +218,17 @@ if [[ "$simulate_onprem" == "yes" ]]; then
     gcloud compute firewall-rules create "${gcp_vpc_name}-allow-web" --network "$gcp_vpc_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW
     # gcloud compute ssh $gcp_vm_name --zone=$zone --command="ip a"    # This command will pause the script if the key file is password-protected
     # Create interconnect
+    echo "Creating router and interconnect..."
     gcloud compute routers create $router_name --project=$project_id --network=$gcp_vpc_name --asn=$gcp_asn --region=$region
     gcloud compute interconnects attachments partner create $attachment_name --region $region --router $router_name --edge-availability-domain availability-domain-1
     pairing_key=$(gcloud compute interconnects attachments describe $attachment_name --region $region --format json | jq -r '.pairingKey')
     # Create VXC in Megaport
     $megaport_script_path -g -s=jomore-${er_pop} -a=create_vxc -k=$pairing_key
     # Activate attachment
-    # wait_for_gcp_attachment_ready $attachment_name $region1
+    echo "Waiting for attachment to get ready..."
+    # wait_for_gcp_attachment_ready $attachment_name $region
     sleep 120
+    echo "Enabling attachment..."
     gcloud compute interconnects attachments partner update $attachment_name --region $region --admin-enabled
 fi
 
