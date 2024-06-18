@@ -114,7 +114,8 @@ function list_locations () {
     if [[ -n "$metro" ]]; then
         locations_url="${locations_url}&metro=${metro}"
     fi
-    locations_json=$(echo 2>/dev/null)
+    locations_json=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}"  -X GET "$locations_url" 2>/dev/null)
+    echo $locations_json | jq -r '.data[] | [.id, .country, .metro, .name] | @tsv'
 }
 
 function list_products () {
