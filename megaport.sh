@@ -76,6 +76,10 @@ do
                quiet=yes
                shift # past argument=value
                ;;
+          -h=*|--help=*)
+               help=yes
+               shift # past argument=value
+               ;;
      esac
 done
 set -- "${POSITIONAL[@]}" # restore positional parameters
@@ -282,6 +286,20 @@ function cancel_product () {
 #############
 #   Start   #
 #############
+
+if [[ "$help" == "yes" ]]; then
+    echo "Usage examples:"
+    echo "  List all products containing a certain string: $0 -a=list -s=string"
+    echo "  List all live products containing a certain string: $0 -a=list_live -s=string"
+    echo "  List all locations: $0 -a=list_locations"
+    echo "  Create a MCR: $0 -a=create_mcr -l=location_id"
+    echo "  Delete a MCR: $0 -a=delete_mcr"
+    echo "  Validate an ExpressRoute service key: $0 -a=validate -k=service_key"
+    echo "  Create a VXC for Azure ExpressRoute: $0 -a=create_vxc -k=service_key"
+    echo "  Get BGP routes: $0 -a=bgp_routes"
+    exit
+fi
+
 
 # Checking dependencies
 for binary in "az" "jq" "curl"
