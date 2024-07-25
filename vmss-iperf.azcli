@@ -98,8 +98,7 @@ write_files:
     echo $remote_ip
   path: /root/get_remote_ip.sh
 runcmd:
-  - remote_ip=$(/usr/bin/bash /root/get_remote_ip.sh')
-  - iperf3 -c $remote_ip -tinf
+  - iperf3 -c $(/usr/bin/bash /root/get_remote_ip.sh) -tinf
 EOF
 # Replace token "__remote_subnet_prefix__" with the right value
 sed -i "s|__subnet2_prefix__|${subnet2_prefix}|g" $vmss1_cloudinit_file
@@ -126,6 +125,21 @@ az vmss create -n $vmss2_name -g $rg -l $location --image $vmss_image --generate
 az vmss create -n $vmss1_name -g $rg -l $location --image $vmss_image --generate-ssh-keys \
     --vnet-name $vnet1_name --subnet $subnet1_name --public-ip-per-vm --orchestration-mode Uniform \
     --vm-sku ${vm_size} --custom-data "$vmss1_cloudinit_file" --instance-count $vmss_instance_count -o none
+
+
+###############
+#  Scale out  #
+###############
+# Scale out
+vmss_instance_count=5
+az vmss scale -n $vmss1_name -g $rg --new-capacity $vmss_instance_count --no-wait
+az vmss scale -n $vmss2_name -g $rg --new-capacity $vmss_instance_count --no-wait
+# Scale up
+vm_size=Standard_F2s_v2
+az vmss update -n $vmss1_name -g $rg --vm-sku $vm_size -o none
+az vmss update-instances -n $vmss1_name -g $rg --instance-ids '*' -o none
+az vmss update -n $vmss2_name -g $rg --vm-sku $vm_size -o none
+az vmss update-instances -n $vmss2_name -g $rg --instance-ids '*' -o none
 
 ###############
 # Diagnostics #
