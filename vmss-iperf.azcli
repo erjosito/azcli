@@ -98,7 +98,7 @@ write_files:
     echo $remote_ip
   path: /root/get_remote_ip.sh
 runcmd:
-  - iperf3 -c $(/usr/bin/bash /root/get_remote_ip.sh) -tinf
+  - iperf3 -c $(/usr/bin/bash /root/get_remote_ip.sh) -tinf | tee /root/iperf.log
 EOF
 # Replace token "__remote_subnet_prefix__" with the right value
 sed -i "s|__subnet2_prefix__|${subnet2_prefix}|g" $vmss1_cloudinit_file
@@ -107,7 +107,7 @@ cat <<EOF > $vmss2_cloudinit_file
 packages:
   - iperf3
 runcmd:
-  - iperf3 -s
+  - iperf3 -s | tee /root/iperf.log
 EOF
 
 
@@ -131,7 +131,7 @@ az vmss create -n $vmss1_name -g $rg -l $location --image $vmss_image --generate
 #  Scale out  #
 ###############
 # Scale out
-vmss_instance_count=5
+vmss_instance_count=10
 az vmss scale -n $vmss1_name -g $rg --new-capacity $vmss_instance_count --no-wait
 az vmss scale -n $vmss2_name -g $rg --new-capacity $vmss_instance_count --no-wait
 # Scale up
@@ -147,3 +147,8 @@ az vmss update-instances -n $vmss2_name -g $rg --instance-ids '*' -o none
 
 az vmss list-instance-public-ips -n $vmss1_name -g $rg -o table
 az vmss list-instance-public-ips -n $vmss2_name -g $rg -o table
+az vmss list-instance-public-ips -n $vmss1_name -g $rg --query '[].{IP:ipAddress, IPConfig:ipConfiguration.id}' -o table
+az vmss list-instance-public-ips -n $vmss2_name -g $rg --query '[].{IP:ipAddress, IPConfig:ipConfiguration.id}' -o table
+az vmss nic list -g $rg --vmss-name $vmss1_name --query '[].{IP:ipConfigurations[0].privateIPAddress, instanceId:virtualMachine.id}' -o table
+az vmss nic list -g $rg --vmss-name $vmss2_name --query '[].{IP:ipConfigurations[0].privateIPAddress, instanceId:virtualMachine.id}' -o table
+
