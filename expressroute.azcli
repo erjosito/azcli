@@ -5,18 +5,19 @@
 #################################
 
 # Control
+rg=ertest
 location=australiaeast
 er_location=australiaeast
 er_pop=Sydney
 er_circuit_sku=Standard
 er_circuit_family=MeteredData  # other values: MeteredData, UnlimitedData
 er_circuit_bw=1000   # other values: 50, 100, 200, 500, 1000
-create_spokes=yes
+create_spokes=no
 number_of_spokes=2
-simulate_onprem=yes
-create_ars=yes
-flowlogs=yes
-traffic_collector=yes
+simulate_onprem=no
+create_ars=no
+flowlogs=no
+traffic_collector=no
 tc_name=mytc
 
 # Other possible pop/region combinations with megaport:
@@ -34,7 +35,6 @@ tc_name=mytc
 # er_pop=Sydney
 
 # Variables
-rg=ertest
 er_provider=Megaport
 er_circuit_name="er-$er_pop"
 ergw_name="ergw-$er_pop"

@@ -131,7 +131,7 @@ az vmss create -n $vmss1_name -g $rg -l $location --image $vmss_image --generate
 #  Scale out  #
 ###############
 # Scale out
-vmss_instance_count=10
+vmss_instance_count=20
 az vmss scale -n $vmss1_name -g $rg --new-capacity $vmss_instance_count --no-wait
 az vmss scale -n $vmss2_name -g $rg --new-capacity $vmss_instance_count --no-wait
 # Scale up

@@ -2,7 +2,7 @@
 # Created by Jose Moreno
 # April 2020
 #
-# The script creates AzFW and AppGW, plus some VMs for testing:
+# The script creates AzFW and AFD, plus some VMs for testing:
 #
 ############################################################################
 
