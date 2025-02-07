@@ -752,6 +752,7 @@ function stop_firewall() {
 }
 function start_firewall() {
     azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
+    azfw_pip_name=$(az network public-ip list -g $rg -o tsv --query "[?contains(name,'fw')].name")
     azfw_ipconfig_name="${azfw_name}-ipconfig"
     az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
     az network firewall update -n $azfw_name -g $rg -o none
