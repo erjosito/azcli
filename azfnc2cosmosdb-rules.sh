@@ -52,7 +52,7 @@ else
 fi
 
 # Get the possible outbound IP addresses for the Azure Function
-function_ips=$(az functionapp show --resource-group $rg --name $function --query outboundIpAddresses --output tsv --only-show-errors)
+function_ips=$(az functionapp show --resource-group $rg --name $function --query possibleOutboundIpAddresses --output tsv --only-show-errors)
 echo "DEBUG: Azure Function $function has the following possible outbound IP addresses: $function_ips"
 
 # Get the current firewall rules for the Cosmos DB

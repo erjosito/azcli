@@ -18,15 +18,15 @@
 ###############
 
 # Control
-no_of_hubs=1         # 1 or 2 hubs
-hrp=ExpressRotue     # Can be ASPath, ExpressRoute or VPN
-no_of_spokes=1       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
+no_of_hubs=2         # 1 or 2 hubs
+hrp=ASPath           # Can be ASPath, ExpressRoute or VPN
+no_of_spokes=3       # Number of spokes per hub (without counting the hub with NVA for indirect spokes)
 secure_hub=yes       # Whether firewalls are provisioned in the hubs
 create_routes=no     # Whether static routes are created or not in RT's secure hub(s)
 create_custom_rt=no  # Whether a custom RT for VNets will be created
-indirect_spokes=no   # Whether spokes with Linux NVAs and indirect spokes are created
+indirect_spokes=yes  # Whether spokes with Linux NVAs and indirect spokes are created
 redundant_nva=no     # Whether the NVA in the last spoke is redundant (2nd VM in the same subnet)
-nva_bgp=no           # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
+nva_bgp=yes          # If using an NVA in last spoke (for example 14/24), whether configuring BGP on it towards VWAN
 route_thru_nva=no    # Whether a static route pointing to the NVA in the last spoke is configured
 vnet_ass=default     # Route table to associate VNet connections. Can be 'default' or 'vnet' (if 'vnet', $create_custom_rt must be yes)
 vnet_prop=default    # Route table to propagate from VNet connections. Can be 'default', 'vnet' or 'none' (if 'vnet', $create_custom_rt must be yes)
@@ -36,9 +36,9 @@ deploy_vpngw=yes     # Whether VPN GWs should be deployed
 branch5=no           # Whether a 2nd S2S branch in hub1 should be deployed
 deploy_er=yes        # Whether ER should be provided (note you need an account with a provider such as Megaport)
 deploy_gcp=yes       # Whether an onprem location to be connected over ER should be deployed in Google Cloud
-er_bow_tie=no        # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
+er_bow_tie=yes       # If creating ER in multiple regions, whether each region should be connected to both virtual hubs
 public_ip=no         # Whether extra VMs are created with public IP addressing
-global_reach=yes     # If 2 hubs and ER, connect both circuits via GR
+global_reach=no      # If 2 hubs and ER, connect both circuits via GR
 routing_intent=yes   # Whether RI is configured
 ri_policy=both       # internet/private/both
 private_link=no      # whether private endpoints will be created for the storage accounts in each region (in the first spoke, using the flow logs storage accounts)
@@ -1259,7 +1259,7 @@ then
     vpngw1_gw0_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]')
     vpngw1_gw1_bgp_ip=$(echo $vpngw1_config | jq -r '.bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]')
     vpngw1_bgp_asn=$(echo $vpngw1_config | jq -r '.bgpSettings.asn')  # This is today always 65515
-    echo "Extracted info for hubvpn1: Gateway0 $vpngw1_gw0_pip, $vpngw1_gw0_bgp_ip. Gateway1 $vpngw1_gw1_pip, $vpngw1_gw0_bgp_ip. ASN $vpngw1_bgp_asn"
+    echo "Extracted info for hubvpn1: Gateway0 $vpngw1_gw0_pip, $vpngw1_gw0_bgp_ip. Gateway1 $vpngw1_gw1_pip, $vpngw1_gw1_bgp_ip. ASN $vpngw1_bgp_asn"
 
     if [[ "$no_of_hubs" == "2" ]]
     then
@@ -1285,6 +1285,25 @@ then
         command_output=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no  -o KexAlgorithms=+diffie-hellman-group-exchange-sha1 $branch1_ip "$command")
     done
     echo $command_output
+
+    # Before configuring the Cat8000v we need to change the license and reboot
+    # (config)# license boot level network-premier addon dna-premier
+    # # wr
+    # # reload   ! (asks for confirmation!)
+    # New IKE config:
+    # crypto ikev2 proposal azure-proposal
+    #   encryption aes-cbc-256 aes-cbc-128 aes-cbc-192 
+    #   # encryption aes-gcm-128 aes-gcm-256 !???
+    #   integrity sha1 sha256 sha384 sha512
+    #   group 14 15 16 19 20 21
+    #   prf sha1 sha256 sha384 sha512
+    # crypto ikev2 policy azure-policy
+    #   match fvrf any
+    #   match address local 10.4.1.10
+    #   proposal azure-proposal
+    # If replacing with VyOS, this might help: https://github.com/vyos/vyos-documentation/blob/current/docs/configexamples/azure-vpn-bgp.rst
+
+
 
     # Create CSR config for branch 1
     csr_config_url="https://raw.githubusercontent.com/erjosito/azure-wan-lab/master/csr_config_2tunnels_tokenized.txt"
@@ -2319,7 +2338,6 @@ then
         # gcloud auth list
         gcloud config set account 'erjosito1138@gmail.com'
         # gcloud config set account 'jomore@contosohotels.com'
-        gcloud config set project $project_id
         # Get environment info
         account=$(gcloud info --format json | jq -r '.config.account')
         billing_account=$(gcloud beta billing accounts list --format json | jq -r '.[0].name')
@@ -2689,6 +2707,31 @@ function update_myip() {
     done <<< "$rt_list"
 }
 update_myip
+
+##############################
+#      Update SSH keys       #
+##############################
+
+function update_ssh_key() {
+    vm_name=$1
+    user=$(whoami)
+    echo "Updating SSH key for VM $vm_name and user $user..."
+    az vm user update -g $rg -u $user -n $vm_name --ssh-key-value "$(< ~/.ssh/id_rsa.pub)" -o none
+}
+
+# Updates the SSH keys of all VMs in this lab for a given publisher (Canonical)
+function update_all_ssh_keys() {
+    vm_list=$(az vm list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r vm_name; do
+        vm_publisher=$(az vm show -n $vm_name -g $rg --query 'storageProfile.imageReference.publisher' -o tsv)
+        if [[ "$vm_publisher" == "Canonical" ]]; then
+            update_ssh_key $vm_name
+        else
+            echo "VM $vm_name is not from Canonical but from $vm_publisher, skipping..."
+        fi
+    done <<< "$vm_list"
+}
+
 
 ######################
 # Connection Monitor #
