@@ -1,7 +1,12 @@
-# AGICv2 (aka kubic, aka traffic controller, aka AppGW for containers)
+# AGICv2 (aka kubic, aka traffic controller, aka AppGW for containers, aka AGC)
+# There are 2 steps to create AGC:
+# 1. Create ALB Controller: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/quickstart-deploy-application-gateway-for-containers-alb-controller?tabs=install-helm-windows
+# 2. Create AGC
+#    Option a - Managed: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/quickstart-create-application-gateway-for-containers-managed-by-alb-controller?tabs=new-subnet-aks-vnet
+#    Option b - BYOD: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/quickstart-create-application-gateway-for-containers-byo-deployment?tabs=existing-vnet-subnet
 
 # Variables
-rg=agicv2
+rg=agc
 location=eastus2
 aks_name=agicv2
 aks_node_size=Standard_B2ms
