@@ -66,16 +66,20 @@ az aks create -g $rg -n $aks_name -l $location -o none \
     --enable-oidc-issuer --enable-workload-identity \
     -c 1 -s $aks_node_size --generate-ssh-keys -u $(whoami) \
     --enable-managed-identity --assign-identity $id_id \
-    --network-plugin azure --vnet-subnet-id $aks_subnet_id --pod-subnet-id $pod_subnet_id --service-cidr $aks_service_cidr \
+    --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
     --network-policy azure \
     --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM"
+# Other networking options:
+# --network-plugin azure --vnet-subnet-id $aks_subnet_id --pod-subnet-id $pod_subnet_id --service-cidr $aks_service_cidr \
+# --network-plugin azure --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
 # For existing clusters
 # az aks update -g $rg -n $aks_name --enable-oidc-issuer --enable-workload-identity -o none
 
 # Create identity for AGC and configure federation with AKS OIDC issuer
 node_rg=$(az aks show -n $aks_name -g $rg --query "nodeResourceGroup" -o tsv)
 node_rg_id=$(az group show -n $node_rg --query id -o tsv)
+rg_id=$(az group show -n $rg --query id -o tsv)
 echo "Creating identity $alb_id_name in resource group $rg..."
 az identity create -n $alb_id_name -g $rg -o none --only-show-errors
 alb_id_principal_id="$(az identity show -n $alb_id_name -g $rg --query principalId -o tsv)"
@@ -84,6 +88,7 @@ sleep 15
 echo "Applying Reader role to the AKS managed cluster resource group for the newly provisioned identity..."
 reader_role=acdd72a7-3385-48ef-bd42-f606fba81ae7
 az role assignment create --assignee-object-id $alb_id_principal_id --role $reader_role --scope $node_rg_id -o none --only-show-errors
+az role assignment create --assignee-object-id $alb_id_principal_id --role $reader_role --scope $rg_id -o none --only-show-errors
 echo "Setting up federation with AKS OIDC issuer..."
 aks_oidc_issuer="$(az aks show -n "$aks_name" -g "$rg" --query "oidcIssuerProfile.issuerUrl" -o tsv)"
 az identity federated-credential create -n $alb_id_name -g $rg -o none --only-show-errors \
@@ -173,7 +178,7 @@ az network vnet subnet create -g $rg --vnet-name $vnet_name -n $agc_subnet_name 
 agc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $agc_subnet_name --query id --output tsv)
 
 # Delegate roles to the ALB identity
-rg_id=$(az group show -n $rg --query id -o tsv)
+az role assignment create --assignee-object-id $alb_id_principal_id --scope $node_rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
 az role assignment create --assignee-object-id $alb_id_principal_id --scope $rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
 az role assignment create --assignee-object-id $alb_id_principal_id --scope $agc_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none # Network Contributor
 
@@ -202,7 +207,7 @@ spec:
     protocol: HTTP
     allowedRoutes:
       namespaces:
-        from: Same
+        from: All
   addresses:
   - type: alb.networking.azure.io/alb-frontend
     value: $agc_frontend_name
@@ -211,13 +216,56 @@ EOF
 k get gateway
 k describe gateway
 
+
+##################################
+#       Diagnostic settings      #
+##################################
+
+# Create log analytics workspace
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    echo "Creating new Log Analytics workspace"
+    logws_name=log$RANDOM
+    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+else
+    echo "Log Analytics workspace $logws_name found"
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+# Enable diagnostics settings for AGC
+agc_id=$(az network alb show -n $agc_name -g $rg --query id -o tsv)
+az monitor diagnostic-settings create --name agc-diagnostics --resource $agc_id --workspace $logws_id -o none --only-show-errors \
+  --logs '[{"category": "TrafficControllerAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+# Get logs
+query="AGCAccessLogs | where TimeGenerated > ago(5m) | project TimeGenerated, ClientIp, HostName, RequestUri, FrontendName, FrontendPort, BackendHost, BackendIp, HttpStatusCode"
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
 ##################################
 # Sample workload in the cluster #
 ##################################
 
+# See https://gateway-api.sigs.k8s.io/guides/multiple-ns/
+
 kubectl create ns $app_ns
 kubectl create deployment yadaapi -n $app_ns --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
-kubectl expose deploy yadaapi -n $app_ns --port=8080 --target-port=8080
+#kubectl expose deploy yadaapi -n $app_ns --port=8080 --target-port=8080
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  name: yadaapi
+  namespace: $app_ns
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8080
+  selector:
+    app: $app_name
+EOF
+
 
 # HTTP route
 fqdn=$(kubectl get gateway $agc_name -o jsonpath='{.status.addresses[0].value}') && echo $fqdn
@@ -226,9 +274,11 @@ apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute
 metadata:
   name: yadaapi
+  namespace: $app_ns
 spec:
   parentRefs:
   - name: $agc_name
+    namespace: default
   hostnames:
   - "$fqdn"
   rules:
