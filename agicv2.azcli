@@ -7,7 +7,7 @@
 
 # Control
 mode=managed # managed or byod
-cni=azure # azure_with_pod_subnet or azure
+cni=azure # azure_pod_subnet or azure
 
 # Variables
 rg=agc2
@@ -69,9 +69,9 @@ az role assignment create --scope $vnet_id --assignee $id_principal_id --role Co
 
 # Create AKS cluster with workload identity enabled.
 # 'AGC supports Azure CNI Pod Subnet for both dynamic and static allocation': https://github.com/Azure/AKS/issues/4681
-if [[ "$cni" == "azure_with_pod_subnet" ]]; then
+if [[ "$cni" == "azure_pod_subnet" ]]; then
     cni_options="--network-plugin azure --vnet-subnet-id $aks_subnet_id --pod-subnet $pod_subnet_prefix"
-elif [[ "$cni" == "azure_with_pod_subnet" ]]; then
+elif [[ "$cni" == "azure_pod_subnet" ]]; then
     cni_options="--network-plugin azure --vnet-subnet-id $aks_subnet_id"
 else  # Default to Azure without pod subnet
     cni_options="--network-plugin azure --vnet-subnet-id $aks_subnet_id"
@@ -214,26 +214,26 @@ if [[ "$mode" == "byod" ]]; then
     # agc_frontend_name=$(az network alb frontend list --alb-name $agc_name -g $rg --query '[0].name' -o tsv)
     echo "Creating Gateway in k8s associated to ALB ID $alb_id and frontend $agc_frontend_name..."
     kubectl apply -f - <<EOF
-    apiVersion: gateway.networking.k8s.io/v1beta1
-    kind: Gateway
-    metadata:
-      name: $agc_name
-      annotations:
-        alb.networking.azure.io/alb-namespace: $alb_ns_name
-        alb.networking.azure.io/alb-id: $agc_id
-    spec:
-      gatewayClassName: azure-alb-external
-      listeners:
-      - name: http
-        port: 80
-        protocol: HTTP
-        allowedRoutes:
-          namespaces:
-            from: All
-      addresses:
-      - type: alb.networking.azure.io/alb-frontend
-        value: $agc_frontend_name
-    EOF
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: Gateway
+metadata:
+  name: $agc_name
+  annotations:
+    alb.networking.azure.io/alb-namespace: $alb_ns_name
+    alb.networking.azure.io/alb-id: $agc_id
+spec:
+  gatewayClassName: azure-alb-external
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: All
+  addresses:
+  - type: alb.networking.azure.io/alb-frontend
+    value: $agc_frontend_name
+EOF
 
     k get gateway
     k describe gateway
@@ -264,8 +264,7 @@ then
     echo "AGC not found in main resource group, looking for AGC in node resource group $node_rg..."
     agc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
 fi
-if [[ -z "$agc_id" ]]
-then
+if [[ -z "$agc_id" ]]; then
     echo "AGC not found in node resource group $node_rg, exiting..."
 else
     echo "AGC found with ID $agc_id, configuring diagnostics settings..."
