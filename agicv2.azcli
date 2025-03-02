@@ -522,6 +522,133 @@ spec:
     useTLS: false
 EOF
 
+
+#####################
+#    TLS service    #
+#####################
+
+###### WIP!!! #######
+
+# Create nginx secret
+# ssl_crt=$(cat $pem_file | base64)
+# ssl_key=$(cat $key_file | base64)
+kubectl create secret tls yadatls-cert --cert=$pem_file --key=$key_file -n $app_ns
+
+# Create deployment
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-conf
+  namespace: $app_ns
+data:
+  nginx.conf: |
+    user nginx;
+    worker_processes auto;
+    events {
+      worker_connections 1024;
+    }
+    pid /var/run/nginx.pid;
+    http {
+        server {
+            listen 443 ssl;
+            server_name localhost;
+            ssl_protocols              TLSv1.2;
+            ssl_ciphers                ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-DSS-AES128-GCM-SHA256:kEDH+AESGCM:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA256:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA:DHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:ECDHE-RSA-RC4-SHA:ECDHE-ECDSA-RC4-SHA:AES128:AES256:RC4-SHA:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!3DES:!MD5:!PSK;
+            ssl_prefer_server_ciphers  on;
+            ssl_session_cache    shared:SSL:10m; # a 1mb cache can hold about 4000 sessions, so we can hold 40000 sessions
+            ssl_session_timeout  24h;
+            keepalive_timeout 300; # up from 75 secs default
+            add_header Strict-Transport-Security 'max-age=31536000; includeSubDomains';
+            ssl_certificate /etc/nginx/ssl/tls.crt;
+            ssl_certificate_key /etc/nginx/ssl/tls.key; 
+            # ssl_certificate      /etc/nginx/ssl.crt;
+            # ssl_certificate_key  /etc/nginx/ssl.key;
+            location /api/ {
+                proxy_pass http://127.0.0.1:8080 ;
+                proxy_set_header Connection "";
+                proxy_set_header Host \$host;
+                proxy_set_header X-Real-IP \$remote_addr;
+                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                # proxy_set_header X-Forwarded-For \$remote_addr;
+            }
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    run: yadatls
+  name: yadatls
+  namespace: $app_ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      run: yadatls
+  template:
+    metadata:
+      labels:
+        run: yadatls
+    spec:
+      containers:
+      - name: api
+        image: erjosito/yadaapi:1.0
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+      - name: nginx
+        image: mcr.microsoft.com/oss/nginx/nginx:1.15.5-alpine
+        ports:
+        - containerPort: 8443
+          protocol: TCP
+        volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: certs
+              mountPath: /etc/nginx/ssl
+      volumes:
+      - name: nginx-conf
+        configMap:
+          name: nginx-conf
+          items:
+            - key: nginx.conf
+              path: nginx.conf
+      - name: certs
+        secret:
+           secretName: yadatls-cert
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yadatls8080
+  namespace: $app_ns
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    run: yadatls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yadatls8443
+  namespace: $app_ns
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8443
+    targetPort: 8443
+  selector:
+    run: yadatls
+EOF
+
 #####################
 # Azure Diagnostics #
 #####################
