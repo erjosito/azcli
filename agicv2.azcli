@@ -8,6 +8,7 @@
 # Control
 mode=managed # managed or byod
 cni=azure # azure_pod_subnet or azure
+frontend_tls=yes  # yes or no
 
 # Variables
 rg=agc2
@@ -31,6 +32,11 @@ agc_name=appgw4c
 agc_frontend_name=test-frontend
 agc_subnet_name=subnet-alb
 agc_subnet_prefix=10.13.100.0/24
+pem_file="$HOME/onedrive/Admin/Certs/cloudtrooper.net/2025/star_cloudtrooper_net_fullchain.pem"
+key_file="$HOME/onedrive/Admin/Certs/cloudtrooper.net/2025/CSR/star_cloudtrooper_net.key"
+secret_name=cloudtrooper-tls
+app_fqdn=yada.cloudtrooper.net
+
 
 # Register required resource providers on Azure.
 echo "Registering resource providers..."
@@ -180,6 +186,18 @@ spec:
     allowedRoutes:
       namespaces:
         from: All
+  - name: https
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: All
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - kind : Secret
+        group: ""
+        name: $secret_name
 EOF
     # k get gateway
 fi
@@ -230,6 +248,18 @@ spec:
     allowedRoutes:
       namespaces:
         from: All
+  - name: https
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: All
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - kind : Secret
+        group: ""
+        name: $secret_name
   addresses:
   - type: alb.networking.azure.io/alb-frontend
     value: $agc_frontend_name
@@ -302,6 +332,39 @@ else
 fi
 
 ##################################
+#         Frontend TLS           #
+##################################
+
+if [[ "$frontend_tls" == "yes" ]]; then
+    echo "Creating secret $secret_name for frontend TLS from file $pem_file..."
+    kubectl create secret tls $secret_name --cert=$pem_file --key=$key_file
+    echo "Creating FrontendTLSPolicy for gateway $agc_name..."
+    # A TLS policy only needed if you need MTLS
+#     kubectl apply -f - <<EOF
+# apiVersion: alb.networking.azure.io/v1
+# kind: FrontendTLSPolicy
+# metadata:
+#   name: mtls-policy
+#   namespace: default
+# spec:
+#   targetRef:
+#     group: gateway.networking.k8s.io
+#     kind: Gateway
+#     name: $agc_name
+#     namespace: default
+#     sectionNames:
+#     - mtls-listener
+#   default:
+#     verify:
+#       caCertificateRef:
+#         name: ca.bundle
+#         group: ""
+#         kind: Secret
+#         namespace: $secret_name
+# EOF
+fi
+
+##################################
 # Sample workload in the cluster #
 ##################################
 
@@ -343,6 +406,7 @@ spec:
     namespace: default
   hostnames:
   - "$fqdn"
+  - $app_fqdn
   rules:
   - backendRefs:
     - name: yadaapi
@@ -355,7 +419,7 @@ kubectl apply -f - <<EOF
 apiVersion: alb.networking.azure.io/v1
 kind: HealthCheckPolicy
 metadata:
-  name: gateway-health-check-policy
+  name: healthcheck-yada-active
   namespace: $app_ns
 spec:
   targetRef:
@@ -393,6 +457,11 @@ curl "http://${fqdn}/api/ip"
 while true; do mydate=$(date); echo -n "${mydate}: "; curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'; sleep 1; done
 while true; do mydate=$(date); echo -n "${mydate}: "; ip=$(curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'); [[ -z "$ip" ]] && echo "No answer" || echo "$ip"; sleep 1; done
 
+if [[ "$frontend_tls" == "yes" ]]; then
+    ip_address=$(dig +short $fqdn)
+    curl --resolve yada.cloudtrooper.net:443:${ip_address} https://yada.cloudtrooper.net/api/ip
+fi
+
 #####################
 #  Backup service   #
 #####################
@@ -429,7 +498,7 @@ kubectl apply -f - <<EOF
 apiVersion: alb.networking.azure.io/v1
 kind: HealthCheckPolicy
 metadata:
-  name: healthcheck-backup
+  name: healthcheck-yada-backup
   namespace: $app_ns
 spec:
   targetRef:
