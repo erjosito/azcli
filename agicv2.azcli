@@ -244,11 +244,12 @@ fi
 ##################################
 
 # Create log analytics workspace
+# ToDo: get the name of AGC, it could be different if created using the managed deployment
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
 if [[ -z "$logws_name" ]]
 then
-    echo "Creating new Log Analytics workspace"
     logws_name=log$RANDOM
+    echo "Creating new Log Analytics workspace $logws_name"
     az monitor log-analytics workspace create -n $logws_name -g $rg -o none
 else
     echo "Log Analytics workspace $logws_name found"
@@ -256,9 +257,22 @@ fi
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 # Enable diagnostics settings for AGC
-agc_id=$(az network alb show -n $agc_name -g $rg --query id -o tsv)
-az monitor diagnostic-settings create --name agc-diagnostics --resource $agc_id --workspace $logws_id -o none --only-show-errors \
-  --logs '[{"category": "TrafficControllerAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+echo "Looking for AGC in the main resource group $rg..."
+agc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
+if [[ -z "$agc_id" ]]
+then
+    echo "AGC not found in main resource group, looking for AGC in node resource group $node_rg..."
+    agc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
+fi
+if [[ -z "$agc_id" ]]
+then
+    echo "AGC not found in node resource group $node_rg, exiting..."
+else
+    echo "AGC found with ID $agc_id, configuring diagnostics settings..."
+    az monitor diagnostic-settings create --name agc-diagnostics --resource $agc_id --workspace $logws_id -o none --only-show-errors \
+      --logs '[{"category": "TrafficControllerAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+fi
+
 # Get logs
 query="AGCAccessLogs | where TimeGenerated > ago(5m) | project TimeGenerated, ClientIp, HostName, RequestUri, FrontendName, FrontendPort, BackendHost, BackendIp, HttpStatusCode"
 az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table

@@ -12,18 +12,19 @@
 ########################################################
 
 # Control
-intra_vnet_vms=no
+intra_vnet_vms=yes
 sample_app=yes
-create_azfw=yes
-create_vpn=yes
-create_appgw=yes
+create_azfw=no
+create_vpn=no
+create_appgw=no
 create_adx=no
 create_elk=no
+create_grafana=yes
 flowlog_type=vnet
 
 # Variables
 rg=flowlogs
-location=eastus2euap
+location=eastus2
 ws_location=eastus2
 vnet_name=flowlogs
 vnet_prefix=192.168.0.0/16
@@ -78,6 +79,9 @@ branch_bgp_ip=172.16.200.11
 branch_asn=65500
 username=$(whoami)
 psk='Microsoft123!'
+
+# Managed grafana variables
+grafana_name=grafana$RANDOM
 
 # ADX variables
 adx_sku='Dev(No SLA)_Standard_E2a_v4'
@@ -478,6 +482,22 @@ function add_extension() {
     extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
     echo "Azure CLI extension $extension_name installed with version $extension_version"
 }
+
+# Managed Grafana
+if [[ "$create_grafana" == "yes" ]]; then
+    echo "Creating managed Grafana..."
+    az grafana create -n $grafana_name -g $rg -l $location -o none
+    grafana_url=$(az grafana show -n $grafana_name -g $rg -o tsv --query properties.endpoint)
+    echo "Grafana URL is $grafana_url"
+    # I got an error message and the role assignment for access to the portal was not created
+    current_user_id=$(az ad signed-in-user show --query id -o tsv)
+    grafana_id=$(az grafana show -n $grafana_name -g $rg --query id -o tsv)
+    az role assignment create --assignee $current_user_id --role 'Grafana Admin' --scope $grafana_id -o none
+    # Grafana needs to have access to the log analytics workspace
+    grafana_principal_id=$(az grafana show -n $grafana_name -g $rg --query identity.principalId -o tsv)
+    az role assignment create --assignee $grafana_principal_id --role 'Log Analytics Reader' --scope $logws_id -o none
+fi
+
 
 # Azure Data eXplorer (optional)
 # WORK IN PROGRESS!!!!
