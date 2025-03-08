@@ -8,7 +8,8 @@
 # Control
 mode=managed # managed or byod
 cni=azure # azure_pod_subnet or azure
-frontend_tls=yes  # yes or no
+tls=yes  # yes or no
+alb_controller_version=1.4.12
 
 # Variables
 rg=agc2
@@ -32,11 +33,12 @@ agc_name=appgw4c
 agc_frontend_name=test-frontend
 agc_subnet_name=subnet-alb
 agc_subnet_prefix=10.13.100.0/24
+# TLS
 pem_file="$HOME/onedrive/Admin/Certs/cloudtrooper.net/2025/star_cloudtrooper_net_fullchain.pem"
 key_file="$HOME/onedrive/Admin/Certs/cloudtrooper.net/2025/CSR/star_cloudtrooper_net.key"
 secret_name=cloudtrooper-tls
-app_fqdn=yada.cloudtrooper.net
-
+tls_app_fqdn=yada.cloudtrooper.net
+tls_app_ns=yadatls
 
 # Register required resource providers on Azure.
 echo "Registering resource providers..."
@@ -121,7 +123,7 @@ kubectl create ns $alb_deployment_ns
 # The --namespace flag doesnt seem to have any effect
 helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller \
       --namespace $alb_deployment_ns \
-      --version 1.4.12 \
+      --version $alb_controller_version \
       --set albController.namespace=$alb_controller_ns \
       --set albController.podIdentity.clientID=$(az identity show -g $rg -n $alb_id_name --query clientId -o tsv)
 
@@ -230,7 +232,7 @@ if [[ "$mode" == "byod" ]]; then
     agc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
     # agc_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
     # agc_frontend_name=$(az network alb frontend list --alb-name $agc_name -g $rg --query '[0].name' -o tsv)
-    echo "Creating Gateway in k8s associated to ALB ID $alb_id and frontend $agc_frontend_name..."
+    echo "Creating Gateway in k8s associated to ALB ID $agc_id and frontend $agc_frontend_name..."
     kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
@@ -248,12 +250,20 @@ spec:
     allowedRoutes:
       namespaces:
         from: All
+#        from: Selector
+#        selector:
+#          matchLabels:
+#            kubernetes.io/metadata.name: $app_ns
   - name: https
     port: 443
     protocol: HTTPS
     allowedRoutes:
       namespaces:
         from: All
+        # from: Selector
+        # selector:
+        #   matchLabels:
+        #     kubernetes.io/metadata.name: $tls_app_ns
     tls:
       mode: Terminate
       certificateRefs:
@@ -282,8 +292,9 @@ then
     echo "Creating new Log Analytics workspace $logws_name"
     az monitor log-analytics workspace create -n $logws_name -g $rg -o none
 else
-    echo "Log Analytics workspace $logws_name found"
+    echo "Log Analytics workspace $logws_name found in resource group $rg."
 fi
+echo "Getting the ID of Log Analytics workspace $logws_name..."
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 # Enable diagnostics settings for AGC
@@ -335,11 +346,12 @@ fi
 #         Frontend TLS           #
 ##################################
 
-if [[ "$frontend_tls" == "yes" ]]; then
+if [[ "$tls" == "yes" ]]; then
     echo "Creating secret $secret_name for frontend TLS from file $pem_file..."
     kubectl create secret tls $secret_name --cert=$pem_file --key=$key_file
     echo "Creating FrontendTLSPolicy for gateway $agc_name..."
-    # A TLS policy only needed if you need MTLS
+    # A TLS policy only needed if you need MTLS, maybe we could create a frontend policy for other purposes such as TLS version?
+    #    According to the docs, only mTLS supported: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/api-specification-kubernetes#alb.networking.azure.io/v1.FrontendTLSPolicyConfig
 #     kubectl apply -f - <<EOF
 # apiVersion: alb.networking.azure.io/v1
 # kind: FrontendTLSPolicy
@@ -404,12 +416,13 @@ spec:
   parentRefs:
   - name: $agc_name
     namespace: default
+    sectionName: http
   hostnames:
   - "$fqdn"
-  - $app_fqdn
   rules:
   - backendRefs:
     - name: yadaapi
+      namespace: $app_ns
       port: 8080
 EOF
 
@@ -457,11 +470,6 @@ curl "http://${fqdn}/api/ip"
 while true; do mydate=$(date); echo -n "${mydate}: "; curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'; sleep 1; done
 while true; do mydate=$(date); echo -n "${mydate}: "; ip=$(curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'); [[ -z "$ip" ]] && echo "No answer" || echo "$ip"; sleep 1; done
 
-if [[ "$frontend_tls" == "yes" ]]; then
-    ip_address=$(dig +short $fqdn)
-    curl --resolve yada.cloudtrooper.net:443:${ip_address} https://yada.cloudtrooper.net/api/ip
-fi
-
 #####################
 #  Backup service   #
 #####################
@@ -481,6 +489,7 @@ spec:
   parentRefs:
   - name: $agc_name
     namespace: default
+    sectionName: http
   hostnames:
   - "$fqdn"
   rules:
@@ -529,18 +538,23 @@ EOF
 
 ###### WIP!!! #######
 
-# Create nginx secret
-# ssl_crt=$(cat $pem_file | base64)
-# ssl_key=$(cat $key_file | base64)
-kubectl create secret tls yadatls-cert --cert=$pem_file --key=$key_file -n $app_ns
+if [[ $tls == "yes" ]]; then
 
-# Create deployment
-kubectl apply -f - <<EOF
+    # Create namespace
+    kubectl create ns $tls_app_ns
+
+    # Create nginx secret
+    # ssl_crt=$(cat $pem_file | base64)
+    # ssl_key=$(cat $key_file | base64)
+    kubectl create secret tls yadatls-cert --cert=$pem_file --key=$key_file -n $tls_app_ns
+
+    # Create deployment
+    kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: nginx-conf
-  namespace: $app_ns
+  namespace: $tls_app_ns
 data:
   nginx.conf: |
     user nginx;
@@ -581,7 +595,7 @@ metadata:
   labels:
     run: yadatls
   name: yadatls
-  namespace: $app_ns
+  namespace: $tls_app_ns
 spec:
   replicas: 1
   selector:
@@ -601,7 +615,7 @@ spec:
       - name: nginx
         image: mcr.microsoft.com/oss/nginx/nginx:1.15.5-alpine
         ports:
-        - containerPort: 8443
+        - containerPort: 443
           protocol: TCP
         volumeMounts:
             - name: nginx-conf
@@ -626,7 +640,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: yadatls8080
-  namespace: $app_ns
+  namespace: $tls_app_ns
 spec:
   type: ClusterIP
   ports:
@@ -638,16 +652,80 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: yadatls8443
-  namespace: $app_ns
+  name: yadatls443
+  namespace: $tls_app_ns
 spec:
   type: ClusterIP
   ports:
-  - port: 8443
-    targetPort: 8443
+  - port: 443
+    targetPort: 443
   selector:
     run: yadatls
+---
+apiVersion: alb.networking.azure.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: yadatlspolicy
+  namespace: $tls_app_ns
+spec:
+  targetRef:
+    group: ""
+    kind: Service
+    name: yadatls443
+    namespace: $tls_app_ns
+  default:
+    sni: $tls_app_fqdn
+    ports:
+    - port: 443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: tlsyadaapi
+  namespace: $tls_app_ns
+spec:
+  parentRefs:
+  - name: $agc_name
+    namespace: default
+    sectionName: https
+  hostnames:
+  - "$tls_app_fqdn"
+  rules:
+  - backendRefs:
+    - name: yadatls443
+      port: 443
+---
+apiVersion: alb.networking.azure.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: healthcheck-yada-tls
+  namespace: $tls_app_ns
+spec:
+  targetRef:
+    group: ""
+    kind: Service
+    namespace: $tls_app_ns
+    name: yadatls443
+  default:
+    interval: 5s
+    timeout: 3s
+    healthyThreshold: 1
+    unhealthyThreshold: 1
+    port: 443
+    http:
+      host: contoso.com
+      path: /api/healthcheck
+      match:
+        statusCodes: 
+        - start: 200
+          end: 299
+    useTLS: true
 EOF
+
+    ip_address=$(dig +short $fqdn)
+    curl --resolve "${tls_app_fqdn}:443:${ip_address}" "https://${tls_app_fqdn}/api/ip"
+
+fi
 
 #####################
 # Azure Diagnostics #
