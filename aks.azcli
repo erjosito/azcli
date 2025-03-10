@@ -224,8 +224,8 @@ elif [[ "$network_plugin" == 'azure_overlay' ]]; then
     cni_options="--network-plugin azure --network-dataplane cilium --network-plugin-mode overlay"
     if [[ "$network_policy" != "cilium" ]]; then
         echo "Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
-        network_policy=cilium
     fi
+    network_policy=cilium
 else
     echo "ERROR: Network plugin $network_plugin not supported"
     exit 1

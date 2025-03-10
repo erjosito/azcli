@@ -6,14 +6,15 @@
 #    Option b - BYOD: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/quickstart-create-application-gateway-for-containers-byo-deployment?tabs=existing-vnet-subnet
 
 # Control
-mode=managed # managed or byod
-cni=azure # azure_pod_subnet or azure
-tls=yes  # yes or no
-alb_controller_version=1.4.12
+mode=byod                        # managed or byod
+cni=overlay                      # azure_pod_subnet, azure or overlay
+tls=no                           # yes or no
+alb_controller_version=1.4.12    # Check the latest version in https://learn.microsoft.com/azure/application-gateway/for-containers/alb-controller-release-notes
+test_cmds=no                     # yes or no
 
 # Variables
-rg=agc2
-location=eastus2
+rg=agc3
+location=eastasia                # eastasia, eastus, etc
 aks_name=agc
 aks_node_size=Standard_B2ms
 vnet_name=aksVnet
@@ -30,7 +31,7 @@ alb_controller_ns=azure-alb-system
 alb_ns_name=alb-infra
 app_ns=yada
 agc_name=appgw4c
-agc_frontend_name=test-frontend
+agc_frontend_name=agc-frontend
 agc_subnet_name=subnet-alb
 agc_subnet_prefix=10.13.100.0/24
 # TLS
@@ -48,8 +49,22 @@ az provider register --namespace Microsoft.NetworkFunction
 az provider register --namespace Microsoft.ServiceNetworking
 
 # Install Azure CLI extensions.
-echo "Installing Azure CLI extensions..."
-az extension add --name alb
+function install_azcli_extension() {
+    extension_name=$1
+    extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+    if [[ -z "$extension_version" ]]
+    then
+        echo "Azure CLI extension $extension_name not found, installing now..."
+        az extension add -n $extension_name -o none
+    else
+        echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
+        az extension update -n $extension_name -o none
+    fi
+    extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
+    echo "Azure CLI extension $extension_name installed with version $extension_version"
+}
+install_azcli_extension alb
+install_azcli_extension aks-preview
 
 # Create RG and VNets
 echo "Creating resource group $rg and VNet $vnet_name in $location..."
@@ -73,29 +88,36 @@ fi
 id_principal_id=$(az identity show -n $aks_id_name -g $rg --query principalId -o tsv)
 vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
 sleep 15 # Time for creation to propagate
+echo "Assigning Contributor role to AKS identity $aks_id_name in VNet $vnet_name..."
 az role assignment create --scope $vnet_id --assignee $id_principal_id --role Contributor -o none
 
 # Create AKS cluster with workload identity enabled.
 # 'AGC supports Azure CNI Pod Subnet for both dynamic and static allocation': https://github.com/Azure/AKS/issues/4681
 if [[ "$cni" == "azure_pod_subnet" ]]; then
-    cni_options="--network-plugin azure --vnet-subnet-id $aks_subnet_id --pod-subnet $pod_subnet_prefix"
+    cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks_subnet_id --pod-subnet $pod_subnet_prefix"
 elif [[ "$cni" == "azure_pod_subnet" ]]; then
-    cni_options="--network-plugin azure --vnet-subnet-id $aks_subnet_id"
+    cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks_subnet_id"
+elif [[ "$cni" == "overlay" ]]; then
+    cni_options="--network-plugin azure --network-policy cilium --network-dataplane cilium --network-plugin-mode overlay"
 else  # Default to Azure without pod subnet
     cni_options="--network-plugin azure --vnet-subnet-id $aks_subnet_id"
 fi
 # Create cluster
-echo "Creating AKS cluster $aks_name in resource group $rg..."
+echo "Creating AKS cluster $aks_name in resource group $rg in $cni CNI mode..."
 az aks create -g $rg -n $aks_name -l $location -o none \
     --enable-oidc-issuer --enable-workload-identity \
     -c 1 -s $aks_node_size --generate-ssh-keys -u $(whoami) --service-cidr $aks_service_cidr \
     --enable-managed-identity --assign-identity $id_id \
     ${(z)cni_options} \
-    --network-policy azure \
     --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM"
 # For existing clusters
 # az aks update -g $rg -n $aks_name --enable-oidc-issuer --enable-workload-identity -o none
+
+# Verify cluster created with right plugin
+if [[ "$test_cmds" == "yes" ]]; then
+    az aks list -g $rg --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy}' -o table
+fi
 
 # Create identity for AGC and configure federation with AKS OIDC issuer
 node_rg=$(az aks show -n $aks_name -g $rg --query "nodeResourceGroup" -o tsv)
@@ -108,8 +130,8 @@ echo "Waiting 15 seconds to allow for replication of the identity..."
 sleep 15
 echo "Applying Reader role to the AKS resource groups for the newly provisioned identity..."
 reader_role=acdd72a7-3385-48ef-bd42-f606fba81ae7
-az role assignment create --assignee-object-id $alb_id_principal_id --role $reader_role --scope $node_rg_id -o none --only-show-errors
-az role assignment create --assignee-object-id $alb_id_principal_id --role $reader_role --scope $rg_id -o none --only-show-errors
+az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --role $reader_role --scope $node_rg_id -o none --only-show-errors
+az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --role $reader_role --scope $rg_id -o none --only-show-errors
 echo "Setting up federation with AKS OIDC issuer..."
 aks_oidc_issuer="$(az aks show -n "$aks_name" -g "$rg" --query "oidcIssuerProfile.issuerUrl" -o tsv)"
 az identity federated-credential create -n $alb_id_name -g $rg -o none --only-show-errors \
@@ -128,10 +150,12 @@ helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-co
       --set albController.podIdentity.clientID=$(az identity show -g $rg -n $alb_id_name --query clientId -o tsv)
 
 # Verify
-kubectl get pods -n $alb_controller_ns
-echo "Waiting 10 seconds for the ALB controller to start..."
-sleep 10
-kubectl get gatewayclass azure-alb-external -o yaml
+if [[ "$test_cmds" == "yes" ]]; then
+    kubectl get pods -n $alb_controller_ns
+    echo "Waiting 20 seconds for the ALB controller to start..."
+    sleep 20
+    kubectl get gatewayclass azure-alb-external -o yaml
+fi
 
 #############################
 #          Managed          #
@@ -171,7 +195,8 @@ EOF
     alb_id=$(az network alb list -g $node_rg --query '[0].id' -o tsv)
     alb_name=$(az network alb list -g $node_rg --query '[0].name' -o tsv)
     echo "Creating Gateway in k8s associated to ALB ID $alb_id..."
-    kubectl apply -f - <<EOF
+    if [[ "$tls" == "yes" ]]; then
+        kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -201,7 +226,30 @@ spec:
         group: ""
         name: $secret_name
 EOF
-    # k get gateway
+    else
+        kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: $agc_name
+  annotations:
+    alb.networking.azure.io/alb-namespace: $alb_ns_name
+    alb.networking.azure.io/alb-id: $alb_id
+spec:
+  gatewayClassName: azure-alb-external
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: All
+EOF
+    fi
+
+    if [[ "$test_cmds" == "yes" ]]; then
+        kubectl get gateway
+    fi
 fi
 
 #############################
@@ -218,9 +266,9 @@ if [[ "$mode" == "byod" ]]; then
 
     # Delegate roles to the ALB identity
     echo "Adding roles for ALB identity..."
-    az role assignment create --assignee-object-id $alb_id_principal_id --scope $node_rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
-    az role assignment create --assignee-object-id $alb_id_principal_id --scope $rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
-    az role assignment create --assignee-object-id $alb_id_principal_id --scope $agc_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none # Network Contributor
+    az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --scope $node_rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
+    az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --scope $rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
+    az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --scope $agc_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none # Network Contributor
 
     # Associate the AppGW4C with the subnet
     echo "Associating the AGC with the subnet..."
@@ -233,7 +281,8 @@ if [[ "$mode" == "byod" ]]; then
     # agc_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
     # agc_frontend_name=$(az network alb frontend list --alb-name $agc_name -g $rg --query '[0].name' -o tsv)
     echo "Creating Gateway in k8s associated to ALB ID $agc_id and frontend $agc_frontend_name..."
-    kubectl apply -f - <<EOF
+    if [[ "$tls" == "yes" ]]; then
+        kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
 metadata:
@@ -250,10 +299,6 @@ spec:
     allowedRoutes:
       namespaces:
         from: All
-#        from: Selector
-#        selector:
-#          matchLabels:
-#            kubernetes.io/metadata.name: $app_ns
   - name: https
     port: 443
     protocol: HTTPS
@@ -274,9 +319,34 @@ spec:
   - type: alb.networking.azure.io/alb-frontend
     value: $agc_frontend_name
 EOF
+    else
+        kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: Gateway
+metadata:
+  name: $agc_name
+  annotations:
+    alb.networking.azure.io/alb-namespace: $alb_ns_name
+    alb.networking.azure.io/alb-id: $agc_id
+spec:
+  gatewayClassName: azure-alb-external
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: All
+  addresses:
+  - type: alb.networking.azure.io/alb-frontend
+    value: $agc_frontend_name
+EOF
+    fi
 
-    k get gateway
-    k describe gateway
+    if [[ "$test_cmds" == "yes" ]]; then
+        kubectl get gateway
+        kubectl describe gateway
+    fi
 fi
 
 ##################################
@@ -315,8 +385,9 @@ fi
 
 # Get logs
 query="AGCAccessLogs | where TimeGenerated > ago(5m) | project TimeGenerated, ClientIp, HostName, RequestUri, FrontendName, FrontendPort, BackendHost, BackendIp, HttpStatusCode"
-az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
-
+if [[ "$test_cmds" == "yes" ]]; then
+    az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+fi
 
 ####################################
 # Wait until gateway is programmed #
@@ -456,19 +527,21 @@ spec:
     useTLS: false
 EOF
 
-# Check
-k get httproute
-k describe httproute yadaapi
+if [[ "$test_cmds" == "yes" ]]; then
+    # Check
+    kubectl get httproute
+    kubectl describe httproute yadaapi
 
-# Scale out
-k scale deploy yadaapi -n $app_ns --replicas=2
+    # Scale out
+    kubectl scale deploy yadaapi -n $app_ns --replicas=2
 
-# Test
-curl "http://${fqdn}/api/healthcheck"
-curl "http://${fqdn}/api/headers"
-curl "http://${fqdn}/api/ip"
-while true; do mydate=$(date); echo -n "${mydate}: "; curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'; sleep 1; done
-while true; do mydate=$(date); echo -n "${mydate}: "; ip=$(curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'); [[ -z "$ip" ]] && echo "No answer" || echo "$ip"; sleep 1; done
+    # Test
+    curl "http://${fqdn}/api/healthcheck"
+    curl "http://${fqdn}/api/headers"
+    curl "http://${fqdn}/api/ip"
+    while true; do mydate=$(date); echo -n "${mydate}: "; curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'; sleep 1; done
+    while true; do mydate=$(date); echo -n "${mydate}: "; ip=$(curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'); [[ -z "$ip" ]] && echo "No answer" || echo "$ip"; sleep 1; done
+fi
 
 #####################
 #  Backup service   #
@@ -723,35 +796,40 @@ spec:
 EOF
 
     ip_address=$(dig +short $fqdn)
-    curl --resolve "${tls_app_fqdn}:443:${ip_address}" "https://${tls_app_fqdn}/api/ip"
-
+    if [[ "$test_cmds" == "yes" ]]; then
+        curl --resolve "${tls_app_fqdn}:443:${ip_address}" "https://${tls_app_fqdn}/api/ip"
+    fi
 fi
 
 #####################
 # Azure Diagnostics #
 #####################
 
-az network alb list -g $node_rg -o table
 agc_name=$(az network alb list -g $node_rg --query '[0].name' -o tsv)
-az network alb association list --alb-name $agc_name -g $node_rg -o table
-az network alb frontend list --alb-name $agc_name -g $node_rg -o table
+if [[ "$test_cmds" == "yes" ]]; then
+    az network alb list -g $node_rg -o table
+    az network alb association list --alb-name $agc_name -g $node_rg -o table
+    az network alb frontend list --alb-name $agc_name -g $node_rg -o table
+fi
 
 ##########################
 # Kubernetes Diagnostics #
 ##########################
 
-# Check the agic pods
-kubectl get pods -n azure-alb-system
-# Verify the ALB in Azure
-az network alb list -g $rg -o table
-alb_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
-az network alb frontend list -g $rg --alb-name $alb_name -o table
-# Verify the ALB in k8s
-k get applicationLoadBalancer
-# Verify the gatewayclass
-kubectl get gatewayclass azure-alb-external -o yaml
-# Gateways
-k get gateway
-k describe gateway
-# HTTP routes
-k get httproute
+if [[ "$test_cmds" == "yes" ]]; then
+    # Check the agic pods
+    kubectl get pods -n azure-alb-system
+    # Verify the ALB in Azure
+    az network alb list -g $rg -o table
+    alb_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
+    az network alb frontend list -g $rg --alb-name $alb_name -o table
+    # Verify the ALB in k8s
+    kubectl get applicationLoadBalancer
+    # Verify the gatewayclass
+    kubectl get gatewayclass azure-alb-external -o yaml
+    # Gateways
+    kubectl get gateway
+    kubectl describe gateway
+    # HTTP routes
+    kubectl get httproute
+fi
