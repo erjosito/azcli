@@ -496,6 +496,29 @@ if [[ "$create_grafana" == "yes" ]]; then
     # Grafana needs to have access to the log analytics workspace
     grafana_principal_id=$(az grafana show -n $grafana_name -g $rg --query identity.principalId -o tsv)
     az role assignment create --assignee $grafana_principal_id --role 'Log Analytics Reader' --scope $logws_id -o none
+
+    # Create storage account to serve the latest version of the IP ranges
+    storage_account_name=ipranges$RANDOM
+    storage_container_name=ipranges
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location --allow-blob-public-access -o none
+    storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
+    az storage container create -n $storage_container_name --account-name $storage_account_name --auth-mode key --account-key $storage_account_key --public-access blob -o none
+    # Get the IP ranges in a local file and upload them to a blob
+    root_url='https://www.microsoft.com/en-us/download/details.aspx?id=56519'
+    file_url=$(curl -Lfs "${url}" | grep -Eoi '<a [^>]+>' | grep -Eo 'href="[^\"]+"' | grep "download.microsoft.com/download/" | grep -m 1 -Eo '(http|https)://[^"]+')  # sample output: https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63/ServiceTags_Public_20250303.json
+    blob_name=ipranges.json
+    wget -q -O "/tmp/${blob_name}" $file_url
+    az storage blob upload -c $storage_container_name -f "/tmp/${blob_name}" -n $blob_name --account-name $storage_account_name --auth-mode key --account-key $storage_account_key --overwrite -o none
+    # Downloading from the blob and put into a variable
+    storage_account_fqdn=$(az storage account show -n $storage_account_name -g $rg --query primaryEndpoints.blob -o tsv)
+    blob_fqdn="${storage_account_fqdn}${storage_container_name}/${blob_name}"
+    ipranges=$(curl -s $blob_fqdn)
+    # Transform to a dictionary and put in a second blob
+    blob_name=iprangesdict.json
+    # echo $ipranges | jq '.values[] | {"name":.name, "prefixes":.properties.addressPrefixes}' > "/tmp/${blob_name}"
+    echo $ipranges | jq '.values | map({(.name): .properties.addressPrefixes}) | add' > "/tmp/${blob_name}" 
+    az storage blob upload -c $storage_container_name -f "/tmp/${blob_name}" -n $blob_name --account-name $storage_account_name --auth-mode key --account-key $storage_account_key --overwrite -o none
+
 fi
 
 
