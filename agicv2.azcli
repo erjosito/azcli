@@ -14,7 +14,7 @@ test_cmds=no                     # yes or no
 
 # Variables
 rg=agc3
-location=eastasia                # eastasia, eastus, etc
+location=eastus                  # eastasia, eastus, etc
 aks_name=agc
 aks_node_size=Standard_B2ms
 vnet_name=aksVnet
@@ -116,7 +116,7 @@ az aks create -g $rg -n $aks_name -l $location -o none \
 
 # Verify cluster created with right plugin
 if [[ "$test_cmds" == "yes" ]]; then
-    az aks list -g $rg --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy}' -o table
+    az aks list -g $rg --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy, PluginMode:networkProfile.networkPluginMode, NetworkMode:networkProfile.networkMode}' -o table
 fi
 
 # Create identity for AGC and configure federation with AKS OIDC issuer
@@ -388,6 +388,22 @@ query="AGCAccessLogs | where TimeGenerated > ago(5m) | project TimeGenerated, Cl
 if [[ "$test_cmds" == "yes" ]]; then
     az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
 fi
+
+##################################
+#      VNet Flow Logs            #
+##################################
+
+storage_account_name=$(az storage account list -g $rg -o tsv --query "[?location=='$location'].name" | head -1)
+if [[ -z "$storage_account_name" ]]; then
+    storage_account_name=$(echo "logs$RANDOM${nsg_location}" | cut -c1-24)  # max 24 characters
+    echo "No storage account found in $location, creating one..."
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location -o none
+else
+    echo "Storage account $storage_account_name created in $location, using it for VNet flow flogs"
+fi
+echo "Enabling VNet Flow Logs for VNet $vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
+az network watcher flow-log create -l $location -g $rg --name "flowlog-$location" --vnet $vnet_name \
+    --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
 
 ####################################
 # Wait until gateway is programmed #
