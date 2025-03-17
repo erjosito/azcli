@@ -9,7 +9,7 @@
 mode=byod                        # managed or byod
 cni=overlay                      # azure_pod_subnet, azure or overlay
 tls=no                           # yes or no
-alb_controller_version=1.4.12    # Check the latest version in https://learn.microsoft.com/azure/application-gateway/for-containers/alb-controller-release-notes
+alb_controller_version=1.4.14    # Check the latest version in https://learn.microsoft.com/azure/application-gateway/for-containers/alb-controller-release-notes
 flowlogs=yes                     # yes or no
 test_cmds=no                     # yes or no
 
