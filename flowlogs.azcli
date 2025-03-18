@@ -301,12 +301,12 @@ if [[ "$create_azfw" == "yes" ]]; then
     echo "Configuring firewall logs and private IP..."
     azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
     az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
-        --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' \
+        --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }}]' \
         --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
                 {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
     az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
     az network firewall update -n $azfw_name -g $rg -o none
-    azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIpAddress') && echo "$azfw_private_ip"
+    azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIPAddress') && echo "$azfw_private_ip"
     # Create route tables
     if [[ "$intra_vnet_vms" == "yes" ]]; then
         az network route-table create --name subnet0 --resource-group "$rg" --location "$location" -o none
@@ -505,7 +505,7 @@ if [[ "$create_grafana" == "yes" ]]; then
     az storage container create -n $storage_container_name --account-name $storage_account_name --auth-mode key --account-key $storage_account_key --public-access blob -o none
     # Get the IP ranges in a local file and upload them to a blob
     root_url='https://www.microsoft.com/en-us/download/details.aspx?id=56519'
-    file_url=$(curl -Lfs "${url}" | grep -Eoi '<a [^>]+>' | grep -Eo 'href="[^\"]+"' | grep "download.microsoft.com/download/" | grep -m 1 -Eo '(http|https)://[^"]+')  # sample output: https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63/ServiceTags_Public_20250303.json
+    file_url=$(curl -Lfs "${root_url}" | grep -Eoi '<a [^>]+>' | grep -Eo 'href="[^\"]+"' | grep "download.microsoft.com/download/" | grep -m 1 -Eo '(http|https)://[^"]+')  # sample output: https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63/ServiceTags_Public_20250303.json
     blob_name=ipranges.json
     wget -q -O "/tmp/${blob_name}" $file_url
     az storage blob upload -c $storage_container_name -f "/tmp/${blob_name}" -n $blob_name --account-name $storage_account_name --auth-mode key --account-key $storage_account_key --overwrite -o none
@@ -515,8 +515,12 @@ if [[ "$create_grafana" == "yes" ]]; then
     ipranges=$(curl -s $blob_fqdn)
     # Transform to a dictionary and put in a second blob
     blob_name=iprangesdict.json
-    # echo $ipranges | jq '.values[] | {"name":.name, "prefixes":.properties.addressPrefixes}' > "/tmp/${blob_name}"
+    # echo $ipranges | jq '.values[] | {"__text":.name, "__value":.properties.addressPrefixes}' > "/tmp/${blob_name}"
     echo $ipranges | jq '.values | map({(.name): .properties.addressPrefixes}) | add' > "/tmp/${blob_name}" 
+    az storage blob upload -c $storage_container_name -f "/tmp/${blob_name}" -n $blob_name --account-name $storage_account_name --auth-mode key --account-key $storage_account_key --overwrite -o none
+    # Transform to a simple array and put in a third blob
+    blob_name=iprangeslist.json
+    echo $ipranges | jq '[ .values[] | {"__text": .name, "__value": .properties.addressPrefixes} ]' > "/tmp/${blob_name}" 
     az storage blob upload -c $storage_container_name -f "/tmp/${blob_name}" -n $blob_name --account-name $storage_account_name --auth-mode key --account-key $storage_account_key --overwrite -o none
 
 fi
