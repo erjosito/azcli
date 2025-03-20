@@ -2,7 +2,7 @@
 # Script to deploy VMs and generate traffic between them.
 # NSG/VNet flow logs and Traffic Analytics can be used to 
 #    explore the traffic flows
-# Optionall create some elements to inspect VNet flow logs:
+# Optionally create some elements to inspect VNet flow logs:
 #  - Azure Firewall
 #  - Azure Application Gateway
 #  - Azure VPN Gateway

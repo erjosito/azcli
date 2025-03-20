@@ -98,8 +98,8 @@ if [[ "$cni" == "azure_pod_subnet" ]]; then
     aks1_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks1_subnet_id --pod-subnet $aks1_pod_subnet_prefix"
     aks2_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks2_subnet_id --pod-subnet $aks2_pod_subnet_prefix"
 elif [[ "$cni" == "azure_pod_subnet" ]]; then
-    aks1_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks1_subnet_id"
-    aks2_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks2_subnet_id"
+    aks1_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks1_subnet_id --vnet-subnet-id $aks1_subnet_id"
+    aks2_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks1_subnet_id --vnet-subnet-id $aks2_subnet_id"
 elif [[ "$cni" == "overlay" ]]; then
     aks1_cni_options="--network-plugin azure --network-policy cilium --network-dataplane cilium --network-plugin-mode overlay"
     aks2_cni_options="--network-plugin azure --network-policy cilium --network-dataplane cilium --network-plugin-mode overlay"

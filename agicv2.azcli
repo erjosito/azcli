@@ -99,7 +99,7 @@ if [[ "$cni" == "azure_pod_subnet" ]]; then
 elif [[ "$cni" == "azure_pod_subnet" ]]; then
     cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks_subnet_id"
 elif [[ "$cni" == "overlay" ]]; then
-    cni_options="--network-plugin azure --network-policy cilium --network-dataplane cilium --network-plugin-mode overlay"
+    cni_options="--network-plugin azure --network-policy cilium --network-dataplane cilium --network-plugin-mode overlay --vnet-subnet-id $aks_subnet_id"
 else  # Default to Azure without pod subnet
     cni_options="--network-plugin azure --vnet-subnet-id $aks_subnet_id"
 fi
