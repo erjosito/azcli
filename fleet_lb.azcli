@@ -1,11 +1,12 @@
 # Control
-cni=overlay                      # azure_pod_subnet, azure or overlay
+cni=azure                        # azure_pod_subnet, azure or overlay (only azure supported today)
 test_cmds=no                     # yes or no
 
 # Variables
 rg=fleetlb
 location=eastasia                # eastasia, eastus, etc
 aks_node_size=Standard_B2ms
+aks_service_cidr=10.0.0.0/16
 aks_id_name=aksid                # Shared for both clusters
 fleet_name=aksfleet
 fleet_cred_file=/tmp/fleet_creds
@@ -22,18 +23,16 @@ aks1_subnet_name=systempool
 aks1_subnet_prefix=10.13.76.0/24  # Min /25 with Azure CNI!
 aks1_pod_subnet_name=pods
 aks1_pod_subnet_prefix=10.13.77.0/24
-aks1_service_cidr=10.0.0.0/16
 aks1_cred_file=/tmp/aks1_creds
 # Cluster 2
 aks2_location=eastus
-aks2_name=aks1
-aks2_vnet_name=aks1Vnet
+aks2_name=aks2
+aks2_vnet_name=aks2Vnet
 aks2_vnet_prefix=10.13.80.0/22
 aks2_subnet_name=systempool
 aks2_subnet_prefix=10.13.80.0/24  # Min /25 with Azure CNI!
 aks2_pod_subnet_name=pods
 aks2_pod_subnet_prefix=10.13.81.0/24
-aks2_service_cidr=10.0.0.0/16
 aks2_cred_file=/tmp/aks2_creds
 
 
@@ -53,6 +52,7 @@ function install_azcli_extension() {
     echo "Azure CLI extension $extension_name installed with version $extension_version"
 }
 install_azcli_extension fleet
+install_azcli_extension aks-preview
 
 # Create RG and VNets
 echo "Creating resource group $rg and VNet $vnet_name in $location..."
@@ -62,15 +62,15 @@ az network vnet create -g $rg -n $aks1_vnet_name --address-prefix $aks1_vnet_pre
 az network vnet subnet create -g $rg -n $aks1_subnet_name --vnet-name $aks1_vnet_name --address-prefix $aks1_subnet_prefix -o none --only-show-errors
 az network vnet subnet create -g $rg -n $aks1_pod_subnet_name --vnet-name $aks1_vnet_name --address-prefix $aks1_pod_subnet_prefix -o none --only-show-errors
 aks1_vnet_id=$(az network vnet show -n $aks1_vnet_name -g $rg --query id -o tsv)
-aks1_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-aks1_pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+aks1_subnet_id=$(az network vnet subnet show -n $aks1_subnet_name --vnet-name $aks1_vnet_name -g $rg --query id -o tsv)
+aks1_pod_subnet_id=$(az network vnet subnet show -n $aks1_pod_subnet_name --vnet-name $aks1_vnet_name -g $rg --query id -o tsv)
 echo "Creating VNet $aks2_vnet_name in $aks2_location..."
 az network vnet create -g $rg -n $aks2_vnet_name --address-prefix $aks2_vnet_prefix -l $aks2_location -o none
 az network vnet subnet create -g $rg -n $aks2_subnet_name --vnet-name $aks2_vnet_name --address-prefix $aks2_subnet_prefix -o none --only-show-errors
 az network vnet subnet create -g $rg -n $aks2_pod_subnet_name --vnet-name $aks2_vnet_name --address-prefix $aks2_pod_subnet_prefix -o none --only-show-errors
-aks2_vnet_id=$(az network vnet show -n $aks1_vnet_name -g $rg --query id -o tsv)
-aks2_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-aks2_pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+aks2_vnet_id=$(az network vnet show -n $aks2_vnet_name -g $rg --query id -o tsv)
+aks2_subnet_id=$(az network vnet subnet show -n $aks2_subnet_name --vnet-name $aks2_vnet_name -g $rg --query id -o tsv)
+aks2_pod_subnet_id=$(az network vnet subnet show -n $aks2_pod_subnet_name --vnet-name $aks2_vnet_name -g $rg --query id -o tsv)
 echo "Peering VNets $aks1_vnet_name and $aks2_vnet_name..."
 az network vnet peering create -g $rg -n $aks1_vnet_name-to-$aks2_vnet_name --vnet-name $aks1_vnet_name --remote-vnet $aks2_vnet_id --allow-vnet-access --allow-forwarded-traffic -o none
 az network vnet peering create -g $rg -n $aks2_vnet_name-to-$aks1_vnet_name --vnet-name $aks2_vnet_name --remote-vnet $aks1_vnet_id --allow-vnet-access --allow-forwarded-traffic -o none
@@ -87,7 +87,7 @@ else
 fi
 aks_id_principal_id=$(az identity show -n $aks_id_name -g $rg --query principalId -o tsv)
 sleep 15 # Time for creation to propagate
-echo "Assigning Contributor role to AKS identity $aks_id_name in VNet $aks1_vnet_name and $aks2_vnet_name..."
+echo "Assigning Contributor role to AKS identity $aks_id_name in VNets $aks1_vnet_name and $aks2_vnet_name..."
 az role assignment create --scope $aks1_vnet_id --assignee $aks_id_principal_id --role Contributor -o none
 az role assignment create --scope $aks2_vnet_id --assignee $aks_id_principal_id --role Contributor -o none
 
@@ -98,8 +98,8 @@ if [[ "$cni" == "azure_pod_subnet" ]]; then
     aks1_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks1_subnet_id --pod-subnet $aks1_pod_subnet_prefix"
     aks2_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks2_subnet_id --pod-subnet $aks2_pod_subnet_prefix"
 elif [[ "$cni" == "azure_pod_subnet" ]]; then
-    aks1_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks1_subnet_id"
-    aks2_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks2_subnet_id"
+    aks1_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks1_subnet_id --vnet-subnet-id $aks1_subnet_id"
+    aks2_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks1_subnet_id --vnet-subnet-id $aks2_subnet_id"
 elif [[ "$cni" == "overlay" ]]; then
     aks1_cni_options="--network-plugin azure --network-policy cilium --network-dataplane cilium --network-plugin-mode overlay"
     aks2_cni_options="--network-plugin azure --network-policy cilium --network-dataplane cilium --network-plugin-mode overlay"
@@ -107,7 +107,7 @@ else  # Default to Azure with node subnet
     aks1_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks1_subnet_id"
     aks2_cni_options="--network-plugin azure --network-policy azure --vnet-subnet-id $aks2_subnet_id"
 fi
-# Create cluster
+# Create clusters
 echo "Creating AKS cluster $aks1_name in location $aks1_location in $cni CNI mode..."
 az aks create -g $rg -n $aks1_name -l $aks1_location -o none \
     --enable-oidc-issuer --enable-workload-identity \
@@ -127,27 +127,40 @@ az aks create -g $rg -n $aks2_name -l $aks2_location -o none \
     --node-resource-group "$aks2_name"-iaas-"$RANDOM"
 aks2_id=$(az aks show -g $rg -n $aks2_name --query id -o tsv)
 
-# Create fleet
+# Create fleet and grant admin access to current user
 echo "Creating fleet $fleet_name in $location..."
-az fleet create -g $rg -n $fleet_name -l $location -o none
+az fleet create -g $rg -n $fleet_name -l $location --enable-hub --vm-size $aks_node_size -o none
+fleet_id=$(az fleet show -g $rg -n $fleet_name --query id -o tsv)
+current_user_id=$(az ad signed-in-user show --query id -o tsv)
+az role assignment create --assignee $current_user_id --role "Azure Kubernetes Fleet Manager RBAC Cluster Admin" --scope $fleet_id -o none
 
 # Join the member clusters
 echo "Joining AKS cluster $aks1_name to fleet $fleet_name..."
 az fleet member create -g $rg --fleet-name $fleet_name -n $aks1_name --member-cluster-id $aks1_id -o none
 echo "Joining AKS cluster $aks2_name to fleet $fleet_name..."
 az fleet member create -g $rg --fleet-name $fleet_name -n $aks2_name --member-cluster-id $aks2_id -o none
+if [[ $test_cmds == "yes" ]]; then
+    echo "Listing fleet members..."
+    az fleet member list -f $fleet_name -g $rg -o table
+fi
 
 # Get credentials
 # https://learn.microsoft.com/en-us/azure/kubernetes-fleet/l4-load-balancing
-az fleet get-credentials -g $rg -n $fleet_name --file $fleet_cred_file -o none
+echo "Getting credentials for fleet $fleet_name and clusters $aks1_name and $aks2_name..."
+az fleet get-credentials -g $rg -n $fleet_name --file $fleet_cred_file -o none      # This gives out an error if the fleet was deployed as hubless
 az aks get-credentials -n $aks1_name -g $rg --file $aks1_cred_file -o none
 az aks get-credentials -n $aks2_name -g $rg --file $aks2_cred_file -o none
 
+# Alias
+alias k1="kubectl --kubeconfig=$aks1_cred_file"
+alias k2="kubectl --kubeconfig=$aks2_cred_file"
+alias kf="kubectl --kubeconfig=$fleet_cred_file"
+
 # Sample workload
-KUBECONFIG=$fleet_cred_file kubectl create namespace $app_ns
+KUBECONFIG=$fleet_cred_file kubectl create namespace $app_ns  # Alternative is using the --kubeconfig=$fleet_cred_file option. Note you need to authenticate to Azure for this operation
 KUBECONFIG=$fleet_cred_file kubectl create deployment $app_name -n $app_ns --image=$app_image --port=$app_port --replicas=1
 KUBECONFIG=$fleet_cred_file kubectl expose deploy $app_name -n $app_ns --port=$app_port --target-port=$app_port
-KUBECONFIG=$fleet_cred_file kubectl kubectl apply -f - <<EOF
+KUBECONFIG=$fleet_cred_file kubectl apply -f - <<EOF
 apiVersion: networking.fleet.azure.com/v1alpha1
 kind: ServiceExport
 metadata:
@@ -156,7 +169,7 @@ metadata:
 EOF
 
 # Cluster resource placement
-KUBECONFIG=$fleet_cred_file kubectl kubectl apply -f - <<EOF
+KUBECONFIG=$fleet_cred_file kubectl apply -f - <<EOF
 apiVersion: placement.kubernetes-fleet.io/v1
 kind: ClusterResourcePlacement
 metadata:
@@ -168,14 +181,15 @@ spec:
       kind: Namespace
       name: $app_ns
   policy:
-    affinity:
-      clusterAffinity:
-        requiredDuringSchedulingIgnoredDuringExecution:
-          clusterSelectorTerms:
-            - labelSelector:
-                matchLabels:
-                  fleet.azure.com/location: $aks1_location
-                  fleet.azure.com/location: $aks2_location
+    placementType: PickAll
+    # affinity:
+    #   clusterAffinity:
+    #     requiredDuringSchedulingIgnoredDuringExecution:
+    #       clusterSelectorTerms:
+    #         - labelSelector:
+    #             matchLabels:
+    #               fleet.azure.com/location: $aks1_location
+    #               fleet.azure.com/location: $aks2_location
 EOF
 
 # Verify
@@ -191,7 +205,7 @@ if [[ "$test_cmds" == "yes" ]]; then
 fi
 
 # Multicluster service (on AKS1)
-KUBECONFIG=$aks1_cred_file kubectl kubectl apply -f - <<EOF
+KUBECONFIG=$aks1_cred_file kubectl apply -f - <<EOF
 apiVersion: networking.fleet.azure.com/v1alpha1
 kind: MultiClusterService
 metadata:
@@ -203,6 +217,12 @@ spec:
 EOF
 
 # Verify MCS
+ip_address=$(KUBECONFIG=$aks1_cred_file kubectl get multiclusterservice $app_name -n $app_ns -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 if [[ "$test_cmds" == "yes" ]]; then
-    KUBECONFIG=$aks1_cred_file kubectl get multiclusterservice $app_name -n $app_ns
+    KUBECONFIG=$aks1_cred_file kubectl get pods -o wide -n $app_ns
+    KUBECONFIG=$aks2_cred_file kubectl get pods -o wide -n $app_ns
+    while true; do
+        curl -s4 $ip_address:$app_port/api/ip | jq -r '.my_private_ip'
+        sleep 1
+    done
 fi
