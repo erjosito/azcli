@@ -78,7 +78,7 @@ echo "Creating diagnostic settings for NSP ID $nsp_id..."
 az monitor diagnostic-settings create -n "diag$suffix" --resource $nsp_id --workspace $logws_id -o none \
     --logs '[{categoryGroup:allLogs,enabled:true,retentionPolicy:{days:0,enabled:false}}]'
 
-# Create storage account
+# Create storage account in profile00
 echo "Creating storage account $storage_account_name..."
 az storage account create -n $storage_account_name -g $rg -l $location --sku Standard_LRS --allow-blob-public-access true -o none --only-show-errors
 storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
@@ -101,11 +101,18 @@ echo "Creating storage account $storage2_account_name..."
 az storage account create -n $storage2_account_name -g $rg -l $location --sku Standard_LRS --allow-blob-public-access true -o none --only-show-errors
 storage2_account_key=$(az storage account keys list -n $storage2_account_name -g $rg --query '[0].value' -o tsv)
 
-# Create AKV
+# Create AKV in profile00
 echo "Creating AKV $akv_name..."
 az keyvault create -n "$akv_name" -g $rg -l $location -o none --only-show-errors
 user=$(az ad signed-in-user show --query userPrincipalName -o tsv)
-az keyvault set-policy -n $akv_name --upn $user --secret-permissions all --key-permissions all --certificate-permissions all -o none --only-show-errors
+use_rbac=yes
+if [[ $use_rbac == "yes" ]]; then
+    echo "Granting AKV permissions to user $user..."
+    az role assignment create --assignee-object-id $(az ad signed-in-user show --query id -o tsv) --role "Key Vault Administrator" --scope $(az keyvault show -n $akv_name -g $rg --query id -o tsv) -o none
+else
+    echo "Setting AKV policy for user $user..."
+    az keyvault set-policy -n $akv_name --upn $user --secret-permissions all --key-permissions all --certificate-permissions all -o none --only-show-errors
+fi
 echo "Adding test secret to AKV..."
 az keyvault secret set --vault-name $akv_name -n testsecret --value 'HelloWorld' -o none --only-show-errors
 echo "Adding test key to AKV..."
@@ -114,7 +121,7 @@ echo "Adding AKV to NSP..."
 profile_name=profile00
 profile_id=$(az network perimeter profile show -n $profile_name --perimeter-name $nsp_name -g $rg --query id -o tsv)
 akv_id=$(az keyvault show -n $akv_name -g $rg --query id -o tsv)
-az network perimeter association create -n $akv_name --perimeter-name $nsp_name -g $rg -o none\
+az network perimeter association create -n "akv-$akv_name" --perimeter-name $nsp_name -g $rg -o none\
      --access-mode Learning --private-link-resource "{id:$akv_id}" --profile "{id:$profile_id}"
 
 # Create Azure SQL Server and database
@@ -128,7 +135,7 @@ az vm create -n $vm_name -g $rg --image Ubuntu2204 --size $vm_size --admin-usern
     --public-ip-address $vm_pip_name --public-ip-sku Standard --nsg $vm_nsg_name \
     -o none --only-show-errors --no-wait
 
-# Create sample workload in VNet2 for access over vnet service endpoint
+# Create sample workload in VNet2 for access over VNet service endpoint
 echo "Creating VM2..."
 az vm create -n $vm2_name -g $rg --image Ubuntu2204 --size $vm_size --admin-username $(whoami) --generate-ssh-keys -l $location \
     --vnet-name $vnet2_name  --vnet-address-prefix $vnet2_prefix --subnet $subnet2_name --subnet-address-prefix $subnet2_prefix \
