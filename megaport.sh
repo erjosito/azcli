@@ -63,6 +63,14 @@ do
                mcr_asn="${i#*=}"
                shift # past argument=value
                ;;
+          --key=*)
+               megaport_user="${i#*=}"
+               shift # past argument=value
+               ;;
+          --secret=*)
+               megaport_password="${i#*=}"
+               shift # past argument=value
+               ;;
           # Only version 2 is working (default)
           --mcr-version=*)
                mcr_version="${i#*=}"
@@ -74,6 +82,10 @@ do
                ;;
           -q|--quiet)
                quiet=yes
+               shift # past argument=value
+               ;;
+          --debug)
+               debug=yes
                shift # past argument=value
                ;;
           -h=*|--help=*)
@@ -164,7 +176,8 @@ function create_mcr () {
         fi
         log_msg "INFO: Creating $mcr_product $mcr_name in Megaport location '$location_id' and ASN '$mcr_asn'..."
         # Sending call to create MCR
-        buy_url="${base_url}/v2/networkdesign/buy"
+        # buy_url="${base_url}/v2/networkdesign/buy"
+        buy_url="${base_url}/v3/networkdesign/buy"
         buy_payload_template='[{locationId: $locationId, productName: $productName, productType: $mcrProduct, portSpeed: 1000, config: { mcrAsn: $mcrAsn } } ]'
         buy_payload=$(jq -n \
             --arg locationId "$location_id" \
@@ -172,7 +185,10 @@ function create_mcr () {
             --arg mcrAsn "$mcr_asn" \
             --arg mcrProduct "$mcr_product" \
             "$buy_payload_template")
-        # log_msg "Sending payload to REST API: $buy_payload..."
+        if [[ "$debug" == "yes" ]]; then
+            log_msg "DEBUG: Sending request to REST API. URL:     $buy_url..."
+            log_msg "DEBUG: Sending request to REST API. Payload: $buy_payload..."
+        fi
         buy_response=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" --data-raw "$buy_payload" -X POST "$buy_url" 2>/dev/null)
         if [[ "$quiet" == "no" ]]; then
             echo "$buy_response" | jq
@@ -216,6 +232,7 @@ function create_vxc () {
     fi
     # Sending call to create VXC
     buy_url="${base_url}/v2/networkdesign/buy" 
+    buy_url="${base_url}/v3/networkdesign/buy" 
     buy_payload_template='[{ productUid: $mcrId, associatedVxcs: [{ productName: $vxcName, rateLimit: 200, aEnd: { vlan: 0 }, bEnd: { productUid: $erPort, partnerConfig: { connectType: "AZURE", serviceKey: $serviceKey, peers: [{ type: "private" }] }} }] }]'
     buy_payload=$(jq -n \
         --arg mcrId "$mcr_id" \
@@ -329,7 +346,7 @@ else
         akv_rg=mykeyvault
         log_msg "INFO: Creating AKV ${akv_name} in RG ${akv_rg}, in Azure region ${akv_location}..."
         az group create -n $akv_rg -l $akv_location -o none
-        az keyvault create -n $akv_name -g $akv_rg -l $akv_location -o none
+        az keyvault create -n $akv_name -g $akv_rg -l $akv_location --enable-rbac-authorization false -o none
         user_name=$(az account show --query 'user.name' -o tsv)
         log_msg "INFO: Setting policies for user ${user_name}..."
         az keyvault set-policy -n $akv_name -g $akv_rg --upn $user_name -o none\
@@ -344,6 +361,7 @@ else
     if [[ -z "$megaport_user" ]]
     then
         read -p "I could not find any API key in AKV $akv_name in the secret ${usr_secret_name}, please enter your Megaport API key to add it to Azure Key Vault as secret: " megaport_user
+        echo "Storing Megaport API key $megaport_user in Azure Key Vault $akv_name as secret $usr_secret_name..."
         az keyvault secret set --vault-name $akv_name --name $usr_secret_name --value $megaport_user -o none
     else
         log_msg "INFO: Megaport API key successfully retrieved from Azure Key Vault $akv_name"
@@ -352,6 +370,7 @@ else
     if [[ -z "$megaport_password" ]]
     then
         read -sp "I could not find any API secret in AKV $akv_name, please enter your Megaport API secret to add it to Azure Key Vault as secret: " megaport_password
+        echo "Storing Megaport API secret $(echo -n $megaport_password | tr -c \\n \*) in Azure Key Vault $akv_name as secret $pwd_secret_name..."
         az keyvault secret set --vault-name $akv_name --name $pwd_secret_name --value $megaport_password -o none
     else
         log_msg "INFO: Megaport API secret successfully retrieved from Azure Key Vault $akv_name"
