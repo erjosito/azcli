@@ -2355,7 +2355,7 @@ then
         # VPC and instance
         gcloud compute networks create "$gcp_vpc1_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
         gcloud compute networks subnets create "$gcp_subnet1_name" --network "$gcp_vpc1_name" --range "$gcp_subnet1_prefix" --region=$region1
-        gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
+        gcloud compute instances create "$gcp_vm1_name" --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc1_name" --subnet "$gcp_subnet1_name" --zone "$zone1"
         gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-icmp" --quiet --network "$gcp_vpc1_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
         gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-ssh" --quiet --network "$gcp_vpc1_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
         gcloud compute firewall-rules create "${gcp_vpc1_name}-allow-web" --quiet --network "$gcp_vpc1_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 --action=ALLOW
@@ -2380,7 +2380,7 @@ then
             # VPC and instance
             gcloud compute networks create "$gcp_vpc2_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
             gcloud compute networks subnets create "$gcp_subnet2_name" --network "$gcp_vpc2_name" --range "$gcp_subnet2_prefix" --region=$region2
-            gcloud compute instances create "$gcp_vm2_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc2_name" --subnet "$gcp_subnet2_name" --zone "$zone2"
+            gcloud compute instances create "$gcp_vm2_name" --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc2_name" --subnet "$gcp_subnet2_name" --zone "$zone2"
             gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-icmp" --network "$gcp_vpc2_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
             gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-ssh" --network "$gcp_vpc2_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
             gcloud compute firewall-rules create "${gcp_vpc2_name}-allow-web" --network "$gcp_vpc2_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 --action=ALLOW

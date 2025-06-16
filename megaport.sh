@@ -15,6 +15,7 @@ base_url=https://api.megaport.com
 # base_url=https://api-staging.megaport.com
 product_string="jomore"  # This is the string that will be used to identify products to be displayed/modified/deleted
 action=list
+debug=no
 
 # Variables to get credentials
 akv_name="erjositoKeyvault"
@@ -252,8 +253,12 @@ function validate_gcp_key () {
         log_msg "ERROR: no attachment key identified, please use the argument -k or --service-key" 1>&2
     else
         validate_url="${base_url}/v2/secure/google/${service_key}"
+        # validate_url="${base_url}/v3/secure/google/${service_key}"
         log_msg "INFO: Sending request to URL $validate_url..."
         validate_response=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" -X GET "$validate_url" 2>/dev/null)
+        if [[ "$debug" == "yes" ]]; then
+            log_msg "DEBUG: Response from Megaport API: $validate_response"
+        fi
         filtered_response=$(echo $validate_response | jq -r ".data | { ports: [ .megaports[0]? | { name, locationId, productId, productUid }] }")
         # Validate we have an output
         if [[ -n $filtered_response ]]
@@ -276,7 +281,8 @@ function create_gcp_vxc () {
         vxc_name="${vxc_name}-${name_suffix}"
     fi
     # Sending call to create VXC
-    buy_url="${base_url}/v2/networkdesign/buy" 
+    # buy_url="${base_url}/v2/networkdesign/buy" 
+    buy_url="${base_url}/v3/networkdesign/buy" 
     buy_payload_template='[{ productUid: $mcrId, associatedVxcs: [{ productName: $vxcName, rateLimit: 50, aEnd: { vlan: 0 }, bEnd: { productUid: $portId, partnerConfig: { connectType: "Google", pairingKey: $serviceKey }} }] }]'
     buy_payload=$(jq -n \
         --arg mcrId "$mcr_id" \
