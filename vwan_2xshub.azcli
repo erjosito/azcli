@@ -443,6 +443,10 @@ function create_spoke() {
         --vnet-address-prefix $vnet_prefix --subnet vm --subnet-address-prefix $subnet_prefix --custom-data $cloudinit_file -o none
     echo "Installing Network Watcher extension in VM spoke${spoke_id}-vm..."
     az vm extension set --vm-name spoke${spoke_id}-vm -g $rg -n NetworkWatcherAgentLinux --publisher Microsoft.Azure.NetworkWatcher --version 1.4 -o none
+    echo "Configuring VNet Flow Logs for VNet spoke${spoke_id}"-${location}..."
+    az network watcher flow-log create -l $location -n flowlog-spoke${spoke_id}-$location -g $rg \
+        --vnet spoke${spoke_id}-$location --storage-account $storage_account1_name --log-version 2 --retention 7 \
+        --workspace $logws_name --interval 10 --traffic-analytics true -o none
     if [[ "$connect_to_hub" == "yes" ]]
     then
         echo "Connecting VNet spoke${spoke_id} to $hub_name..."
@@ -1138,8 +1142,9 @@ az network watcher configure --locations $location1 --resource-group $rg --enabl
 echo "Configuring NSG flow logs for $nsg1_name..."
 storage_account1_name=vwan$RANDOM$location1
 az storage account create -n $storage_account1_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location1 -o none
-az network watcher flow-log create -l $location1 -n flowlog-$location1 -g $rg \
-    --nsg $nsg1_name --storage-account $storage_account1_name --log-version 2 --retention 7 -o none
+# Flow logs are created along the VNets
+# az network watcher flow-log create -l $location1 -n flowlog-$location1 -g $rg \
+#     --nsg $nsg1_name --storage-account $storage_account1_name --log-version 2 --retention 7 -o none
 
 # Hub2
 if [[ "$no_of_hubs" == "2" ]]
