@@ -259,12 +259,6 @@ echo "Web app URL: http://${web_app_fqdn}"
 az containerapp update -n app1 -g $rg --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 -o none
 az containerapp update -n app2 -g $rg --cpu 0.25 --memory 0.5Gi --min-replicas 1 --max-replicas 2 -o none
 
-# Exec into app
-api_replica0_name=$(az containerapp replica list -n $api_app_name -g $rg --query '[0].name' -o tsv)
-az containerapp exec -n $api_app_name -g $rg --command bash
-# IP scan
-# az containerapp exec -n $api_app_name -g $rg --command 'for i in {0..255}; do for j in {0..255}; do dig -x 10.0.$i.$j | grep -e cluster.local ; done ; done'
-
 # Change image
 az containerapp update -n $api_app_name -g $rg --image $api_image_name -o none
 az containerapp update -n $web_app_name -g $rg --image $web_image_name -o none
@@ -277,9 +271,18 @@ az containerapp update -n $api_app_name -g $rg --set-env-vars "SQL_SERVER_USERNA
 # Diagnostics #
 ###############
 
+# Exec into app
+api_replica0_name=$(az containerapp replica list -n $api_app_name -g $rg --query '[0].name' -o tsv)
+az containerapp exec -n $api_app_name -g $rg --command bash
+# IP scan
+# az containerapp exec -n $api_app_name -g $rg --command 'for i in {0..255}; do for j in {0..255}; do dig -x 10.0.$i.$j | grep -e cluster.local ; done ; done'
+
 # ACA env
 az containerapp env list -g $rg -o table
 az containerapp env show -n $aca_env_name -g $rg
+
+# Workload profiles
+az containerapp env workload-profile list -n $aca_env_name -g $rg -o table
 
 # ACA apps
 az containerapp list -g $rg -o table
