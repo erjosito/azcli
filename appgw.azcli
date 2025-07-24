@@ -239,7 +239,7 @@ if [[ $backend_type == "aci" ]]; then
     for i in $(seq 1 $backend_count)
     do
         echo "Creating ACI $i..."
-        az container create -n ${aci_name}-$i -g $rg --image $aci_image --ip-address private --ports 8080 --vnet $vnet_id --subnet $aci_subnet_id -o none --only-show-errors
+        az container create -n ${aci_name}-$i -g $rg --image $aci_image --ip-address private --ports 8080 --vnet $vnet_id --subnet $aci_subnet_id  --os-type linux --cpu 0.5 --memory 1 -o none --only-show-errors
         aci_ip=$(az container show -n ${aci_name}-$i -g $rg --query 'ipAddress.ip' -o tsv)
         echo "ACI $i created with IP $aci_ip"
     done
