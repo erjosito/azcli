@@ -1,0 +1,295 @@
+##############################################
+# Creates a StrongSwan VM and configures it
+# to act as P2S VPN server
+#
+# Jose Moreno, August 2025
+##############################################
+
+
+# Variables (potentially, some of these could be given as parameters)
+rg=strongswan
+location=eastus
+vnet_name=strongswan
+vnet_prefix=10.13.76.0/24
+subnet_name=strongswan
+subnet_prefix=10.13.76.0/27
+vm_name=strongswan
+vm_size=Standard_B1s
+cloudinit_file=/tmp/strongswan-cloud-init.txt
+image=Ubuntu2204
+username=$(whoami)
+cert_org=cloudtrooper.net
+ipsec_network=0.0.0.0/0 # IPsec network for the VPN clients
+strongswan_file=/tmp/strongswan.conf
+swanctl_file=/tmp/swanctl.conf
+akv_name=cloudtrooper-vault
+akv_secret_name=psk
+
+test_private_link=yes
+ep_subnet_name=ep
+ep_subnet_prefix=10.13.76.32/27
+
+
+# Create resource group and VNet
+az group create -n $rg -l $location -o none
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -o none
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $subnet_name --address-prefix $subnet_prefix -o none
+
+# Create VM with cloud-init script to install StrongSwan
+cat <<EOF > $cloudinit_file
+#cloud-config
+packages:
+  - strongswan
+runcmd:
+  - apt update && apt install -y strongswan strongswan-swanctl strongswan-pki libcharon-extra-plugins libstrongswan-extra-plugins dnsmasq
+  - systemctl enable strongswan
+  - systemctl start strongswan
+  - echo "StrongSwan installed and started"
+EOF
+az vm create -g $rg -n $vm_name --image $image --size $vm_size --vnet-name $vnet_name --subnet $subnet_name --admin-username $username --generate-ssh-keys --custom-data "$cloudinit_file" -o none
+
+# Get the VM public and private IP addresses
+nic_id=$(az vm show -g $rg -n $vm_name --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+vm_public_ip_id=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].publicIPAddress.id' -o tsv)
+vm_public_ip=$(az network public-ip show --ids $vm_public_ip_id --query 'ipAddress' -o tsv)
+vm_private_ip=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+echo "VM public IP: $vm_public_ip, private IP: $vm_private_ip"
+
+# Update the VM's NSG to allow IPsec traffic
+nsg_id=$(az network nic show --ids $nic_id --query 'networkSecurityGroup.id' -o tsv)
+if [ -z "$nsg_id" ]; then
+  echo "No NSG found for the VM"
+else
+    myip=$(curl -s ifconfig.me)
+    echo "NIC NSG found: $nsg_id. Adding rules to allow IPsec traffic..."
+    az network nsg rule create --resource-group $rg --nsg-name $(basename $nsg_id) --name AllowIPsec --priority 1000 --protocol udp --destination-port-ranges 500 4500 --source-address-prefixes "$myip/32" --access allow -o none
+    az network nsg rule create --resource-group $rg --nsg-name $(basename $nsg_id) --name AllowSSH --priority 1010 --protocol tcp --destination-port-ranges 22 --source-address-prefixes "$myip/32" --access allow -o none
+    az network nsg rule create --resource-group $rg --nsg-name $(basename $nsg_id) --name AllowESP --priority 1020 --protocol esp --source-address-prefixes "$myip/32" --access allow -o none
+    az network nsg rule create --resource-group $rg --nsg-name $(basename $nsg_id) --name AllowAH --priority 1030 --protocol ah --source-address-prefixes "$myip/32" --access allow -o none
+fi
+
+
+# Update the subnet's NSG to allow IPsec traffic
+nsg_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $subnet_name --query 'networkSecurityGroup.id' -o tsv)
+if [ -z "$nsg_id" ]; then
+  echo "No NSG found for the subnet"
+else
+    myip=$(curl -s ifconfig.me)
+    echo "Subnet NSG found: $nsg_id. Adding rules to allow IPsec traffic..."
+    az network nsg rule create --resource-group $rg --nsg-name $(basename $nsg_id) --name AllowIPsec --priority 1000 --protocol udp --destination-port-ranges 500 4500 --source-address-prefixes "$myip/32" --access allow -o none
+    az network nsg rule create --resource-group $rg --nsg-name $(basename $nsg_id) --name AllowSSH --priority 1010 --protocol tcp --destination-port-ranges 22 --source-address-prefixes "$myip/32" --access allow -o none
+    az network nsg rule create --resource-group $rg --nsg-name $(basename $nsg_id) --name AllowESP --priority 1020 --protocol esp --source-address-prefixes "$myip/32" --access allow -o none
+    az network nsg rule create --resource-group $rg --nsg-name $(basename $nsg_id) --name AllowAH --priority 1030 --protocol ah --source-address-prefixes "$myip/32" --access allow -o none
+fi
+
+# Configure routing and SNAT (should go to cloudconfig)
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo sysctl -w net.ipv4.ip_forward=1"
+
+# Configure dnsmasq
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_public_ip "sudo sed -i '$ a\log-queries' /etc/dnsmasq.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_public_ip "sudo systemctl disable systemd-resolved"
+# From now on commands will be very slow, as DNS is not working
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_public_ip" "sudo sed -i \"\$ a 168.63.129.16 dnsserver\" /etc/hosts"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_public_ip "sudo systemctl stop systemd-resolved"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_public_ip "sudo unlink /etc/resolv.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_public_ip "echo nameserver 168.63.129.16 | sudo tee /etc/resolv.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_public_ip "sudo sed -i 's/DNSMASQ_OPTS="${DNSMASQ_OPTS} --local-service"/# DNSMASQ_OPTS="${DNSMASQ_OPTS} --local-service"/' /etc/init.d/dnsmasq"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_public_ip "sudo systemctl restart dnsmasq"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_public_ip "sudo systemctl enable dnsmasq"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_public_ip "systemctl status dnsmasq"
+
+
+# Check the VM IP config
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "ip a" || {
+  echo "Failed to connect to the VM. Please check the VM status and network configuration."
+  exit 1
+}
+
+# Check the status of strongswan service
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "systemctl status ipsec"
+
+# Generate a self-signed certificate for StrongSwan CA (key and cert)
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo pki --gen --type ecdsa --outform pem > caKey.pem"
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo pki --self --ca --lifetime 3652 --in caKey.pem --dn 'C=CH, O=strongSwan, CN=strongSwan Root CA' --outform pem > caCert.pem"
+# Generate an end entity certificate for the VPN server (key, request and cert)
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo pki --gen --type ecdsa --outform pem > vmKey.pem"
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo pki --req --type priv --in vmKey.pem --dn 'C=CH, O=${cert_org}, CN=${vm_name}.${cert_org}' --san ${vm_name}.${cert_org} --outform pem > vmReq.pem"
+# Flags: see https://docs.strongswan.org/docs/latest/interop/windowsCertRequirements.html
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo pki --issue --flag serverAuth --flag ikeIntermediate --cacert caCert.pem --cakey caKey.pem --type pkcs10 --in vmReq.pem --serial 01 --lifetime 1826 --outform pem > vmCert.pem"
+# Move files to the correct locations
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo mv vmKey.pem /etc/swanctl/private/vmKey.pem"
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo mv vmCert.pem /etc/swanctl/x509/vmCert.pem"
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo mv caCert.pem /etc/swanctl/x509ca/caCert.pem"
+# Download the CA key to the local machine
+scp -o StrictHostKeyChecking=no $username@$vm_public_ip:/home/${username}/caKey.pem ~/downloads/caKey.pem
+# If file ~/downloads/caKey.pem exists, delete it from the VM
+if [ -f ~/downloads/caKey.pem ]; then
+  echo "CA key downloaded successfully. Deleting it from the VM..."
+  ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo rm /home/${username}/caKey.pem"
+else
+  echo "Failed to download the CA key. Please check the connection and permissions."
+  exit 1
+fi
+# Download the CA cert to the local machine
+scp -o StrictHostKeyChecking=no $username@$vm_public_ip:/etc/swanctl/x509ca/caCert.pem ~/downloads/caCert.pem
+
+# Get pre-shared key from Azure Key Vault
+akv_id=$(az keyvault show -n $akv_name --query 'id' -o tsv)
+if [ -z "$akv_id" ]; then
+  echo "Key Vault $akv_name not found. Please create it first."
+  exit 1
+else
+    akv_rg=$(echo $akv_id | cut -d'/' -f5)
+    echo "Key Vault $akv_name found in resource group $akv_rg."
+fi
+p2s_key=$(az keyvault secret show --vault-name $akv_name --name $akv_secret_name --query 'value' -o tsv)
+if [ -z "$akv_id" ]; then
+  echo "Pre-shared key could not be downloaded from Azure Key Vault $akv_name."
+  exit 1
+else
+    echo "Pre-shared key successfully downloaded from Azure Key Vault $akv_name."
+fi
+
+# Generate swanctl.conf file
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo mv /etc/swanctl/swanctl.conf /etc/swanctl/swanctl.conf.bak"
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo mv /etc/strongswan.conf /etc/strongswan.conf.bak"
+# Strongswan.conf
+cat <<EOF > $strongswan_file
+charon {
+  plugins {
+    eap-dynamic {
+      prefer_user = yes
+      preferred = tls, mschapv2
+    }
+  }
+}
+include strongswan.d/*.conf
+EOF
+# Public key auth
+# cat <<EOF > $swanctl_file
+# connections {
+#     rw {
+#         local {
+#             auth = pubkey
+#             certs = vmCert.pem
+#             id = ${vm_name}.${cert_org}
+#         }
+#         remote {
+#             auth = pubkey
+#         }
+#         children {
+#             rw {
+#                 local_ts  = $ipsec_network
+#             }
+#         }
+#     }
+# }
+# EOF
+# EAP auth
+# proposals="aes256-sha256-modp8192"
+proposals="aes256-sha1-modp1024"
+cat <<EOF > $swanctl_file
+connections {
+    rw {
+        local_addrs = $vm_private_ip
+        pools = rw_pool
+        proposals = $proposals
+        local {
+            auth = pubkey
+            certs = vmCert.pem
+            id = ${vm_name}.${cert_org}
+        }
+        remote {
+            auth = eap-dynamic
+            eap_id = %any
+        }
+        children {
+            rw {
+                local_ts  = $ipsec_network
+                esp_proposals = $proposals
+            }
+        }
+        send_certreq = no
+        version = 2
+    }
+}
+secrets {
+    eap-$username {
+        id = $username@$cert_org
+        secret = $p2s_key
+    }
+}
+pools {
+    rw_pool {
+        addrs = 172.16.16.0/24
+        dns = $vm_private_ip
+    }
+
+}
+charon-systemd {
+  plugins {
+    eap-dynamic {
+      prefer_user = yes
+      preferred = tls, mschapv2
+    }
+  }
+}
+EOF
+scp -o StrictHostKeyChecking=no $swanctl_file $username@$vm_public_ip:/home/${username}/swanctl.conf
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo mv /home/${username}/swanctl.conf /etc/swanctl/swanctl.conf"
+scp -o StrictHostKeyChecking=no $strongswan_file $username@$vm_public_ip:/home/${username}/strongswan.conf
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo mv /home/${username}/strongswan.conf /etc/strongswan.conf"
+# Restart the strongswan service and apply sysctl changes
+echo "Restarting StrongSwan..."
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo systemctl restart ipsec"
+echo "Applying sysctl changes..."
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo swanctl --load-all"
+
+# Optional: test private endpoint access
+if [[ "$test_private_link" == "yes" ]]; then
+    storage_endpoint_name=storageep
+    storage_account_name=test$RANDOM
+    storage_container_name=helloworld
+    echo "Creating storage account..."
+    az storage account create -g $rg -n $storage_account_name --sku Standard_LRS --kind StorageV2 -l $location --public-network-access Disabled -o none
+    storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
+    storage_account_id=$(az storage account show -n $storage_account_name -g $rg -o tsv --query id)
+    echo "Creating private endpoint..."
+    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $ep_subnet_name --address-prefix $ep_subnet_prefix -o none
+    az network private-endpoint create -n $storage_endpoint_name -g $rg --vnet-name $vnet_name --subnet $ep_subnet_name --private-connection-resource-id $storage_account_id --group-id blob --connection-name blob -o none
+    storage_nic_id=$(az network private-endpoint show -n $storage_endpoint_name -g $rg --query 'networkInterfaces[0].id' -o tsv)
+    storage_endpoint_ip=$(az network nic show --ids $storage_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+    echo "Private IP address for Storage Account ${storage_account_name}: ${storage_endpoint_ip}"
+    echo "Configuring DNS..."
+    dns_zone_name=privatelink.blob.core.windows.net
+    az network private-dns zone create -n $dns_zone_name -g $rg -o none
+    az network private-dns link vnet create -g $rg -z $dns_zone_name -n $vnet_name --virtual-network $vnet_name --registration-enabled false -o none
+    az network private-endpoint dns-zone-group create --endpoint-name $storage_endpoint_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $dns_zone_name -o none
+    # Test DNS
+    dig +short ${storage_account_name}.blob.core.windows.net
+    # This operation requires data access
+    az storage container create -n $storage_container_name --public-access container --auth-mode key --account-name $storage_account_name --account-key $storage_account_key -o none
+
+fi
+
+
+###############
+# Diagnostics #
+###############
+
+# NSG rules (both subnet and NIC)
+echo "Listing NSG rules for the VM's NIC..."
+nic_id=$(az vm show -g $rg -n $vm_name --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+nsg_id=$(az network nic show --ids $nic_id --query 'networkSecurityGroup.id' -o tsv)
+nsg_name=$(basename $nsg_id)
+az network nsg rule list -g $rg --nsg-name $nsg_name -o table
+echo "Listing NSG rules for the VM's subnet..."
+nsg_id=$(az network vnet subnet show -g $rg -n $subnet_name --vnet-name $vnet_name --query 'networkSecurityGroup.id' -o tsv)
+nsg_name=$(basename $nsg_id)
+az network nsg rule list -g $rg --nsg-name $nsg_name -o table
+
+
+# IP sec status
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo ipsec status"
+ssh -o StrictHostKeyChecking=no $username@$vm_public_ip "sudo ipsec statusall"
