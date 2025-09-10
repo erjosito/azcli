@@ -59,6 +59,10 @@ az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name -
 az container create -g $rg -n $aci_name --os-type Linux --image $api_image_name --cpu 1 --memory 1.5 --vnet $vnet_name --subnet $aci_subnet_name --ports 8080 -o none
 aci_private_ip=$(az container show -g $rg -n $aci_name --query 'ipAddress.ip' -o tsv) && echo "ACI Private IP: $aci_private_ip"
 
+####################
+# Test VMs and NSG #
+####################
+
 # Optionally, create a Linux VM in the same vnet to test connectivity
 if [[ "$create_linux_vm" == "yes" ]]; then
   az vm create -n $vm_name -g $rg -l $location --image $vm_image --size $vm_size --vnet-name $vnet_name --subnet $vm_subnet_name --generate-ssh-keys --public-ip-sku Standard -o none --only-show-errors
@@ -80,7 +84,6 @@ if [[ "$create_win_vm" == "yes" ]]; then
   vm_public_ip_id=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].publicIPAddress.id' -o tsv --only-show-errors)
   vm_public_ip=$(az network public-ip show --ids $vm_public_ip_id --query 'ipAddress' -o tsv --only-show-errors) && echo "Windows VM public IP: $vm_public_ip"
 fi
-
 
 # Add an NSG to the APIM subnet
 # https://learn.microsoft.com/en-us/azure/api-management/api-management-using-with-vnet#configure-nsg-rules
@@ -127,6 +130,10 @@ apim_subnet_id=$(az network vnet subnet show -n $apim_subnet_name --vnet-name $v
 az apim update -n $apim_name -g $rg -o none \
   --set virtualNetworkType=$apim_vnet_type \
   --set virtualNetworkConfiguration.subnetResourceId=$apim_subnet_id
+
+
+# Error in the portal: Connection to management endoint failed with WebException: ConnectFailure: unable to connect to the remote server
+# Workaround: https://learn.microsoft.com/en-us/azure/api-management/api-management-using-with-vnet#troubleshoot-connection-issues
 
 # Create product and API
 az apim product create -g $rg --service-name $apim_name -o none \
