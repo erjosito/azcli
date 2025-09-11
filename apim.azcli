@@ -32,6 +32,7 @@ apim_publisher_name=Contoso
 product_name=MyAPIs
 api_name=myapi
 vm_subnet_name=vm
+vm_nsg_name=vm-nsg
 vm_subnet_prefix=10.13.76.96/27
 vm_name=vm
 vm_size=Standard_B1s
@@ -45,6 +46,7 @@ azfw_name=azfw
 azfw_public_ip_name=azfw-pip
 azfw_policy_name=azfwpolicy
 azfw_subnet_prefix=10.13.76.128/26
+suffix=$RANDOM
 
 ######################
 # Deploy API in ACI  #
@@ -55,13 +57,54 @@ az group create -n $rg -l $location -o none
 az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix -o none
 az network vnet subnet create -g $rg -n $apim_subnet_name --vnet-name $vnet_name --address-prefix $apim_subnet_prefix -o none
 az network vnet subnet create -g $rg -n $aci_subnet_name --vnet-name $vnet_name --address-prefix $aci_subnet_prefix -o none
-az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name --address-prefix $vm_subnet_prefix -o none
 az container create -g $rg -n $aci_name --os-type Linux --image $api_image_name --cpu 1 --memory 1.5 --vnet $vnet_name --subnet $aci_subnet_name --ports 8080 -o none
 aci_private_ip=$(az container show -g $rg -n $aci_name --query 'ipAddress.ip' -o tsv) && echo "ACI Private IP: $aci_private_ip"
 
-####################
-# Test VMs and NSG #
-####################
+###########################
+# Log Analytics workspace #
+###########################
+
+# Create LA workspace and storage account
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    logws_name=logws$suffix
+    echo "Creating Log Analytics workspace ${logws_name}..."
+    az monitor log-analytics workspace create -g $rg -n $logws_name -o none
+else
+    echo "Log Analytics workspace $logws_name found in resource group $rg"
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+storage_account_name=$(az storage account list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$storage_account_name" ]]
+then
+    storage_account_name=logs$suffix
+    echo "Creating Storage Account ${storage_account_name}..."
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --encryption-services blob -o none
+else
+    echo "Storage Account $storage_account_name found in resource group $rg"
+fi
+
+# Enable VNet Flow Logs in the APIM subnet
+apim_subnet_id=$(az network vnet subnet show --vnet-name $vnet_name -n $apim_subnet_name -g $rg --query id -o tsv)
+az network watcher flow-log create -n "${apim_subnet_name}-subnet" -g $rg --enabled true --retention 7 \
+  --storage-account $storage_account_name --workspace $logws_id \
+  --subnet $apim_subnet_id \
+  --log-version 2 --interval 10 --traffic-analytics true -o none
+
+#########################
+# Test VMs and APIM NSG #
+#########################
+
+# Create NSG for the VM subnet
+az network nsg create -g $rg -n $vm_nsg_name -o none
+az network nsg rule create -g $rg --nsg-name $vm_nsg_name -n Allow-SSH-in --priority 100 --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 22 --source-address-prefixes '*' --destination-address-prefixes '*' -o none
+az network nsg rule create -g $rg --nsg-name $vm_nsg_name -n Allow-RDP-in --priority 110 --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 3389 --source-address-prefixes '*' --destination-address-prefixes '*' -o none
+az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name --address-prefix $vm_subnet_prefix -o none
+
+# Create the VM subnet
+az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name --address-prefix $vm_subnet_prefix --network-security-group $vm_nsg_name -o none
 
 # Optionally, create a Linux VM in the same vnet to test connectivity
 if [[ "$create_linux_vm" == "yes" ]]; then
@@ -72,17 +115,18 @@ if [[ "$create_linux_vm" == "yes" ]]; then
   vm_public_ip=$(az network public-ip show --ids $vm_public_ip_id --query 'ipAddress' -o tsv --only-show-errors) && echo "Linux VM public IP: $vm_public_ip"
   echo "Testing connectivity to VM..."
   ssh -o "StrictHostKeyChecking no" $vm_public_ip "ip a"
-  echo "Testing connectivity to ACI from VM..."
-  ssh -o "StrictHostKeyChecking no" $vm_public_ip "curl -s4 http://$aci_private_ip:8080/api/ip"
+  api_url=http://${aci_private_ip}:8080/api/healthcheck
+  echo "Testing connectivity to API from VM (${api_url})..."
+  ssh -o "StrictHostKeyChecking no" $vm_public_ip "curl -s4 $api_url"
 fi
 
 # Optionally, create a Windows VM in the same vnet to work as jump host (for example to the dev portal)
 if [[ "$create_win_vm" == "yes" ]]; then
   az vm create -n $winvm_name -g $rg -l $location --image $winvm_image --size $winvm_size --vnet-name $vnet_name --subnet $vm_subnet_name --admin-username $winvm_user --admin-password $winvm_password --public-ip-sku Standard -o none --only-show-errors
-  vm_nic_id=$(az vm show -n $winvm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv --only-show-errors)
-  vm_private_ip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv --only-show-errors) && echo "Windows VM private IP: $vm_private_ip"
-  vm_public_ip_id=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].publicIPAddress.id' -o tsv --only-show-errors)
-  vm_public_ip=$(az network public-ip show --ids $vm_public_ip_id --query 'ipAddress' -o tsv --only-show-errors) && echo "Windows VM public IP: $vm_public_ip"
+  winvm_nic_id=$(az vm show -n $winvm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv --only-show-errors)
+  winvm_private_ip=$(az network nic show --ids $winvm_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv --only-show-errors) && echo "Windows VM private IP: $winvm_private_ip"
+  winvm_public_ip_id=$(az network nic show --ids $winvm_nic_id --query 'ipConfigurations[0].publicIPAddress.id' -o tsv --only-show-errors)
+  winvm_public_ip=$(az network public-ip show --ids $winvm_public_ip_id --query 'ipAddress' -o tsv --only-show-errors) && echo "Windows VM public IP: $winvm_public_ip"
 fi
 
 # Add an NSG to the APIM subnet
@@ -98,6 +142,10 @@ az network nsg rule create -g $rg --nsg-name $apim_nsg -n Allow-SQL-out --priori
 az network nsg rule create -g $rg --nsg-name $apim_nsg -n Allow-KeyVault-out --priority 140 --access Allow --protocol Tcp --direction Outbound --destination-port-ranges 443 --source-address-prefixes VirtualNetwork --destination-address-prefixes AzureKeyVault -o none
 az network nsg rule create -g $rg --nsg-name $apim_nsg -n Allow-Monitor-out --priority 150 --access Allow --protocol Tcp --direction Outbound --destination-port-ranges 1886 443 --source-address-prefixes VirtualNetwork --destination-address-prefixes AzureMonitor -o none
 az network vnet subnet update -g $rg --vnet-name $vnet_name -n $apim_subnet_name --network-security-group $apim_nsg -o none
+
+# Enable required service endpoints in the APIM subnet: Storage, SQL, KeyVault, AAD, EventHub, Service Bus
+az network vnet subnet update -g $rg --vnet-name $vnet_name -n $apim_subnet_name -o none \
+  --service-endpoints Microsoft.Storage Microsoft.Sql Microsoft.KeyVault Microsoft.AzureActiveDirectory Microsoft.EventHub Microsoft.ServiceBus
 
 ########
 # APIM #
@@ -131,6 +179,21 @@ az apim update -n $apim_name -g $rg -o none \
   --set virtualNetworkType=$apim_vnet_type \
   --set virtualNetworkConfiguration.subnetResourceId=$apim_subnet_id
 
+# Create DNS zones and register APIM's private IP address
+dns_zone_name='azure-api.net'
+apim_private_ip=$(az apim show -n $apim_name -g $rg --query 'privateIpAddresses[0]' -o tsv)
+az network private-dns zone create -g $rg -n $dns_zone_name -o none
+az network private-dns record-set a create -g $rg -z $dns_zone_name -n $apim_name -o none
+az network private-dns record-set a add-record -g $rg -z $dns_zone_name -n $apim_name -a $apim_private_ip -o none
+az network private-dns record-set a create -g $rg -z $dns_zone_name -n "${apim_name}.portal" -o none
+az network private-dns record-set a add-record -g $rg -z $dns_zone_name -n "${apim_name}.portal" -a $apim_private_ip -o none
+az network private-dns record-set a create -g $rg -z $dns_zone_name -n "${apim_name}.developer" -o none
+az network private-dns record-set a add-record -g $rg -z $dns_zone_name -n "${apim_name}.developer" -a $apim_private_ip -o none
+az network private-dns record-set a create -g $rg -z $dns_zone_name -n "${apim_name}.management" -o none
+az network private-dns record-set a add-record -g $rg -z $dns_zone_name -n "${apim_name}.management" -a $apim_private_ip -o none
+az network private-dns record-set a create -g $rg -z $dns_zone_name -n "${apim_name}.scm" -o none
+az network private-dns record-set a add-record -g $rg -z $dns_zone_name -n "${apim_name}.scm" -a $apim_private_ip -o none
+az network private-dns link vnet create -g $rg -n ${dns_zone_name}-link --virtual-network $vnet_name --zone-name $dns_zone_name --registration-enabled false -o none
 
 # Error in the portal: Connection to management endoint failed with WebException: ConnectFailure: unable to connect to the remote server
 # Workaround: https://learn.microsoft.com/en-us/azure/api-management/api-management-using-with-vnet#troubleshoot-connection-issues
@@ -179,14 +242,48 @@ if [[ "$create_azfw" == "yes" ]]; then
   az network route-table route create -g $rg --route-table-name $apim_rt_name -n default-route --address-prefix '0.0.0.0/0' --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
   # Associate the route table to the APIM subnet
   az network vnet subnet update -g $rg --vnet-name $vnet_name -n $apim_subnet_name --route-table $apim_rt_name -o none
+  # Enable Azure firewall logs
+  azfw_id=$(az network firewall show -g $rg -n $azfw_name --query id -o tsv)
+  az monitor diagnostic-settings create -n mydiag$RANDOM --resource $azfw_id --workspace $logws_id \
+      --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+              {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+
 fi
 
 ###############
 # Diagnostics #
 ###############
 
+# APIM
 az apim list -g $rg -o table
 az network nsg rule list -g $rg --nsg-name $apim_nsg -o table
+az network vnet subnet show -g $rg --vnet-name $vnet_name -n $apim_subnet_name --query serviceEndpoints -o jsonc -o table
+subscription_id=$(az account show --query id -o tsv)
+az rest --method GET --url https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$rg/providers/Microsoft.ApiManagement/service/$apim_name/networkstatus?api-version=2024-05-01
+
+# Query the log analytics workspace for VNet flow logs
+query='NTANetAnalytics
+| where TimeGenerated > ago(10m)
+| where SubType == \"FlowLog\"
+//| where SrcIp == \"${src_ip}\"
+//| where ipv4_is_in_range(SrcIp, \"${azfw_subnet_prefix}\")
+//| where DestIp == \"${dst_ip}\"
+//| where DestPort == 8080
+//| where FlowStatus == \"Allowed\"
+| summarize BytesSrc2Dst=sum(BytesSrcToDest), BytesDst2Src=sum(BytesDestToSrc) by MacAddress, SrcIp, SourceSystem, L4Protocol, DestIp, DestPort, ConnectionType, FlowStatus'
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
+
+# Query the firewall logs
+query='AzureDiagnostics
+| where TimeGenerated > ago(10m)
+| where ResourceType == \"AZUREFIREWALLS\"
+| where Category == \"AzureFirewallNetworkRule\"
+//| where src_ip_s == \"${src_ip}\"
+//| where ipv4_is_in_range(src_ip_s, \"${azfw_subnet_prefix}\")
+//| where dest_ip_s == \"${dst_ip}\"
+//| where dest_port_s == \"8080\"
+| project TimeGenerated, src_ip_s, dest_ip_s, dest_port_s, action_s, msg_s'
+az monitor log-analytics query -w $logws_customerid --analytics-query "$query" -o table
 
 ###############
 # DANGER ZONE #
