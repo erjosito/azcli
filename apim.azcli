@@ -18,7 +18,8 @@ vnet_name=apimvnet
 vnet_prefix=10.13.76.0/24
 aci_subnet_name=aci
 aci_subnet_prefix=10.13.76.64/27
-api_image_name=erjosito/sqlapi:1.0
+aci_rt_name=aci-rt
+api_image_name=erjosito/yadaapi:1.0
 aci_name=aci
 apim_nsg=apim-nsg
 apim_name=apim$RANDOM
@@ -32,6 +33,7 @@ apim_publisher_name=Contoso
 product_name=MyAPIs
 api_name=myapi
 vm_subnet_name=vm
+vm_rt_name=vm-rt
 vm_nsg_name=vm-nsg
 vm_subnet_prefix=10.13.76.96/27
 vm_name=vm
@@ -110,7 +112,7 @@ az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name -
 # Optionally, create a Linux VM in the same vnet to test connectivity
 if [[ "$create_linux_vm" == "yes" ]]; then
   echo "Creating Linux VM ${vm_name}..."
-  az vm create -n $vm_name -g $rg -l $location --image $vm_image --size $vm_size --vnet-name $vnet_name --subnet $vm_subnet_name --generate-ssh-keys --public-ip-sku Standard -o none --only-show-errors
+  az vm create -n $vm_name -g $rg -l $location --image $vm_image --size $vm_size --vnet-name $vnet_name --subnet $vm_subnet_name --generate-ssh-keys --public-ip-sku Standard --nsg '' -o none --only-show-errors
   vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv --only-show-errors)
   vm_private_ip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv --only-show-errors) && echo "Linux VM private IP: $vm_private_ip"
   vm_public_ip_id=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].publicIPAddress.id' -o tsv --only-show-errors)
@@ -125,7 +127,7 @@ fi
 # Optionally, create a Windows VM in the same vnet to work as jump host (for example to the dev portal)
 if [[ "$create_win_vm" == "yes" ]]; then
   echo "Creating Windows VM ${winvm_name}..."
-  az vm create -n $winvm_name -g $rg -l $location --image $winvm_image --size $winvm_size --vnet-name $vnet_name --subnet $vm_subnet_name --admin-username $winvm_user --admin-password $winvm_password --public-ip-sku Standard -o none --only-show-errors
+  az vm create -n $winvm_name -g $rg -l $location --image $winvm_image --size $winvm_size --vnet-name $vnet_name --subnet $vm_subnet_name --admin-username $winvm_user --admin-password $winvm_password --public-ip-sku Standard --nsg '' -o none --only-show-errors
   winvm_nic_id=$(az vm show -n $winvm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv --only-show-errors)
   winvm_private_ip=$(az network nic show --ids $winvm_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv --only-show-errors) && echo "Windows VM private IP: $winvm_private_ip"
   winvm_public_ip_id=$(az network nic show --ids $winvm_nic_id --query 'ipConfigurations[0].publicIPAddress.id' -o tsv --only-show-errors)
@@ -178,6 +180,14 @@ else
     echo "APIM $apim_name found in resource group $rg"
 fi
 
+# Configure logging
+apim_id=$(az apim show -n $apim_name -g $rg --query id -o tsv)
+az monitor diagnostic-settings create -n apimdiag$RANDOM --resource $apim_id --workspace $logws_id \
+    --logs '[{"category": "GatewayLogs", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "WebSocketConnectionLogs", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "DeveloperPortalAuditLogs", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+            {"category": "GatewayLlmLogs", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+
 # Add the APIM to the vnet. According to https://learn.microsoft.com/en-us/azure/api-management/api-management-using-with-internal-vnet,
 #     only portal/ARM is supported
 apim_subnet_id=$(az network vnet subnet show -n $apim_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
@@ -224,6 +234,7 @@ az apim api create -g $rg --service-name $apim_name --api-id $api_name --path '/
 az apim product api add -n $apim_name -g $rg --product-id $product_name --api-id $api_name -o none
 az apim api operation create -g $rg --service-name $apim_name --api-id $api_name --display-name 'IP info' --operation-id ip --url-template /api/ip --method GET -o none
 az apim api operation create -g $rg --service-name $apim_name --api-id $api_name --display-name 'Healthcheck' --operation-id healthcheck --url-template /api/healthcheck --method GET -o none
+az apim api operation create -g $rg --service-name $apim_name --api-id $api_name --display-name 'Headers' --operation-id headers --url-template /api/headers --method GET -o none
 
 # You can test the APIs right now
 apim_url=$(az apim show -n $apim_name -g $rg --query gatewayUrl -o tsv)
@@ -302,20 +313,44 @@ if [[ "$create_azfw" == "yes" ]]; then
     az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
         --name APIM --collection-priority 101 --action Allow --rule-name AllowAPIM --rule-type NetworkRule --description "Allow all traffic from APIM" \
         --destination-addresses '*' --source-addresses $apim_subnet_prefix --ip-protocols TCP UDP --destination-ports '*' -o none
+    # Create a rule in the same collection to allow intra-vnet traffic
+    az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+        --name IntraVNet --collection-priority 102 --action Allow --rule-name AllowVNet --rule-type NetworkRule --description "Allow all traffic from VNet" \
+        --destination-addresses $vnet_prefix --source-addresses $vnet_prefix --ip-protocols TCP UDP --destination-ports '*' -o none
   # az network firewall network-rule collection create -g $rg --firewall-name $azfw_name -n AllowAPIMSubnet --action Allow --priority 100 -o noneo
   # az network firewall network-rule create -g $rg --firewall-name $azfw_name --collection-name AllowAPIMSubnet -n AllowAPIMSubnetRule --protocols Any --source-addresses '*' --destination-addresses $apim_subnet_prefix --destination-ports '*' -o none
   # Get the firewall private IP
-  azfw_private_ip=$(az network firewall show -g $rg -n $azfw_name --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo "Azure Firewall Private IP: $azfw_private_ip"
-  # Create a route table and a route to force traffic to the firewall
-  az network route-table create -g $rg -n $apim_rt_name -o none
-  az network route-table route create -g $rg --route-table-name $apim_rt_name -n default-route --address-prefix '0.0.0.0/0' --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
-  # Associate the route table to the APIM subnet
-  az network vnet subnet update -g $rg --vnet-name $vnet_name -n $apim_subnet_name --route-table $apim_rt_name -o none
+  azfw_private_ip=$(az network firewall show -g $rg -n $azfw_name --query 'ipConfigurations[0].privateIPAddress' -o tsv) && echo "Azure Firewall Private IP: $azfw_private_ip"  
   # Enable Azure firewall logs
   azfw_id=$(az network firewall show -g $rg -n $azfw_name --query id -o tsv)
   az monitor diagnostic-settings create -n mydiag$RANDOM --resource $azfw_id --workspace $logws_id \
       --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
               {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+
+  # Create a route table and a route to force traffic from APIM to the firewall
+  az network route-table create -g $rg -n $apim_rt_name -o none
+  # az network route-table route create -g $rg --route-table-name $apim_rt_name -n default-route --address-prefix '0.0.0.0/0' --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+  az network route-table route create -g $rg --route-table-name $apim_rt_name -n aci-to-azfw --address-prefix $aci_subnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+  az network route-table route create -g $rg --route-table-name $apim_rt_name -n vm-to-azfw --address-prefix $vm_subnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+  az network route-table route create -g $rg --route-table-name $apim_rt_name -n subnet-to-vnet --address-prefix $apim_subnet_prefix --next-hop-type VnetLocal -o none
+  # Associate the route table to the APIM subnet
+  az network vnet subnet update -g $rg --vnet-name $vnet_name -n $apim_subnet_name --route-table $apim_rt_name -o none
+  
+  # Create a route table and a route to force traffic from VM to the firewall
+  az network route-table create -g $rg -n $vm_rt_name -o none
+  az network route-table route create -g $rg --route-table-name $vm_rt_name -n aci-to-azfw --address-prefix $aci_subnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+  az network route-table route create -g $rg --route-table-name $vm_rt_name -n apim-to-azfw --address-prefix $apim_subnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+  az network route-table route create -g $rg --route-table-name $vm_rt_name -n subnet-to-vnet --address-prefix $vm_subnet_prefix --next-hop-type VnetLocal -o none
+  # Associate the route table to the VM subnet
+  az network vnet subnet update -g $rg --vnet-name $vnet_name -n $vm_subnet_name --route-table $vm_rt_name -o none
+
+  # Create a route table and a route to force traffic from the ACI container to the firewall
+  az network route-table create -g $rg -n $aci_rt_name -o none
+  az network route-table route create -g $rg --route-table-name $aci_rt_name -n vm-to-azfw --address-prefix $vm_subnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+  az network route-table route create -g $rg --route-table-name $aci_rt_name -n apim-to-azfw --address-prefix $apim_subnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+  az network route-table route create -g $rg --route-table-name $aci_rt_name -n subnet-to-vnet --address-prefix $aci_subnet_prefix --next-hop-type VnetLocal -o none
+  # Associate the route table to the ACI subnet
+  az network vnet subnet update -g $rg --vnet-name $vnet_name -n $aci_subnet_name --route-table $aci_rt_name -o none
 
 fi
 
@@ -368,7 +403,7 @@ function stop_firewall() {
 }
 function start_firewall() {
     echo "Starting Azure Firewall ${azfw_name}..."
-    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_public_ip_name --vnet-name $vnet_name -o none
     az network firewall update -n $azfw_name -g $rg -o none
 }
 function stop_vms() {
