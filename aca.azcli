@@ -8,7 +8,7 @@
 
 # Control
 internal=no
-create_azfw=yes
+create_azfw=no
 custom_dns=no
 
 # Variables

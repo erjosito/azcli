@@ -8,7 +8,7 @@
 
 # Control
 create_linux_vm=yes
-create_win_vm=yes
+create_win_vm=no
 create_azfw=yes
 
 # Variables
@@ -154,6 +154,9 @@ az network vnet subnet update -g $rg --vnet-name $vnet_name -n $apim_subnet_name
 # This is only relevant if applying 0.0.0.0/0 routes to the APIM subnet, but it doesn't hurt
 az network vnet subnet update -g $rg --vnet-name $vnet_name -n $apim_subnet_name -o none \
   --service-endpoints Microsoft.Storage Microsoft.Sql Microsoft.KeyVault Microsoft.AzureActiveDirectory Microsoft.EventHub Microsoft.ServiceBus
+
+# If v2, you need to delegate the subnet (although the portal would do it for you)
+# az network vnet subnet update -g $rg --vnet-name $vnet_name -n $apim_subnet_name --delegations "Microsoft.Web/hostingEnvironments" -o none
 
 ########
 # APIM #

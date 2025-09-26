@@ -407,28 +407,24 @@ function default_gw(){
 function create_spoke() {
     hub=$1
     spoke=$2
-    if [[ -z "$hub" ]] || [[ -z "spoke" ]]
-    then
+    if [[ -z "$hub" ]] || [[ -z "spoke" ]]; then
         echo "You need to provide a hub ID and a spoke ID"
         exit
     fi
     connect_to_hub=$3
-    if [[ -z "$connect_to_hub" ]]
-    then
+    if [[ -z "$connect_to_hub" ]]; then
         connect_to_hub="yes"
     fi
     spoke_id="${hub}${spoke}"
     hub_name="hub${hub}"
     vnet_prefix="10.${hub}.${spoke}.0/24"
     subnet_prefix="10.${hub}.${spoke}.0/26"
-    if [[ "$hub" == "1" ]]
-    then
+    if [[ "$hub" == "1" ]]; then
         location="$location1"
         nsg_name="$nsg1_name"
         hub_vnet_ass_rt_id="$hub1_vnet_ass_rt_id"
         hub_vnet_prop_rt_id="$hub1_vnet_prop_rt_id"
-    elif [[ "$hub" == "2" ]]
-    then
+    elif [[ "$hub" == "2" ]]; then
         location="$location2"
         nsg_name="$nsg2_name"
         hub_vnet_ass_rt_id="$hub2_vnet_ass_rt_id"
@@ -1193,6 +1189,8 @@ then
     # You might have to accept the CSR marketplace terms to deploy the image
     echo "Accepting the Cisco marketplace image for Cisco CSR..."
     az vm image terms accept -p $publisher -f $offer --plan $sku -o none
+    echo "Making sure that the required features are registered..."
+    az feature register --namespace Microsoft.Compute --name UseStandardSecurityType -o none
     echo "Creating NVAs..."
     az vm create -n branch1-nva -g $rg -l $location1 --image ${publisher}:${offer}:${sku}:${version} --security-type Standard \
         --generate-ssh-keys --admin-username $username --nsg $nsg1_name --size $nva_size --disable-integrity-monitoring \
@@ -3145,6 +3143,14 @@ function update_all_ssh_keys() {
     done <<< "$vm_list"
 }
 
+# Patch NSGs
+function patch_nsgs() {
+    nsg_list=$(az network nsg list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r nsg_name; do
+        echo "Patching NSG $nsg_name..."
+        az network nsg rule create -g $rg --nsg-name $nsg_name -n Allow-SSH-in --priority 4000 --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 22 --source-address-prefixes Internet --destination-address-prefixes VirtualNetwork -o none
+    done <<< "$nsg_list"
+}
 
 #################
 #  DANGER ZONE  #

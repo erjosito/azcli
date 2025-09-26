@@ -1,0 +1,183 @@
+#################################
+# Created by Jose Moreno
+# September 2025
+#
+# Some useful commands around AKS BYOCNI
+# Started following https://isovalent.com/blog/post/cilium-egress-gateway-aks/
+#################################
+
+# Control options
+install_cilium_cli=no
+cilium_version=1.18.2       # Get from https://raw.githubusercontent.com/cilium/cilium/refs/heads/main/stable.txt?
+
+# Variables
+rg=akstest
+location=eastus2
+wait_interval=5s
+# AKS
+aks_name=aksbyocni
+aks_rbac=yes
+aks_service_cidr=10.0.0.0/16
+vm_size=Standard_B2ms         # Some possible values: Standard_B2ms, Standard_D2_v3
+preview_version=yes
+network_plugin=azure_cilium    # azure/kubenet/none/azure_overlay/azure_cilium
+network_policy=cilium          # azure/calico/cilium/none
+azure_cni_pod_subnet=no        # yes/no
+az_monitor=no
+# Vnet
+vnet_name=aksVnet
+vnet_prefix=10.13.0.0/16
+aks_subnet_name=aks1stpool
+aks_subnet_prefix=10.13.76.0/24  # Min /25 with Azure CNI!
+egressgw_subnet_name=egressgw
+egressgw_subnet_prefix=10.13.75.0/24
+
+####################
+# Helper functions #
+####################
+
+# Wait for resource to be created
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
+
+########
+# Main #
+########
+
+# Install CILIUM CLI
+# Slightly changed from https://docs.cilium.io/en/stable/gettingstarted/k8s-install-default/ for zsh compatibility
+if [[ "$install_cilium_cli" == 'yes' ]]; then
+    echo "Installing Cilium CLI..."
+    CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+    CLI_ARCH=amd64
+    if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+    curl -s -L --fail --remote-name-all "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}"
+    sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+    sudo tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+    rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+fi
+
+# Just in case
+az provider register --namespace Microsoft.ContainerService -o none
+
+# Create RG, LA workspace, vnet, AKS
+echo "Creating RG and VNet..."
+az group create -n $rg -l $location -o none
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location -o none
+az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix -o none
+az network vnet subnet create -g $rg -n $egressgw_subnet_name --vnet-name $vnet_name --address-prefix $egressgw_subnet_prefix -o none
+vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+egressgw_subnet_id=$(az network vnet subnet show -n $egressgw_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+
+# Create LA workspace
+if [[ "$az_monitor" == 'yes' ]]; then
+    logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+    if [[ -z "$logws_name" ]]
+    then
+        logws_name=log$RANDOM
+        echo "INFO: Creating log analytics workspace ${logws_name}..."
+        az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+    else
+        echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+    fi
+    logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+    logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+fi
+
+# Create user-managed identity and assign Contributor to the vnet
+id_name=aksid
+id_id=$(az identity show -n $id_name -g $rg --query id -o tsv 2>/dev/null)
+if [[ -z "$id_id" ]]
+then
+    echo "Identity $id_name not found in the resource group, creating a new one..."
+    az identity create -n $id_name -g $rg -o none
+    id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
+else
+    echo "Identity $id_name found with ID $id_id"
+fi
+id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
+sleep 15 # Time for creation to propagate
+az role assignment create --scope $vnet_id --assignee $id_principal_id --role Contributor -o none
+
+# Create AKS with no CNI with 2 nodes (Cilium gives errors with 1 node)
+echo "Creating AKS $aks_name..."
+az aks create -l $location -g $rg -n $aks_name -o none --only-show-errors \
+    --enable-managed-identity --assign-identity $id_id \
+    --vnet-subnet-id $aks_subnet_id --network-plugin none \
+    -c 2 --node-vm-size $vm_size --generate-ssh-keys --node-resource-group "$aks_name"-iaas-"$RANDOM"
+
+# Get credentials
+echo "Getting AKS credentials..."
+az aks get-credentials -n $aks_name -g $rg --overwrite-existing -o none
+
+# Deploy Cilium with Helm
+helm repo add cilium https://helm.cilium.io/
+helm install cilium cilium/cilium --version $cilium_version \
+  --namespace kube-system \
+  --set "aksbyocni.enabled=true" \
+  --set "nodeinit.enabled=true" \
+  --set "pam.operator.clusterPoolIPv4PodCIDRList=192.168.0.0/16" \
+  --set "hubble.relay.enabled=true"
+
+# Enable multicast
+# See https://docs.cilium.io/en/latest/network/multicast/
+cilium config set multicast-enabled true            # Crashes the cilium containers!!!
+
+# Create two pods to test multicast connectivity
+kubectl create namespace test
+kubectl run -n test pod1 --image=ubuntu:22.04 -- sleep 1d
+# kubectl run -n test pod2 --image=ubuntu:22.04 --sysctl net.ipv4.icmp_echo_ignore_broadcasts=0 -- sleep 1d
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod2
+  namespace: test  
+spec:
+  containers:
+  - name: ubuntu
+    image: ubuntu:22.04
+    command: [ "sleep", "1d" ] 
+    securityContext:
+      sysctls:
+        - name: net.ipv4.icmp_echo_ignore_broadcasts
+          value: "0" 
+EOF
+kubectl exec -n test pod1 -- ping 224.10.10.10 -c 5
+# kubectl exec -n test pod2 -- sysctl -w net.ipv4.icmp_echo_ignore_broadcasts=0
+kubectl exec -n test pod2 -- ip addr add 224.10.10.10/24 dev eth0 autojoin
+kubectl exec -n test pod2 -- ip -f inet maddr show dev eth0
+kubectl exec -n test pod1 -- ping 224.10.10.10 -c 5
+
+
+
+
+###############
+# Diagnostics #
+###############
+
+# Check Cilium status
+cilium status --wait
+cilium connectivity test
