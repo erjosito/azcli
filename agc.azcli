@@ -9,7 +9,7 @@
 mode=byod                        # managed or byod
 cni=overlay                      # azure_pod_subnet, azure or overlay
 tls=no                           # yes or no
-alb_controller_version=1.4.14    # Check the latest version in https://learn.microsoft.com/azure/application-gateway/for-containers/alb-controller-release-notes
+alb_controller_version=1.8.8     # Check the latest version in https://learn.microsoft.com/azure/application-gateway/for-containers/alb-controller-release-notes
 flowlogs=yes                     # yes or no
 test_cmds=no                     # yes or no
 
@@ -44,10 +44,10 @@ tls_app_ns=yadatls
 
 # Register required resource providers on Azure.
 echo "Registering resource providers..."
-az provider register --namespace Microsoft.ContainerService
-az provider register --namespace Microsoft.Network
-az provider register --namespace Microsoft.NetworkFunction
-az provider register --namespace Microsoft.ServiceNetworking
+az provider register --namespace Microsoft.ContainerService --only-show-errors
+az provider register --namespace Microsoft.Network --only-show-errors
+az provider register --namespace Microsoft.NetworkFunction --only-show-errors
+az provider register --namespace Microsoft.ServiceNetworking --only-show-errors
 
 # Install Azure CLI extensions.
 function install_azcli_extension() {
@@ -56,16 +56,16 @@ function install_azcli_extension() {
     if [[ -z "$extension_version" ]]
     then
         echo "Azure CLI extension $extension_name not found, installing now..."
-        az extension add -n $extension_name -o none
+        az extension add -n $extension_name -o none --only-show-errors
     else
         echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
-        az extension update -n $extension_name -o none
+        az extension update -n $extension_name -o none --only-show-errors
     fi
     extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
     echo "Azure CLI extension $extension_name installed with version $extension_version"
 }
-install_azcli_extension alb
-install_azcli_extension aks-preview
+install_azcli_extension alb --only-show-errors
+install_azcli_extension aks-preview --only-show-errors
 
 # Create RG and VNets
 echo "Creating resource group $rg and VNet $vnet_name in $location..."
@@ -105,7 +105,7 @@ else  # Default to Azure without pod subnet
 fi
 # Create cluster
 echo "Creating AKS cluster $aks_name in resource group $rg in $cni CNI mode..."
-az aks create -g $rg -n $aks_name -l $location -o none \
+az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
     --enable-oidc-issuer --enable-workload-identity \
     -c 1 -s $aks_node_size --generate-ssh-keys -u $(whoami) --service-cidr $aks_service_cidr \
     --enable-managed-identity --assign-identity $id_id \
@@ -117,6 +117,7 @@ az aks create -g $rg -n $aks_name -l $location -o none \
 
 # Verify cluster created with right plugin
 if [[ "$test_cmds" == "yes" ]]; then
+    echo "Verifying CNI plugin for AKS cluster $aks_name in resource group $rg..."
     az aks list -g $rg --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy, PluginMode:networkProfile.networkPluginMode, NetworkMode:networkProfile.networkMode}' -o table
 fi
 
