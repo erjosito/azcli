@@ -679,7 +679,7 @@ if [[ "$waf" == "yes" ]]; then
     echo "Enabling policy (per default disabled)"
     az network application-gateway waf-policy policy-setting update --policy-name $waf_policy_name -g $rg --state Enabled -o none
     # WIP: create custom rule based on geolocation
-    match_conditions="[{\"matchVariables\": {\"name\": \"RemoteAddr\"},\"operator\":\"GeoMatch\",\"matchValues\": [\"us\"], \"transforms\": [\"lowerCase\"]}]"
+    match_conditions="[{'variables': [{'variableName': 'RemoteAddr'}],'operator':'GeoMatch','values': ['US'], 'transforms': ['lowerCase']}]"
     az network application-gateway waf-policy custom-rule create -g $rg --policy-name $waf_policy_name -n customrule00 --priority 10 --action Block \
       --rule-type MatchRule --action Block --match-conditions "$match_conditions" \
       -o none --only-show-errors
@@ -702,11 +702,12 @@ spec:
   webApplicationFirewall:
     id: $waf_policy_id
 EOF
-    # Add also to TLS route / listener?
+    # Attach also to TLS route / listener?
 fi
 
 if [[ "$test_cmds" == "yes" ]]; then
     az network application-gateway waf-policy list -g $rg -o table
+    az network application-gateway waf-policy policy-setting list -g $rg --policy-name $waf_policy_name -o jsonc
     kubectl get WebApplicationFirewallPolicy -n $app_ns
     kubectl describe WebApplicationFirewallPolicy -n $app_ns
     kubectl describe httproute yadaapi -n $app_ns
