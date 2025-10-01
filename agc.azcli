@@ -8,7 +8,7 @@
 # Control
 mode=byod                        # managed or byod
 cni=overlay                      # azure_pod_subnet, azure or overlay
-tls=no                           # yes or no
+tls=yes                          # yes or no
 alb_controller_version=1.8.8     # Check the latest version in https://learn.microsoft.com/azure/application-gateway/for-containers/alb-controller-release-notes
 flowlogs=yes                     # yes or no
 test_cmds=no                     # yes or no
@@ -118,11 +118,11 @@ az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
 # Verify cluster created with right plugin
 if [[ "$test_cmds" == "yes" ]]; then
     echo "Verifying CNI plugin for AKS cluster $aks_name in resource group $rg..."
-    az aks list -g $rg --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy, PluginMode:networkProfile.networkPluginMode, NetworkMode:networkProfile.networkMode}' -o table
+    az aks list -g $rg --only-show-errors --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy, PluginMode:networkProfile.networkPluginMode, NetworkMode:networkProfile.networkMode}' -o table
 fi
 
 # Create identity for AGC and configure federation with AKS OIDC issuer
-node_rg=$(az aks show -n $aks_name -g $rg --query "nodeResourceGroup" -o tsv)
+node_rg=$(az aks show -n $aks_name -g $rg --query "nodeResourceGroup" -o tsv --only-show-errors)
 node_rg_id=$(az group show -n $node_rg --query id -o tsv)
 rg_id=$(az group show -n $rg --query id -o tsv)
 echo "Creating ALB identity $alb_id_name in resource group $rg..."
@@ -135,14 +135,14 @@ reader_role=acdd72a7-3385-48ef-bd42-f606fba81ae7
 az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --role $reader_role --scope $node_rg_id -o none --only-show-errors
 az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --role $reader_role --scope $rg_id -o none --only-show-errors
 echo "Setting up federation with AKS OIDC issuer..."
-aks_oidc_issuer="$(az aks show -n "$aks_name" -g "$rg" --query "oidcIssuerProfile.issuerUrl" -o tsv)"
+aks_oidc_issuer="$(az aks show -n "$aks_name" -g "$rg" --query "oidcIssuerProfile.issuerUrl" -o tsv --only-show-errors)"
 az identity federated-credential create -n $alb_id_name -g $rg -o none --only-show-errors \
     --identity-name $alb_id_name --issuer "$aks_oidc_issuer" --subject "system:serviceaccount:azure-alb-system:alb-controller-sa"
 
 # Deploy Helm chart
 # Notice the version is hard-coded, you can update it with 'helm upgrade'
-echo "Deploying Helm chart for ALB controller"
-az aks get-credentials -n $aks_name -g $rg --overwrite-existing
+echo "Deploying helm chart for ALB, version ${alb_controller_version}..."
+az aks get-credentials -n $aks_name -g $rg --overwrite-existing --only-show-errors
 kubectl create ns $alb_deployment_ns
 # The --namespace flag doesnt seem to have any effect
 helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller \
@@ -272,18 +272,19 @@ if [[ "$mode" == "byod" ]]; then
     az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --scope $rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
     az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --scope $agc_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none # Network Contributor
 
-    # Associate the AppGW4C with the subnet
+    # Associate the AGC with the subnet
     echo "Associating the AGC with the subnet..."
     association_name='AppGW4Cassociation'
     az network alb association create -g $rg -n $association_name --alb-name $agc_name --subnet $agc_subnet_id -o none --only-show-errors
 
     # Create Gateway in k8s
-    echo "Creating gateway in k8s..."
     agc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
     # agc_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
     # agc_frontend_name=$(az network alb frontend list --alb-name $agc_name -g $rg --query '[0].name' -o tsv)
     echo "Creating Gateway in k8s associated to ALB ID $agc_id and frontend $agc_frontend_name..."
     if [[ "$tls" == "yes" ]]; then
+        kubectl create namespace $alb_ns_name
+        kubectl create secret tls $secret_name --cert=$pem_file --key=$key_file -n default
         kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
@@ -356,7 +357,6 @@ fi
 ##################################
 
 # Create log analytics workspace
-# ToDo: get the name of AGC, it could be different if created using the managed deployment
 logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
 if [[ -z "$logws_name" ]]
 then
@@ -438,8 +438,8 @@ fi
 ##################################
 
 if [[ "$tls" == "yes" ]]; then
-    echo "Creating secret $secret_name for frontend TLS from file $pem_file..."
-    kubectl create secret tls $secret_name --cert=$pem_file --key=$key_file
+    # echo "Creating secret $secret_name for frontend TLS from file $pem_file..."     # Secret must have been created earlier
+    # kubectl create secret tls $secret_name --cert=$pem_file --key=$key_file
     echo "Creating FrontendTLSPolicy for gateway $agc_name..."
     # A TLS policy only needed if you need MTLS, maybe we could create a frontend policy for other purposes such as TLS version?
     #    According to the docs, only mTLS supported: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/api-specification-kubernetes#alb.networking.azure.io/v1.FrontendTLSPolicyConfig
@@ -474,7 +474,7 @@ fi
 # See https://gateway-api.sigs.k8s.io/guides/multiple-ns/
 # See https://github.com/microsoft/YADA/tree/main/api
 
-echo "Creating sample app in namespace $app_ns"
+echo "Creating sample app in namespace $app_ns..."
 kubectl create ns $app_ns
 kubectl create deployment yadaapi -n $app_ns --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
 kubectl expose deploy yadaapi -n $app_ns --port=8080 --target-port=8080
@@ -549,8 +549,8 @@ EOF
 
 if [[ "$test_cmds" == "yes" ]]; then
     # Check
-    kubectl get httproute
-    kubectl describe httproute yadaapi
+    kubectl get httproute -n $app_ns
+    kubectl describe httproute yadaapi -n $app_ns
 
     # Scale out
     kubectl scale deploy yadaapi -n $app_ns --replicas=2
@@ -594,6 +594,32 @@ spec:
       port: 8080
       weight: 1
 EOF
+
+# HTTPS route
+if [[ "$tls" == "yes" ]]; then
+  kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: yadaapitls    # lowercase
+  namespace: $app_ns
+spec:
+  parentRefs:
+  - name: $agc_name
+    namespace: default
+    sectionName: https
+  hostnames:
+  - "$fqdn"
+  rules:
+  - backendRefs:
+    - name: yadaapi
+      port: 8080
+      weight: 999
+    - name: yadaapi-backup
+      port: 8080
+      weight: 1
+EOF
+fi
 
 # Health check policy
 kubectl apply -f - <<EOF
