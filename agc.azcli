@@ -44,7 +44,8 @@ secret_name=cloudtrooper-tls
 tls_app_fqdn=yada.cloudtrooper.net
 tls_app_ns=yadatls
 # WAF
-waf_policy_name=agc-agc-waf-policy
+waf_policy_name=agc-waf-policy
+sec_policy_name=agc-sec-policy
 
 # Register required resource providers on Azure.
 echo "Registering resource providers..."
@@ -678,9 +679,22 @@ if [[ "$waf" == "yes" ]]; then
     fi
     echo "Enabling policy (per default disabled)"
     az network application-gateway waf-policy policy-setting update --policy-name $waf_policy_name -g $rg --state Enabled -o none
-    # WIP: create custom rule based on geolocation
+    # Create security policy
+    # https://learn.microsoft.com/en-us/rest/api/applicationgatewaycontainers/security-policies-interface/create-or-update?view=rest-applicationgatewaycontainers-2025-01-01&tabs=HTTP
+    echo "Creating security policy linked to WAF policy..."
+    subscription_id=$(az account show --query id -o tsv)
+    waf_policy_id=$(az network application-gateway waf-policy show -g $rg -n $waf_policy_name --query id -o tsv)
+    url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.ServiceNetworking/trafficControllers/${agc_name}/securityPolicies/${sec_policy_name}?api-version=2025-01-01"
+    body="{ \"location\": \"$location\", \"properties\": { \"wafPolicy\": { \"id\": \"$waf_policy_id\" } } }"
+    az rest --method put --uri "$url" --body "$body" -o none --only-show-errors
+    # Create custom rule based on geolocation
     match_conditions="[{'variables': [{'variableName': 'RemoteAddr'}],'operator':'GeoMatch','values': ['US'], 'transforms': ['lowerCase']}]"
     az network application-gateway waf-policy custom-rule create -g $rg --policy-name $waf_policy_name -n customrule00 --priority 10 --action Block \
+      --rule-type MatchRule --action Block --match-conditions "$match_conditions" \
+      -o none --only-show-errors
+    # Create custom rule based on custom header
+    match_conditions="[{'variables': [{'variableName': 'RequestHeaders', 'selector': 'User-Agent'}],'operator':'Contains','values': ['evilbot'], 'transforms': ['lowerCase']}]"
+    az network application-gateway waf-policy custom-rule create -g $rg --policy-name $waf_policy_name -n customrule01 --priority 20 --action Block \
       --rule-type MatchRule --action Block --match-conditions "$match_conditions" \
       -o none --only-show-errors
     # Create k8s WAF policy and attach to HTTP route
@@ -711,6 +725,13 @@ if [[ "$test_cmds" == "yes" ]]; then
     kubectl get WebApplicationFirewallPolicy -n $app_ns
     kubectl describe WebApplicationFirewallPolicy -n $app_ns
     kubectl describe httproute yadaapi -n $app_ns
+fi
+
+if [[ "$test_cmds" == "yes" ]]; then
+    echo "This should work:"
+    curl "http://${fqdn}/api/healthcheck"
+    echo "This should be blocked:"
+    curl -A evilbot "http://${fqdn}/api/healthcheck"
 fi
 
 #####################
