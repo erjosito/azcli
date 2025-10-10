@@ -8,12 +8,15 @@
 # Control
 mode=byod                        # managed or byod
 waf=yes                          # yes or no
-waf_type=default                 # default, bot or OWASP
+waf_type=default                 # default, bot or OWASP (only default supported!)
 cni=overlay                      # azure_pod_subnet, azure or overlay
 tls=yes                          # yes or no
 alb_controller_version=1.8.8     # Check the latest version in https://learn.microsoft.com/azure/application-gateway/for-containers/alb-controller-release-notes
 flowlogs=yes                     # yes or no
 test_cmds=no                     # yes or no
+backup_service=no                # yes or no: whether creating a backup application to test load balancing
+istio=yes                        # yes or no: whether installing Istio for service mesh
+bookapp=yes                      # yes or no: whether installing Bookinfo sample app for Istio
 
 # Variables
 rg=agc
@@ -108,15 +111,33 @@ elif [[ "$cni" == "overlay" ]]; then
 else  # Default to Azure without pod subnet
     cni_options="--network-plugin azure --vnet-subnet-id $aks_subnet_id"
 fi
+
+# AKS number of nodes
+if [[ "$istio" == "yes" ]]; then
+    aks_node_count=2
+else
+    aks_node_count=1
+fi
+
+# Istio installation
+if [[ "$istio" == "yes" ]]; then
+    istio_options="--enable-azure-service-mesh"
+else
+    istio_options=""
+fi
+
 # Create cluster
 echo "Creating AKS cluster $aks_name in resource group $rg in $cni CNI mode..."
 az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
     --enable-oidc-issuer --enable-workload-identity \
-    -c 1 -s $aks_node_size --generate-ssh-keys -u $(whoami) --service-cidr $aks_service_cidr \
+    -c $aks_node_count -s $aks_node_size --generate-ssh-keys -u $(whoami) --service-cidr $aks_service_cidr \
     --enable-managed-identity --assign-identity $id_id \
     ${(z)cni_options} \
+    ${(z)istio_options} \
     --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM"
+echo ""   # New line after az command
+
 # For existing clusters
 # az aks update -g $rg -n $aks_name --enable-oidc-issuer --enable-workload-identity -o none
 
@@ -124,6 +145,17 @@ az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
 if [[ "$test_cmds" == "yes" ]]; then
     echo "Verifying CNI plugin for AKS cluster $aks_name in resource group $rg..."
     az aks list -g $rg --only-show-errors --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy, PluginMode:networkProfile.networkPluginMode, NetworkMode:networkProfile.networkMode}' -o table
+    if [[ "$istio" == "yes" ]]; then
+        echo "Verifying Istio installation..."
+        installed_service_mesh=$(az aks show -g $rg -n $aks_name --query "serviceMeshProfile.mode" -o tsv)
+        echo "Service mesh installed in the cluster is: $installed_service_mesh"
+    fi
+fi
+
+# If Istio, get the revision
+if [[ "$istio" == "yes" ]]; then
+    istio_revision=$(az aks show -n $aks_name -g $rg --query 'serviceMeshProfile.istio.revisions' -o tsv)
+    echo "Istio revision installed is $istio_revision"
 fi
 
 # Create identity for AGC and configure federation with AKS OIDC issuer
@@ -164,6 +196,14 @@ if [[ "$test_cmds" == "yes" ]]; then
     kubectl get gatewayclass azure-alb-external -o yaml
 fi
 
+# If using the service mesh extension, install it
+# The attribute albServiceMeshExtension.image should not be required in the future
+echo "Installing service mesh extension for ALB via Helm..."
+helm install alb-controller-servicemesh-extension oci://mcr.microsoft.com/application-lb/charts/alb-controller-servicemesh-extension \
+     --namespace $alb_deployment_ns \
+     --version $alb_controller_version \
+     --set albServiceMeshExtension.image.tag=$alb_controller_version
+
 #############################
 #          Managed          #
 #############################
@@ -198,11 +238,15 @@ EOF
     # kubectl get ApplicationLoadBalancer -n $alb_ns_name
     # kubectl describe ApplicationLoadBalancer -n $alb_ns_name
 
+    # Wait for the ALB to be created (a loop would probably be better)
+    sleep 20
+
     # Create Gateway in k8s
     alb_id=$(az network alb list -g $node_rg --query '[0].id' -o tsv)
     alb_name=$(az network alb list -g $node_rg --query '[0].name' -o tsv)
     echo "Creating Gateway in k8s associated to ALB ID $alb_id..."
     if [[ "$tls" == "yes" ]]; then
+        kubectl create secret tls $secret_name --cert=$pem_file --key=$key_file -n default
         kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -380,14 +424,15 @@ agc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
 if [[ -z "$agc_id" ]]
 then
     echo "AGC not found in main resource group, looking for AGC in node resource group $node_rg..."
-    agc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
+    agc_id=$(az network alb list -g $node_rg --query '[0].id' -o tsv)
 fi
 if [[ -z "$agc_id" ]]; then
     echo "AGC not found in node resource group $node_rg, exiting..."
 else
     echo "AGC found with ID $agc_id, configuring diagnostics settings..."
     az monitor diagnostic-settings create --name agc-diagnostics --resource $agc_id --workspace $logws_id -o none --only-show-errors \
-      --logs '[{"category": "TrafficControllerAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
+      --logs '[{"category": "TrafficControllerAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+               {"category": "TrafficControllerFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
 fi
 
 # Get logs
@@ -401,13 +446,13 @@ fi
 ##################################
 
 if [[  "$flowlogs" == "yes" ]]; then
-    storage_account_name=$(az storage account list -g $rg -o tsv --query "[?location=='$location'].name" | head -1)
+    storage_account_name=$(az storage account list -g $rg -o tsv --query '[0].name' 2>/dev/null | head -1)
     if [[ -z "$storage_account_name" ]]; then
-        storage_account_name=$(echo "logs$RANDOM${nsg_location}" | cut -c1-24)  # max 24 characters
-        echo "No storage account found in $location, creating one..."
+        storage_account_name="logs$RANDOM"  # max 24 characters
+        echo "No storage account found in resource group $rg, creating one..."
         az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location -o none
     else
-        echo "Storage account $storage_account_name created in $location, using it for VNet flow flogs"
+        echo "Storage account $storage_account_name found in $location, using it for VNet flow flogs"
     fi
     echo "Enabling VNet Flow Logs for VNet $vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
     az network watcher flow-log create -l $location -g $rg --name "flowlog-$location" --vnet $vnet_name \
@@ -481,8 +526,24 @@ fi
 
 echo "Creating sample app in namespace $app_ns..."
 kubectl create ns $app_ns
+if [[ "$istio" == "yes" ]]; then
+    echo "Labeling namespace $app_ns for Istio injection with revision $istio_revision..."
+    kubectl label namespace $app_ns istio.io/rev=${istio_revision}
+    kubectl label namespace $app_ns istio-injection=enabled
+    kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: $app_ns
+spec:
+  mtls:
+    mode: STRICT
+EOF
+fi
 kubectl create deployment yadaapi -n $app_ns --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
 kubectl expose deploy yadaapi -n $app_ns --port=8080 --target-port=8080
+# Or if you need more control when creating the service:
 # kubectl apply -f - <<EOF
 # apiVersion: v1
 # kind: Service
@@ -516,6 +577,37 @@ spec:
   hostnames:
   - "$fqdn"
   rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api/
+  - backendRefs:
+    - name: yadaapi
+      namespace: $app_ns
+      port: 8080
+EOF
+
+# HTTPS route
+echo "Creating HTTPRoute for sample app for TLS frontend..."
+fqdn=$(kubectl get gateway $agc_name -o jsonpath='{.status.addresses[0].value}') && echo "The frontend FQDN is $fqdn"
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: HTTPRoute
+metadata:
+  name: yadaapitls
+  namespace: $app_ns
+spec:
+  parentRefs:
+  - name: $agc_name
+    namespace: default
+    sectionName: https
+  hostnames:
+  - "$fqdn"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api/
   - backendRefs:
     - name: yadaapi
       namespace: $app_ns
@@ -572,12 +664,13 @@ fi
 #  Backup service   #
 #####################
 
-kubectl create deployment yadaapi-backup -n $app_ns --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
-kubectl expose deploy yadaapi-backup -n $app_ns --port=8080 --target-port=8080
+if [[ "$backup_service" == "yes" ]]; then
+    kubectl create deployment yadaapi-backup -n $app_ns --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
+    kubectl expose deploy yadaapi-backup -n $app_ns --port=8080 --target-port=8080
 
-# HTTP route
-fqdn=$(kubectl get gateway $agc_name -o jsonpath='{.status.addresses[0].value}') && echo $fqdn
-kubectl apply -f - <<EOF
+    # HTTP route
+    fqdn=$(kubectl get gateway $agc_name -o jsonpath='{.status.addresses[0].value}') && echo $fqdn
+    kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -600,9 +693,9 @@ spec:
       weight: 1
 EOF
 
-# HTTPS route
-if [[ "$tls" == "yes" ]]; then
-  kubectl apply -f - <<EOF
+    # HTTPS route
+    if [[ "$tls" == "yes" ]]; then
+      kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -624,10 +717,10 @@ spec:
       port: 8080
       weight: 1
 EOF
-fi
+    fi
 
-# Health check policy
-kubectl apply -f - <<EOF
+    # Health check policy
+    kubectl apply -f - <<EOF
 apiVersion: alb.networking.azure.io/v1
 kind: HealthCheckPolicy
 metadata:
@@ -654,6 +747,70 @@ spec:
           end: 299
     useTLS: false
 EOF
+fi
+
+##################################
+#         Book info app          #
+##################################
+
+if [[ "$bookapp" == "yes" ]]; then
+    book_ns=bookinfo
+    echo "Creating bookinfo app in namespace $book_ns..."
+    kubectl create ns $book_ns
+    if [[ "$istio" == "yes" ]]; then
+        echo "Labeling namespace $book_ns for Istio injection with revision $istio_revision..."
+        kubectl label namespace $book_ns istio.io/rev=${istio_revision}
+        kubectl label namespace $app_ns istio-injection=enabled
+    fi
+    kubectl apply -n $book_ns -f https://raw.githubusercontent.com/istio/istio/release-1.18/samples/bookinfo/platform/kube/bookinfo.yaml
+    # Create HTTP route
+    kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: bookinfo
+  namespace: $book_ns
+spec:
+  parentRefs:
+  - name: $agc_name
+    namespace: default
+    sectionName: http
+  hostnames:
+  - "$fqdn"
+  rules:
+  - backendRefs:
+    - name: productpage
+      port: 9080
+EOF
+    kubectl apply -f - <<EOF
+apiVersion: alb.networking.azure.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: healthcheck-productpage
+  namespace: $book_ns
+spec:
+  targetRef:
+    group: ""
+    kind: Service
+    namespace: $book_ns
+    name: productpage
+  default:
+    interval: 5s
+    timeout: 3s
+    healthyThreshold: 1
+    unhealthyThreshold: 1
+    port: 9080
+    http:
+      host: contoso.com
+      path: /
+      match:
+        statusCodes: 
+        - start: 200
+          end: 299
+    useTLS: false
+EOF
+fi
+
 
 #####################
 #        WAF        #
@@ -679,26 +836,29 @@ if [[ "$waf" == "yes" ]]; then
     fi
     echo "Enabling policy (per default disabled)"
     az network application-gateway waf-policy policy-setting update --policy-name $waf_policy_name -g $rg --state Enabled -o none
-    # Create security policy
-    # https://learn.microsoft.com/en-us/rest/api/applicationgatewaycontainers/security-policies-interface/create-or-update?view=rest-applicationgatewaycontainers-2025-01-01&tabs=HTTP
-    echo "Creating security policy linked to WAF policy..."
-    subscription_id=$(az account show --query id -o tsv)
-    waf_policy_id=$(az network application-gateway waf-policy show -g $rg -n $waf_policy_name --query id -o tsv)
-    url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.ServiceNetworking/trafficControllers/${agc_name}/securityPolicies/${sec_policy_name}?api-version=2025-01-01"
-    body="{ \"location\": \"$location\", \"properties\": { \"wafPolicy\": { \"id\": \"$waf_policy_id\" } } }"
-    az rest --method put --uri "$url" --body "$body" -o none --only-show-errors
+    # Create security policy (only in BYOD mode)
+    if [[ "$mode" == "byod" ]]; then
+        # https://learn.microsoft.com/en-us/rest/api/applicationgatewaycontainers/security-policies-interface/create-or-update?view=rest-applicationgatewaycontainers-2025-01-01&tabs=HTTP
+        echo "Creating security policy linked to WAF policy..."
+        subscription_id=$(az account show --query id -o tsv)
+        waf_policy_id=$(az network application-gateway waf-policy show -g $rg -n $waf_policy_name --query id -o tsv)
+        url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.ServiceNetworking/trafficControllers/${agc_name}/securityPolicies/${sec_policy_name}?api-version=2025-01-01"
+        body="{ \"location\": \"$location\", \"properties\": { \"wafPolicy\": { \"id\": \"$waf_policy_id\" } } }"
+        az rest --method put --uri "$url" --body "$body" -o none --only-show-errors
+    fi
     # Create custom rule based on geolocation
-    match_conditions="[{'variables': [{'variableName': 'RemoteAddr'}],'operator':'GeoMatch','values': ['US'], 'transforms': ['lowerCase']}]"
-    az network application-gateway waf-policy custom-rule create -g $rg --policy-name $waf_policy_name -n customrule00 --priority 10 --action Block \
-      --rule-type MatchRule --action Block --match-conditions "$match_conditions" \
-      -o none --only-show-errors
+    echo "Creating custom rules in WAF policy..."
+    # match_conditions="[{'variables': [{'variableName': 'RemoteAddr'}],'operator':'GeoMatch','values': ['US'], 'transforms': ['lowerCase']}]"
+    # az network application-gateway waf-policy custom-rule create -g $rg --policy-name $waf_policy_name -n customrule00 --priority 10 --action Block \
+    #   --rule-type MatchRule --action Block --match-conditions "$match_conditions" \
+    #   -o none --only-show-errors
     # Create custom rule based on custom header
     match_conditions="[{'variables': [{'variableName': 'RequestHeaders', 'selector': 'User-Agent'}],'operator':'Contains','values': ['evilbot'], 'transforms': ['lowerCase']}]"
     az network application-gateway waf-policy custom-rule create -g $rg --policy-name $waf_policy_name -n customrule01 --priority 20 --action Block \
       --rule-type MatchRule --action Block --match-conditions "$match_conditions" \
       -o none --only-show-errors
     # Create k8s WAF policy and attach to HTTP route
-    waf_policy_id=$(az network.application-gateway.waf-policy show -g $rg -n $waf_policy_name --query id -o tsv)
+    waf_policy_id=$(az network application-gateway waf-policy show -g $rg -n $waf_policy_name --query id -o tsv)
     echo "Attaching the WAF policy to the HTTP routes"
     kubectl apply -f - <<EOF
 apiVersion: alb.networking.azure.io/v1
@@ -716,8 +876,25 @@ spec:
   webApplicationFirewall:
     id: $waf_policy_id
 EOF
-    # Attach also to TLS route / listener?
-fi
+    # WAF policy attached to TLS listener
+    if [[ "$tls" == "yes" ]]; then
+      kubectl apply -f - <<EOF
+apiVersion: alb.networking.azure.io/v1
+kind: WebApplicationFirewallPolicy
+metadata:
+  name: ${waf_policy_name}-tls
+  namespace: default
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: $agc_name
+    namespace: default
+    sectionNames: [ https ]  # Must be corrected in the docs???
+  webApplicationFirewall:
+    id: $waf_policy_id
+EOF
+    fi
 
 if [[ "$test_cmds" == "yes" ]]; then
     az network application-gateway waf-policy list -g $rg -o table
@@ -739,6 +916,8 @@ fi
 #####################
 
 ###### WIP!!! #######
+
+# Maybe not required, since we can use the Istio extension to speak mTLS to the backend services??
 
 if [[ $tls == "yes" ]]; then
 
@@ -960,5 +1139,10 @@ if [[ "$test_cmds" == "yes" ]]; then
     kubectl get gateway
     kubectl describe gateway
     # HTTP routes
-    kubectl get httproute
+    kubectl get httproute -n $app_ns
+    kubectl describe httproute yadaapi -n $app_ns
+    # Istio
+    az aks show -n $aks_name -g $rg --query 'serviceMeshProfile.istio.revisions' -o tsv
+    kubectl get ns --show-labels
+    kubectl get peerauthentication -n $app_ns
 fi
