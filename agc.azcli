@@ -1,4 +1,4 @@
-# AGICv2 (aka kubic, aka traffic controller, aka AppGW for containers, aka AGC)
+# Application Gateway for containers (aka kubic, aka traffic controller, aka AppGW for containers, aka AGICv2)
 # There are 2 steps to create AGC:
 # 1. Create ALB Controller: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/quickstart-deploy-application-gateway-for-containers-alb-controller?tabs=install-helm-windows
 # 2. Create AGC
@@ -7,7 +7,7 @@
 
 # Control
 mode=byod                        # managed or byod
-waf=yes                          # yes or no
+waf=no                           # yes or no
 waf_type=default                 # default, bot or OWASP (only default supported!)
 cni=overlay                      # azure_pod_subnet, azure or overlay
 tls=yes                          # yes or no
@@ -16,6 +16,7 @@ flowlogs=yes                     # yes or no
 test_cmds=no                     # yes or no
 backup_service=no                # yes or no: whether creating a backup application to test load balancing
 istio=yes                        # yes or no: whether installing Istio for service mesh
+istio_mode=community             # community or azure (managed Istio). Only community supported by ALB controller as of October 2025
 bookapp=yes                      # yes or no: whether installing Bookinfo sample app for Istio
 
 # Variables
@@ -120,7 +121,7 @@ else
 fi
 
 # Istio installation
-if [[ "$istio" == "yes" ]]; then
+if [[ "$istio" == "yes" ]] && [[ "$istio_mode" == "addon" ]]; then
     istio_options="--enable-azure-service-mesh"
 else
     istio_options=""
@@ -137,15 +138,29 @@ az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
     --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM"
 echo ""   # New line after az command
+az aks get-credentials -n $aks_name -g $rg --overwrite-existing --only-show-errors
 
 # For existing clusters
 # az aks update -g $rg -n $aks_name --enable-oidc-issuer --enable-workload-identity -o none
+
+# Deploy Istio community if required
+# REVIEW
+if [[ "$istio" == "yes" ]] && [[ "$istio_mode" == "community" ]]; then
+    istio_version=1.27.1
+    echo "Deploying Istio community edition version $istio_version..."
+    curl -L https://istio.io/downloadIstio | ISTIO_VERSION=$istio_version sh -
+    export PATH=$PATH:$PWD/istio-$istio_version/bin
+    istioctl install --set profile=default -y
+    # istio_revision=$(kubectl get namespace istio-system -o jsonpath='{.metadata.labels.istio\.io/rev}')
+    # echo "Istio community edition installed with revision $istio_revision"
+    # rm -rf istio-$istio_version     # we may need istioctl later
+fi
 
 # Verify cluster created with right plugin
 if [[ "$test_cmds" == "yes" ]]; then
     echo "Verifying CNI plugin for AKS cluster $aks_name in resource group $rg..."
     az aks list -g $rg --only-show-errors --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy, PluginMode:networkProfile.networkPluginMode, NetworkMode:networkProfile.networkMode}' -o table
-    if [[ "$istio" == "yes" ]]; then
+    if [[ "$istio" == "yes" ]] && [[ "$istio_mode" == "addon" ]]; then
         echo "Verifying Istio installation..."
         installed_service_mesh=$(az aks show -g $rg -n $aks_name --query "serviceMeshProfile.mode" -o tsv)
         echo "Service mesh installed in the cluster is: $installed_service_mesh"
@@ -153,7 +168,7 @@ if [[ "$test_cmds" == "yes" ]]; then
 fi
 
 # If Istio, get the revision
-if [[ "$istio" == "yes" ]]; then
+if [[ "$istio" == "yes" ]] && [[ "$istio_mode" == "addon" ]]; then
     istio_revision=$(az aks show -n $aks_name -g $rg --query 'serviceMeshProfile.istio.revisions' -o tsv)
     echo "Istio revision installed is $istio_revision"
 fi
@@ -179,7 +194,6 @@ az identity federated-credential create -n $alb_id_name -g $rg -o none --only-sh
 # Deploy Helm chart
 # Notice the version is hard-coded, you can update it with 'helm upgrade'
 echo "Deploying helm chart for ALB, version ${alb_controller_version}..."
-az aks get-credentials -n $aks_name -g $rg --overwrite-existing --only-show-errors
 kubectl create ns $alb_deployment_ns
 # The --namespace flag doesnt seem to have any effect
 helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller \
@@ -1125,8 +1139,18 @@ fi
 ##########################
 
 if [[ "$test_cmds" == "yes" ]]; then
-    # Check the agic pods
+    # Check the AGC pods
     kubectl get pods -n azure-alb-system
+    # Check the logs in the AGC pods
+    agc_pods=$(kubectl get pods -n azure-alb-system --no-headers | awk '{print $1}')
+    for pod in $agc_pods; do kubectl logs $pod -n azure-alb-system; done
+    # Check the logs in the AGC pods excluding info messages
+    agc_pods=$(kubectl get pods -n azure-alb-system --no-headers | awk '{print $1}')
+    echo "$agc_pods" | while IFS= read -r pod; do kubectl logs $pod -n azure-alb-system | jq 'select(.level != "info")'; done
+    # Check the logs in the AGC istio extension pods excluding info messages
+    istio_extension_ns=alb
+    istio_extension_pods=$(kubectl get pods -n $istio_extension_ns --no-headers | awk '{print $1}')
+    echo "$istio_extension_pods" | while IFS= read -r pod; do kubectl logs $pod -n $istio_extension_ns | jq 'select(.level != "info")'; done
     # Verify the ALB in Azure
     az network alb list -g $rg -o table
     alb_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
@@ -1146,3 +1170,11 @@ if [[ "$test_cmds" == "yes" ]]; then
     kubectl get ns --show-labels
     kubectl get peerauthentication -n $app_ns
 fi
+
+###########
+# Cleanup #
+###########
+
+# !!! Danger !!!
+# az group delete -n $rg -y --no-wait
+# rm -rf istio-$istio_version     # we may need istioctl later
