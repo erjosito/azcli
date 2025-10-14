@@ -542,7 +542,9 @@ echo "Creating sample app in namespace $app_ns..."
 kubectl create ns $app_ns
 if [[ "$istio" == "yes" ]]; then
     echo "Labeling namespace $app_ns for Istio injection with revision $istio_revision..."
-    kubectl label namespace $app_ns istio.io/rev=${istio_revision}
+    if [[ "$istio_mode" == "addon" ]]; then
+        kubectl label namespace $app_ns istio.io/rev=${istio_revision}
+    fi
     kubectl label namespace $app_ns istio-injection=enabled
     kubectl apply -f - <<EOF
 apiVersion: security.istio.io/v1beta1
@@ -773,7 +775,9 @@ if [[ "$bookapp" == "yes" ]]; then
     kubectl create ns $book_ns
     if [[ "$istio" == "yes" ]]; then
         echo "Labeling namespace $book_ns for Istio injection with revision $istio_revision..."
-        kubectl label namespace $book_ns istio.io/rev=${istio_revision}
+        if [[ "$istio_mode" == "addon" ]]; then
+            kubectl label namespace $book_ns istio.io/rev=${istio_revision}
+        fi
         kubectl label namespace $app_ns istio-injection=enabled
     fi
     kubectl apply -n $book_ns -f https://raw.githubusercontent.com/istio/istio/release-1.18/samples/bookinfo/platform/kube/bookinfo.yaml
@@ -1151,6 +1155,8 @@ if [[ "$test_cmds" == "yes" ]]; then
     istio_extension_ns=alb
     istio_extension_pods=$(kubectl get pods -n $istio_extension_ns --no-headers | awk '{print $1}')
     echo "$istio_extension_pods" | while IFS= read -r pod; do kubectl logs $pod -n $istio_extension_ns | jq 'select(.level != "info")'; done
+    # Same with no JSON
+    echo "$istio_extension_pods" | while IFS= read -r pod; do kubectl logs $pod -n $istio_extension_ns | jq -r '[.Timestamp, .message] | @tsv'; done
     # Verify the ALB in Azure
     az network alb list -g $rg -o table
     alb_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
