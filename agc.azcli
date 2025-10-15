@@ -11,7 +11,7 @@ waf=no                           # yes or no
 waf_type=default                 # default, bot or OWASP (only default supported!)
 cni=overlay                      # azure_pod_subnet, azure or overlay
 tls=yes                          # yes or no
-alb_controller_version=1.8.8     # Check the latest version in https://learn.microsoft.com/azure/application-gateway/for-containers/alb-controller-release-notes
+alb_controller_version=1.8.9     # Check the latest version in https://learn.microsoft.com/azure/application-gateway/for-containers/alb-controller-release-notes
 flowlogs=yes                     # yes or no
 test_cmds=no                     # yes or no
 backup_service=no                # yes or no: whether creating a backup application to test load balancing
@@ -212,11 +212,11 @@ fi
 
 # If using the service mesh extension, install it
 # The attribute albServiceMeshExtension.image should not be required in the future
+#      --set albServiceMeshExtension.image.tag=$alb_controller_version
 echo "Installing service mesh extension for ALB via Helm..."
 helm install alb-controller-servicemesh-extension oci://mcr.microsoft.com/application-lb/charts/alb-controller-servicemesh-extension \
      --namespace $alb_deployment_ns \
-     --version $alb_controller_version \
-     --set albServiceMeshExtension.image.tag=$alb_controller_version
+     --version $alb_controller_version
 
 #############################
 #          Managed          #
