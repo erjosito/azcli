@@ -9,10 +9,13 @@
 rg=akstest
 location=eastus2
 wait_interval=5s
-use_msi=yes
+flow_logs=yes
 # AKS
-aks_name=akscilium
+aks_isolated=yes
+aks_name=aks
 aks_rbac=yes
+use_msi=yes
+kubelet_identity=yes
 aks_service_cidr=10.0.0.0/16
 vm_size=Standard_B2ms         # Some possible values: Standard_B2ms, Standard_D2_v3
 preview_version=yes
@@ -31,6 +34,8 @@ aks2_pod_subnet_name=aks2ndpoolpods
 aks2_pod_subnet_prefix=10.13.65.0/24
 pod_subnet_name=pods
 pod_subnet_prefix=10.13.80.0/24
+aks_api_subnet_name=aks_api
+aks_api_subnet_prefix=10.13.81.0/24
 vm_subnet_name=vm
 vm_subnet_prefix=10.13.1.0/24
 bastion_subnet_name=AzureBastionSubnet 
@@ -45,9 +50,9 @@ akslb_subnet_prefix=10.13.77.0/24
 arm_subnet_prefix=10.13.79.0/24
 aci_subnet_name=aci
 aci_subnet_prefix=10.13.100.0/24
-ep_subnet_name=aci
+ep_subnet_name=ep
 ep_subnet_prefix=10.13.101.0/24
-# Other resources
+# Other resources (not used)
 kv_name=erjositoKeyvault
 acr_name=erjositoAcr
 
@@ -60,7 +65,7 @@ function wait_until_finished {
      wait_interval=15
      resource_id=$1
      resource_name=$(echo $resource_id | cut -d/ -f 9)
-     echo "Waiting for resource $resource_name to finish provisioning..."
+     echo "INFO: Waiting for resource $resource_name to finish provisioning..."
      start_time=`date +%s`
      state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
      until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
@@ -70,12 +75,12 @@ function wait_until_finished {
      done
      if [[ -z "$state" ]]
      then
-        echo "Something really bad happened..."
+        echo "ERROR: Something really bad happened..."
      else
         run_time=$(expr `date +%s` - $start_time)
         ((minutes=${run_time}/60))
         ((seconds=${run_time}%60))
-        echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+        echo "INFO: Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
      fi
 }
 
@@ -88,20 +93,20 @@ function enableAksFeature () {
     state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
     if [[ "$state" == "Registered" ]]
     then
-        echo "$feature_name is already registered"
+        echo "INFO: $feature_name is already registered"
     else
-        echo "Registering feature $feature_name..."
+        echo "INFO: Registering feature $feature_name..."
         az feature register --name "$feature_name" --namespace microsoft.containerservice -o none --only-show-errors
         state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
-        echo "Waiting for feature $feature_name to finish registering..."
+        echo "INFO: Waiting for feature $feature_name to finish registering..."
         wait_interval=15
         until [[ "$state" == "Registered" ]]
         do
             sleep $wait_interval
             state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
-            echo "Current registration status for feature $feature_name is $state"
+            echo "INFO: Current registration status for feature $feature_name is $state"
         done
-        echo "Registering resource provider Microsoft.ContainerService now..."
+        echo "INFO: Registering resource provider Microsoft.ContainerService now..."
         az provider register --namespace Microsoft.ContainerService -o none --only-show-errors
     fi
 }
@@ -110,13 +115,13 @@ function enableAksFeature () {
 # enableAksFeature "EnablePodIdentityPreview"
 # enableAksFeature "MigrateToMSIClusterPreview"
 # enableAksFeature "PodSubnetPreview"
-# enableAksFeature "EnableAPIServerVnetIntegrationPreview"
+enableAksFeature "EnableAPIServerVnetIntegrationPreview"
 # enableAksFeature "CiliumDataplanePreview"
 # enableAksFeature "AzureServiceMeshPreview"
-enableAksFeature "NetworkObservabilityPreview"
+# enableAksFeature "NetworkObservabilityPreview"
 
 # Update extension
-echo "Updating aks-preview extension..."
+echo "INFO: Updating aks-preview extension..."
 az extension update -n aks-preview
 
 ########
@@ -124,31 +129,49 @@ az extension update -n aks-preview
 ########
 
 # Create RG, LA workspace, vnet, AKS
-echo "Creating RG and VNet..."
+echo "INFO: Creating RG and VNet..."
 az group create -n $rg -l $location -o none
-acr_rg=$(az acr list -o tsv --query "[?name=='$acr_name'].resourceGroup") && echo "ACR RG is '$acr_rg'"
+acr_rg=$(az acr list -o tsv --query "[?name=='$acr_name'].resourceGroup") && echo "INFO: ACR RG is '$acr_rg'"
 if [[ -n "$acr_rg" ]]; then
     acr_id=$(az acr show -n erjositoAcr -g $acr_rg --query id -o tsv)
 fi
 az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location -o none
 az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix -o none
 az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix -o none
+az network vnet subnet create -g $rg -n $aks_api_subnet_name --vnet-name $vnet_name --address-prefix $aks_api_subnet_prefix -o none
+az network vnet subnet create -g $rg -n $ep_subnet_name --vnet-name $vnet_name --address-prefix $ep_subnet_prefix -o none
 aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 
 # Create LA workspace
-if [[ "$az_monitor" == 'yes' ]]; then
-    logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
-    if [[ -z "$logws_name" ]]
-    then
-        logws_name=log$RANDOM
-        echo "INFO: Creating log analytics workspace ${logws_name}..."
-        az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -o tsv)
+if [[ -z "$logws_name" ]]
+then
+    logws_name=log$RANDOM
+    echo "INFO: Creating log analytics workspace ${logws_name}..."
+    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+else
+    echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+
+if [[  "$flow_logs" == "yes" ]]; then
+    storage_account_name=$(az storage account list -g $rg -o tsv --query '[0].name' 2>/dev/null | head -1)
+    if [[ -z "$storage_account_name" ]]; then
+        storage_account_name="logs$RANDOM"  # max 24 characters
+        echo "INFO: No storage account found in resource group $rg, creating one..."
+        az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location -o none
     else
-        echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+        echo "INFO: Storage account $storage_account_name found in $location, using it for VNet flow flogs"
     fi
-    logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
-    logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+    echo "INFO: Enabling VNet Flow Logs for VNet $vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
+    if [[ -z "$logws_name" ]]; then
+        echo "ERROR: Log Analytics workspace is not defined, cannot enable traffic analytics"
+    else
+        az network watcher flow-log create -l $location -g $rg --name "aks-${aks_name}-${location}" --vnet $vnet_name \
+          --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
+    fi
 fi
 
 # Get latest supported/preview version
@@ -156,10 +179,10 @@ fi
 # if [[ "$preview_version" == "yes" ]]
 # then
 #     k8s_version=$(echo $k8s_versions | jq -r '.values | map(select(.isPreview == true))[0] | .version')
-#     echo "Latest supported k8s version is $k8s_version (in preview)"
+#     echo "INFO: Latest supported k8s version is $k8s_version (in preview)"
 # else
 #     k8s_version=$(echo $k8s_versions | jq -r '.values | map(select(.isPreview == null))[0] | .version')
-#     echo "Latest supported k8s version (not in preview) is $k8s_version"
+#     echo "INFO: Latest supported k8s version (not in preview) is $k8s_version"
 # fi
 
 # Setting identity flags (managed identity or SP)
@@ -184,18 +207,34 @@ else
     id_id=$(az identity show -n $id_name -g $rg --query id -o tsv 2>/dev/null)
     if [[ -z "$id_id" ]]
     then
-        echo "Identity $id_name not found, creating a new one..."
+        echo "INFO: Identity $id_name not found, creating a new one..."
         az identity create -n $id_name -g $rg -o none
         id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
     else
-        echo "Identity $id_name found with ID $id_id"
+        echo "INFO: Identity $id_name found with ID $id_id"
     fi
     id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
     vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
     sleep 15 # Time for creation to propagate
+    echo "INFO: Assigning contributor role for identity $id_name on VNet $vnet_name..."
     az role assignment create --scope $vnet_id --assignee $id_principal_id --role Contributor -o none
-    # User identity
-    identity_options="--enable-managed-identity --assign-identity $id_id"
+    # Kubelet identity
+    if [[ "$kubelet_identity" == "yes" ]]; then
+        kid_name="${id_name}-kubelet"
+        kid_id=$(az identity show -n $kid_name -g $rg --query id -o tsv 2>/dev/null)
+        if [[ -z "$kid_id" ]]
+        then
+            echo "INFO: Kubelet identity $kid_name not found, creating a new one..."
+            az identity create -n $kid_name -g $rg -o none
+            kid_id=$(az identity show -n $kid_name -g $rg --query id -o tsv)
+        else
+            echo "INFO: Kubelet identity $kid_name found with ID $kid_id"
+        fi
+        kid_principal_id=$(az identity show -n $kid_name -g $rg --query principalId -o tsv)
+        identity_options="--enable-managed-identity --assign-identity $id_id --assign-kubelet-identity $kid_id"
+    else
+      identity_options="--enable-managed-identity --assign-identity $id_id"
+    fi
     # System identity
     # identity_options="--enable-managed-identity"
 fi
@@ -217,18 +256,58 @@ elif [[ "$network_plugin" == 'kubenet' ]]; then
 elif [[ "$network_plugin" == 'azure_cilium' ]]; then
     cni_options="--network-plugin azure --network-dataplane cilium --pod-subnet-id $pod_subnet_id"
     if [[ "$network_policy" != "cilium" ]]; then
-        echo "Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
+        echo "ERROR: Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
         network_policy=cilium
     fi
 elif [[ "$network_plugin" == 'azure_overlay' ]]; then
     cni_options="--network-plugin azure --network-dataplane cilium --network-plugin-mode overlay"
     if [[ "$network_policy" != "cilium" ]]; then
-        echo "Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
+        echo "ERROR: Network policy must be cilium when using azure_cilium. Setting network policy to cilium..."
     fi
     network_policy=cilium
 else
     echo "ERROR: Network plugin $network_plugin not supported"
     exit 1
+fi
+
+# If isolated cluster
+if [[ "$aks_isolated" == "yes" ]]; then
+    acr_name=$(az acr list -g $rg -o tsv --query '[0].name' 2>/dev/null)
+    if [[ -n "$acr_name" ]]; then
+        echo "INFO: ACR $acr_name found in resource group $rg, using it for isolated AKS cluster"
+        acr_id=$(az acr show -n $acr_name -g $rg --query id -o tsv)
+    else
+        acr_name="${aks_name}${RANDOM}"
+        echo "INFO: Creating ACR $acr_name for isolated AKS cluster..."
+        az acr create -n $acr_name -g $rg  --sku Premium --public-network-enabled false -o none
+        echo "INFO: Configuring cache for ACR $acr_name..."
+        az acr cache create -n aks-managed-mcr -r $acr_name -g $rg --source-repo "mcr.microsoft.com/*" --target-repo "aks-managed-repository/*" -o none
+        echo "INFO: Creating private endpoint for ACR $acr_name..."
+        acr_id=$(az acr show -n $acr_name -g $rg --query id -o tsv)
+        pe_name=${acr_name}-pe
+        az network private-endpoint create -n $pe_name -g $rg --vnet-name $vnet_name --subnet $ep_subnet_name \
+          --private-connection-resource-id $acr_id --group-id registry --connection-name myConnection -o none
+        echo "INFO: Configuring DNS for private endpoint $pe_name..."
+        zone_name="privatelink.azurecr.io"
+        az network private-dns zone create -g $rg -n $zone_name -o none
+        az network private-dns link vnet create -g $rg --zone-name $zone_name -n $vnet_name --virtual-network $vnet_name --registration-enabled false -o none
+        az network private-endpoint dns-zone-group create --endpoint-name $pe_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $zone_name -o none
+        if [[ "$use_msi" == "yes" ]]; then
+            if [[ "$kubelet_identity" == "yes" ]] && [[ -n "$kid_principal_id" ]]; then
+                echo "INFO: Assigning AcrPull role for kubelet identity $kid_name on ACR $acr_name..."
+                az role assignment create --assignee $kid_principal_id --role AcrPull --scope $acr_id -o none
+            else
+                echo "ERROR: You need to use both use_msi=yes and kubelet_identity=yes to assign AcrPull role to the kubelet identity"
+            fi
+        else
+            echo "ERROR: You need to use both use_msi=yes and kubelet_identity=yes to assign AcrPull role to the kubelet identity"
+        fi
+    fi
+    # AKS isolated options
+    api_subnet_id=$(az network vnet subnet show -n $aks_api_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+    isolated_options="--bootstrap-artifact-source Cache --bootstrap-container-registry-resource-id $acr_id --outbound-type none --enable-private-cluster --enable-apiserver-vnet-integration --apiserver-subnet-id $api_subnet_id"
+else
+    isolated_options=""
 fi
 
 # Error control because the code to get the k8s version is broken
@@ -239,15 +318,19 @@ else
 fi
 
 # Create AKS
-echo "Deploying cluster..."
+echo "INFO: Deploying cluster..."
+# echo "DEBUG: Identity options  : $identity_options"
+# echo "DEBUG: Networking options: $cni_options"
+# echo "DEBUG: Isolated options  : $isolated_options"
 az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
     -c 1 -s $vm_size --generate-ssh-keys -u $(whoami) \
     ${(z)identity_options} \
     ${(z)cni_options} \
+    ${(z)isolated_options} \
     --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
     --network-policy $network_policy \
     --load-balancer-sku Standard \
-    --node-resource-group "wl-$aks_name"-iaas-"$RANDOM" \
+    --node-resource-group "$aks_name"-iaas-"$RANDOM" \
     --dns-name-prefix cloudtrooper --no-wait
 
 # Other options you can use in the previous command
@@ -343,7 +426,7 @@ az aks update --enable-azure-monitor-metrics -n $aks_name -g $rg --azure-monitor
 
 # Browse
 grafana_url=$(az grafana show -n $grafana_name -g $rg -o tsv --query properties.endpoint)
-echo "Grafana URL is $grafana_url"
+echo "INFO: Grafana URL is $grafana_url"
 
 # Verify
 kubectl get po -owide -n kube-system | grep ama-
@@ -470,7 +553,7 @@ kubectl -n kube-system exec -ti $cilium_pod_name -- cilium monitor | grep -v 168
 # xx drop (Policy denied) flow 0xd7fa1fe8 to endpoint 0, file bpf_lxc.c line 1182, , identity 23553->world: 10.13.80.36:52243 -> 13.78.248.58:11039 tcp SYN
 
 # Finding pod ID (from ceps)
-apipod_id=$(k get cep -l run=api -o jsonpath='{.items[0].status.id}') && echo "API pod has ID $apipod_id"
+apipod_id=$(k get cep -l run=api -o jsonpath='{.items[0].status.id}') && echo "INFO: API pod has ID $apipod_id"
 # Finding pod ID (from the cilium pod)
 kubectl -n kube-system exec -ti $cilium_pod_name -- cilium endpoint list -o jsonpath='{range [*]}{.id}{"\t"}{.status.external-identifiers.pod-name}{"\n"}{end}'
 ns=default
