@@ -10,8 +10,10 @@ rg=akstest
 location=eastus2
 wait_interval=5s
 flow_logs=yes
-# AKS
-aks_isolated=yes
+# AKS settings
+aks_isolated=no
+aks_private=yes
+aks_private_mode=vnet   # plink/vnet
 aks_name=aks
 aks_rbac=yes
 use_msi=yes
@@ -19,8 +21,8 @@ kubelet_identity=yes
 aks_service_cidr=10.0.0.0/16
 vm_size=Standard_B2ms         # Some possible values: Standard_B2ms, Standard_D2_v3
 preview_version=yes
-network_plugin=azure_cilium    # azure/kubenet/none/azure_overlay/azure_cilium
-network_policy=cilium          # azure/calico/cilium/none
+network_plugin=azure           # azure/kubenet/none/azure_overlay/azure_cilium
+network_policy=none            # azure/calico/cilium/none
 azure_cni_pod_subnet=no        # yes/no
 az_monitor=no
 # Vnet
@@ -34,13 +36,14 @@ aks2_pod_subnet_name=aks2ndpoolpods
 aks2_pod_subnet_prefix=10.13.65.0/24
 pod_subnet_name=pods
 pod_subnet_prefix=10.13.80.0/24
-aks_api_subnet_name=aks_api
+aks_api_subnet_name=aksapi
 aks_api_subnet_prefix=10.13.81.0/24
 vm_subnet_name=vm
 vm_subnet_prefix=10.13.1.0/24
 bastion_subnet_name=AzureBastionSubnet 
 bastion_subnet_prefix=10.13.15.0/24
 bastion_name=aksbastion
+gw_subnet_prefix=10.13.0.0/24
 appgw_subnet_name=AppGateway
 appgw_subnet_prefix=10.13.10.0/24
 azfw_subnet_prefix=10.13.11.0/24
@@ -52,6 +55,8 @@ aci_subnet_name=aci
 aci_subnet_prefix=10.13.100.0/24
 ep_subnet_name=ep
 ep_subnet_prefix=10.13.101.0/24
+vm_name=testlinuxvm
+vm_size=Standard_B2ms
 # Other resources (not used)
 kv_name=erjositoKeyvault
 acr_name=erjositoAcr
@@ -136,10 +141,11 @@ if [[ -n "$acr_rg" ]]; then
     acr_id=$(az acr show -n erjositoAcr -g $acr_rg --query id -o tsv)
 fi
 az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location -o none
-az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix -o none
-az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix -o none
+az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix --default-outbound true -o none
+az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix --default-outbound true -o none
 az network vnet subnet create -g $rg -n $aks_api_subnet_name --vnet-name $vnet_name --address-prefix $aks_api_subnet_prefix -o none
 az network vnet subnet create -g $rg -n $ep_subnet_name --vnet-name $vnet_name --address-prefix $ep_subnet_prefix -o none
+az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name --address-prefix $vm_subnet_prefix -o none
 aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 
@@ -156,6 +162,7 @@ fi
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 
+# Flow logs in VNet
 if [[  "$flow_logs" == "yes" ]]; then
     storage_account_name=$(az storage account list -g $rg -o tsv --query '[0].name' 2>/dev/null | head -1)
     if [[ -z "$storage_account_name" ]]; then
@@ -245,6 +252,8 @@ if [[ "$network_policy" == 'none' ]]; then
 fi
 
 # CNI options
+aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
 if [[ "$network_plugin" == 'azure' ]]; then
     if [[ "$azure_cni_pod_subnet" == "yes" ]]; then
       cni_options="--network-plugin azure --pod-subnet-id $pod_subnet_id"
@@ -270,20 +279,62 @@ else
     exit 1
 fi
 
-# If isolated cluster
+# Create VPN gateway if isolated
 if [[ "$aks_isolated" == "yes" ]]; then
+    echo "INFO: Creating VPN gateway for isolated AKS cluster (using '--no-wait' flag)..."
+    gw_name=${vnet_name}-gw
+    gw_pip_name=${vnet_name}-gw-pip
+    az network public-ip create -g $rg -n $gw_pip_name --sku Standard --allocation-method Static -o none
+    az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name $vnet_name --address-prefix $gw_subnet_prefix -o none
+    az network vnet-gateway create -g $rg -n $gw_name --public-ip-address $gw_pip_name --vnet $vnet_name --sku VpnGw1 -o none --no-wait
+fi
+
+# Create DNS server if isolated or private cluster
+if [[ "$aks_isolated" == "yes" ]] || [[ "$aks_private" == "yes" ]]; then
+        # DNS Server
+        echo "INFO: creating DNS server VM '${vm_name}' in subnet '${vm_subnet_name}'..."
+        vm_pip_name="${vm_name}-pip"
+        az vm create -n $vm_name -g $rg --image Ubuntu2204 --generate-ssh-keys --size $vm_size -l $location \
+           --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $vm_pip_name --public-ip-sku Standard -o none
+        vm_pip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+        vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        vm_privateip=$(az network nic show --ids $vm_nic_id --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+        echo "DNS server deployed to $vm_privateip, $vm_pip"
+        echo "Installing dnsmasq in VM ${vm_name}..."
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo apt update -y && sudo apt -y install dnsmasq"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sed -i '$ a\log-queries' /etc/dnsmasq.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sed -i '/\-\-local\-service/s/^/#/' /etc/init.d/dnsmasq"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo systemctl disable systemd-resolved"
+        # From now on until DNS is fully configured, commands will be very slow, as DNS is not working
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "$vm_pip" "sudo sed -i \"\$ a 168.63.129.16 dnsserver\" /etc/hosts"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo systemctl stop systemd-resolved"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo unlink /etc/resolv.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "echo nameserver 168.63.129.16 | sudo tee /etc/resolv.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo systemctl restart dnsmasq"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo systemctl enable dnsmasq"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo systemctl status dnsmasq"
+fi
+
+# Create ACR with private link if isolated or private cluster
+if [[ "$aks_isolated" == "yes" ]] && [[ "$aks_private" == "yes" ]]; then
     acr_name=$(az acr list -g $rg -o tsv --query '[0].name' 2>/dev/null)
     if [[ -n "$acr_name" ]]; then
         echo "INFO: ACR $acr_name found in resource group $rg, using it for isolated AKS cluster"
         acr_id=$(az acr show -n $acr_name -g $rg --query id -o tsv)
     else
+        # ACR
         acr_name="${aks_name}${RANDOM}"
         echo "INFO: Creating ACR $acr_name for isolated AKS cluster..."
         az acr create -n $acr_name -g $rg  --sku Premium --public-network-enabled false -o none
         echo "INFO: Configuring cache for ACR $acr_name..."
         az acr cache create -n aks-managed-mcr -r $acr_name -g $rg --source-repo "mcr.microsoft.com/*" --target-repo "aks-managed-repository/*" -o none
-        echo "INFO: Creating private endpoint for ACR $acr_name..."
+        echo "INFO: configuring diagnostic settings for ACR $acr_name..."
         acr_id=$(az acr show -n $acr_name -g $rg --query id -o tsv)
+        az monitor diagnostic-settings create -n mydiag --resource $acr_id --workspace $logws_id \
+                --logs '[{"category": "ContainerRegistryRepositoryEvents", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
+                        {"category": "ContainerRegistryLoginEvents", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
+        # Private endpoint
+        echo "INFO: Creating private endpoint for ACR $acr_name..."
         pe_name=${acr_name}-pe
         az network private-endpoint create -n $pe_name -g $rg --vnet-name $vnet_name --subnet $ep_subnet_name \
           --private-connection-resource-id $acr_id --group-id registry --connection-name myConnection -o none
@@ -292,6 +343,7 @@ if [[ "$aks_isolated" == "yes" ]]; then
         az network private-dns zone create -g $rg -n $zone_name -o none
         az network private-dns link vnet create -g $rg --zone-name $zone_name -n $vnet_name --virtual-network $vnet_name --registration-enabled false -o none
         az network private-endpoint dns-zone-group create --endpoint-name $pe_name -g $rg -n myzonegroup --zone-name zone1 --private-dns-zone $zone_name -o none
+        # Kubelet identity
         if [[ "$use_msi" == "yes" ]]; then
             if [[ "$kubelet_identity" == "yes" ]] && [[ -n "$kid_principal_id" ]]; then
                 echo "INFO: Assigning AcrPull role for kubelet identity $kid_name on ACR $acr_name..."
@@ -305,9 +357,25 @@ if [[ "$aks_isolated" == "yes" ]]; then
     fi
     # AKS isolated options
     api_subnet_id=$(az network vnet subnet show -n $aks_api_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-    isolated_options="--bootstrap-artifact-source Cache --bootstrap-container-registry-resource-id $acr_id --outbound-type none --enable-private-cluster --enable-apiserver-vnet-integration --apiserver-subnet-id $api_subnet_id"
+    if [[ "$aks_private_mode" == "vnet" ]]; then
+        isolated_options="--bootstrap-artifact-source Cache --bootstrap-container-registry-resource-id $acr_id --outbound-type none --enable-private-cluster --enable-apiserver-vnet-integration --apiserver-subnet-id $api_subnet_id"
+    elif [[ "$aks_private_mode" == "plink" ]]; then
+        isolated_options="--bootstrap-artifact-source Cache --bootstrap-container-registry-resource-id $acr_id --outbound-type none --enable-private-cluster --private-dns-zone System --disable-public-fqdn"
+    fi
 else
     isolated_options=""
+fi
+
+# Private cluster options (not isolated)
+if [[ "$aks_isolated" == "no" ]] && [[ "$aks_private" == "yes" ]]; then
+    if [[ "$aks_private_mode" == "plink" ]]; then
+        isolated_options="--enable-private-cluster --private-dns-zone System --disable-public-fqdn"
+    elif [[ "$aks_private_mode" == "vnet" ]]; then
+        isolated_options="--enable-private-cluster --enable-apiserver-vnet-integration --apiserver-subnet-id $api_subnet_id"
+    else
+        echo "ERROR: aks_private_mode $aks_private_mode not supported"
+        exit 1
+    fi
 fi
 
 # Error control because the code to get the k8s version is broken
@@ -318,7 +386,7 @@ else
 fi
 
 # Create AKS
-echo "INFO: Deploying cluster..."
+echo "INFO: Deploying cluster ${aks_name}..."
 # echo "DEBUG: Identity options  : $identity_options"
 # echo "DEBUG: Networking options: $cni_options"
 # echo "DEBUG: Isolated options  : $isolated_options"
@@ -362,6 +430,22 @@ wait_until_finished $aks_id
 az aks list -o table
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl get nodes
+
+# Finish VPN GW (to be tested)
+if [[ "$aks_isolated" == "yes" ]]; then
+    gw_id=$(az network vnet-gateway show -n $gw_name -g $rg --query id -o tsv)
+    wait_until_finished $gw_id
+    echo "INFO: VPN gateway for isolated AKS cluster is ready. Creating P2S configuration..."
+    aad_audience="c632b3df-fb67-4d84-bdcf-b95ad541b5c8"
+    tenant_id=$(az account show --query tenantId -o tsv)
+    aad_issuer="https://sts.windows.net/${tenant_id}/"
+    aad_tenant="https://login.microsoftonline.com/${tenant_id}/"
+    az network vnet-gateway aad assign --gateway-name $gw_name -g $rg --tenant "$aad_tenant" --audience "$aad_audience" --issuer "$aad_issuer" -o none
+    echo "INFO: Creating VPN client configuration package..."
+    az network vnet-gateway vpn-client generate -n $gw_name -g $rg --authentication-method AAD --output-package vpnclientpackage.zip -o none
+    download_url=$(az network vnet-gateway vpn-client show-url -n $gw_name -g $rg -o tsv)
+    echo "INFO: VPN client configuration package download URL: $download_url"
+fi
 
 ######################
 # Modify the cluster #
@@ -942,6 +1026,11 @@ az aks nodepool list --cluster-name $aks_name -g $rg -o table
 ###########################
 # Deploy sample workloads #
 ###########################
+
+if [[ "$aks_isolated" == "yes" ]]; then
+    echo "INFO: Cluster is isolated, creating cache in ACR $acr_name..."
+    az acr cache create -n aks-managed-mcr -r $acr_name -g $rg --source-repo "gcr.io/kuar-demo/kuard-amd64" --target-repo "demos/" -o none
+fi
 
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=1
@@ -1641,7 +1730,6 @@ vm_name=testvm
 vm_pip_name=testvm-pip
 vm_sku=Standard_B1s
 echo "Creating subnet..."
-az network vnet subnet create -g $rg -n $vm_subnet_name --vnet-name $vnet_name --address-prefix $vm_subnet_prefix -o none
 echo "Creating VM..."
 az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku -l $location \
    --vnet-name $vnet_name --subnet $vm_subnet_name --public-ip-address $vm_pip_name --public-ip-sku Standard -o none

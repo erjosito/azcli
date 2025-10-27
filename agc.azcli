@@ -1143,6 +1143,8 @@ fi
 ##########################
 
 if [[ "$test_cmds" == "yes" ]]; then
+    # Check AKS and network config
+    az aks list -g $rg --only-show-errors --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy, PluginMode:networkProfile.networkPluginMode, NetworkMode:networkProfile.networkMode}' -o table
     # Check the AGC pods
     kubectl get pods -n azure-alb-system
     # Check the logs in the AGC pods
