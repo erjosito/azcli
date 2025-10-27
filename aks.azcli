@@ -1950,6 +1950,17 @@ insights_query='InsightsMetrics
 //| where TagInfo.app !startswith "istio"
 //| where TagInfo.app !startswith "cert"
 //| where TagInfo.app != ""
-| summarize count() by Namespace
-'
+| summarize count() by Namespace'
 az monitor log-analytics query -w $logws_customerid --analytics-query $insights_query -o tsv
+# Flow Logs (this example is for outbound flows)
+flowlogs_query='NTANetAnalytics
+| where TimeGenerated > ago(15m)
+| where FlowType == "AzurePublic" or FlowType == "ExternalPublic"
+| where isnotempty(SrcIp)
+| where SrcSubnet != "akstest/aksvnet/gatewaysubnet"
+| project SrcIp, DestPort, DestPublicIPInfo=split(DestPublicIps, " ")
+| mv-expand DestPublicIPInfo
+| extend DestPublicIP = tostring(split(DestPublicIPInfo, "|")[0]) | project-away DestPublicIPInfo
+| lookup kind=leftouter (NTAIpDetails | project Ip, PublicIpDetails) on $left.DestPublicIP==$right.Ip
+| distinct SrcIp, DestPort, PublicIpDetails'
+az monitor log-analytics query -w $logws_customerid --analytics-query $flowlogs_query -o tsv
