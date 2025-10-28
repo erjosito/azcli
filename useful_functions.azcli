@@ -1,0 +1,334 @@
+###############################
+# Some functions that have
+#   been useful over the years.
+# They can be taken as well as
+#   inspiration for automation.
+#
+# Jose Moreno, 2021-2025
+###############################
+
+##############################
+#      RPs and features      #
+##############################
+
+# Wait for a resource (whose ID is provided as parameter) to be created
+function wait_until_finished {
+     wait_interval=15
+     resource_id=$1
+     resource_name=$(echo $resource_id | cut -d/ -f 9)
+     echo "INFO: Waiting for resource $resource_name to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     until [[ "$state" == "Succeeded" ]] || [[ "$state" == "Failed" ]] || [[ -z "$state" ]]
+     do
+        sleep $wait_interval
+        state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
+     done
+     if [[ -z "$state" ]]
+     then
+        echo "ERROR: Something really bad happened..."
+     else
+        run_time=$(expr `date +%s` - $start_time)
+        ((minutes=${run_time}/60))
+        ((seconds=${run_time}%60))
+        echo "INFO: Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
+# Enable a feature on the AKS resource provider
+# It can be easily extended to other resource providers, or to take the resource provider as parameter (note though the different casing of the RP name, not sure if that is relevant).
+function enableAksFeature () {
+    feature_name=$1
+    state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
+    if [[ "$state" == "Registered" ]]
+    then
+        echo "INFO: $feature_name is already registered"
+    else
+        echo "INFO: Registering feature $feature_name..."
+        az feature register --name "$feature_name" --namespace microsoft.containerservice -o none --only-show-errors
+        state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
+        echo "INFO: Waiting for feature $feature_name to finish registering..."
+        wait_interval=15
+        until [[ "$state" == "Registered" ]]
+        do
+            sleep $wait_interval
+            state=$(az feature list -o table --query "[?contains(name, 'microsoft.containerservice/$feature_name')].properties.state" -o tsv)
+            echo "INFO: Current registration status for feature $feature_name is $state"
+        done
+        echo "INFO: Registering resource provider Microsoft.ContainerService now..."
+        az provider register --namespace Microsoft.ContainerService -o none --only-show-errors
+    fi
+}
+
+##############################
+#        Networking          #
+##############################
+
+# Patch all NSGs in a resource group to allow SSH access from Internet
+# It can allow all Internet (first parameter is 'any') or the user's IP only (first parameter is 'myip'). It defaults to 'myip'.
+# Assumes the variable $rg is set
+function patch_nsgs() {
+    mode=$1
+    if [[ "$mode" == "any" ]]; then
+        echo "Patching NSGs to allow SSH from any Internet IP..."
+    else
+        myip=$(curl -s4 ifconfig.me)
+        echo "Patching NSGs to allow SSH from my IP $myip..."
+    fi
+    nsg_list=$(az network nsg list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r nsg_name; do
+        echo "Patching NSG $nsg_name..."
+        if [[ "$mode" == "any" ]]; then
+            az network nsg rule create -g $rg --nsg-name $nsg_name -n Allow-SSH-in --priority 4000 --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 22 --source-address-prefixes Internet --destination-address-prefixes VirtualNetwork -o none
+        else
+            az network nsg rule create -g $rg --nsg-name $nsg_name -n Allow-SSH-in --priority 4000 --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 22 --source-address-prefixes $myip --destination-address-prefixes VirtualNetwork -o none
+        fi
+    done <<< "$nsg_list"
+}
+
+# Remove all NSGs from a given VNet
+# Assumes the variable $rg is set
+# VNet name can be provided as parameter or taken from variable vnet_name
+function remove_nsgs_from_vnet() {
+    if [[ -n "$1" ]]; then
+        vnet_name=$1
+    elif [[ -n "$vnet_name" ]]; then
+        vnet_name=$vnet_name
+    else
+        echo "ERROR: No VNet name provided or set in variable vnet_name"
+        return 1
+    fi
+    echo "Removing NSGs from subnets in VNet $vnet_name..."
+    subnet_list=$(az network vnet subnet list --vnet-name $vnet_name -g $rg --query '[].name' -o tsv)
+    while IFS= read -r subnet_name; do
+        echo "Removing NSG from subnet $subnet_name..."
+        az network vnet subnet update --vnet-name $vnet_name -g $rg -n $subnet_name --network-security-group null -o none
+    done <<< "$subnet_list"
+}
+
+# Function to update UDR back to testing PC. The route needs to be called 'clientIP'
+# Assumes the variable $rg is set
+# If you supply the 'create' parameter, it will create the route if not found
+function update_myip() {
+    myip=$(curl -s4 ifconfig.co)
+    rt_list=$(az network route-table list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r rt_name; do
+        echo "Checking route table $rt_name..."
+        current_ip=$(az network route-table route show --route-table-name $rt_name -g $rg --name clientIP --query addressPrefix -o tsv --only-show-errors 2>/dev/null | cut -d/ -f1)
+        if [[ "$current_ip" == "$myip" ]]; then
+            echo "IP $myip is already set in route table $rt_name, skipping..."
+            continue
+        elif [[ -z "$current_ip" ]]; then
+            if [[ "$1" == "create" ]]; then
+                echo "Route named clientIP not found in route table $rt_name, creating it with IP $myip..."
+                az network route-table route create --route-table-name $rt_name -g $rg --address-prefix "${myip}/32" --next-hop-type Internet --name clientIP -o none
+            else
+                echo "No route named clientIP found in route table $rt_name, nothing to do."
+            fi
+        else
+            echo "Updating IP to $myip..."
+            az network route-table route update --route-table-name $rt_name -g $rg --address-prefix "${myip}/32" --name clientIP -o none
+        fi
+    done <<< "$rt_list"
+}
+
+# Converts a Linux NVA to an NVA:
+# - Enables IP forwarding
+# - Enables routing on the OS (assumes Ubuntu)
+# - Enables NAT on the OS (optionally)
+function convert_to_nva {
+    vm_name=$1
+    if [[ -z "$vm_name" ]]; then
+        echo "ERROR: No VM name provided in the first parameter"
+        return 1
+    fi
+    nic_id=$(az vm show -g $rg -n $vm_name --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    echo "Enabling IP forwarding on NIC $nic_id..."
+    az network nic update --ids $nic_id --ip-forwarding true -o none
+    vm_pip=$(az vm list-ip-addresses -g $rg -n $vm_name --query '[0].virtualMachine.network.publicIpAddresses[0].ipAddress' -o tsv)
+    # If VM has a Linux OS, enabling IP forwarding
+    vm_os=$(az vm show -g $rg -n $vm_name --query 'storageProfile.osDisk.osType' -o tsv)
+    if [[ "$vm_os" == "Linux" ]]; then
+        echo "Enabling IP forwarding on VM $vm_name (IP $vm_pip) via SSH..."
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sysctl -w net.ipv4.ip_forward=1"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf"
+        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sysctl -p"
+        # Enabling NAT as well if specified in the 2nd parameter
+        if [[ "$2" == "nat" ]]; then
+            echo "Enabling NAT on VM $vm_name (IP $vm_pip) via SSH..."
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+            # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sh -c 'iptables-save > /etc/iptables.rules'"
+            # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo bash -c 'echo -e \"\n# Load iptables rules on boot\npre-up iptables-restore < /etc/iptables.rules\" >> /etc/network/interfaces'"
+        else
+            echo "'nat' not specified in the second parameter, skipping NAT configuration."
+        fi
+    else
+        echo "WARNING: VM $vm_name has OS type $vm_os, skipping OS configuration."
+    fi
+}
+
+
+
+##############################
+#       IP addresses         #
+##############################
+
+# Auxiliary function to add a number to an IP address
+function increment_ip(){
+    ip=$1
+    increment=$2
+    if [[ -z "$increment" ]]; then
+        increment=1
+    fi
+    IP=$(echo $ip | cut -d/ -f 1)  # In case the IP is given in CIDR format
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + $increment ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
+
+# Auxiliary function to get the first IP of a subnet (default gateway)
+function first_ip(){
+    echo "$(increment_ip $1 1)"
+}
+
+# Auxiliary function to get the last IP of a subnet (right before the broadcast address)
+function last_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    MASK=$(echo $subnet | cut -d/ -f 2)
+    OFFSET=$((2 ** (32 - $MASK) - 2))
+    echo "$(increment_ip $IP $OFFSET)"
+}
+
+# Auxiliary function to get the first usable IP of a subnet (subnet address + 4)
+function first_usable(){
+    echo "$(increment_ip $1 4)"
+}
+
+# Helper function to calculate the default gateway for a subnet
+# Example: default_gw 172.16.1.31 255.255.255.248
+function default_gw(){
+    IP=$1
+    MASK=$2
+    DEBUG=$3    # Set to yes for message debugging
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    MASK_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $MASK | sed -e 's/\./ /g'`)
+    IP_DEC=$(echo "ibase=16; $IP_HEX" | bc)
+    MASK_DEC=$(echo "ibase=16; $MASK_HEX" | bc)
+    SUBNET_DEC=$(( IP_DEC&MASK_DEC ))
+    GW_DEC=$(( $SUBNET_DEC + 1 ))
+    GW_HEX=$(printf '%x\n' $GW_DEC)
+    if [[ "${#GW_HEX}" == "7" ]]; then
+        GW_HEX="0${GW_HEX}"
+    fi
+    GW=$(printf '%d.%d.%d.%d\n' `echo $GW_HEX | sed -r 's/(..)/0x\1 /g'`)
+    if [[ "$DEBUG" == "yes" ]]
+    then
+        echo "Input: ${IP}/${MASK}"
+        echo "Decimal: ${IP_DEC}/${MASK_DEC}"
+        echo "Subnet decimal: ${SUBNET_DEC}"
+        echo "Gateway dec: ${GW_DEC}"
+        echo "Gateway hex: ${GW_HEX}"
+        echo "Gateway: ${GW}"
+    else
+        echo "$GW"
+    fi
+}
+
+##############################
+#      Update SSH keys       #
+##############################
+
+function update_ssh_key() {
+    vm_name=$1
+    user=$(whoami)
+    echo "Updating SSH key for VM $vm_name and user $user..."
+    az vm user update -g $rg -u $user -n $vm_name --ssh-key-value "$(< ~/.ssh/id_rsa.pub)" -o none
+}
+
+# Updates the SSH keys of all VMs in this lab for a given publisher (Canonical)
+function update_all_ssh_keys() {
+    vm_list=$(az vm list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r vm_name; do
+        vm_publisher=$(az vm show -n $vm_name -g $rg --query 'storageProfile.imageReference.publisher' -o tsv)
+        if [[ "$vm_publisher" == "Canonical" ]]; then
+            update_ssh_key $vm_name
+        else
+            echo "VM $vm_name is not from Canonical but from $vm_publisher, skipping..."
+        fi
+    done <<< "$vm_list"
+}
+
+##################################
+#    Start/stop lab resources    #
+##################################
+
+# Stop all
+function stop_lab() {
+    echo "Stopping AKS..."
+    aks_name=$(az aks list -g $rg --query '[0].name' -o tsv)
+    az aks stop -n $aks_name -g $rg --no-wait -o none
+    echo "Stopping VMs..."
+    stop_vms
+    echo "Stopping AML compute..."
+    stop_aml_compute
+    echo "Stopping Azure Firewall..."
+    stop_firewall
+}
+
+# Stop VMs
+function stop_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        az vm deallocate -g $rg -n "$vm_name" --no-wait -o none
+    done <<< "$vm_list"
+}
+
+# Stop AML compute
+function stop_aml_compute() {
+    compute_list=$(az ml compute list -o tsv -w $aml_ws_name -g "$rg" --query "[].name")
+    while IFS= read -r compute_name; do
+        az ml compute stop -g $rg -w $aml_ws_name -n "$compute_name" --no-wait -o none
+    done <<< "$compute_list"
+}
+
+# Start
+function start_lab() {
+    aks_name=$(az aks list -g $rg --query '[0].name' -o tsv)
+    az aks start -n $aks_name -g $rg --no-wait -o none
+    start_vms
+    start_firewall
+    start_aml_compute
+}
+
+# Start VMs
+function start_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        az vm start -g $rg -n "$vm_name" --no-wait -o none
+    done <<< "$vm_list"
+}
+
+# Start AML compute
+function start_aml_compute() {
+    compute_list=$(az ml compute list -o tsv -w $aml_ws_name -g "$rg" --query "[].name")
+    while IFS= read -r compute_name; do
+        az ml compute start -g $rg -w $aml_ws_name -n "$compute_name" -o none
+    done <<< "$compute_list"
+}
+
+# Functions to start/stop the firewall
+function stop_firewall() {
+    azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
+    azfw_ipconfig_name=$(az network firewall show -n $azfw_name -g $rg --query 'ipConfigurations[0].name' -o tsv)
+    az network firewall ip-config delete -f $azfw_name -n $azfw_ipconfig_name -g $rg -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}
+function start_firewall() {
+    azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
+    azfw_pip_name=$(az network public-ip list -g $rg -o tsv --query "[?contains(name,'fw')].name")
+    azfw_ipconfig_name="${azfw_name}-ipconfig"
+    az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
+    az network firewall update -n $azfw_name -g $rg -o none
+}

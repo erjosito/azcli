@@ -315,7 +315,7 @@ if [[ "$aks_isolated" == "yes" ]] || [[ "$aks_private" == "yes" ]]; then
         ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo systemctl status dnsmasq"
 fi
 
-# Create ACR with private link if isolated or private cluster
+# Create ACR with private link if isolated or private cluster and set the options
 if [[ "$aks_isolated" == "yes" ]] && [[ "$aks_private" == "yes" ]]; then
     acr_name=$(az acr list -g $rg -o tsv --query '[0].name' 2>/dev/null)
     if [[ -n "$acr_name" ]]; then
@@ -1954,13 +1954,15 @@ insights_query='InsightsMetrics
 az monitor log-analytics query -w $logws_customerid --analytics-query $insights_query -o tsv
 # Flow Logs (this example is for outbound flows)
 flowlogs_query='NTANetAnalytics
-| where TimeGenerated > ago(15m)
+| where TimeGenerated > ago(1h)
 | where FlowType == "AzurePublic" or FlowType == "ExternalPublic"
 | where isnotempty(SrcIp)
 | where SrcSubnet != "akstest/aksvnet/gatewaysubnet"
-| project SrcIp, DestPort, DestPublicIPInfo=split(DestPublicIps, " ")
+| project SrcSubnet, SrcIp, DestPort, DestPublicIPInfo=split(DestPublicIps, " ")
 | mv-expand DestPublicIPInfo
-| extend DestPublicIP = tostring(split(DestPublicIPInfo, "|")[0]) | project-away DestPublicIPInfo
+| extend DestPublicIP = tostring(split(DestPublicIPInfo, "|")[0])
+| extend OutboundBytes = toint(split(DestPublicIPInfo, "|")[5]), InboundBytes = toint(split(DestPublicIPInfo, "|")[6])
+| project-away DestPublicIPInfo
 | lookup kind=leftouter (NTAIpDetails | project Ip, PublicIpDetails) on $left.DestPublicIP==$right.Ip
-| distinct SrcIp, DestPort, PublicIpDetails'
+| summarize OutboundBytes=sum(OutboundBytes), InboundBtyes=sum(InboundBytes) by SrcIp, DestPublicIP, DestPort, PublicIpDetails'
 az monitor log-analytics query -w $logws_customerid --analytics-query $flowlogs_query -o tsv
