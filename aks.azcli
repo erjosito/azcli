@@ -59,6 +59,7 @@ vm_name=testlinuxvm
 vm_size=Standard_B2ms
 gw_name=${vnet_name}-gw
 gw_pip_name=${vnet_name}-gw-pip
+p2s_address_pool='100.64.0.0/24'
 # Other resources (not used)
 # kv_name=erjositoKeyvault
 # acr_name=erjositoAcr
@@ -442,7 +443,7 @@ if [[ "$aks_isolated" == "yes" ]]; then
     tenant_id=$(az account show --query tenantId -o tsv)
     aad_issuer="https://sts.windows.net/${tenant_id}/"
     aad_tenant="https://login.microsoftonline.com/${tenant_id}/"
-    az network vnet-gateway update -g $rg -n $gw_name --address-prefixes 100.64.0.0/24 --client-protocol OpenVPN -o none
+    az network vnet-gateway update -g $rg -n $gw_name --address-prefixes $p2s_address_pool --client-protocol OpenVPN -o none
     az network vnet-gateway aad assign --gateway-name $gw_name -g $rg --tenant "$aad_tenant" --audience "$aad_audience" --issuer "$aad_issuer" -o none
     echo "INFO: Creating VPN client configuration package..."
     az network vnet-gateway vpn-client generate -n $gw_name -g $rg --authentication-method AAD --output-package vpnclientpackage.zip -o none
