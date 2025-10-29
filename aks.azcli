@@ -25,7 +25,7 @@ network_plugin=azure           # azure/kubenet/none/azure_overlay/azure_cilium
 network_policy=none            # azure/calico/cilium/none
 azure_cni_pod_subnet=no        # yes/no
 az_monitor=no
-# Vnet
+# VNet
 vnet_name=aksVnet
 vnet_prefix=10.13.0.0/16
 aks_subnet_name=aks1stpool
@@ -57,9 +57,11 @@ ep_subnet_name=ep
 ep_subnet_prefix=10.13.101.0/24
 vm_name=testlinuxvm
 vm_size=Standard_B2ms
+gw_name=${vnet_name}-gw
+gw_pip_name=${vnet_name}-gw-pip
 # Other resources (not used)
-kv_name=erjositoKeyvault
-acr_name=erjositoAcr
+# kv_name=erjositoKeyvault
+# acr_name=erjositoAcr
 
 ####################
 # Helper functions #
@@ -278,12 +280,13 @@ else
     echo "ERROR: Network plugin $network_plugin not supported"
     exit 1
 fi
+if [[ -n "$network_policy" ]]; then
+    cni_options+=" --network-policy $network_policy"
+fi
 
 # Create VPN gateway if isolated
 if [[ "$aks_isolated" == "yes" ]]; then
     echo "INFO: Creating VPN gateway for isolated AKS cluster (using '--no-wait' flag)..."
-    gw_name=${vnet_name}-gw
-    gw_pip_name=${vnet_name}-gw-pip
     az network public-ip create -g $rg -n $gw_pip_name --sku Standard --allocation-method Static -o none
     az network vnet subnet create -g $rg -n GatewaySubnet --vnet-name $vnet_name --address-prefix $gw_subnet_prefix -o none
     az network vnet-gateway create -g $rg -n $gw_name --public-ip-address $gw_pip_name --vnet $vnet_name --sku VpnGw1 -o none --no-wait
@@ -396,7 +399,6 @@ az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
     ${(z)cni_options} \
     ${(z)isolated_options} \
     --vnet-subnet-id $aks_subnet_id --service-cidr $aks_service_cidr \
-    --network-policy $network_policy \
     --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM" \
     --dns-name-prefix cloudtrooper --no-wait
@@ -440,6 +442,7 @@ if [[ "$aks_isolated" == "yes" ]]; then
     tenant_id=$(az account show --query tenantId -o tsv)
     aad_issuer="https://sts.windows.net/${tenant_id}/"
     aad_tenant="https://login.microsoftonline.com/${tenant_id}/"
+    az network vnet-gateway update -g $rg -n $gw_name --address-prefixes 100.64.0.0/24 --client-protocol OpenVPN -o none
     az network vnet-gateway aad assign --gateway-name $gw_name -g $rg --tenant "$aad_tenant" --audience "$aad_audience" --issuer "$aad_issuer" -o none
     echo "INFO: Creating VPN client configuration package..."
     az network vnet-gateway vpn-client generate -n $gw_name -g $rg --authentication-method AAD --output-package vpnclientpackage.zip -o none
