@@ -106,28 +106,43 @@ function remove_nsgs_from_vnet() {
     done <<< "$subnet_list"
 }
 
+# Remove NSGs from all VNets in the resource group
+# Assumes the variable $rg is set
+function remove_nsgs_from_all_vnets() {
+    vnet_list=$(az network vnet list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r vnet_name; do
+        echo "Removing NSGs from subnets in VNet $vnet_name..."
+        subnet_list=$(az network vnet subnet list --vnet-name $vnet_name -g $rg --query '[].name' -o tsv)
+        while IFS= read -r subnet_name; do
+            echo "- Removing NSG from subnet $subnet_name in VNet $vnet_name..."
+            az network vnet subnet update --vnet-name $vnet_name -g $rg -n $subnet_name --network-security-group null -o none
+        done <<< "$subnet_list"
+    done <<< "$vnet_list"
+}
+
 # Function to update UDR back to testing PC. The route needs to be called 'clientIP'
 # Assumes the variable $rg is set
-# If you supply the 'create' parameter, it will create the route if not found
+# You can supply a subnet length if you don't want /32 (e.g., /24)
 function update_myip() {
+    mask=$1
+    if [[ -z "$mask" ]]; then
+        mask="/32"
+    fi
     myip=$(curl -s4 ifconfig.co)
+    mycidr=$(subnet_ip_address "${myip}${mask}")
     rt_list=$(az network route-table list -g $rg --query '[].name' -o tsv)
     while IFS= read -r rt_name; do
         echo "Checking route table $rt_name..."
-        current_ip=$(az network route-table route show --route-table-name $rt_name -g $rg --name clientIP --query addressPrefix -o tsv --only-show-errors 2>/dev/null | cut -d/ -f1)
-        if [[ "$current_ip" == "$myip" ]]; then
-            echo "IP $myip is already set in route table $rt_name, skipping..."
+        current_cidr=$(az network route-table route show --route-table-name $rt_name -g $rg --name clientIP --query addressPrefix -o tsv --only-show-errors 2>/dev/null)
+        if [[ "$current_cidr" == "$mycidr" ]]; then
+            echo "IP $mycidr is already set in route table $rt_name, skipping..."
             continue
-        elif [[ -z "$current_ip" ]]; then
-            if [[ "$1" == "create" ]]; then
-                echo "Route named clientIP not found in route table $rt_name, creating it with IP $myip..."
-                az network route-table route create --route-table-name $rt_name -g $rg --address-prefix "${myip}/32" --next-hop-type Internet --name clientIP -o none
-            else
-                echo "No route named clientIP found in route table $rt_name, nothing to do."
-            fi
+        elif [[ -z "$current_cidr" ]]; then
+            echo "Route named clientIP not found in route table $rt_name, creating it with IP $mycidr..."
+            az network route-table route create --route-table-name $rt_name -g $rg --address-prefix "${mycidr}" --next-hop-type Internet --name clientIP -o none
         else
-            echo "Updating IP to $myip..."
-            az network route-table route update --route-table-name $rt_name -g $rg --address-prefix "${myip}/32" --name clientIP -o none
+            echo "Updating IP to $mycidr..."
+            az network route-table route update --route-table-name $rt_name -g $rg --address-prefix "${mycidr}" --name clientIP -o none
         fi
     done <<< "$rt_list"
 }
@@ -167,13 +182,11 @@ function convert_to_nva {
     fi
 }
 
-
-
 ##############################
 #       IP addresses         #
 ##############################
 
-# Auxiliary function to add a number to an IP address
+# Add a number to an IP address
 function increment_ip(){
     ip=$1
     increment=$2
@@ -187,12 +200,12 @@ function increment_ip(){
     echo "$NEXT_IP"
 }
 
-# Auxiliary function to get the first IP of a subnet (default gateway)
+# Get the first IP of a subnet (default gateway)
 function first_ip(){
     echo "$(increment_ip $1 1)"
 }
 
-# Auxiliary function to get the last IP of a subnet (right before the broadcast address)
+# Get the last IP of a subnet (right before the broadcast address)
 function last_ip(){
     subnet=$1
     IP=$(echo $subnet | cut -d/ -f 1)
@@ -201,12 +214,37 @@ function last_ip(){
     echo "$(increment_ip $IP $OFFSET)"
 }
 
-# Auxiliary function to get the first usable IP of a subnet (subnet address + 4)
-function first_usable(){
+# Get the first usable IP of an Azure subnet (subnet address + 4)
+function first_usable_ip(){
     echo "$(increment_ip $1 4)"
 }
 
-# Helper function to calculate the default gateway for a subnet
+# Get the subnet IP address given an IP in the subnet in CIDR format (1.2.3.4/24)
+function subnet_ip_address(){
+    ip=$1
+    if [[ -z "$ip" ]]; then
+        echo "ERROR: No IP address provided"
+        return 1
+    fi
+    IP=$(echo $ip | cut -d/ -f 1)
+    MASK=$(echo $ip | cut -d/ -f 2)
+    # Get IP and MASK in HEX
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    MASK_DEC=$(( 0xFFFFFFFF << (32 - $MASK) & 0xFFFFFFFF ))
+    MASK_HEX=$(printf '%.8X\n' $MASK_DEC)
+    # AND operation between IP and MASK
+    IP_DEC=$(echo "ibase=16; $IP_HEX" | bc)
+    MASK_DEC=$(echo "ibase=16; $MASK_HEX" | bc)
+    SUBNET_DEC=$(( IP_DEC&MASK_DEC ))
+    SUBNET_HEX=$(printf '%x\n' $SUBNET_DEC)
+    if [[ "${#SUBNET_HEX}" == "7" ]]; then
+        SUBNET_HEX="0${SUBNET_HEX}"
+    fi
+    SUBNET_IP=$(printf '%d.%d.%d.%d\n' `echo $SUBNET_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "${SUBNET_IP}/${MASK}"
+}
+
+# Calculate the default gateway for a subnet expressed in IP and MASK
 # Example: default_gw 172.16.1.31 255.255.255.248
 function default_gw(){
     IP=$1
@@ -281,6 +319,7 @@ function stop_lab() {
 function stop_vms() {
     vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
     while IFS= read -r vm_name; do
+        echo "Deallocating VM $vm_name..."
         az vm deallocate -g $rg -n "$vm_name" --no-wait -o none
     done <<< "$vm_list"
 }
@@ -306,6 +345,7 @@ function start_lab() {
 function start_vms() {
     vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
     while IFS= read -r vm_name; do
+        echo "Starting VM $vm_name..."
         az vm start -g $rg -n "$vm_name" --no-wait -o none
     done <<< "$vm_list"
 }
@@ -322,6 +362,7 @@ function start_aml_compute() {
 function stop_firewall() {
     azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
     azfw_ipconfig_name=$(az network firewall show -n $azfw_name -g $rg --query 'ipConfigurations[0].name' -o tsv)
+    echo "Stopping firewall $azfw..."
     az network firewall ip-config delete -f $azfw_name -n $azfw_ipconfig_name -g $rg -o none
     az network firewall update -n $azfw_name -g $rg -o none
 }
@@ -329,6 +370,7 @@ function start_firewall() {
     azfw_name=$(az network firewall list -g $rg --query '[0].name' -o tsv)
     azfw_pip_name=$(az network public-ip list -g $rg -o tsv --query "[?contains(name,'fw')].name")
     azfw_ipconfig_name="${azfw_name}-ipconfig"
+    echo "Starting firewall $azfw_name..."
     az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $vnet_name -o none
     az network firewall update -n $azfw_name -g $rg -o none
 }
