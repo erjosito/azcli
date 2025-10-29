@@ -61,6 +61,8 @@ gw_name=${vnet_name}-gw
 gw_pip_name=${vnet_name}-gw-pip
 p2s_address_pool='100.64.0.0/24'
 p2s_config_file="$HOME/downloads/$(date +%Y%m%d)-vpnclientpackage.zip"
+docker_username='your_dockerhub_username'
+docker_pat='your_dockerhub_pat'
 # Other resources (not used)
 # kv_name=erjositoKeyvault
 # acr_name=erjositoAcr
@@ -1038,13 +1040,50 @@ az aks nodepool list --cluster-name $aks_name -g $rg -o table
 if [[ "$aks_isolated" == "yes" ]]; then
     echo "INFO: Cluster is isolated, creating cache in ACR $acr_name..."
     # Create AKV
-    az acr credential-set create -r MyRegistry -n dockerhub -l docker.io -u https://MyKeyvault.vault.azure.net/secrets/usernamesecret -p https://MyKeyvault.vault.azure.net/secrets/passwordsecret
+    akv_name=$(az keyvault list -g $rg --query '[0].name' -o tsv)
+    if [[ -z "$akv_name" ]]; then
+        akv_name=$acr_name
+        echo "INFO: Creating Key Vault $akv_name..."
+        az keyvault create -n $akv_name -g $rg -l $location --sku standard -o none
+        # Create identity for ACR to access AKV
+        # User identity not supported yet: https://github.com/Azure/acr/issues/790?ref=dariuszparys.com
+        # acr_id_name="${acr_name}-id"
+        # acr_id_id=$(az identity show -g $rg -n $acr_id_name --query id -o tsv 2>/dev/null)
+        # if [[ -z "$acr_id_id" ]]; then
+        #     echo "INFO: Creating identity $acr_id_name for ACR to access AKV..."
+        #     acr_id_id=$(az identity create -g $rg -n $acr_id_name --query id -o tsv)
+        #     az acr identity assign -n $acr_name -g $rg --identities $acr_id_id -o none
+        # else
+        #     echo "INFO: Using existing identity $acr_id_name for ACR to access AKV..."
+        # fi
+        # acr_id_principal_id=$(az identity show -g $rg -n $acr_id_name --query principalId -o tsv)
+        # Managed identity
+        az acr identity assign --identities '[system]' -n $acr_name -o none
+        acr_id_principal_id=$(az acr identity show -n $acr_name --query principalId -o tsv)
+        # Assign RBAC role to the identity
+        akv_id=$(az keyvault show -n $akv_name -g $rg --query id -o tsv)
+        az role assignment create --assignee $acr_id_principal_id --role "Key Vault Secrets User" --scope $akv_id -o none
+        current_user_principal_id=$(az ad signed-in-user show --query id -o tsv)
+        az role assignment create --assignee $current_user_principal_id --role "Key Vault Secrets Officer" --scope $akv_id -o none
+        # Add secrets to AKV
+        echo "INFO: Adding secrets to Key Vault $akv_name..."
+        az keyvault secret set --vault-name $akv_name --name dockerusername --value $docker_username -o none
+        az keyvault secret set --vault-name $akv_name --name dockerpat --value $docker_pat -o none
+    else
+        echo "INFO: Using existing Key Vault $akv_name..."
+    fi
+    # Create ACR credential set and cache
+    az acr credential-set create -r $acr_name -n dockerhub -l docker.io -u "https://${akv_name}.vault.azure.net/secrets/dockerusername" -p "https://${akv_name}.vault.azure.net/secrets/dockerpat" -o none
     az acr cache create -r $acr_name -n yadaapi --source-repo docker.io/erjosito/yadaapi --target-repo yadaapi --cred-set dockerhub -o none
+    # Set image variable to point to ACR
+    yada_image="${acr_name}.azurecr.io/yadaapi:1.0"
+else
+    yada_image="erjosito/yadaapi:1.0"
 fi
 
 az aks get-credentials -n $aks_name -g $rg --overwrite
 kubectl create deployment kuard --image=gcr.io/kuar-demo/kuard-amd64:blue --port=8080 --replicas=1
-kubectl create deployment yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --replicas=1
+kubectl create deployment yadaapi --image=$yada_image --port=8080 --replicas=1
 # kubectl run yadaapi --image=erjosito/yadaapi:1.0 --port=8080 --env="SQL_SERVER_FQDN=${sql_server_fqdn}" --env="SQL_SERVER_USERNAME=${sql_username}" --env="SQL_SERVER_PASSWORD=${sql_password}"
 
 # Full YADA app
