@@ -60,6 +60,7 @@ vm_size=Standard_B2ms
 gw_name=${vnet_name}-gw
 gw_pip_name=${vnet_name}-gw-pip
 p2s_address_pool='100.64.0.0/24'
+p2s_config_file="$HOME/downloads/$(date +%Y%m%d)-vpnclientpackage.zip"
 # Other resources (not used)
 # kv_name=erjositoKeyvault
 # acr_name=erjositoAcr
@@ -446,9 +447,12 @@ if [[ "$aks_isolated" == "yes" ]]; then
     az network vnet-gateway update -g $rg -n $gw_name --address-prefixes $p2s_address_pool --client-protocol OpenVPN -o none
     az network vnet-gateway aad assign --gateway-name $gw_name -g $rg --tenant "$aad_tenant" --audience "$aad_audience" --issuer "$aad_issuer" -o none
     echo "INFO: Creating VPN client configuration package..."
-    az network vnet-gateway vpn-client generate -n $gw_name -g $rg --authentication-method AAD --output-package vpnclientpackage.zip -o none
+    az network vnet-gateway vpn-client generate -n $gw_name -g $rg --processor-architecture Amd64 -o none
     download_url=$(az network vnet-gateway vpn-client show-url -n $gw_name -g $rg -o tsv)
-    echo "INFO: VPN client configuration package download URL: $download_url"
+    p2s_config_file_abs=$(readlink -f "$p2s_config_file")
+    curl -s -o $p2s_config_file_abs $download_url
+    unzip -o $p2s_config_file_abs
+    echo "INFO: VPN client configuration downloaded to $p2s_config_file_abs and unzipped"
 fi
 
 ######################
@@ -1033,7 +1037,9 @@ az aks nodepool list --cluster-name $aks_name -g $rg -o table
 
 if [[ "$aks_isolated" == "yes" ]]; then
     echo "INFO: Cluster is isolated, creating cache in ACR $acr_name..."
-    az acr cache create -n aks-managed-mcr -r $acr_name -g $rg --source-repo "gcr.io/kuar-demo/kuard-amd64" --target-repo "demos/" -o none
+    # Create AKV
+    az acr credential-set create -r MyRegistry -n dockerhub -l docker.io -u https://MyKeyvault.vault.azure.net/secrets/usernamesecret -p https://MyKeyvault.vault.azure.net/secrets/passwordsecret
+    az acr cache create -r $acr_name -n yadaapi --source-repo docker.io/erjosito/yadaapi --target-repo yadaapi --cred-set dockerhub -o none
 fi
 
 az aks get-credentials -n $aks_name -g $rg --overwrite
@@ -1957,16 +1963,16 @@ insights_query='InsightsMetrics
 | summarize count() by Namespace'
 az monitor log-analytics query -w $logws_customerid --analytics-query $insights_query -o tsv
 # Flow Logs (this example is for outbound flows)
-flowlogs_query='NTANetAnalytics
+flowlogs_query="NTANetAnalytics
 | where TimeGenerated > ago(1h)
-| where FlowType == "AzurePublic" or FlowType == "ExternalPublic"
+| where FlowType == 'AzurePublic' or FlowType == 'ExternalPublic'
 | where isnotempty(SrcIp)
-| where SrcSubnet != "akstest/aksvnet/gatewaysubnet"
-| project SrcSubnet, SrcIp, DestPort, DestPublicIPInfo=split(DestPublicIps, " ")
+| where SrcSubnet =~ '${rg}/${vnet_name}/${aks_subnet_name}'
+| project SrcSubnet, SrcIp, DestPort, DestPublicIPInfo=split(DestPublicIps, ' ')
 | mv-expand DestPublicIPInfo
-| extend DestPublicIP = tostring(split(DestPublicIPInfo, "|")[0])
-| extend OutboundBytes = toint(split(DestPublicIPInfo, "|")[5]), InboundBytes = toint(split(DestPublicIPInfo, "|")[6])
+| extend DestPublicIP = tostring(split(DestPublicIPInfo, '|')[0])
+| extend OutboundBytes = toint(split(DestPublicIPInfo, '|')[5]), InboundBytes = toint(split(DestPublicIPInfo, '|')[6])
 | project-away DestPublicIPInfo
-| lookup kind=leftouter (NTAIpDetails | project Ip, PublicIpDetails) on $left.DestPublicIP==$right.Ip
-| summarize OutboundBytes=sum(OutboundBytes), InboundBtyes=sum(InboundBytes) by SrcIp, DestPublicIP, DestPort, PublicIpDetails'
+| lookup kind=leftouter (NTAIpDetails | project Ip, PublicIpDetails) on \$left.DestPublicIP==\$right.Ip
+| summarize OutboundBytes=sum(OutboundBytes), InboundBtyes=sum(InboundBytes) by SrcSubnet, SrcIp, DestPublicIP, DestPort, PublicIpDetails"
 az monitor log-analytics query -w $logws_customerid --analytics-query $flowlogs_query -o tsv
