@@ -129,7 +129,15 @@ function update_myip() {
         mask="/32"
     fi
     myip=$(curl -s4 ifconfig.co)
-    mycidr=$(subnet_ip_address "${myip}${mask}")
+    if [[ "$mask" != /* ]]; then
+        echo "ERROR: Mask provided ($mask) is not in CIDR format (e.g., /24)"
+        return 1
+    fi
+    if [[ "$mask" != "/32" ]]; then
+        mycidr=$(subnet_ip_address "${myip}${mask}")
+    else
+        mycidr="${myip}${mask}"
+    fi
     rt_list=$(az network route-table list -g $rg --query '[].name' -o tsv)
     while IFS= read -r rt_name; do
         echo "Checking route table $rt_name..."
@@ -166,7 +174,7 @@ function convert_to_nva {
     if [[ "$vm_os" == "Linux" ]]; then
         echo "Enabling IP forwarding on VM $vm_name (IP $vm_pip) via SSH..."
         ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sysctl -w net.ipv4.ip_forward=1"
-        # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf"
         # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $vm_pip "sudo sysctl -p"
         # Enabling NAT as well if specified in the 2nd parameter
         if [[ "$2" == "nat" ]]; then
@@ -278,6 +286,7 @@ function default_gw(){
 #      Update SSH keys       #
 ##############################
 
+# Updates the SSH key of a given VM
 function update_ssh_key() {
     vm_name=$1
     user=$(whoami)
