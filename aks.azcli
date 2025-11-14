@@ -1299,8 +1299,7 @@ kubectl expose deploy yadaapi --port=80 --target-port=8080
 
 # Service
 app_name=yadaapi
-yaml_file=/tmp/svc.yaml
-cat <<EOF > $yaml_file
+cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Service
 metadata:
@@ -1315,7 +1314,6 @@ spec:
   selector:
     app: $app_name
 EOF
-kubectl apply -f $yaml_file
 
 # Service with Static PIP
 svc_pip_name=k8ssvcpip
@@ -1329,8 +1327,7 @@ else
     client_id=$id_principal_id
 fi
 az role assignment create --assignee $client_id --role "Network Contributor" --scope $svc_pip_id
-yaml_file=/tmp/svc.yaml
-cat <<EOF > $yaml_file
+cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Service
 metadata:
@@ -1345,8 +1342,6 @@ spec:
   selector:
     app: kuard
 EOF
-kubectl apply -f $yaml_file
-echo "Browse to http://$svc_pip_ip:8080"
 
 # Workload with PV/PVC
 yaml_file=/tmp/pvc.yaml
