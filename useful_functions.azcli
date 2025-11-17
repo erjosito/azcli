@@ -70,18 +70,20 @@ function enableAksFeature () {
 function patch_nsgs() {
     mode=$1
     if [[ "$mode" == "any" ]]; then
-        echo "Patching NSGs to allow SSH from any Internet IP..."
+        echo "Patching NSGs to allow SSH and RDP from any Internet IP..."
     else
         myip=$(curl -s4 ifconfig.me)
-        echo "Patching NSGs to allow SSH from my IP $myip..."
+        echo "Patching NSGs to allow SSH and RDP from my IP $myip..."
     fi
     nsg_list=$(az network nsg list -g $rg --query '[].name' -o tsv)
     while IFS= read -r nsg_name; do
         echo "Patching NSG $nsg_name..."
         if [[ "$mode" == "any" ]]; then
             az network nsg rule create -g $rg --nsg-name $nsg_name -n Allow-SSH-in --priority 4000 --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 22 --source-address-prefixes Internet --destination-address-prefixes VirtualNetwork -o none
+            az network nsg rule create -g $rg --nsg-name $nsg_name -n Allow-RDP-in --priority 4001 --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 3389 --source-address-prefixes Internet --destination-address-prefixes VirtualNetwork -o none
         else
             az network nsg rule create -g $rg --nsg-name $nsg_name -n Allow-SSH-in --priority 4000 --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 22 --source-address-prefixes $myip --destination-address-prefixes VirtualNetwork -o none
+            az network nsg rule create -g $rg --nsg-name $nsg_name -n Allow-RDP-in --priority 4001 --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 3389 --source-address-prefixes $myip --destination-address-prefixes VirtualNetwork -o none
         fi
     done <<< "$nsg_list"
 }
