@@ -1,0 +1,16 @@
+#################################
+# Created by Jose Moreno
+# November 2025
+#
+# Useful commands for arc-enabled
+#    servers and SQL Servers.
+#################################
+
+# Variables
+rg=arc
+location=swedencentral
+
+# Diagnostic commands
+az connectedmachine list -g $rg -o table --query '[].{Name:name, Status:status}'
+az connectedmachine extension list --machine-name $machine_name -g $rg -o table
+

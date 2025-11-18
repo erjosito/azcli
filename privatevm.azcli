@@ -1,0 +1,80 @@
+#################################
+# Created by Jose Moreno
+# November 2025
+#
+# Capture traffic from a private VM
+#################################
+
+# Variables
+rg=privatevm
+location=swedencentral
+vnet_name=privatevm-vnet
+subnet_name=privatevm-subnet
+vnet_prefix=10.13.76.0/24
+subnet_prefix=10.13.76.0/27
+vm_name=privatevm0
+vm_size=Standard_B1s
+image=Ubuntu2204
+nsg_name=${vm_name}-nsg
+
+# Create resource group, NSG and VNet
+echo "INFO: Creating resource group $rg in $location..."
+az group create -n $rg -l $location -o none
+echo "INFO: Creating NSG $nsg_name and VNet $vnet_name with subnet $subnet_name..."
+az network nsg create -n $nsg_name -g $rg -l $location -o none
+az network vnet create -n $vnet_name -g $rg --address-prefix $vnet_prefix -o none
+az network vnet subnet create --vnet-name $vnet_name -g $rg -n $subnet_name --address-prefixes $subnet_prefix --default-outbound-access false --network-security-group $nsg_name -o none
+
+# Create storage account and log analytics workspace for VNet Flow Logs
+# Verify first if storage account and log analytics workspace already exist via ARG
+suffix=$RANDOM
+arg_query="resources | where type=~'Microsoft.Storage/storageAccounts' and resourceGroup=~'$rg' | project name"
+storage_account_name=$(az graph query -q "$arg_query" --query data -o tsv | head -1 | awk '{print $1}')
+if [[ -z "$storage_account_name" ]]; then
+    storage_account_name="logs${suffix}"  # max 24 characters
+    echo "INFO: No storage account found in resource group $rg, creating one..."
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location -o none
+else
+    echo "INFO: Storage account $storage_account_name found in $location, using it for VNet flow flogs"
+fi
+arg_query="resources | where type=~'Microsoft.OperationalInsights/workspaces' and resourceGroup=~'$rg' | project name"
+logws_name=$(az graph query -q "$arg_query" --query data -o tsv | head -1 | awk '{print $1}')
+if [[ -z "$logws_name" ]]
+then
+    logws_name="log${suffix}"
+    echo "INFO: Creating log analytics workspace ${logws_name}..."
+    az monitor log-analytics workspace create -n $logws_name -g $rg -o none
+else
+    echo "INFO: Log Analytics workspace $logws_name found in resource group $rg"
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
+echo "INFO: Enabling VNet Flow Logs for VNet $vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
+az network watcher flow-log create -l $location -g $rg --name "${vnet_name}-${location}" --vnet $vnet_name \
+    --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
+
+# A few minutes should be allowed for VNet Flow Logs to be fully deployed
+arg_query="resources | where type=~'microsoft.compute/virtualmachines' and name=~'$vm_name' and resourceGroup=~'$rg' | project id"
+existing_vms=$(az graph query -q "$arg_query" --query data -o tsv)
+if [[ -n "$existing_vms" ]]; then
+    echo "INFO: VM $vm_name already exists in resource group $rg, deleting first..."
+    az vm delete -n $vm_name -g $rg -y -o none
+fi
+echo "INFO: Creating VM $vm_name in resource group $rg..."
+az vm create -n $vm_name -g $rg --image $image --size $vm_size --vnet-name $vnet_name --subnet $subnet_name --nsg $nsg_name -o none
+
+# Query Log Analytics workspace to verify VNet Flow Logs are being captured
+echo "INFO: Querying Log Analytics workspace $logws_name to verify VNet Flow Logs are being captured..."
+flowlogs_query="NTANetAnalytics
+| where TimeGenerated > ago(1h)
+| where FlowType == 'AzurePublic' or FlowType == 'ExternalPublic'
+| where isnotempty(SrcIp)
+| where SrcSubnet =~ '${rg}/${vnet_name}/${subnet_name}'
+| project SrcSubnet, SrcIp, DestPort, DestPublicIPInfo=split(DestPublicIps, ' ')
+| mv-expand DestPublicIPInfo
+| extend DestPublicIP = tostring(split(DestPublicIPInfo, '|')[0])
+| extend OutboundBytes = toint(split(DestPublicIPInfo, '|')[5]), InboundBytes = toint(split(DestPublicIPInfo, '|')[6])
+| project-away DestPublicIPInfo
+| lookup kind=leftouter (NTAIpDetails | project Ip, PublicIpDetails) on \$left.DestPublicIP==\$right.Ip
+| summarize OutboundBytes=sum(OutboundBytes), InboundBtyes=sum(InboundBytes) by SrcSubnet, SrcIp, DestPublicIP, DestPort, PublicIpDetails"
+az monitor log-analytics query -w $logws_customerid --query "$flowlog_query" -o tsv
