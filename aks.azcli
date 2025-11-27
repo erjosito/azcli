@@ -1343,7 +1343,7 @@ spec:
     app: kuard
 EOF
 
-# Workload with PV/PVC
+# Workload with PV/PVC (disk performance test)
 yaml_file=/tmp/pvc.yaml
 cat <<EOF > $yaml_file
 kind: PersistentVolumeClaim
@@ -1412,6 +1412,79 @@ node1_disk_count=$(kubectl get CSINode $node1_name -o jsonpath="{.spec.drivers[1
 svc_ip=$(kubectl get svc/sqlapi -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null) && echo $svc_ip
 curl "http://${svc_ip}/api/healthcheck"
 curl "http://${svc_ip}/api/healthcheck/api/ioperf?file=%2Fmnt%2Fazure%2Fiotest"
+
+########################
+# NFS Azure file share #
+########################
+
+# Create file share
+file_share_name=myshare$RANDOM
+az resource create \
+  --resource-type "Microsoft.FileShares/fileShares" \
+  --name $file_share_name \
+  --location $location \
+  --resource-group $rg \
+  --properties "{
+    \"redundancy\": \"Local\",
+    \"protocol\": \"NFS\",
+    \"provisionedStorageGiB\": 32,
+    \"ProvisionedIoPerSec\": 3032,
+    \"ProvisionedThroughputMiBPerSec\": 128,
+    \"mediaTier\": \"SSD\",
+    \"nfsProtocolProperties\": {
+      \"rootSquash\": \"RootSquash\"
+    }
+}" -o none
+# Create private endpoint
+vnet_name=aksVNet
+subnet_name=ep
+subnet_id=$(az network vnet subnet show -n $subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+file_share_id=$(az resource show -g $rg -n $file_share_name --resource-type "Microsoft.FileShares/fileShares" --query id -o tsv)
+ep_name="${file_share_name}-ep"
+az network private-endpoint create -n $ep_name -g $rg --vnet-name $vnet_name --subnet $subnet_name \
+  --private-connection-resource-id $file_share_id --group-ids FileShare --connection-name "${ep_name}-conn" -o none
+# Create DNS zone and records
+dns_zone_name="privatelink.file.core.windows.net"
+az network private-dns zone create -g $rg -n $dns_zone_name -o none
+az network private-dns link vnet create -g $rg -n "${vnet_name}-link" --virtual-network $vnet_name --zone-name $dns_zone_name --registration-enabled false -o none
+az network private-endpoint dns-zone-group create -g $rg -n "${ep_name}-dnszonegroup" --endpoint-name $ep_name --private-dns-zone $dns_zone_name --zone-name file -o none
+# Check the A recors in the DNS zone
+az network private-dns record-set a list -z $dns_zone_name -g $rg --query '[].{IP:aRecords[0].ipv4Address, FQDN:fqdn, Creator:metadata.creator}' -o table
+# Output instructions
+file_share_hostname=$(az resource show -g $rg -n $file_share_name --resource-type "Microsoft.FileShares/fileShares" --query properties.hostName -o tsv)
+storage_account_name=$(echo $file_share_hostname | cut -d'.' -f1)
+echo "File share created: $file_share_name"
+echo "To mount the file share in a VM, use the following command:"
+echo "sudo mount -t nfs ${file_share_hostname}:/${storage_account_name}/${file_share_name} /mnt/azure -o vers=4,minorversion=1,sec=sys"
+# Create k8s resources
+cat <<EOF | kubectl apply -f -
+kind: Pod
+apiVersion: v1
+metadata:
+  name: sqlapi
+  labels:
+    run: sqlapi
+spec:
+  containers:
+  - name: mypod
+    image: yada/sqlapi:1.0
+    imagePullPolicy: Always
+    resources:
+      requests:
+        cpu: 250m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    volumeMounts:
+    - mountPath: "/mnt/azure"
+      name: nfs
+  volumes:
+  - name: nfs
+    nfs:
+      server: $file_share_hostname
+      path: "/$storage_account_name/$file_share_name"
+EOF
 
 ###########################
 #          AGIC           #
