@@ -137,15 +137,15 @@ function list_locations () {
 
 function list_products () {
     # Optional parameter with provisioningStatus
-    status=$1
+    mcr_status=$1
     # Sending call to get services, and associated VXCs
     products_url="${base_url}/v2/products"
-    products_json=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}"  -X GET "$products_url" 2>/dev/null)
+    products_json=$(curl -H "Content-Type: application/json" -H "Authorization: Bearer ${megaport_token}" -X GET "$products_url" 2>/dev/null)
     output=$(echo "$products_json" | jq -r "[ .data[] | select( .productName | contains(\"${product_string}\")) | { productName, productType, provisioningStatus, productUid, vxcs: [ .associatedVxcs[]? | { productName, productType, provisioningStatus, productUid }] } ]")
     # Only show products with a certain state
-    if [[ -n "$status" ]]
+    if [[ -n "$mcr_status" ]]
     then
-        output=$(echo $output | jq -r "[ .[] | select(.provisioningStatus==\"${status}\") ]")
+        output=$(echo $output | jq -r "[ .[] | select(.provisioningStatus==\"${mcr_status}\") ]")
     fi
     # Validate we have an output
     if [[ -n $output ]]
