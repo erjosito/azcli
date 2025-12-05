@@ -1461,13 +1461,13 @@ cat <<EOF | kubectl apply -f -
 kind: Pod
 apiVersion: v1
 metadata:
-  name: sqlapi
+  name: yadaapi
   labels:
-    run: sqlapi
+    run: yadaapi
 spec:
   containers:
   - name: mypod
-    image: yada/sqlapi:1.0
+    image: aks30049.azurecr.io/yadaapi:1.0
     imagePullPolicy: Always
     resources:
       requests:
