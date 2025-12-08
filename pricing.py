@@ -22,9 +22,11 @@ get_skus_parser = subparsers.add_parser('get-skus', help='Get available VM sizes
 get_skus_parser.add_argument('--region', '--location', '-l', dest='region', metavar= 'REGION', action='store',
                     help='Azure region to get available VM sizes for, for example eastus2')
 get_skus_parser.add_argument('--cores', '-c', dest='cores', metavar= 'CORES', type=int, action='store',
-                    help='Number of CPUs for the VM sizes to be listed')
+                    help='Number of CPUs for the VM sizes to be listed. Either single number or range (e.g., 4-16)')
 get_skus_parser.add_argument('--memory', '-m', dest='memory', metavar= 'MEMORY_GB', type=int, action='store',
-                    help='Amount of memory (in GB) for the VM sizes to be listed')
+                    help='Amount of memory (in GB) for the VM sizes to be listed. Either single number or range (e.g., 16-64)')
+get_skus_parser.add_argument('--cpu-arch', dest='cpu_arch', metavar= 'CPU_ARCH', action='store',
+                    help='CPU architecture for the VM sizes to be listed ("i" for Intel, "a" for AMD, "p" for ARM)'),
 get_skus_parser.add_argument('--subscription-id', dest='subscription_id', metavar= 'SUBSCRIPTION_ID', action='store',
                     help='Azure Subscription ID to use for authentication')
 # Create the 'get-price' command
@@ -61,9 +63,9 @@ def get_prices_json(query=None, base_url="https://prices.azure.com/api/retail/pr
 def get_prices_sku(region, sku, base_url="https://prices.azure.com/api/retail/prices", api_version="2023-01-01-preview", currency="USD", format="details"):
     api_url = base_url + "?api-version=" + api_version + "&currencyCode=" + currency
     query = f"armRegionName eq '{region}' and armSkuName eq '{sku}'"
-    # print("DEBUG: sending REST request with query '{0}'".format(query))
-    response = requests.get(api_url, params={'$filter': query})
-    json_data = json.loads(response.text)
+    if args.verbose:
+        print("DEBUG: sending REST request with query '{0}'".format(query))
+    json_data = get_prices_json(query=query, base_url=base_url, api_version=api_version, currency=currency)
     if 'Items' in json_data:
         if format == "json":
             print(json.dumps(json_data['Items'], indent=4))
@@ -128,12 +130,10 @@ def get_prices_sku(region, sku, base_url="https://prices.azure.com/api/retail/pr
 
 # Returns a sorted listed with the on-demand Linux prices in all available regions for a specific SKU
 def get_prices_sku_all_regions(sku, base_url="https://prices.azure.com/api/retail/prices", api_version="2023-01-01-preview", currency="USD", format="table"):
-    api_url = base_url + "?api-version=" + api_version + "&currencyCode=" + currency
     query = f"armSkuName eq '{sku}' and type eq 'Consumption'"
     if args.verbose:
         print("DEBUG: sending REST request with query '{0}'".format(query))
-    response = requests.get(api_url, params={'$filter': query})
-    json_data = json.loads(response.text)
+    json_data = get_prices_json(query=query, base_url=base_url, api_version=api_version, currency=currency)
     prices = []
     if 'Items' in json_data:
         for item in json_data['Items']:
@@ -154,10 +154,26 @@ def get_prices_sku_all_regions(sku, base_url="https://prices.azure.com/api/retai
         print("ERROR: No pricing data found for the specified SKU ({0}).".format(sku))
         return None
 
+# Helper function to check if a number is in a range or equals a single value
+# The parameter can be a single digit (e.g., 4) or a range (e.g., 4-16)
+def number_in_range(value, range_param):
+    if isinstance(range_param, int):
+        return value == range_param
+    elif isinstance(range_param, str) and '-' in range_param:
+        parts = range_param.split('-')
+        if len(parts) == 2:
+            try:
+                lower = int(parts[0])
+                upper = int(parts[1])
+                return lower <= value <= upper
+            except ValueError:
+                return False
+    return False
+
 # Get available VM sizes from the region, equivalent to the Azure CLI command `az vm list-sizes --location <region>`
 # Use the Azure python SDK for Microsoft.Compute/VirtualMachines
 # Authenticate and initialize the client
-def get_vm_sizes(region, subscription_id="", cores=None, memory=None):
+def get_vm_sizes(region, subscription_id="", cores=None, memory=None, cpu_arch=None):
     credential = DefaultAzureCredential()
     if len(subscription_id) != 36:
         print("ERROR: subscription_id must be provided to get VM sizes.")
@@ -174,9 +190,9 @@ def get_vm_sizes(region, subscription_id="", cores=None, memory=None):
     vm_sizes = compute_client.virtual_machine_sizes.list(location=region)
     size_list = []
     for size in vm_sizes:
-        if (cores is not None and size.number_of_cores != cores):
+        if (cores is not None and not number_in_range(size.number_of_cores, cores)):
             continue
-        if (memory is not None and round(size.memory_in_mb/1024, 0) != memory):
+        if (memory is not None and not number_in_range(round(size.memory_in_mb/1024, 0), memory)):
             continue
         # Find the price for this VM size in the region_prices data
         vm_price = None
@@ -230,7 +246,7 @@ elif args.command == 'get-price':
 elif args.command == 'get-skus':
     if args.region and args.subscription_id:
         if args.cores or args.memory:
-            get_vm_sizes(args.region, subscription_id=args.subscription_id, cores=args.cores, memory=args.memory)
+            get_vm_sizes(args.region, subscription_id=args.subscription_id, cores=args.cores, memory=args.memory, cpu_arch=args.cpu_arch)
         else:
             print("ERROR: At least one of --cores or --memory arguments must be provided to filter VM sizes.")
     else:
