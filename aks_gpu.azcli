@@ -1,0 +1,426 @@
+#############################################
+# Useful commands to test AKS GPU clusters
+#
+# Jose Moreno, January 2026
+#############################################
+
+###################
+#    Variables    #
+###################
+
+# Control variables
+use_managed_gpu=false   # true | false
+install_kaito=false     # true | false
+grafana_mode=managed    # managed | selfhosted
+kaito_mode=selfhosted   # managed | selfhosted
+# Deployment variables
+rg=aksgpu
+location=swedencentral
+aks_name=aksgpu
+systempool_vm_size=Standard_B2ms                 # Some possible values: Standard_B2ms, Standard_D2_v3
+gpupool_vm_size=Standard_NC24ads_A100_v4         # Some possible values: Standard_NC6s_v3, Standard_ND96asr_v4, Standard_NC24ads_A100_v4
+grafana_name="${aks_name}-grafana-${RANDOM}"
+monitor_ws_name="${aks_name}-monitor-${RANDOM}"
+# Tokens
+echo -n "Enter your Hugging Face token: "
+read -s hf_token
+
+
+####################
+# Update extension #
+####################
+
+# Update AzCLI extension
+echo "INFO: Updating aks-preview extension..."
+az extension add -n aks-preview --upgrade -o none --only-show-errors
+
+###################
+# Enable features #
+###################
+
+function enableAksFeature () {
+    feature_name=$1
+    state=$(az feature list -o table --query "[?contains(name, 'Microsoft.ContainerService/$feature_name')].properties.state" -o tsv)
+    if [[ "$state" == "Registered" ]]
+    then
+        echo "INFO: $feature_name is already registered"
+    else
+        echo "INFO: Registering feature $feature_name..."
+        az feature register --name "$feature_name" --namespace Microsoft.ContainerService -o none --only-show-errors
+        state=$(az feature list -o table --query "[?contains(name, 'Microsoft.ContainerService/$feature_name')].properties.state" -o tsv)
+        echo "INFO: Waiting for feature $feature_name to finish registering..."
+        wait_interval=15
+        until [[ "$state" == "Registered" ]]
+        do
+            sleep $wait_interval
+            state=$(az feature list -o table --query "[?contains(name, 'Microsoft.ContainerService/$feature_name')].properties.state" -o tsv)
+            echo "INFO: Current registration status for feature $feature_name is $state"
+        done
+        echo "INFO: Registering resource provider Microsoft.ContainerService now..."
+        az provider register --namespace Microsoft.ContainerService -o none --only-show-errors
+    fi
+}
+
+enableAksFeature "ManagedGPUExperiencePreview"
+
+##############
+#    Main    #
+##############
+
+# Get last AKS version
+echo "INFO: Getting latest AKS Kubernetes version in $location..."
+k8s_last_minor_version=$(az aks get-versions -l $location -o tsv --only-show-errors --query 'values[].version' | sort -u | tail -1)
+k8s_version=$(az aks get-versions -l $location -o json --only-show-errors | jq -r --arg jq_k8s_version $k8s_last_minor_version '.values[] | select(.version == $jq_k8s_version) | .patchVersions | keys[]' | sort -u | tail -1)
+echo "INFO: Latest AKS Kubernetes version in $location is $k8s_version"
+
+# Create resource group
+echo "INFO: Creating resource group $rg in $location..."
+az group create -n $rg -l $location -o none --only-show-errors
+
+# Create AKS cluster with a managed GPU node pool
+# Using Overlay network plugin (Cilium dataplane)
+echo "INFO: Creating AKS cluster $aks_name in resource group $rg..."
+az aks create -n $aks_name -g $rg -l $location --generate-ssh-keys \
+    --network-plugin azure --network-dataplane cilium --network-plugin-mode overlay \
+    --nodepool-name systempool \
+    --kubernetes-version $k8s_version \
+    --node-vm-size $systempool_vm_size --node-count 1 \
+    -o none --only-show-errors
+echo "INFO: Adding GPU node pool to AKS cluster $aks_name (managed mode is $use_managed_gpu)..."
+az aks nodepool add -n gpupool01 -g $rg --cluster-name $aks_name \
+    --tags "EnableManagedGPUExperience=${use_managed_gpu}" \
+    --priority Spot --eviction-policy Delete  \
+    --node-vm-size $gpupool_vm_size --node-count 1  -o none --only-show-errors
+
+# Get AKS credentials and show nodes
+echo "INFO: Getting AKS credentials for cluster $aks_name..."
+az aks get-credentials -n $aks_name -g $rg --overwrite-existing
+echo "INFO: Showing nodes in AKS cluster $aks_name..."
+# kubectl get nodes -o wide --show-labels
+kubectl get nodes -o wide
+
+# Sample model (manual deployment) - WIP!
+# From book Generative AI on Kubernetes, Chapter 2
+# PVC is using disk.csi.azure.com by default in AKS
+# You need to have a valid Hugging Face token with access to the model
+echo "INFO: Deploying vLLM model server with Meta-Llama-3.1-8B model..."
+kubectl apply -f - <<EOF
+kind: Secret
+apiVersion: v1
+metadata:
+  name: huggingface-secret
+type: Opaque
+data:
+  token: $(echo -n $hf_token | base64)
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      containers:
+        - resources:
+            limits:
+              cpu: '4'
+              memory: 12Gi
+              nvidia.com/gpu: '1'
+            requests:
+              cpu: '2'
+          name: vllm
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: huggingface-secret
+                  key: token
+          args: [
+            "--port",
+            "8080",
+            "--model",
+            "meta-llama/Meta-Llama-3.1-8B",
+            "--download-dir",
+            "/models-cache" ]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: models-cache
+              mountPath: /models-cache
+          image: vllm/vllm-openai:latest
+      volumes:
+        - name: models-cache
+          persistentVolumeClaim:
+            claimName: vllm-models-cache
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-models-cache
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8080
+  selector:
+    app: vllm
+EOF
+vllm_svc_ip=$(kubectl get svc vllm-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+curl -X POST "http://${vllm_svc_ip}:8080/v1/completions" -H "Content-Type: application/json" --data '{
+        "model": "meta-llama/Meta-Llama-3.1-8B",
+        "prompt": "What is the capital of France?",
+        "max_tokens": 10,
+        "temperature": 0.5
+    }'
+kubectl delete pod curl --ignore-not-found=true
+kubectl run -it --rm --restart=Never curl --image=curlimages/curl -- curl -X POST http://vllm-service/v1/completions -H "Content-Type: application/json" -d '{
+        "model": "meta-llama/Meta-Llama-3.1-8B",
+        "prompt": "What is the capital of France?",
+        "max_tokens": 10,
+        "temperature": 0.5
+    }'
+
+
+# Install KAITO
+# https://learn.microsoft.com/en-us/azure/aks/ai-toolchain-operator
+# https://raw.githubusercontent.com/kaito-project/kaito/refs/heads/main/examples/inference/kaito_workspace_phi_4_mini.yaml
+if [[ "$install_kaito" == "true" ]]; then
+    if [[ "$kaito_mode" == "managed" ]]; then
+        echo "INFO: Installing KAITO AI Toolchain Operator in managed mode..."
+        az aks update -n $aks_name -g $rg --enable-ai-toolchain-operator --enable-oidc-issuer -o none --only-show-errors
+    else
+        echo "INFO: Installing KAITO AI Toolchain Operator in self-hosted mode with NAP disabled..."
+        kaito_enabled=$(az aks show -n $aks_name -g $rg -o jsonc | jq -r '.aiToolchainOperatorProfile.enabled')
+        if [[ "$kaito_enabled" == "true" ]]; then
+            echo "INFO: Disabling managed KAITO first..."
+            az aks update -n $aks_name -g $rg --disable-ai-toolchain-operator -o none --only-show-errors
+        fi
+        helm repo add kaito https://kaito-project.github.io/kaito/charts/kaito
+        helm repo update
+        helm upgrade --install kaito-workspace kaito/workspace \
+            --namespace kaito-workspace \
+            --create-namespace \
+            --set clusterName="$aks_name" \
+            --set featureGates.disableNodeAutoProvisioning=true \
+            --wait
+    fi
+    gpu_node_name=$(k get node -l kubernetes.azure.com/agentpool==gpupool01 -o jsonpath='{.items[*].metadata.name}')
+    kubectl apply -f - <<EOF
+# See examples in https://deepwiki.com/kaito-project/kaito/5.1-preset-models
+apiVersion: kaito.sh/v1beta1
+kind: Workspace
+metadata:
+    name: phi4mini
+resource:
+#     instanceType: "${gpupool_vm_size}"  # This needs to be omitted when using BYO GPU nodes
+    labelSelector:
+        matchLabels:
+            accelerator: nvidia
+        # preferredNodeNames:
+        #   - "${gpu_node_name}"
+inference:
+    preset:
+        name: phi-4-mini-instruct
+    template:
+        spec:
+            tolerations:
+                - key: "kubernetes.azure.com/scalesetpriority"
+                  operator: "Equal"
+                  value: "spot"
+                  effect: "NoSchedule"
+EOF
+    phi_service_ip=$(kubectl get svc phi4mini -o jsonpath='{.spec.clusterIP}')
+    kubectl run -it --rm --restart=Never curl --image=curlimages/curl -- curl -X POST http://$phi_service_ip/v1/completions -H "Content-Type: application/json" -d '{
+            "model": "phi-4-mini-instruct",
+            "prompt": "How should I dress for the weather today?",
+            "max_tokens": 10
+        }'
+fi
+
+# Ray (WIP)
+# https://learn.microsoft.com/en-us/azure/aks/deploy-ray
+# https://raw.githubusercontent.com/ray-project/kuberay/master/ray-operator/config/samples/pytorch-mnist/ray-job.pytorch-mnist.yaml
+
+# Kueue (WIP)
+# https://learn.microsoft.com/en-us/azure/aks/kueue-overview
+cat <<EOF > /tmp/kueue_values.yaml
+controllerManager:
+  featureGates:
+    - name: TopologyAwareScheduling
+      enabled: true
+    - name: LocalQueueMetrics
+      enabled: true
+  managerConfig:
+    controllerManagerConfigYaml: |
+      apiVersion: config.kueue.x-k8s.io/v1beta1
+      kind: Configuration
+      integrations:
+        frameworks:
+          - batch/job
+          - kubeflow.org/mpijob
+          - ray.io/rayjob
+          - ray.io/raycluster
+          - jobset.x-k8s.io/jobset
+          - kubeflow.org/paddlejob
+          - kubeflow.org/pytorchjob
+          - kubeflow.org/tfjob
+          - kubeflow.org/xgboostjob
+          - kubeflow.org/jaxjob
+EOF
+kueue_latest_version=$(curl -s https://api.github.com/repos/kubernetes-sigs/kueue/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/^v//')
+helm install kueue oci://registry.k8s.io/kueue/charts/kueue \
+    --version=${kueue_latest_version} \
+    --create-namespace --namespace=kueue-system \
+    --values values.yaml
+helm list -n kueue-system
+kubectl get deploy -n kueue-system
+kubectl get crds | grep kueue
+
+# Install NVIDIA GPU Operator
+# https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/getting-started.html
+if [[ "$use_managed_gpu" == "true" ]]
+then
+    echo "ERROR:  NVIDIA GPU Operator in managed GPU mode not supported yet in this script. See https://learn.microsoft.com/azure/aks/aks-managed-gpu-nodes?tabs=add-ubuntu-gpu-node-pool#bring-your-own-byo-gpu-driver"
+else
+    echo "INFO: Installing NVIDIA GPU Operator in unmanaged GPU mode..."
+    kubectl create ns gpu-operator        # Not required if using the flag --create-namespace in helm install
+    kubectl label --overwrite ns gpu-operator pod-security.kubernetes.io/enforce=privileged
+    helm repo add nvidia https://helm.ngc.nvidia.com/nvidia && helm repo update
+    # Get helm chart's version
+    nvidia_gpu_operator_version=$( helm show chart nvidia/gpu-operator | grep ^version | cut -d ' ' -f2)
+    # Uninstalling previous installation if any
+    chart_name=$(helm ls -n gpu-operator -o json | jq -r '.[0].name')
+    if [[ -n "$chart_name" ]]
+    then
+        echo "INFO: Previous installation of NVIDIA GPU Operator found (chart name: $chart_name). Uninstalling it first..."
+        helm uninstall $chart_name -n gpu-operator
+    fi
+    # Install helm chart and include tolerations for spot nodes
+    echo "INFO: Installing NVIDIA GPU Operator helm chart version $nvidia_gpu_operator_version..."
+    helm install --wait --generate-name -n gpu-operator --create-namespace nvidia/gpu-operator --version=$nvidia_gpu_operator_version \
+         --set 'daemonsets.tolerations[0].effect=NoSchedule,daemonsets.tolerations[0].key=kubernetes.azure.com/scalesetpriority,daemonsets.tolerations[0].value=spot,daemonsets.tolerations[0].operator=Equal' \
+         --set 'node-feature-discovery.worker.tolerations[0].effect=NoSchedule,node-feature-discovery.worker.tolerations[0].key=kubernetes.azure.com/scalesetpriority,node-feature-discovery.worker.tolerations[0].value=spot,node-feature-discovery.worker.tolerations[0].operator=Equal' \
+         --set 'node-feature-discovery.master.tolerations[0].effect=NoSchedule,node-feature-discovery.master.tolerations[0].key=kubernetes.azure.com/scalesetpriority,node-feature-discovery.master.tolerations[0].value=spot,node-feature-discovery.master.tolerations[0].operator=Equal'
+fi
+
+# Prometheus and Grafana (managed or self-hosted)
+if [[ "$grafana_mode" == "selfhosted" ]]; then
+    echo "INFO: Installing self-hosted Prometheus and Grafana..."
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    helm repo add grafana https://grafana.github.io/helm-charts
+    helm repo update
+    helm install prometheus prometheus-community/prometheus --namespace monitoring --create-namespace
+    helm install grafana grafana/grafana --namespace monitoring
+    echo "INFO: Waiting 30 seconds for Grafana pods to be in running state..."
+    sleep 30 # Give some time to the pods to start
+    echo "INFO: Port-forwarding Grafana to http://localhost:3000 ..."
+    kubectl port-forward svc/grafana 3000:80 -n monitoring
+    # Configure Prometheus source in Grafana: http://prometheus-server.monitoring.svc.cluster.local:80
+    # You can import dashboards such as 315 (k8s) or 14574 (NVIDIA GPU)
+else
+    echo "INFO: Creating Grafana instance $grafana_name and Monitor Workspace $monitor_ws_name..."
+    az grafana create -n $grafana_name -g $rg -o none --only-show-errors        # Requires extension amg
+    az monitor account create -n $monitor_ws_name -g $rg -l $location -o none --only-show-errors
+    grafana_id=$(az grafana show -n $grafana_name -g $rg -o none --query id -o tsv)
+    monitor_ws_id=$(az monitor account show -n $monitor_ws_name -g $rg -o none --query id -o tsv)
+    echo "INFO: Enabling Azure Monitor for containers in AKS cluster $aks_name..."
+    # az aks update --disable-azure-monitor-metrics -n $aks_name -g $rg -o none --only-show-errors
+    az aks update --enable-azure-monitor-metrics -n $aks_name -g $rg --azure-monitor-workspace-resource-id $monitor_ws_id --grafana-resource-id  $grafana_id -o none --only-show-errors
+    grafana_url=$(az grafana show -n $grafana_name -g $rg -o tsv --query properties.endpoint)
+    echo "INFO: Grafana URL is $grafana_url"
+fi
+
+###############
+# Diagnostics #
+###############
+
+# AKS and nodepools
+kubectl get nodes -l accelerator=nvidia
+az aks nodepool list --cluster-name $aks_name -g $rg -o table
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
+
+# AKS infra RG resources
+aks_infra_rg=$(az aks show -n $aks_name -g $rg -o tsv --query nodeResourceGroup)
+echo "INFO: Showing resources in AKS infra resource group $aks_infra_rg..."
+az resource list -g $aks_infra_rg -o table
+
+# Labels in GPU node
+gpu_node_name=$(k get node -l kubernetes.azure.com/agentpool==gpupool01 -o jsonpath='{.items[*].metadata.name}')
+cpu_node_name=$(k get node -l kubernetes.azure.com/agentpool==systempool -o jsonpath='{.items[*].metadata.name}')
+echo "INFO: Showing labels in GPU node $gpu_node_name..."
+kubectl get node $gpu_node_name -o json | jq '.metadata.labels'
+echo "INFO: Showing labels in CPU node $cpu_node_name..."
+kubectl get node $cpu_node_name -o json | jq '.metadata.labels'
+
+# NVIDIA GPU Operator
+kubectl get ds -n gpu-operator
+kubectl get pods -n gpu-operator -o wide
+kubectl get clusterpolicy
+kubectl describe clusterpolicy
+
+# nvidia-smi in GPU node
+pod_name=$(k get pod gpu-pod -o jsonpath='{.metadata.name}')
+if [[ -n "$pod_name" ]]; then
+    echo "INFO: Deleting pod $pod_name first..."
+    kubectl delete pod gpu-pod
+fi
+echo "INFO: Running nvidia-smi in GPU node..."
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-pod
+spec:
+  containers:
+  - name: gpu-container
+    image: nvidia/cuda:12.8.1-base-ubi9
+    command: ["nvidia-smi"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+    restartPolicy: Never
+  tolerations:
+  - key: "kubernetes.azure.com/scalesetpriority"
+    operator: "Equal"
+    value: "spot"
+    effect: "NoSchedule"
+EOF
+sleep 5 # Give some time to the pod to start
+kubectl logs gpu-pod
+
+# Managed Grafana
+# kubectl get pod -o wide -n kube-system | grep ama-
+# kubectl get ds ama-metrics-node --namespace=kube-system
+
+# KAITO
+kubectl get workspaces
+kubectl describe workspace workspace-phi-4-mini
+

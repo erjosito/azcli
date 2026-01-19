@@ -88,6 +88,17 @@ function patch_nsgs() {
     done <<< "$nsg_list"
 }
 
+# Patch all NSGs in a resource group to allow traffic to/from RFC1918 IP ranges
+function allow_rfc1918() {
+    nsg_list=$(az network nsg list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r nsg_name; do
+        echo "Patching NSG $nsg_name to allow inbound traffic to/from RFC1918..."
+        az network nsg rule create -g $rg --nsg-name $nsg_name -n Allow-RFC1918-in --priority 3010 --access Allow --protocol '*' --direction Inbound --destination-port-ranges '*' --source-address-prefixes 10.0.0.0/8 192.168.0.0/16 172.16.0.0/12 --destination-address-prefixes 10.0.0.0/8 192.168.0.0/16 172.16.0.0/12 -o none
+        echo "Patching NSG $nsg_name to allow outbound traffic to/from RFC1918..."
+        az network nsg rule create -g $rg --nsg-name $nsg_name -n Allow-RFC1918-out --priority 3011 --access Allow --protocol '*' --direction Outbound --destination-port-ranges '*' --source-address-prefixes 10.0.0.0/8 192.168.0.0/16 172.16.0.0/12 --destination-address-prefixes 10.0.0.0/8 192.168.0.0/16 172.16.0.0/12 -o none
+    done <<< "$nsg_list"
+}
+
 # Remove all NSGs from a given VNet
 # Assumes the variable $rg is set
 # VNet name can be provided as parameter or taken from variable vnet_name
