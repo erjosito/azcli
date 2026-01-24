@@ -212,7 +212,7 @@ if [[ "$simulate_onprem" == "yes" ]]; then
     echo "Creating Google Cloud VPC, compute instance and firewall rules..."
     gcloud compute networks create "$gcp_vpc_name" --bgp-routing-mode=regional --mtu=1500 --subnet-mode=custom
     gcloud compute networks subnets create "$gcp_subnet_name" --network "$gcp_vpc_name" --range "$gcp_subnet_prefix" --region=$region
-    gcloud compute instances create "$gcp_vm_name" --image-family=ubuntu-2004-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc_name" --subnet "$gcp_subnet_name" --zone "$zone"
+    gcloud compute instances create "$gcp_vm_name" --image-family=ubuntu-2204-lts --image-project=ubuntu-os-cloud --machine-type "$machine_type" --network "$gcp_vpc_name" --subnet "$gcp_subnet_name" --zone "$zone"
     gcloud compute firewall-rules create "${gcp_vpc_name}-allow-icmp" --network "$gcp_vpc_name" --priority=1000 --direction=INGRESS --rules=icmp --source-ranges=0.0.0.0/0 --action=ALLOW
     gcloud compute firewall-rules create "${gcp_vpc_name}-allow-ssh" --network "$gcp_vpc_name" --priority=1010 --direction=INGRESS --rules=tcp:22 --source-ranges=0.0.0.0/0 --action=ALLOW
     gcloud compute firewall-rules create "${gcp_vpc_name}-allow-web" --network "$gcp_vpc_name" --priority=1020 --direction=INGRESS --rules=tcp:80 --source-ranges=192.168.0.0/16 --action=ALLOW

@@ -344,7 +344,7 @@ if [[ "$grafana_mode" == "selfhosted" ]]; then
     echo "INFO: Port-forwarding Grafana to http://localhost:3000 ..."
     kubectl port-forward svc/grafana 3000:80 -n monitoring
     # Configure Prometheus source in Grafana: http://prometheus-server.monitoring.svc.cluster.local:80
-    # You can import dashboards such as 315 (k8s) or 14574 (NVIDIA GPU)
+    # You can import dashboards such as 315 (k8s) or 12239 (NVIDIA GPU). 14574 doesnt seem to work with DCGM metrics.
 else
     echo "INFO: Creating Grafana instance $grafana_name and Monitor Workspace $monitor_ws_name..."
     az grafana create -n $grafana_name -g $rg -o none --only-show-errors        # Requires extension amg
