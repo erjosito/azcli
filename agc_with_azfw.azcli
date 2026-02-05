@@ -10,7 +10,7 @@
 #    Option b - BYOD: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/quickstart-create-application-gateway-for-containers-byo-deployment?tabs=existing-vnet-subnet
 
 # Control
-mode=managed                     # managed or byod
+mode=byod                        # managed or byod
 waf=yes                          # yes or no
 waf_type=default                 # default, bot or OWASP (only default supported!)
 cni=overlay                      # azure_pod_subnet, azure or overlay
@@ -25,7 +25,7 @@ bookapp=no                       # yes or no: whether installing Bookinfo sample
 interspoke_peering=yes           # yes or no: whether to create VNet peering between AKS and AGC spokes
 
 # Variables
-rg=agc
+rg=agcbyod
 location=eastus                  # eastasia, eastus, etc
 hub_vnet_name=hubVnet
 hub_vnet_prefix=10.12.0.0/16
@@ -107,14 +107,14 @@ az network firewall policy rule-collection-group create -n ruleset01 --policy-na
 echo "Creating rule to allow SSH and HTTP..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name allowall --collection-priority 101 --action Allow --rule-name allowall --rule-type NetworkRule --description "Allow all" \
-    --destination-addresses 0.0.0.0/0 --source-addresses 0.0.0.0/0 --ip-protocols Any --destination-ports '*' -o none
+    --destination-addresses 0.0.0.0/0 --source-addresses 0.0.0.0/0 --ip-protocols Any --destination-ports '*' -o none 2>/dev/null
 # az network firewall application-rule create -f $azfw_name -g $rg -c AllowAll \
 #  --protocols Http=80 Https=443 --target-fqdns "*" --source-addresses "0.0.0.0/0" \
 #  -n Allow-all --priority 200 --action Allow -o none
-az network firewall create -n $azfw_name -g $rg --policy $azfw_policy_name -l $location -o none
-azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
-az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $hub_vnet_name -o none
-az network firewall update -n $azfw_name -g $rg -o none
+az network firewall create -n $azfw_name -g $rg --policy $azfw_policy_name -l $location -o none 2>/dev/null
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id 2>/dev/null)
+az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $hub_vnet_name -o none 2>/dev/null
+az network firewall update -n $azfw_name -g $rg -o none 2>/dev/null
 azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIPAddress' 2>/dev/null)
 echo "Azure Firewall deployed with private IP $azfw_private_ip and public IP $azfw_ip."
 
