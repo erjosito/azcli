@@ -1,4 +1,8 @@
 # Application Gateway for containers (aka kubic, aka traffic controller, aka AppGW for containers, aka AGICv2)
+# This script creates AGC in spoke1 and AKS in spoke2, joint by a common hub VNet with AzFW.
+#
+# As far as I have tested, this is not supported today: AGC and AKS need to be in the same VNet.
+#
 # There are 2 steps to create AGC:
 # 1. Create ALB Controller: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/quickstart-deploy-application-gateway-for-containers-alb-controller?tabs=install-helm-windows
 # 2. Create AGC
@@ -7,7 +11,7 @@
 
 # Control
 mode=managed                     # managed or byod
-waf=no                           # yes or no
+waf=yes                          # yes or no
 waf_type=default                 # default, bot or OWASP (only default supported!)
 cni=overlay                      # azure_pod_subnet, azure or overlay
 tls=yes                          # yes or no
@@ -18,14 +22,22 @@ backup_service=no                # yes or no: whether creating a backup applicat
 istio=no                         # yes or no: whether installing Istio for service mesh
 istio_mode=community             # community or azure (managed Istio). Only community supported by ALB controller as of October 2025
 bookapp=no                       # yes or no: whether installing Bookinfo sample app for Istio
+interspoke_peering=yes           # yes or no: whether to create VNet peering between AKS and AGC spokes
 
 # Variables
-rg=agctest
+rg=agc
 location=eastus                  # eastasia, eastus, etc
+hub_vnet_name=hubVnet
+hub_vnet_prefix=10.12.0.0/16
+azfw_subnet_name=AzureFirewallSubnet
+azfw_subnet_prefix=10.12.1.0/24
+azfw_name=agcfw
+azfw_pip_name=agcfw-pip
+azfw_policy_name=agcfw-policy
 aks_name=agc
 aks_node_size=Standard_B2ms
-vnet_name=aksVnet
-vnet_prefix=10.13.0.0/16
+aks_vnet_name=aksVnet
+aks_vnet_prefix=10.13.0.0/16
 aks_subnet_name=aks1stpool
 aks_subnet_prefix=10.13.76.0/24  # Min /25 with Azure CNI!
 pod_subnet_name=pods
@@ -39,8 +51,10 @@ alb_ns_name=alb-infra
 app_ns=yada
 agc_name=appgw4c
 agc_frontend_name=agc-frontend
+agc_vnet_name=agcVnet
+agc_vnet_prefix=10.14.0.0/16
 agc_subnet_name=subnet-alb
-agc_subnet_prefix=10.13.100.0/24
+agc_subnet_prefix=10.14.100.0/24
 # TLS
 pem_file="$HOME/onedrive/Admin/Certs/cloudtrooper.net/2025/star_cloudtrooper_net_fullchain.pem"
 key_file="$HOME/onedrive/Admin/Certs/cloudtrooper.net/2025/CSR/star_cloudtrooper_net.key"
@@ -59,31 +73,57 @@ az provider register --namespace Microsoft.NetworkFunction --only-show-errors
 az provider register --namespace Microsoft.ServiceNetworking --only-show-errors
 
 # Install Azure CLI extensions.
-function install_azcli_extension() {
-    extension_name=$1
-    extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
-    if [[ -z "$extension_version" ]]
-    then
-        echo "Azure CLI extension $extension_name not found, installing now..."
-        az extension add -n $extension_name -o none --only-show-errors
-    else
-        echo "Azure CLI extension $extension_name found with version $extension_version, trying to upgrade..."
-        az extension update -n $extension_name -o none --only-show-errors
-    fi
-    extension_version=$(az extension show -n $extension_name --query version -o tsv 2>/dev/null)
-    echo "Azure CLI extension $extension_name installed with version $extension_version"
-}
-install_azcli_extension alb --only-show-errors
-install_azcli_extension aks-preview --only-show-errors
+az extension add -n alb --upgrade --only-show-errors
+az extension add -n aks-preview --upgrade --only-show-errors
+az extension add -n azure-firewall --upgrade --only-show-errors
 
 # Create RG and VNets
-echo "Creating resource group $rg and VNet $vnet_name in $location..."
+echo "Creating resource group $rg and VNets in $location..."
 az group create -n $rg -l $location -o none --only-show-errors
-az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix -l $location -o none
-az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $vnet_name --address-prefix $aks_subnet_prefix -o none --only-show-errors
-az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $vnet_name --address-prefix $pod_subnet_prefix -o none --only-show-errors
-aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
-pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az network vnet create -g $rg -n $aks_vnet_name --address-prefix $aks_vnet_prefix -l $location -o none
+az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $aks_vnet_name --address-prefix $aks_subnet_prefix -o none --only-show-errors
+az network vnet subnet create -g $rg -n $pod_subnet_name --vnet-name $aks_vnet_name --address-prefix $pod_subnet_prefix -o none --only-show-errors
+aks_subnet_id=$(az network vnet subnet show -n $aks_subnet_name --vnet-name $aks_vnet_name -g $rg --query id -o tsv)
+pod_subnet_id=$(az network vnet subnet show -n $pod_subnet_name --vnet-name $aks_vnet_name -g $rg --query id -o tsv)
+az network vnet create -g $rg -n $agc_vnet_name --address-prefix $agc_vnet_prefix -l $location -o none
+az network vnet create -g $rg -n $hub_vnet_name --address-prefix $hub_vnet_prefix -l $location -o none
+az network vnet subnet create -g $rg -n $azfw_subnet_name --vnet-name $hub_vnet_name --address-prefix $azfw_subnet_prefix -o none --only-show-errors
+az network vnet peering create -g $rg -n ${aks_vnet_name}-to-${hub_vnet_name} --vnet-name $aks_vnet_name --remote-vnet ${hub_vnet_name} --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
+az network vnet peering create -g $rg -n ${hub_vnet_name}-to-${aks_vnet_name} --vnet-name $hub_vnet_name --remote-vnet ${aks_vnet_name} --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
+az network vnet peering create -g $rg -n ${agc_vnet_name}-to-${hub_vnet_name} --vnet-name $agc_vnet_name --remote-vnet ${hub_vnet_name} --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
+az network vnet peering create -g $rg -n ${hub_vnet_name}-to-${agc_vnet_name} --vnet-name $hub_vnet_name --remote-vnet ${agc_vnet_name} --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
+if [[ "$interspoke_peering" == "yes" ]]; then
+    az network vnet peering create -g $rg -n ${aks_vnet_name}-to-${agc_vnet_name} --vnet-name $aks_vnet_name --remote-vnet ${agc_vnet_name} --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
+    az network vnet peering create -g $rg -n ${agc_vnet_name}-to-${aks_vnet_name} --vnet-name $agc_vnet_name --remote-vnet ${aks_vnet_name} --allow-vnet-access --allow-forwarded-traffic -o none --only-show-errors
+fi
+
+# Create AzFW in the hub
+echo "Creating Azure Firewall $azfw_name in subnet $azfw_subnet_name and VNet $hub_vnet_name..."
+az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location -o none
+azfw_ip=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
+az network firewall policy create -n $azfw_policy_name -g $rg -o none
+az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
+# Allow any-to-any rule
+echo "Creating rule to allow SSH and HTTP..."
+az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
+    --name allowall --collection-priority 101 --action Allow --rule-name allowall --rule-type NetworkRule --description "Allow all" \
+    --destination-addresses 0.0.0.0/0 --source-addresses 0.0.0.0/0 --ip-protocols Any --destination-ports '*' -o none
+# az network firewall application-rule create -f $azfw_name -g $rg -c AllowAll \
+#  --protocols Http=80 Https=443 --target-fqdns "*" --source-addresses "0.0.0.0/0" \
+#  -n Allow-all --priority 200 --action Allow -o none
+az network firewall create -n $azfw_name -g $rg --policy $azfw_policy_name -l $location -o none
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $hub_vnet_name -o none
+az network firewall update -n $azfw_name -g $rg -o none
+azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIPAddress' 2>/dev/null)
+echo "Azure Firewall deployed with private IP $azfw_private_ip and public IP $azfw_ip."
+
+# Create route table for spokes
+echo "Creating route table for spokes to route traffic to Azure Firewall in the hub..."
+rt_name=spoke-rt
+az network route-table create -g $rg -n $rt_name -l $location -o none
+az network route-table route create -g $rg --route-table-name $rt_name -n default-route --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
+az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $aks_subnet_name --route-table $rt_name -o none
 
 # Create/retrieve identity for AKS
 id_id=$(az identity show -n $aks_id_name -g $rg --query id -o tsv 2>/dev/null)
@@ -96,10 +136,10 @@ else
     echo "Identity $aks_id_name found with ID $id_id"
 fi
 id_principal_id=$(az identity show -n $aks_id_name -g $rg --query principalId -o tsv)
-vnet_id=$(az network vnet show -n $vnet_name -g $rg --query id -o tsv)
+aks_vnet_id=$(az network vnet show -n $aks_vnet_name -g $rg --query id -o tsv)
 sleep 15 # Time for creation to propagate
-echo "Assigning Contributor role to AKS identity $aks_id_name in VNet $vnet_name..."
-az role assignment create --scope $vnet_id --assignee $id_principal_id --role Contributor -o none
+echo "Assigning Contributor role to AKS identity $aks_id_name in VNet $aks_vnet_name..."
+az role assignment create --scope $aks_vnet_id --assignee $id_principal_id --role Contributor -o none
 
 # Create AKS cluster with workload identity enabled.
 # 'AGC supports Azure CNI Pod Subnet for both dynamic and static allocation': https://github.com/Azure/AKS/issues/4681
@@ -135,6 +175,7 @@ az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
     --enable-managed-identity --assign-identity $id_id \
     ${(z)cni_options} \
     ${(z)istio_options} \
+    --outbound-type userDefinedRouting \
     --load-balancer-sku Standard \
     --node-resource-group "$aks_name"-iaas-"$RANDOM"
 echo ""   # New line after az command
@@ -192,7 +233,6 @@ az identity federated-credential create -n $alb_id_name -g $rg -o none --only-sh
     --identity-name $alb_id_name --issuer "$aks_oidc_issuer" --subject "system:serviceaccount:azure-alb-system:alb-controller-sa"
 
 # Deploy Helm chart
-# Notice the version is hard-coded, you can update it with 'helm upgrade'
 echo "Deploying helm chart for ALB, version ${alb_controller_version}..."
 kubectl create ns $alb_deployment_ns
 # The --namespace flag doesnt seem to have any effect
@@ -224,8 +264,9 @@ helm install alb-controller-servicemesh-extension oci://mcr.microsoft.com/applic
 if [[ "$mode" == "managed" ]]; then
     # Create AppGW for containers
     echo "Creating subnet for AGC..."
-    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $agc_subnet_name --address-prefix $agc_subnet_prefix --delegations 'Microsoft.ServiceNetworking/trafficControllers' -o none --only-show-errors
-    agc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $agc_subnet_name --query id --output tsv)
+    az network vnet subnet create -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --address-prefix $agc_subnet_prefix --delegations 'Microsoft.ServiceNetworking/trafficControllers' -o none --only-show-errors
+    az network vnet subnet update -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --route-table $rt_name -o none
+    agc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --query id --output tsv)
 
     # Delegate roles to the ALB identity
     echo "Adding roles for ALB identity..."
@@ -238,8 +279,8 @@ if [[ "$mode" == "managed" ]]; then
 
     # Create ALB with subnet association
     echo "Creating AGC and frontend in managed mode..."
-  kubectl create ns $alb_ns_name
-  kubectl apply -f - <<EOF
+    kubectl create ns $alb_ns_name
+    kubectl apply -f - <<EOF
 apiVersion: alb.networking.azure.io/v1
 kind: ApplicationLoadBalancer
 metadata:
@@ -326,8 +367,8 @@ if [[ "$mode" == "byod" ]]; then
     echo "Creating AGC and frontend in Bring-Your-Own-Deployment mode..."
     az network alb create -g $rg -n $agc_name -o none --only-show-errors
     az network alb frontend create -g $rg --alb-name $agc_name -n $agc_frontend_name -o none --only-show-errors
-    az network vnet subnet create -g $rg --vnet-name $vnet_name -n $agc_subnet_name --address-prefix $agc_subnet_prefix --delegations 'Microsoft.ServiceNetworking/trafficControllers' -o none --only-show-errors
-    agc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $vnet_name -n $agc_subnet_name --query id --output tsv)
+    az network vnet subnet create -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --address-prefix $agc_subnet_prefix --delegations 'Microsoft.ServiceNetworking/trafficControllers' -o none --only-show-errors
+    agc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --query id --output tsv)
 
     # Delegate roles to the ALB identity
     echo "Adding roles for ALB identity..."
@@ -448,6 +489,11 @@ else
       --logs '[{"category": "TrafficControllerAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
                {"category": "TrafficControllerFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
 fi
+# Enable diagnostics for Azure Firewall
+azfw_id=$(az network firewall show -n $azfw_name -g $rg --query id -o tsv)
+az monitor diagnostic-settings create -n mydiag --resource $azfw_id --workspace $logws_id \
+    --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, 
+            {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]' -o none
 
 # Get logs
 query="AGCAccessLogs | where TimeGenerated > ago(5m) | project TimeGenerated, ClientIp, HostName, RequestUri, FrontendName, FrontendPort, BackendHost, BackendIp, HttpStatusCode"
@@ -468,8 +514,11 @@ if [[  "$flowlogs" == "yes" ]]; then
     else
         echo "Storage account $storage_account_name found in $location, using it for VNet flow flogs"
     fi
-    echo "Enabling VNet Flow Logs for VNet $vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
-    az network watcher flow-log create -l $location -g $rg --name "flowlog-$location" --vnet $vnet_name \
+    echo "Enabling VNet Flow Logs for VNet $aks_vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
+    az network watcher flow-log create -l $location -g $rg --name "aksflowlog-$location" --vnet $aks_vnet_name \
+        --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
+    echo "Enabling VNet Flow Logs for VNet $agc_vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
+    az network watcher flow-log create -l $location -g $rg --name "agcflowlog-$location" --vnet $agc_vnet_name \
         --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
 fi
 
@@ -578,7 +627,7 @@ kubectl expose deploy yadaapi -n $app_ns --port=8080 --target-port=8080
 
 # HTTP route
 echo "Creating HTTPRoute for sample app..."
-fqdn=$(kubectl get gateway $agc_name -o jsonpath='{.status.addresses[0].value}') && echo "The frontend FQDN is $fqdn"
+fqdn=$(kubectl get gateway -n default $agc_name -o jsonpath='{.status.addresses[0].value}') && echo "The frontend FQDN is $fqdn"
 kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute
@@ -1145,9 +1194,14 @@ fi
 if [[ "$test_cmds" == "yes" ]]; then
     # Check AKS and network config
     az aks list -g $rg --only-show-errors --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy, PluginMode:networkProfile.networkPluginMode, NetworkMode:networkProfile.networkMode}' -o table
+    # Check the helm deployment
+    kubectl get deployment -n azure-alb-system -o wide
     # Check the AGC pods
     kubectl get pods -n azure-alb-system
     # Check the logs in the AGC pods
+    # Some potential errors:
+    # AGC and AKS in different VNets:
+    # failed to reconcile overlay resources: Overlay extension config azure-alb-system/alb-overlay-extension-config-0c3df5e1 failed with error: OEC IP range 10.14.100.0/24 is not within any of the VNet CIDRs 10.13.0.0/16
     agc_pods=$(kubectl get pods -n azure-alb-system --no-headers | awk '{print $1}')
     for pod in $agc_pods; do kubectl logs $pod -n azure-alb-system; done
     # Check the logs in the AGC pods excluding info messages
@@ -1168,6 +1222,8 @@ if [[ "$test_cmds" == "yes" ]]; then
     # Verify the gatewayclass
     kubectl get gatewayclass azure-alb-external -o yaml
     # Gateways
+    # Some potential errors:
+    # Cannot get configuration endpoint for undeployed or unknown Application Gateway for Containers resource
     kubectl get gateway
     kubectl describe gateway
     # HTTP routes

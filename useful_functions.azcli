@@ -133,6 +133,20 @@ function remove_nsgs_from_all_vnets() {
     done <<< "$vnet_list"
 }
 
+# Allow default outbound access in all VNets in the resource group
+# Assumes the variable $rg is set
+function enable_default_outbound() {
+    vnet_list=$(az network vnet list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r vnet_name; do
+        echo "Enabling default outbound access in VNet $vnet_name..."
+        subnet_list=$(az network vnet subnet list --vnet-name $vnet_name -g $rg --query '[].name' -o tsv)
+        while IFS= read -r subnet_name; do
+            echo "- Enabling default outbound access in subnet $subnet_name in VNet $vnet_name..."
+            az network vnet subnet update --vnet-name $vnet_name -g $rg -n $subnet_name --default-outbound-access true -o none
+        done <<< "$subnet_list"
+    done <<< "$vnet_list"
+}
+
 # Function to update UDR back to testing PC. The route needs to be called 'clientIP'
 # Assumes the variable $rg is set
 # You can supply a subnet length if you don't want /32 (e.g., /24)
