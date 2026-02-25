@@ -25,8 +25,8 @@ bookapp=no                       # yes or no: whether installing Bookinfo sample
 interspoke_peering=yes           # yes or no: whether to create VNet peering between AKS and AGC spokes
 
 # Variables
-rg=agcbyod
-location=eastus                  # eastasia, eastus, etc
+rg=agchnsbyod
+location=swedencentral                  # eastasia, eastus, etc
 hub_vnet_name=hubVnet
 hub_vnet_prefix=10.12.0.0/16
 azfw_subnet_name=AzureFirewallSubnet
@@ -66,7 +66,7 @@ waf_policy_name=agc-waf-policy
 sec_policy_name=agc-sec-policy
 
 # Register required resource providers on Azure.
-echo "Registering resource providers..."
+echo "INFO: Registering resource providers..."
 az provider register --namespace Microsoft.ContainerService --only-show-errors
 az provider register --namespace Microsoft.Network --only-show-errors
 az provider register --namespace Microsoft.NetworkFunction --only-show-errors
@@ -78,7 +78,7 @@ az extension add -n aks-preview --upgrade --only-show-errors
 az extension add -n azure-firewall --upgrade --only-show-errors
 
 # Create RG and VNets
-echo "Creating resource group $rg and VNets in $location..."
+echo "INFO: Creating resource group $rg and VNets in $location..."
 az group create -n $rg -l $location -o none --only-show-errors
 az network vnet create -g $rg -n $aks_vnet_name --address-prefix $aks_vnet_prefix -l $location -o none
 az network vnet subnet create -g $rg -n $aks_subnet_name --vnet-name $aks_vnet_name --address-prefix $aks_subnet_prefix -o none --only-show-errors
@@ -98,13 +98,13 @@ if [[ "$interspoke_peering" == "yes" ]]; then
 fi
 
 # Create AzFW in the hub
-echo "Creating Azure Firewall $azfw_name in subnet $azfw_subnet_name and VNet $hub_vnet_name..."
+echo "INFO: Creating Azure Firewall $azfw_name in subnet $azfw_subnet_name and VNet $hub_vnet_name..."
 az network public-ip create -g $rg -n $azfw_pip_name --sku standard --allocation-method static -l $location -o none
 azfw_ip=$(az network public-ip show -g $rg -n $azfw_pip_name --query ipAddress -o tsv)
 az network firewall policy create -n $azfw_policy_name -g $rg -o none
 az network firewall policy rule-collection-group create -n ruleset01 --policy-name $azfw_policy_name -g $rg --priority 1000 -o none
 # Allow any-to-any rule
-echo "Creating rule to allow SSH and HTTP..."
+echo "INFO: Creating rule to allow SSH and HTTP..."
 az network firewall policy rule-collection-group collection add-filter-collection --policy-name $azfw_policy_name --rule-collection-group-name ruleset01 -g $rg \
     --name allowall --collection-priority 101 --action Allow --rule-name allowall --rule-type NetworkRule --description "Allow all" \
     --destination-addresses 0.0.0.0/0 --source-addresses 0.0.0.0/0 --ip-protocols Any --destination-ports '*' -o none 2>/dev/null
@@ -116,29 +116,30 @@ azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id 2>/dev
 az network firewall ip-config create -f $azfw_name -n azfw-ipconfig -g $rg --public-ip-address $azfw_pip_name --vnet-name $hub_vnet_name -o none 2>/dev/null
 az network firewall update -n $azfw_name -g $rg -o none 2>/dev/null
 azfw_private_ip=$(az network firewall show -n $azfw_name -g $rg -o tsv --query 'ipConfigurations[0].privateIPAddress' 2>/dev/null)
-echo "Azure Firewall deployed with private IP $azfw_private_ip and public IP $azfw_ip."
+echo "INFO: Azure Firewall deployed with private IP $azfw_private_ip and public IP $azfw_ip."
 
 # Create route table for spokes
-echo "Creating route table for spokes to route traffic to Azure Firewall in the hub..."
+echo "INFO: Creating route table for spokes to route traffic to Azure Firewall in the hub..."
 rt_name=spoke-rt
 az network route-table create -g $rg -n $rt_name -l $location -o none
 az network route-table route create -g $rg --route-table-name $rt_name -n default-route --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $azfw_private_ip -o none
 az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $aks_subnet_name --route-table $rt_name -o none
+az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $pod_subnet_name --route-table $rt_name -o none
 
 # Create/retrieve identity for AKS
 id_id=$(az identity show -n $aks_id_name -g $rg --query id -o tsv 2>/dev/null)
 if [[ -z "$id_id" ]]
 then
-    echo "Identity $aks_id_name not found, creating a new one..."
+    echo "INFO: Identity $aks_id_name not found, creating a new one..."
     az identity create -n $aks_id_name -g $rg -o none
     id_id=$(az identity show -n $aks_id_name -g $rg --query id -o tsv)
 else
-    echo "Identity $aks_id_name found with ID $id_id"
+    echo "INFO: Identity $aks_id_name found with ID $id_id"
 fi
 id_principal_id=$(az identity show -n $aks_id_name -g $rg --query principalId -o tsv)
 aks_vnet_id=$(az network vnet show -n $aks_vnet_name -g $rg --query id -o tsv)
 sleep 15 # Time for creation to propagate
-echo "Assigning Contributor role to AKS identity $aks_id_name in VNet $aks_vnet_name..."
+echo "INFO: Assigning Contributor role to AKS identity $aks_id_name in VNet $aks_vnet_name..."
 az role assignment create --scope $aks_vnet_id --assignee $id_principal_id --role Contributor -o none
 
 # Create AKS cluster with workload identity enabled.
@@ -168,7 +169,7 @@ else
 fi
 
 # Create cluster
-echo "Creating AKS cluster $aks_name in resource group $rg in $cni CNI mode..."
+echo "INFO: Creating AKS cluster $aks_name in resource group $rg in $cni CNI mode..."
 az aks create -g $rg -n $aks_name -l $location -o none --only-show-errors \
     --enable-oidc-issuer --enable-workload-identity \
     -c $aks_node_count -s $aks_node_size --generate-ssh-keys -u $(whoami) --service-cidr $aks_service_cidr \
@@ -188,52 +189,52 @@ az aks get-credentials -n $aks_name -g $rg --overwrite-existing --only-show-erro
 # REVIEW
 if [[ "$istio" == "yes" ]] && [[ "$istio_mode" == "community" ]]; then
     istio_version=1.27.1
-    echo "Deploying Istio community edition version $istio_version..."
+    echo "INFO: Deploying Istio community edition version $istio_version..."
     curl -L https://istio.io/downloadIstio | ISTIO_VERSION=$istio_version sh -
     export PATH=$PATH:$PWD/istio-$istio_version/bin
     istioctl install --set profile=default -y
     # istio_revision=$(kubectl get namespace istio-system -o jsonpath='{.metadata.labels.istio\.io/rev}')
-    # echo "Istio community edition installed with revision $istio_revision"
+    # echo "INFO: Istio community edition installed with revision $istio_revision"
     # rm -rf istio-$istio_version     # we may need istioctl later
 fi
 
 # Verify cluster created with right plugin
 if [[ "$test_cmds" == "yes" ]]; then
-    echo "Verifying CNI plugin for AKS cluster $aks_name in resource group $rg..."
+    echo "INFO: Verifying CNI plugin for AKS cluster $aks_name in resource group $rg..."
     az aks list -g $rg --only-show-errors --query '[].{Name:name, Plugin:networkProfile.networkPlugin, Dataplane:networkProfile.networkDataplane, Policy:networkProfile.networkPolicy, PluginMode:networkProfile.networkPluginMode, NetworkMode:networkProfile.networkMode}' -o table
     if [[ "$istio" == "yes" ]] && [[ "$istio_mode" == "addon" ]]; then
-        echo "Verifying Istio installation..."
+        echo "INFO: Verifying Istio installation..."
         installed_service_mesh=$(az aks show -g $rg -n $aks_name --query "serviceMeshProfile.mode" -o tsv)
-        echo "Service mesh installed in the cluster is: $installed_service_mesh"
+        echo "INFO: Service mesh installed in the cluster is: $installed_service_mesh"
     fi
 fi
 
 # If Istio, get the revision
 if [[ "$istio" == "yes" ]] && [[ "$istio_mode" == "addon" ]]; then
     istio_revision=$(az aks show -n $aks_name -g $rg --query 'serviceMeshProfile.istio.revisions' -o tsv)
-    echo "Istio revision installed is $istio_revision"
+    echo "INFO: Istio revision installed is $istio_revision"
 fi
 
 # Create identity for AGC and configure federation with AKS OIDC issuer
 node_rg=$(az aks show -n $aks_name -g $rg --query "nodeResourceGroup" -o tsv --only-show-errors)
 node_rg_id=$(az group show -n $node_rg --query id -o tsv)
 rg_id=$(az group show -n $rg --query id -o tsv)
-echo "Creating ALB identity $alb_id_name in resource group $rg..."
+echo "INFO: Creating ALB identity $alb_id_name in resource group $rg..."
 az identity create -n $alb_id_name -g $rg -o none --only-show-errors
 alb_id_principal_id="$(az identity show -n $alb_id_name -g $rg --query principalId -o tsv)"
-echo "Waiting 15 seconds to allow for replication of the identity..."
+echo "INFO: Waiting 15 seconds to allow for replication of the identity..."
 sleep 15
-echo "Applying Reader role to the AKS resource groups for the newly provisioned identity..."
+echo "INFO: Applying Reader role to the AKS resource groups for the newly provisioned identity..."
 reader_role=acdd72a7-3385-48ef-bd42-f606fba81ae7
 az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --role $reader_role --scope $node_rg_id -o none --only-show-errors
 az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --role $reader_role --scope $rg_id -o none --only-show-errors
-echo "Setting up federation with AKS OIDC issuer..."
+echo "INFO: Setting up federation with AKS OIDC issuer..."
 aks_oidc_issuer="$(az aks show -n "$aks_name" -g "$rg" --query "oidcIssuerProfile.issuerUrl" -o tsv --only-show-errors)"
 az identity federated-credential create -n $alb_id_name -g $rg -o none --only-show-errors \
     --identity-name $alb_id_name --issuer "$aks_oidc_issuer" --subject "system:serviceaccount:azure-alb-system:alb-controller-sa"
 
 # Deploy Helm chart
-echo "Deploying helm chart for ALB, version ${alb_controller_version}..."
+echo "INFO: Deploying helm chart for ALB, version ${alb_controller_version}..."
 kubectl create ns $alb_deployment_ns
 # The --namespace flag doesnt seem to have any effect
 helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller \
@@ -245,7 +246,7 @@ helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-co
 # Verify
 if [[ "$test_cmds" == "yes" ]]; then
     kubectl get pods -n $alb_controller_ns
-    echo "Waiting 20 seconds for the ALB controller to start..."
+    echo "INFO: Waiting 20 seconds for the ALB controller to start..."
     sleep 20
     kubectl get gatewayclass azure-alb-external -o yaml
 fi
@@ -253,7 +254,7 @@ fi
 # If using the service mesh extension, install it
 # The attribute albServiceMeshExtension.image should not be required in the future
 #      --set albServiceMeshExtension.image.tag=$alb_controller_version
-echo "Installing service mesh extension for ALB via Helm..."
+echo "INFO: Installing service mesh extension for ALB via Helm..."
 helm install alb-controller-servicemesh-extension oci://mcr.microsoft.com/application-lb/charts/alb-controller-servicemesh-extension \
      --namespace $alb_deployment_ns \
      --version $alb_controller_version
@@ -263,13 +264,13 @@ helm install alb-controller-servicemesh-extension oci://mcr.microsoft.com/applic
 #############################
 if [[ "$mode" == "managed" ]]; then
     # Create AppGW for containers
-    echo "Creating subnet for AGC..."
+    echo "INFO: Creating subnet for AGC..."
     az network vnet subnet create -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --address-prefix $agc_subnet_prefix --delegations 'Microsoft.ServiceNetworking/trafficControllers' -o none --only-show-errors
     az network vnet subnet update -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --route-table $rt_name -o none
     agc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --query id --output tsv)
 
     # Delegate roles to the ALB identity
-    echo "Adding roles for ALB identity..."
+    echo "INFO: Adding roles for ALB identity..."
     node_rg=$(az aks show -n $aks_name -g $rg --query "nodeResourceGroup" -o tsv)
     node_rg_id=$(az group show -n $node_rg --query id -o tsv)
     rg_id=$(az group show -n $rg --query id -o tsv)
@@ -278,7 +279,7 @@ if [[ "$mode" == "managed" ]]; then
     az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --scope $agc_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none # Network Contributor
 
     # Create ALB with subnet association
-    echo "Creating AGC and frontend in managed mode..."
+    echo "INFO: Creating AGC and frontend in managed mode..."
     kubectl create ns $alb_ns_name
     kubectl apply -f - <<EOF
 apiVersion: alb.networking.azure.io/v1
@@ -299,7 +300,7 @@ EOF
     # Create Gateway in k8s
     alb_id=$(az network alb list -g $node_rg --query '[0].id' -o tsv)
     alb_name=$(az network alb list -g $node_rg --query '[0].name' -o tsv)
-    echo "Creating Gateway in k8s associated to ALB ID $alb_id..."
+    echo "INFO: Creating Gateway in k8s associated to ALB ID $alb_id..."
     if [[ "$tls" == "yes" ]]; then
         kubectl create secret tls $secret_name --cert=$pem_file --key=$key_file -n default
         kubectl apply -f - <<EOF
@@ -364,20 +365,20 @@ fi
 
 if [[ "$mode" == "byod" ]]; then
     # Create ALB and frontend
-    echo "Creating AGC and frontend in Bring-Your-Own-Deployment mode..."
+    echo "INFO: Creating AGC and frontend in Bring-Your-Own-Deployment mode..."
     az network alb create -g $rg -n $agc_name -o none --only-show-errors
     az network alb frontend create -g $rg --alb-name $agc_name -n $agc_frontend_name -o none --only-show-errors
     az network vnet subnet create -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --address-prefix $agc_subnet_prefix --delegations 'Microsoft.ServiceNetworking/trafficControllers' -o none --only-show-errors
     agc_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $agc_vnet_name -n $agc_subnet_name --query id --output tsv)
 
     # Delegate roles to the ALB identity
-    echo "Adding roles for ALB identity..."
+    echo "INFO: Adding roles for ALB identity..."
     az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --scope $node_rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
     az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --scope $rg_id --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none  # AppGw for Containers Configuration Manager role
     az role assignment create --assignee-object-id $alb_id_principal_id --assignee-principal-type ServicePrincipal --scope $agc_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none # Network Contributor
 
     # Associate the AGC with the subnet
-    echo "Associating the AGC with the subnet..."
+    echo "INFO: Associating the AGC with the subnet..."
     association_name='AppGW4Cassociation'
     az network alb association create -g $rg -n $association_name --alb-name $agc_name --subnet $agc_subnet_id -o none --only-show-errors
 
@@ -385,7 +386,7 @@ if [[ "$mode" == "byod" ]]; then
     agc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
     # agc_name=$(az network alb list -g $rg --query '[0].name' -o tsv)
     # agc_frontend_name=$(az network alb frontend list --alb-name $agc_name -g $rg --query '[0].name' -o tsv)
-    echo "Creating Gateway in k8s associated to ALB ID $agc_id and frontend $agc_frontend_name..."
+    echo "INFO: Creating Gateway in k8s associated to ALB ID $agc_id and frontend $agc_frontend_name..."
     if [[ "$tls" == "yes" ]]; then
         kubectl create namespace $alb_ns_name
         kubectl create secret tls $secret_name --cert=$pem_file --key=$key_file -n default
@@ -465,26 +466,26 @@ logws_name=$(az monitor log-analytics workspace list -g $rg --query '[0].name' -
 if [[ -z "$logws_name" ]]
 then
     logws_name=log$RANDOM
-    echo "Creating new Log Analytics workspace $logws_name"
+    echo "INFO: Creating new Log Analytics workspace $logws_name"
     az monitor log-analytics workspace create -n $logws_name -g $rg -o none
 else
-    echo "Log Analytics workspace $logws_name found in resource group $rg."
+    echo "INFO: Log Analytics workspace $logws_name found in resource group $rg."
 fi
-echo "Getting the ID of Log Analytics workspace $logws_name..."
+echo "INFO: Getting the ID of Log Analytics workspace $logws_name..."
 logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv)
 logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv)
 # Enable diagnostics settings for AGC
-echo "Looking for AGC in the main resource group $rg..."
+echo "INFO: Looking for AGC in the main resource group $rg..."
 agc_id=$(az network alb list -g $rg --query '[0].id' -o tsv)
 if [[ -z "$agc_id" ]]
 then
-    echo "AGC not found in main resource group, looking for AGC in node resource group $node_rg..."
+    echo "INFO: AGC not found in main resource group, looking for AGC in node resource group $node_rg..."
     agc_id=$(az network alb list -g $node_rg --query '[0].id' -o tsv)
 fi
 if [[ -z "$agc_id" ]]; then
-    echo "AGC not found in node resource group $node_rg, exiting..."
+    echo "INFO: AGC not found in node resource group $node_rg, exiting..."
 else
-    echo "AGC found with ID $agc_id, configuring diagnostics settings..."
+    echo "INFO: AGC found with ID $agc_id, configuring diagnostics settings..."
     az monitor diagnostic-settings create --name agc-diagnostics --resource $agc_id --workspace $logws_id -o none --only-show-errors \
       --logs '[{"category": "TrafficControllerAccessLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}},
                {"category": "TrafficControllerFirewallLog", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'
@@ -509,15 +510,15 @@ if [[  "$flowlogs" == "yes" ]]; then
     storage_account_name=$(az storage account list -g $rg -o tsv --query '[0].name' 2>/dev/null | head -1)
     if [[ -z "$storage_account_name" ]]; then
         storage_account_name="logs$RANDOM"  # max 24 characters
-        echo "No storage account found in resource group $rg, creating one..."
+        echo "INFO: No storage account found in resource group $rg, creating one..."
         az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2 -l $location -o none
     else
-        echo "Storage account $storage_account_name found in $location, using it for VNet flow flogs"
+        echo "INFO: Storage account $storage_account_name found in $location, using it for VNet flow flogs"
     fi
-    echo "Enabling VNet Flow Logs for VNet $aks_vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
+    echo "INFO: Enabling VNet Flow Logs for VNet $aks_vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
     az network watcher flow-log create -l $location -g $rg --name "aksflowlog-$location" --vnet $aks_vnet_name \
         --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
-    echo "Enabling VNet Flow Logs for VNet $agc_vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
+    echo "INFO: Enabling VNet Flow Logs for VNet $agc_vnet_name in storage account $storage_account_name and Log Analytics workspace $logws_name..."
     az network watcher flow-log create -l $location -g $rg --name "agcflowlog-$location" --vnet $agc_vnet_name \
         --storage-account $storage_account_name --workspace $logws_name --interval 10 --traffic-analytics true -o none
 fi
@@ -528,7 +529,7 @@ fi
 
 wait_interval=15
 max_wait_time=600
-echo "Waiting for gateway $agc_name to finish provisioning..."
+echo "INFO: Waiting for gateway $agc_name to finish provisioning..."
 start_time=`date +%s`
 state=$(kubectl get gateway $agc_name -o json | jq -r '.status.conditions[] | select(.type=="Programmed") | .status')
 run_time=0
@@ -539,11 +540,11 @@ until [[ "$state" == "True" ]] || [[ run_time -gt $max_wait_time ]] || [[ -z "$s
 done
 if [[ -z "$state" ]]
 then
-  echo "I could not retrieve the state of the gateway $agc_name"
+  echo "INFO: I could not retrieve the state of the gateway $agc_name"
 else
   ((minutes=${run_time}/60))
   ((seconds=${run_time}%60))
-  echo "Gateway Programmed state is $state, wait time $minutes minutes and $seconds seconds"
+  echo "INFO: Gateway Programmed state is $state, wait time $minutes minutes and $seconds seconds"
 fi
 
 ##################################
@@ -551,9 +552,9 @@ fi
 ##################################
 
 if [[ "$tls" == "yes" ]]; then
-    # echo "Creating secret $secret_name for frontend TLS from file $pem_file..."     # Secret must have been created earlier
+    # echo "INFO: Creating secret $secret_name for frontend TLS from file $pem_file..."     # Secret must have been created earlier
     # kubectl create secret tls $secret_name --cert=$pem_file --key=$key_file
-    echo "Creating FrontendTLSPolicy for gateway $agc_name..."
+    echo "INFO: Creating FrontendTLSPolicy for gateway $agc_name..."
     # A TLS policy only needed if you need MTLS, maybe we could create a frontend policy for other purposes such as TLS version?
     #    According to the docs, only mTLS supported: https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/api-specification-kubernetes#alb.networking.azure.io/v1.FrontendTLSPolicyConfig
 #     kubectl apply -f - <<EOF
@@ -587,10 +588,10 @@ fi
 # See https://gateway-api.sigs.k8s.io/guides/multiple-ns/
 # See https://github.com/microsoft/YADA/tree/main/api
 
-echo "Creating sample app in namespace $app_ns..."
+echo "INFO: Creating sample app in namespace $app_ns..."
 kubectl create ns $app_ns
 if [[ "$istio" == "yes" ]]; then
-    echo "Labeling namespace $app_ns for Istio injection with revision $istio_revision..."
+    echo "INFO: Labeling namespace $app_ns for Istio injection with revision $istio_revision..."
     if [[ "$istio_mode" == "addon" ]]; then
         kubectl label namespace $app_ns istio.io/rev=${istio_revision}
     fi
@@ -626,8 +627,8 @@ kubectl expose deploy yadaapi -n $app_ns --port=8080 --target-port=8080
 # EOF
 
 # HTTP route
-echo "Creating HTTPRoute for sample app..."
-fqdn=$(kubectl get gateway -n default $agc_name -o jsonpath='{.status.addresses[0].value}') && echo "The frontend FQDN is $fqdn"
+echo "INFO: Creating HTTPRoute for sample app..."
+fqdn=$(kubectl get gateway -n default $agc_name -o jsonpath='{.status.addresses[0].value}') && echo "INFO: The frontend FQDN is $fqdn"
 kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute
@@ -653,8 +654,8 @@ spec:
 EOF
 
 # HTTPS route
-echo "Creating HTTPRoute for sample app for TLS frontend..."
-fqdn=$(kubectl get gateway $agc_name -o jsonpath='{.status.addresses[0].value}') && echo "The frontend FQDN is $fqdn"
+echo "INFO: Creating HTTPRoute for sample app for TLS frontend..."
+fqdn=$(kubectl get gateway $agc_name -o jsonpath='{.status.addresses[0].value}') && echo "INFO: The frontend FQDN is $fqdn"
 kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute
@@ -680,7 +681,7 @@ spec:
 EOF
 
 # Health check policy
-echo "Creating health check policy for sample app..."
+echo "INFO: Creating health check policy for sample app..."
 kubectl apply -f - <<EOF
 apiVersion: alb.networking.azure.io/v1
 kind: HealthCheckPolicy
@@ -722,7 +723,7 @@ if [[ "$test_cmds" == "yes" ]]; then
     curl "http://${fqdn}/api/headers"
     curl "http://${fqdn}/api/ip"
     while true; do mydate=$(date); echo -n "${mydate}: "; curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'; sleep 1; done
-    while true; do mydate=$(date); echo -n "${mydate}: "; ip=$(curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'); [[ -z "$ip" ]] && echo "No answer" || echo "$ip"; sleep 1; done
+    while true; do mydate=$(date); echo -n "${mydate}: "; ip=$(curl -s "http://${fqdn}/api/ip" | jq -r '.my_private_ip'); [[ -z "$ip" ]] && echo "INFO: No answer" || echo "INFO: $ip"; sleep 1; done
 fi
 
 #####################
@@ -820,10 +821,10 @@ fi
 
 if [[ "$bookapp" == "yes" ]]; then
     book_ns=bookinfo
-    echo "Creating bookinfo app in namespace $book_ns..."
+    echo "INFO: Creating bookinfo app in namespace $book_ns..."
     kubectl create ns $book_ns
     if [[ "$istio" == "yes" ]]; then
-        echo "Labeling namespace $book_ns for Istio injection with revision $istio_revision..."
+        echo "INFO: Labeling namespace $book_ns for Istio injection with revision $istio_revision..."
         if [[ "$istio_mode" == "addon" ]]; then
             kubectl label namespace $book_ns istio.io/rev=${istio_revision}
         fi
@@ -886,12 +887,12 @@ fi
 if [[ "$waf" == "yes" ]]; then
     waf_policy_id=$(az network application-gateway waf-policy list -g $rg --query '[0].id' -o tsv --only-show-errors)
     if [[ -z "$waf_policy_id" ]]; then
-        echo "No WAF policy found in resource group $rg, creating a new one..."
+        echo "INFO: No WAF policy found in resource group $rg, creating a new one..."
     else
-        echo "WAF policy found with ID $waf_policy_id, deleting first..."
+        echo "INFO: WAF policy found with ID $waf_policy_id, deleting first..."
         az network application-gateway waf-policy delete -g $rg -n $waf_policy_name -o none --only-show-errors
     fi
-    echo "Creating WAF policy..."
+    echo "INFO: Creating WAF policy..."
     if [[ "$waf_type" == "default" ]]; then
         az network application-gateway waf-policy create -g $rg -n $waf_policy_name --type Microsoft_DefaultRuleSet --version 2.1 -o none --only-show-errors
     elif [[ "$waf_type" == "OWASP" ]]; then
@@ -899,14 +900,14 @@ if [[ "$waf" == "yes" ]]; then
     elif [[ "$waf_type" == "bot" ]]; then
         az network application-gateway waf-policy create -g $rg -n $waf_policy_name --type Microsoft_BotProtection --version 1.1 -o none --only-show-errors
     else
-        echo "WAF type $waf_type not recognized, supported types are: default, OWASP, bot"
+        echo "INFO: WAF type $waf_type not recognized, supported types are: default, OWASP, bot"
     fi
-    echo "Enabling policy (per default disabled)"
+    echo "INFO: Enabling policy (per default disabled)"
     az network application-gateway waf-policy policy-setting update --policy-name $waf_policy_name -g $rg --state Enabled -o none
     # Create security policy (only in BYOD mode)
     if [[ "$mode" == "byod" ]]; then
         # https://learn.microsoft.com/en-us/rest/api/applicationgatewaycontainers/security-policies-interface/create-or-update?view=rest-applicationgatewaycontainers-2025-01-01&tabs=HTTP
-        echo "Creating security policy linked to WAF policy..."
+        echo "INFO: Creating security policy linked to WAF policy..."
         subscription_id=$(az account show --query id -o tsv)
         waf_policy_id=$(az network application-gateway waf-policy show -g $rg -n $waf_policy_name --query id -o tsv)
         url="https://management.azure.com/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.ServiceNetworking/trafficControllers/${agc_name}/securityPolicies/${sec_policy_name}?api-version=2025-01-01"
@@ -914,7 +915,7 @@ if [[ "$waf" == "yes" ]]; then
         az rest --method put --uri "$url" --body "$body" -o none --only-show-errors
     fi
     # Create custom rule based on geolocation
-    echo "Creating custom rules in WAF policy..."
+    echo "INFO: Creating custom rules in WAF policy..."
     # match_conditions="[{'variables': [{'variableName': 'RemoteAddr'}],'operator':'GeoMatch','values': ['US'], 'transforms': ['lowerCase']}]"
     # az network application-gateway waf-policy custom-rule create -g $rg --policy-name $waf_policy_name -n customrule00 --priority 10 --action Block \
     #   --rule-type MatchRule --action Block --match-conditions "$match_conditions" \
@@ -926,7 +927,7 @@ if [[ "$waf" == "yes" ]]; then
       -o none --only-show-errors
     # Create k8s WAF policy and attach to HTTP route
     waf_policy_id=$(az network application-gateway waf-policy show -g $rg -n $waf_policy_name --query id -o tsv)
-    echo "Attaching the WAF policy to the HTTP routes"
+    echo "INFO: Attaching the WAF policy to the HTTP routes"
     kubectl apply -f - <<EOF
 apiVersion: alb.networking.azure.io/v1
 kind: WebApplicationFirewallPolicy
@@ -972,9 +973,9 @@ if [[ "$test_cmds" == "yes" ]]; then
 fi
 
 if [[ "$test_cmds" == "yes" ]]; then
-    echo "This should work:"
+    echo "INFO: This should work:"
     curl "http://${fqdn}/api/healthcheck"
-    echo "This should be blocked:"
+    echo "INFO: This should be blocked:"
     curl -A evilbot "http://${fqdn}/api/healthcheck"
 fi
 
@@ -1206,13 +1207,13 @@ if [[ "$test_cmds" == "yes" ]]; then
     for pod in $agc_pods; do kubectl logs $pod -n azure-alb-system; done
     # Check the logs in the AGC pods excluding info messages
     agc_pods=$(kubectl get pods -n azure-alb-system --no-headers | awk '{print $1}')
-    echo "$agc_pods" | while IFS= read -r pod; do kubectl logs $pod -n azure-alb-system | jq 'select(.level != "info")'; done
+    echo "INFO: $agc_pods" | while IFS= read -r pod; do kubectl logs $pod -n azure-alb-system | jq 'select(.level != "info")'; done
     # Check the logs in the AGC istio extension pods excluding info messages
     istio_extension_ns=alb
     istio_extension_pods=$(kubectl get pods -n $istio_extension_ns --no-headers | awk '{print $1}')
-    echo "$istio_extension_pods" | while IFS= read -r pod; do kubectl logs $pod -n $istio_extension_ns | jq 'select(.level != "info")'; done
+    echo "INFO: $istio_extension_pods" | while IFS= read -r pod; do kubectl logs $pod -n $istio_extension_ns | jq 'select(.level != "info")'; done
     # Same with no JSON
-    echo "$istio_extension_pods" | while IFS= read -r pod; do kubectl logs $pod -n $istio_extension_ns | jq -r '[.Timestamp, .message] | @tsv'; done
+    echo "INFO: $istio_extension_pods" | while IFS= read -r pod; do kubectl logs $pod -n $istio_extension_ns | jq -r '[.Timestamp, .message] | @tsv'; done
     # Verify the ALB in Azure
     az network alb list -g $rg -o table
     alb_name=$(az network alb list -g $rg --query '[0].name' -o tsv)

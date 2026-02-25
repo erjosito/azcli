@@ -26,11 +26,15 @@ get_skus_parser.add_argument('--cores', '-c', dest='cores', metavar= 'CORES', ac
 get_skus_parser.add_argument('--memory', '-m', dest='memory', metavar= 'MEMORY_GB', action='store',
                     help='Amount of memory (in GB) for the VM sizes to be listed. Either single number or range (e.g., 16-64)')
 get_skus_parser.add_argument('--cpu-arch', dest='cpu_arch', metavar= 'CPU_ARCH', action='store',
-                    help='CPU architecture for the VM sizes to be listed ("i" for Intel, "a" for AMD, "p" for ARM)'),
+                    help='Comma-separated CPU architectures for the VM sizes to be listed ("i" for Intel, "a" for AMD, "p" for ARM)'),
+get_skus_parser.add_argument('--sku-family', dest='sku_family', metavar= 'SKU_FAMILY', action='store',
+                    help='Comma-separated SKU families for the VM sizes to be listed (e.g., "A,N,D,E")'),
 get_skus_parser.add_argument('--sku-version', dest='sku_version', metavar= 'VM_SKU_VERSION', action='store',
                     help='VM SKU version to filter the VM sizes to be listed (e.g., "6" or "5-6")')
 get_skus_parser.add_argument('--subscription-id', dest='subscription_id', metavar= 'SUBSCRIPTION_ID', action='store',
                     help='Azure Subscription ID to use for authentication')
+get_skus_parser.add_argument('--only-cheapest', dest='only_cheapest', action='store_true',
+                    default=False, help='only return the cheapest SKU (default: False)')
 # Create the 'get-price' command
 get_price_parser = subparsers.add_parser('get-price', help='Get price for a specific SKU in a region', parents=[base_subparser])
 get_price_parser.add_argument('--region', '--location', '-l', dest='region', metavar= 'REGION', action='store',
@@ -175,10 +179,20 @@ def number_in_range(value, range_param):
         print("DEBUG: range_param '{0}' is not valid".format(range_param))
     return False
 
+# Helper function to check if an architecture is in a comma-separated list of architectures
+def arch_in_list(arch, arch_list):
+    if arch == "intel":
+        return ("i" in arch_list)
+    elif arch == "amd":
+        return ("a" in arch_list)
+    elif arch == "arm":
+        return ("p" in arch_list)
+    return False
+
 # Get available VM sizes from the region, equivalent to the Azure CLI command `az vm list-sizes --location <region>`
 # Use the Azure python SDK for Microsoft.Compute/VirtualMachines
 # Authenticate and initialize the client
-def get_vm_sizes(region, subscription_id="", cores=None, memory=None, cpu_arch=None, sku_version=None, hyperthreading=None):
+def get_vm_sizes(region, subscription_id="", cores=None, memory=None, cpu_arch=None, sku_version=None, hyperthreading=None, ephemeral_os_disk=None, sku_family=None):
     if args.verbose:
         print("DEBUG: Getting VM sizes for region '{0}' with filters: cores='{1}', memory='{2}', cpu_arch='{3}'".format(region, cores, memory, cpu_arch))
     credential = DefaultAzureCredential()
@@ -194,18 +208,25 @@ def get_vm_sizes(region, subscription_id="", cores=None, memory=None, cpu_arch=N
     if args.verbose:
         print("DEBUG: Retrieved pricing data for region '{0}'. {1} items found.".format(region, len(region_prices['Items'])))
     # List VM sizes for a specific region
-    vm_sizes = compute_client.virtual_machine_sizes.list(location=region)
+    vm_sizes = list(compute_client.virtual_machine_sizes.list(location=region))
     size_list = []
+    if args.verbose:
+        print("DEBUG: Retrieved {0} VM sizes for region '{1}' from the Microsoft.Compute API.".format(len(vm_sizes), region))
     for size in vm_sizes:
-        # Info about the size
-        size['prefix'] = size.name.split('_')[0]
-        size['sku_version'] = (size.name.split('_')[-1]).split('v')[-1]
-        if 'a' in size['size']:
-            size['cpu_arch'] = 'amd'
-        elif 'p' in size['size']:
-            size['cpu_arch'] = 'arm'
+        # if args.verbose:
+        #     print("DEBUG: Processing VM size '{0}' with {1} cores and {2} GB memory.".format(size.name, size.number_of_cores, round(size.memory_in_mb/1024, 0)))
+        # Add relevant fields to a new dictionary for easier access and filtering
+        this_size = {}
+        this_size['name'] = size.name
+        this_size['prefix'] = size.name.split('_')[0]
+        this_size['sku_family'] = size.name.split('_')[1]
+        this_size['sku_version'] = size.name.split('_')[-1].split('v')[-1]
+        if 'a' in str(this_size['sku_family']):
+            this_size['cpu_arch'] = 'amd'
+        elif 'p' in str(this_size['sku_family']):
+            this_size['cpu_arch'] = 'arm'
         else:
-            size['cpu_arch'] = 'intel'
+            this_size['cpu_arch'] = 'intel'
         # Looks like the API doesnt return the capabilities
         # https://learn.microsoft.com/rest/api/compute/virtual-machine-sizes/list?view=rest-compute-2025-04-01
         # if 'EphemeralOSDiskSupported' in size['capabilities']:
@@ -214,12 +235,24 @@ def get_vm_sizes(region, subscription_id="", cores=None, memory=None, cpu_arch=N
         #     size['hyperthreading'] = (size['capabilities']['vCPUsPerCore'] == '2')
         # Filters
         if (cores is not None and not number_in_range(size.number_of_cores, cores)):
+            # if args.verbose:
+            #     print("DEBUG: Skipping VM size '{0}' because number of cores {1} does not match filter '{2}'.".format(size.name, size.number_of_cores, cores))
             continue
         if (memory is not None and not number_in_range(round(size.memory_in_mb/1024, 0), memory)):
+            # if args.verbose:
+            #     print("DEBUG: Skipping VM size '{0}' because memory {1} GB does not match filter '{2}'.".format(size.name, round(size.memory_in_mb/1024, 0), memory))
             continue
-        if (cpu_arch is not None and cpu_arch.lower() != size['cpu_arch']):
+        if (cpu_arch is not None and arch_in_list(this_size['cpu_arch'], cpu_arch.lower()) == False):
+            # if args.verbose:
+            #     print("DEBUG: Skipping VM size '{0}' because CPU architecture '{1}' does not match filter '{2}'.".format(size.name, size['cpu_arch'], cpu_arch))    
             continue
         if (sku_version is not None and sku_version != size['sku_version']):
+            # if args.verbose:
+            #     print("DEBUG: Skipping VM size '{0}' because SKU version '{1}' does not match filter '{2}'.".format(size.name, size['sku_version'], sku_version))
+            continue
+        if (sku_family is not None and not this_size['sku_family'][0].lower() in sku_family.lower()):
+            # if args.verbose:
+            #     print("DEBUG: Skipping VM size '{0}' because SKU family '{1}' does not match filter '{2}'.".format(size.name, this_size['sku_family'], sku_family))
             continue
         # Find the price for this VM size in the region_prices data
         vm_price = None
@@ -236,19 +269,29 @@ def get_vm_sizes(region, subscription_id="", cores=None, memory=None, cpu_arch=N
                 vm_price = item.get("retailPrice")
                 break
         if vm_price is not None:
-            size_list.append({'size': size, 'price': vm_price, 'cores': size.number_of_cores, 'memory_gb': round(size.memory_in_mb / 1024, 0), 'price_per_core_month': round((vm_price * 730) / size.number_of_cores, 2)})
+            size_list.append({'size': size.name, 'price': vm_price, 'cores': size.number_of_cores, 'memory_gb': round(size.memory_in_mb / 1024, 0), 'price_per_core_month': round((vm_price * 730) / size.number_of_cores, 2), 'sku_family': this_size['sku_family'], 'cpu_arch': this_size['cpu_arch'], 'sku_version': this_size['sku_version']})
+        else:
+            if args.verbose:
+                print("DEBUG: No price found for VM size '{0}' in region '{1}'.".format(size.name, region))
+    # Debug
+    if args.verbose:
+        print("DEBUG: Found {0} VM sizes in region '{1}' matching the specified filters and with available pricing data.".format(len(size_list), region))
     # Sort the list by price per core per month
     size_list.sort(key=lambda x: x['price_per_core_month'])
+    return size_list
+
+# Print the VM sizes and prices generated by get_vm_sizes() in a table format
+def print_vm_sizes(size_list, number_of_rows=None):
     # Print the header
     print(f"{'VM Size':<25} {'Cores':>5} {'Memory':>7} {'Price (USD/hour)':>15} {'Price (USD/month)':>20} {'Price/core/month':>20}")
     print("-" *  105)
     # Print the sizes and prices
+    row_conter = 0
     for entry in size_list:
-        print(f"{entry['size'].name:<25} {entry['size'].number_of_cores:>3}   {entry['memory_gb']:6.0f}      ${entry['price']:7.4f}/h      ${round(entry['price'] * 730, 2):8.2f}/month      ${entry['price_per_core_month']:6.2f}/month*core")
-
-    # Print the VM sizes and prices
-    # Print line with VM size and price (if available)
-    # print(f"{size.name:<25} - {size.number_of_cores:>3} cores - {round(size.memory_in_mb/1024, 0):4.0f} GB - ${vm_price:7.4f}/h - ${round(vm_price * 730, 2):8.2f}/month - ${round(vm_price * 730 / size.number_of_cores, 2):8.2f}/month*core")
+        print(f"{entry['size']:<25} {entry['cores']:>3}   {entry['memory_gb']:6.0f}      ${entry['price']:7.4f}/h      ${round(entry['price'] * 730, 2):8.2f}/month      ${entry['price_per_core_month']:6.2f}/month*core")
+        row_conter += 1
+        if number_of_rows is not None and row_conter >= number_of_rows:
+            break
 
 ################
 # Main program #
@@ -273,7 +316,10 @@ elif args.command == 'get-price':
 elif args.command == 'get-skus':
     if args.region and args.subscription_id:
         if args.cores or args.memory:
-            get_vm_sizes(args.region, subscription_id=args.subscription_id, cores=args.cores, memory=args.memory, cpu_arch=args.cpu_arch, sku_version=args.sku_version)
+            vm_sizes = get_vm_sizes(args.region, subscription_id=args.subscription_id, cores=args.cores, memory=args.memory, cpu_arch=args.cpu_arch, sku_version=args.sku_version, sku_family=args.sku_family)
+            if args.only_cheapest:
+                vm_sizes = vm_sizes[:1]
+            print_vm_sizes(vm_sizes)
         else:
             print("ERROR: At least one of --cores or --memory arguments must be provided to filter VM sizes.")
     else:

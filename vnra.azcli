@@ -1,0 +1,672 @@
+############################################################################
+# Created by Jose Moreno
+# February 2026
+#
+# Script to test Virtual Network Routing Appliance (VNRA) in a hub-and-spoke
+# topology. VNRA is deployed as the high-performance forwarding layer in the
+# hub VNet. Test VMs in spokes validate functional connectivity and throughput.
+#
+# Since VNRA native CLI support is not available during preview, `az rest` is
+# used to create the VNRA resource via the ARM REST API.
+#
+# References:
+# - https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-routing-appliance-overview
+############################################################################
+
+##############################################
+# Variables
+##############################################
+
+# Control flags
+create_vnra=yes
+create_spokes=yes
+run_functional_tests=yes
+run_performance_tests=yes
+
+# General
+rg=vnra
+location=westeurope
+subscription_id=$(az account show --query id -o tsv)
+
+# Hub VNet
+hub_vnet_name=hub
+hub_vnet_prefix=10.1.0.0/24
+hub_vnra_subnet_name=VirtualNetworkApplianceSubnet
+hub_vnra_subnet_prefix=10.1.0.0/26
+hub_vm_subnet_name=vm
+hub_vm_subnet_prefix=10.1.0.64/26
+
+# Spoke1 VNet
+spoke1_vnet_name=spoke1
+spoke1_vnet_prefix=10.1.1.0/24
+spoke1_vm_subnet_name=vm
+spoke1_vm_subnet_prefix=10.1.1.0/24
+
+# Spoke2 VNet
+spoke2_vnet_name=spoke2
+spoke2_vnet_prefix=10.1.2.0/24
+spoke2_vm_subnet_name=vm
+spoke2_vm_subnet_prefix=10.1.2.0/24
+
+# VNRA
+vnra_name=hubvnra
+vnra_bandwidth=50
+vnra_api_version=2025-05-01
+
+# VMs
+vm_size=Standard_D4s_v5
+vm_image='Ubuntu2204'
+hub_vm1_name=hubvm1
+spoke1_vm1_name=spoke1vm1
+spoke2_vm1_name=spoke2vm1
+vm_cloudinit_file=/tmp/vnra_cloudinit.txt
+net_core_mem_max=134217728 # 128 MB, to allow large TCP windows for high-throughput tests
+
+# Route tables
+spoke1_rt_name=spoke1-rt
+spoke2_rt_name=spoke2-rt
+hub_vm_rt_name=hubvm-rt
+
+# NSG
+nsg_name=vnra-yourvm-nsg
+
+##############################################
+# Feature registration check
+##############################################
+
+echo "Checking feature registration for VNRA..."
+feature_state=$(az feature show --namespace Microsoft.Network --name AllowVirtualNetworkAppliance --query 'properties.state' -o tsv 2>/dev/null)
+if [[ "$feature_state" != "Registered" ]]; then
+    echo "WARNING: Feature Microsoft.Network/AllowVirtualNetworkAppliance is '$feature_state'."
+    echo "Registering feature flag (this may take several minutes)..."
+    az feature register --namespace Microsoft.Network --name AllowVirtualNetworkAppliance -o none
+    echo "Waiting for feature registration..."
+    while [[ "$(az feature show --namespace Microsoft.Network --name AllowVirtualNetworkAppliance --query 'properties.state' -o tsv)" != "Registered" ]]; do
+        echo "  Still registering... waiting 30s"
+        sleep 30
+    done
+    echo "Feature registered. Propagating to resource provider..."
+    az provider register --namespace Microsoft.Network -o none
+fi
+echo "Feature registration OK."
+
+##############################################
+# Resource Group
+##############################################
+
+echo "Creating resource group..."
+az group create -n $rg -l $location -o none
+
+##############################################
+# Hub VNet
+##############################################
+
+echo "Creating hub VNet..."
+# As per the docs, the VNRA's subnet must be dedicated
+az network vnet create -g $rg -n $hub_vnet_name --address-prefix $hub_vnet_prefix \
+    --subnet-name $hub_vnra_subnet_name --subnet-prefix $hub_vnra_subnet_prefix \
+    -l $location -o none
+az network vnet subnet create -g $rg --vnet-name $hub_vnet_name \
+    -n $hub_vm_subnet_name --address-prefix $hub_vm_subnet_prefix -o none
+
+##############################################
+# Spoke VNets
+##############################################
+
+if [[ "$create_spokes" == "yes" ]]; then
+    echo "Creating spoke VNets..."
+    az network vnet create -g $rg -n $spoke1_vnet_name --address-prefix $spoke1_vnet_prefix \
+        --subnet-name $spoke1_vm_subnet_name --subnet-prefix $spoke1_vm_subnet_prefix \
+        -l $location -o none
+    az network vnet create -g $rg -n $spoke2_vnet_name --address-prefix $spoke2_vnet_prefix \
+        --subnet-name $spoke2_vm_subnet_name --subnet-prefix $spoke2_vm_subnet_prefix \
+        -l $location -o none
+fi
+
+##############################################
+# VNet peerings
+##############################################
+
+if [[ "$create_spokes" == "yes" ]]; then
+    echo "Creating VNet peering full mesh..."
+    # Hub to Spoke1
+    az network vnet peering create -n hub2spoke1 -g $rg --vnet-name $hub_vnet_name \
+        --remote-vnet $spoke1_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n spoke12hub -g $rg --vnet-name $spoke1_vnet_name \
+        --remote-vnet $hub_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    # Hub to Spoke2
+    az network vnet peering create -n hub2spoke2 -g $rg --vnet-name $hub_vnet_name \
+        --remote-vnet $spoke2_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n spoke22hub -g $rg --vnet-name $spoke2_vnet_name \
+        --remote-vnet $hub_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    # Spoke1 to Spoke2
+    az network vnet peering create -n spoke12spoke2 -g $rg --vnet-name $spoke1_vnet_name \
+        --remote-vnet $spoke2_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n spoke22spoke1 -g $rg --vnet-name $spoke2_vnet_name \
+        --remote-vnet $spoke1_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+fi
+
+##############################################
+# Deploy VNRA via az rest
+##############################################
+
+# Docs:
+# - https://learn.microsoft.com/azure/templates/microsoft.network/virtualnetworkappliances?pivots=deployment-language-arm-template
+
+if [[ "$create_vnra" == "yes" ]]; then
+    echo "Deploying Virtual Network Routing Appliance in the hub VNet..."
+    vnra_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $hub_vnet_name \
+        -n $hub_vnra_subnet_name --query id -o tsv)
+    vnra_uri="/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualNetworkAppliances/${vnra_name}?api-version=${vnra_api_version}"
+    vnra_body="{
+        \"location\": \"${location}\",
+        \"properties\": {
+            \"bandwidthInGbps\": \"${vnra_bandwidth}\",
+            \"subnet\": {
+                \"id\": \"${vnra_subnet_id}\"
+            }
+        }
+    }"
+    az rest --method PUT --uri "$vnra_uri" --body "$vnra_body" -o none
+    echo "Waiting for VNRA provisioning..."
+    vnra_state=""
+    while [[ "$vnra_state" != "Succeeded" ]]; do
+        sleep 15
+        vnra_state=$(az rest --method GET --uri "$vnra_uri" --query 'properties.provisioningState' -o tsv 2>/dev/null)
+        echo "  VNRA provisioning state: $vnra_state"
+        if [[ "$vnra_state" == "Failed" ]]; then
+            echo "ERROR: VNRA provisioning failed."
+            az rest --method GET --uri "$vnra_uri" -o json
+            break
+        fi
+    done
+    # Extract VNRA private IP(s)
+    vnra_details=$(az rest --method GET --uri "$vnra_uri" -o json)
+    echo "VNRA deployment details:"
+    echo "$vnra_details" | jq
+    # Try to extract the internal IP - the property path may vary
+    vnra_ip=$(echo "$vnra_details" | jq -r '.properties.ipConfigurations[] | select(.properties.primary==true) | .properties.privateIPAddress')
+    if [[ -z "$vnra_ip" ]]; then
+        echo "WARNING: Could not auto-detect VNRA private IP. Inspect the VNRA resource above."
+        echo "Set vnra_ip manually: vnra_ip=<ip>"
+    else
+        echo "VNRA private IP: $vnra_ip"
+    fi
+fi
+
+##############################################
+# Route tables
+##############################################
+
+echo "Creating route tables..."
+# Get local public IP for SSH access preservation
+myip=$(curl -s4 ifconfig.co)
+
+# Spoke1 route table
+az network route-table create -n $spoke1_rt_name -g $rg -l $location -o none
+az network route-table route create -n mypc -g $rg --route-table-name $spoke1_rt_name \
+    --address-prefix "${myip}/32" --next-hop-type Internet -o none
+az network vnet subnet update -g $rg --vnet-name $spoke1_vnet_name -n $spoke1_vm_subnet_name \
+    --route-table $spoke1_rt_name -o none
+
+# Spoke2 route table
+az network route-table create -n $spoke2_rt_name -g $rg -l $location -o none
+az network route-table route create -n mypc -g $rg --route-table-name $spoke2_rt_name \
+    --address-prefix "${myip}/32" --next-hop-type Internet -o none
+az network vnet subnet update -g $rg --vnet-name $spoke2_vnet_name -n $spoke2_vm_subnet_name \
+    --route-table $spoke2_rt_name -o none
+
+# Hub VM subnet route table
+az network route-table create -n $hub_vm_rt_name -g $rg -l $location -o none
+az network route-table route create -n mypc -g $rg --route-table-name $hub_vm_rt_name \
+    --address-prefix "${myip}/32" --next-hop-type Internet -o none
+az network vnet subnet update -g $rg --vnet-name $hub_vnet_name -n $hub_vm_subnet_name \
+    --route-table $hub_vm_rt_name -o none
+
+# Add routes to every other VNet via the VNRA and overwrites the system peering routes.
+function add_vnra_routes() {
+    echo "Adding VNRA routes to spoke1 route table..."
+    az network route-table route create -n to-spoke2 -g $rg --route-table-name $spoke1_rt_name \
+        --address-prefix $spoke2_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+    az network route-table route create -n to-hub -g $rg --route-table-name $spoke1_rt_name \
+        --address-prefix $hub_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+    echo "Adding VNRA routes to spoke2 route table..."
+    az network route-table route create -n to-spoke1 -g $rg --route-table-name $spoke2_rt_name \
+        --address-prefix $spoke1_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+    az network route-table route create -n to-hub -g $rg --route-table-name $spoke2_rt_name \
+        --address-prefix $hub_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+    echo "Adding VNRA routes to hub VM route table..."
+    az network route-table route create -n to-spoke1 -g $rg --route-table-name $hub_vm_rt_name \
+        --address-prefix $spoke1_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+    az network route-table route create -n to-spoke2 -g $rg --route-table-name $hub_vm_rt_name \
+        --address-prefix $spoke2_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+    echo "Waiting for route propagation after route addition..."
+    sleep 30
+}
+
+# Removes the routes pointing to the VNRA, so that the peering routes kick in.
+function remove_vnra_routes() {
+    echo "Removing VNRA routes from spoke1 route table..."
+    az network route-table route delete -n to-spoke2 -g $rg --route-table-name $spoke1_rt_name -o none
+    az network route-table route delete -n to-hub -g $rg --route-table-name $spoke1_rt_name -o none
+    echo "Removing VNRA routes from spoke2 route table..."
+    az network route-table route delete -n to-spoke1 -g $rg --route-table-name $spoke2_rt_name -o none
+    az network route-table route delete -n to-hub -g $rg --route-table-name $spoke2_rt_name -o none
+    echo "Removing VNRA routes from hub VM route table..."
+    az network route-table route delete -n to-spoke1 -g $rg --route-table-name $hub_vm_rt_name -o none
+    az network route-table route delete -n to-spoke2 -g $rg --route-table-name $hub_vm_rt_name -o none
+    echo "Waiting for route propagation after route removal..."
+    sleep 30
+}
+
+add_vnra_routes
+
+##############################################
+# NSGs
+##############################################
+
+echo "Creating NSG..."
+az network nsg create -n $nsg_name -g $rg -l $location -o none
+az network nsg rule create --nsg-name $nsg_name -g $rg -n AllowSSH --priority 1000 \
+    --access Allow --protocol Tcp --direction Inbound \
+    --destination-port-ranges 22 -o none
+az network nsg rule create --nsg-name $nsg_name -g $rg -n AllowICMP --priority 1010 \
+    --access Allow --protocol Icmp --direction Inbound \
+    --destination-port-ranges '*' -o none
+az network nsg rule create --nsg-name $nsg_name -g $rg -n AllowRFC1918 --priority 1020 \
+    --access Allow --protocol '*' --direction Inbound \
+    --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' \
+    --destination-port-ranges '*' -o none
+az network nsg rule create --nsg-name $nsg_name -g $rg -n AllowIperf --priority 1030 \
+    --access Allow --protocol Tcp --direction Inbound \
+    --destination-port-ranges 5201 -o none
+az network nsg rule create --nsg-name $nsg_name -g $rg -n AllowQperf --priority 1040 \
+    --access Allow --protocol Tcp --direction Inbound \
+    --destination-port-ranges 19765 -o none
+
+
+##############################################
+# Cloud-init for test VMs
+##############################################
+
+cat <<'EOF' > $vm_cloudinit_file
+#cloud-config
+packages:
+  - iperf3
+  - qperf
+  - traceroute
+  - nmap
+  - curl
+  - net-tools
+  - netperf
+runcmd:
+  - echo "Cloud-init for VNRA test VM complete"
+EOF
+
+##############################################
+# Test VMs (Ubuntu 22.04)
+##############################################
+
+function create_vms() {
+    # Verify with Azure Resource Graph if the VMs exist and are the correct size. Otherwise delete them
+    arg_query="Resources | where type =~ 'Microsoft.Compute/virtualMachines' and name in~ ('$hub_vm1_name', '$spoke1_vm1_name', '$spoke2_vm1_name') | project name, location, properties.hardwareProfile.vmSize"
+    existing_vms=$(az graph query -q "$arg_query" --subscriptions $subscription_id -o json)
+    # (Re)Create VMs
+    echo "Creating test VMs..."
+    spoke1_vm1_exists=$(echo $existing_vms | jq -r ".data[] | select(.name==\"$spoke1_vm1_name\") | .name")
+    spoke1_vm1_size=$(echo $existing_vms | jq -r ".data[] | select(.name==\"$spoke1_vm1_name\") | .properties_hardwareProfile_vmSize")
+    if [[ "$spoke1_vm1_exists" == "$spoke1_vm1_name" ]] && [[ "$spoke1_vm1_size" == "$vm_size" ]]; then
+        echo "VM $spoke1_vm1_name already exists and is the correct size. Skipping creation."
+    else
+        echo "Recreating VM $spoke1_vm1_name because it either does not exist or is not the correct size."
+        az vm delete -n $spoke1_vm1_name -g $rg --yes --no-wait 2>/dev/null || true
+        az vm create -n $spoke1_vm1_name -g $rg -l $location --image $vm_image --size $vm_size \
+            --generate-ssh-keys --public-ip-sku Standard --public-ip-address "${spoke1_vm1_name}-pip" \
+            --vnet-name $spoke1_vnet_name --subnet $spoke1_vm_subnet_name \
+            --nsg $nsg_name --custom-data $vm_cloudinit_file --no-wait -o none --only-show-errors
+    fi
+    spoke2_vm1_exists=$(echo $existing_vms | jq -r ".data[] | select(.name==\"$spoke2_vm1_name\") | .name")
+    spoke2_vm1_size=$(echo $existing_vms | jq -r ".data[] | select(.name==\"$spoke2_vm1_name\") | .properties_hardwareProfile_vmSize")
+    if [[ "$spoke2_vm1_exists" == "$spoke2_vm1_name" ]] && [[ "$spoke2_vm1_size" == "$vm_size" ]]; then
+        echo "VM $spoke2_vm1_name already exists and is the correct size. Skipping creation."
+    else
+        echo "Recreating VM $spoke2_vm1_name because it either does not exist or is not the correct size."
+        az vm delete -n $spoke2_vm1_name -g $rg --yes --no-wait 2>/dev/null || true
+        az vm create -n $spoke2_vm1_name -g $rg -l $location --image $vm_image --size $vm_size \
+            --generate-ssh-keys --public-ip-sku Standard --public-ip-address "${spoke2_vm1_name}-pip" \
+            --vnet-name $spoke2_vnet_name --subnet $spoke2_vm_subnet_name \
+            --nsg $nsg_name --custom-data $vm_cloudinit_file --no-wait -o none --only-show-errors
+    fi
+    hub_vm1_exists=$(echo $existing_vms | jq -r ".data[] | select(.name==\"$hub_vm1_name\") | .name")
+    hub_vm1_size=$(echo $existing_vms | jq -r ".data[] | select(.name==\"$hub_vm1_name\") | .properties_hardwareProfile_vmSize")
+    if [[ "$hub_vm1_exists" == "$hub_vm1_name" ]] && [[ "$hub_vm1_size" == "$vm_size" ]]; then
+        echo "VM $hub_vm1_name already exists and is the correct size. Skipping creation."
+    else
+        echo "Recreating VM $hub_vm1_name because it either does not exist or is not the correct size."
+        az vm delete -n $hub_vm1_name -g $rg --yes --no-wait 2>/dev/null || true
+        az vm create -n $hub_vm1_name -g $rg -l $location --image $vm_image --size $vm_size \
+            --generate-ssh-keys --public-ip-sku Standard --public-ip-address "${hub_vm1_name}-pip" \
+            --vnet-name $hub_vnet_name --subnet $hub_vm_subnet_name \
+            --nsg $nsg_name --custom-data $vm_cloudinit_file --no-wait -o none --only-show-errors
+    fi
+    echo "Waiting for VMs to be ready..."
+    sleep 5 # Initial wait before checking VM status
+    az vm wait -g $rg --created -o none --ids \
+        $(az vm show -g $rg -n $hub_vm1_name --query id -o tsv) \
+        $(az vm show -g $rg -n $spoke1_vm1_name --query id -o tsv) \
+        $(az vm show -g $rg -n $spoke2_vm1_name --query id -o tsv)
+}
+create_vms
+
+# Retrieve IPs
+hub_vm1_pip=$(az network public-ip show -n "${hub_vm1_name}-pip" -g $rg --query ipAddress -o tsv)
+spoke1_vm1_pip=$(az network public-ip show -n "${spoke1_vm1_name}-pip" -g $rg --query ipAddress -o tsv)
+spoke2_vm1_pip=$(az network public-ip show -n "${spoke2_vm1_name}-pip" -g $rg --query ipAddress -o tsv)
+hub_vm1_private_ip=$(az vm show -g $rg -n $hub_vm1_name -d --query privateIps -o tsv)
+spoke1_vm1_private_ip=$(az vm show -g $rg -n $spoke1_vm1_name -d --query privateIps -o tsv)
+spoke2_vm1_private_ip=$(az vm show -g $rg -n $spoke2_vm1_name -d --query privateIps -o tsv)
+echo "Hub VM:    PIP=$hub_vm1_pip  Private=$hub_vm1_private_ip"
+echo "Spoke1 VM: PIP=$spoke1_vm1_pip  Private=$spoke1_vm1_private_ip"
+echo "Spoke2 VM: PIP=$spoke2_vm1_pip  Private=$spoke2_vm1_private_ip"
+
+##############################################
+# Update local IP route (if PIP changed)
+##############################################
+
+myip=$(curl -s4 ifconfig.co)
+az network route-table route update -n mypc -g $rg --route-table-name $spoke1_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none 2>/dev/null
+az network route-table route update -n mypc -g $rg --route-table-name $spoke2_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none 2>/dev/null
+az network route-table route update -n mypc -g $rg --route-table-name $hub_vm_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none 2>/dev/null
+
+##############################################
+# Functional tests
+##############################################
+
+if [[ "$run_functional_tests" == "yes" ]]; then
+    echo ""
+    echo "============================================"
+    echo "  FUNCTIONAL TESTS"
+    echo "============================================"
+
+    # Test 1: VNRA resource status
+    echo ""
+    echo "--- Test 1: VNRA resource status ---"
+    vnra_uri="/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualNetworkAppliances/${vnra_name}?api-version=${vnra_api_version}"
+    vnra_prov_state=$(az rest --method GET --uri "$vnra_uri" --query 'properties.provisioningState' -o tsv 2>/dev/null)
+    echo "VNRA provisioning state: $vnra_prov_state"
+
+    # Test 2: Spoke1 → Spoke2 connectivity (ping)
+    echo ""
+    echo "--- Test 2: Spoke1 → Spoke2 ping (via VNRA) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "ping -c 5 -W 2 $spoke2_vm1_private_ip"
+
+    # Test 3: Spoke2 → Spoke1 connectivity (ping)
+    echo ""
+    echo "--- Test 3: Spoke2 → Spoke1 ping (via VNRA) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "ping -c 5 -W 2 $spoke1_vm1_private_ip"
+
+    # Test 4: Hub → Spoke1 connectivity (ping)
+    echo ""
+    echo "--- Test 4: Hub → Spoke1 ping ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "ping -c 5 -W 2 $spoke1_vm1_private_ip"
+
+    # Test 5: Hub → Spoke2 connectivity (ping)
+    echo ""
+    echo "--- Test 5: Hub → Spoke2 ping ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "ping -c 5 -W 2 $spoke2_vm1_private_ip"
+
+    # Test 6: Traceroute Spoke1 → Spoke2 (VNRA not visible in the path)
+    echo ""
+    echo "--- Test 6: Traceroute (mtr) Spoke1 → Spoke2 (check VNRA hop) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "mtr --report -T -P 22 $spoke2_vm1_private_ip"
+
+    # Test 7: Traceroute Spoke2 → Spoke1 (VNRA not visible in the path)
+    echo ""
+    echo "--- Test 7: Traceroute (mtr) Spoke2 → Spoke1 (check VNRA hop) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "mtr --report -T -P 22 $spoke1_vm1_private_ip"
+
+    # Test 8: Outbound connectivity
+    echo ""
+    echo "--- Test 8: Outbound connectivity ---"
+    echo -n "  Hub VM egress IP: "
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "curl -s4 ifconfig.me"
+    echo ""
+    echo -n "  Spoke1 VM egress IP: "
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "curl -s4 ifconfig.me"
+    echo ""
+    echo -n "  Spoke2 VM egress IP: "
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "curl -s4 ifconfig.me"
+    echo ""
+
+    # Test 9: DNS resolution
+    echo ""
+    echo "--- Test 9: DNS resolution ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "nslookup www.microsoft.com | head -6"
+
+    # Test 10: Effective routes
+    echo ""
+    echo "--- Test 10: Effective routes ---"
+    hub_nic_id=$(az vm show -n $hub_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    spoke1_nic_id=$(az vm show -n $spoke1_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    spoke2_nic_id=$(az vm show -n $spoke2_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    echo "  Hub VM effective routes:"
+    az network nic show-effective-route-table --ids $hub_nic_id -o table
+    echo "  Spoke1 VM effective routes:"
+    az network nic show-effective-route-table --ids $spoke1_nic_id -o table
+    echo "  Spoke2 VM effective routes:"
+    az network nic show-effective-route-table --ids $spoke2_nic_id -o table
+fi
+
+##############################################
+# Performance tests
+##############################################
+
+if [[ "$run_performance_tests" == "yes" ]]; then
+
+    # Resize VMs if required
+    # echo "Ensuring VMs are the desired size ($vm_size) for performance tests..."
+    # for vm_name in $hub_vm1_name $spoke1_vm1_name $spoke2_vm1_name; do
+    #     current_size=$(az vm show -n $vm_name -g $rg --query 'hardwareProfile.vmSize' -o tsv)
+    #     if [[ "$current_size" != "$vm_size" ]]; then
+    #         echo "Resizing $vm_name from $current_size to $vm_size..."
+    #         # az vm deallocate -n $vm_name -g $rg -o none # Deallocate before resizing to not be constrained to a cluster that supports the new size
+    #         az vm resize -n $vm_name -g $rg --size $vm_size -o none --no-wait
+    #     else
+    #         echo "$vm_name is already the desired size ($vm_size)."
+    #     fi
+    # done
+    # echo "Getting information about the VM SKU $vm_size to estimate expected bandwidth..."
+    # vm_sku_info=$(az vm list-skus --location $location --size $vm_size --query '[0]' -o json)
+    # expected_bandwidth=$(echo "$vm_sku_info" | jq -r '.capabilities[] | select(.name=="MaxNetworkBandwidthInGbps") | .value')
+    # if [[ -n "$expected_bandwidth" ]]; then
+    #     expected_bandwidth="${expected_bandwidth% Gbps}"
+    # else
+    #     expected_bandwidth="Unknown"
+    # fi
+    # echo "Expected max bandwidth for $vm_size: ${expected_bandwidth}"
+    # accelerated_nw=$(echo "$vm_sku_info" | jq -r '.capabilities[] | select(.name=="AcceleratedNetworkingEnabled") | .value')
+    # echo "Accelerated Networking for $vm_size: $accelerated_nw"
+    # rdma_support=$(echo "$vm_sku_info" | jq -r '.capabilities[] | select(.name=="RdmaEnabled") | .value')
+    # echo "RDMA support for $vm_size: $rdma_support"
+    # echo "Waiting for VMs to be running after resize (if applicable)..."
+    # az vm wait -g $rg --custom "instanceView.statuses[?code=='PowerState/running']" -o none --ids \
+    #     $(az vm show -g $rg -n $hub_vm1_name --query id -o tsv) \
+    #     $(az vm show -g $rg -n $spoke1_vm1_name --query id -o tsv) \
+    #     $(az vm show -g $rg -n $spoke2_vm1_name --query id -o tsv)
+    create_vms # Re-run the VM creation function to ensure VMs are resized if needed
+
+
+    echo ""
+    echo "============================================"
+    echo "  PERFORMANCE TESTS"
+    echo "============================================"
+
+    # Removing VNRA routes to let the peering routes take effect and test performance without VNRA in the path as well.
+    echo "Removing VNRA routes to test performance without VNRA in the path (can take around 60 seconds)..."
+    remove_vnra_routes
+
+    # Start iperf3 and qperf servers on all machines
+    echo "Starting iperf3 and qperf servers..."
+    echo "  Spoke1 VM: (re)starting iperf3 and qperf servers"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "pkill iperf3; sleep 1; nohup iperf3 -s -D"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "pkill qperf; sleep 1; nohup qperf --listen_port 19765 2>&1 &"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "sudo sysctl -w net.core.wmem_max=$net_core_mem_max"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "sudo sysctl -w net.core.rmem_max=$net_core_mem_max"
+    echo "  Spoke2 VM: (re)starting iperf3 and qperf servers"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "pkill iperf3; sleep 1; nohup iperf3 -s -D"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "pkill qperf; sleep 1; nohup qperf --listen_port 19765 2>&1 &"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "sudo sysctl -w net.core.wmem_max=$net_core_mem_max"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "sudo sysctl -w net.core.rmem_max=$net_core_mem_max"
+    echo "  Hub VM: (re)starting iperf3 and qperf servers"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "pkill iperf3; sleep 1; nohup iperf3 -s -D"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "pkill qperf; sleep 1; nohup qperf --listen_port 19765 2>&1 &"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo sysctl -w net.core.wmem_max=$net_core_mem_max"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo sysctl -w net.core.rmem_max=$net_core_mem_max"
+    sleep 3
+
+    # Perf Test 1a: Latency - Spoke1 → Spoke2 (100 pings)
+    echo ""
+    echo "--- Perf Test 1: Baseline latency Spoke1 → Spoke2 (100 pings) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "ping -c 100 -i 0.05 $spoke2_vm1_private_ip | tail -3"
+
+    # Perf Test 1b: Latency - Spoke1 → Spoke2 (qperf)
+    echo ""
+    echo "--- Perf Test 1b: Baseline latency Spoke1 → Spoke2 (qperf) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "qperf $spoke2_vm1_private_ip tcp_lat udp_lat"
+
+    # Perf Test 2a: Latency - Hub → Spoke1 (100 pings)
+    echo ""
+    echo "--- Perf Test 2a: Baseline latency Hub → Spoke1 (100 pings) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "ping -c 100 -i 0.05 $spoke1_vm1_private_ip | tail -3"
+
+    # Perf Test 2b: Latency - Hub → Spoke1 (qperf)
+    echo ""
+    echo "--- Perf Test 2b: Baseline latency Hub → Spoke1 (qperf) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "qperf $spoke1_vm1_private_ip tcp_lat udp_lat"
+
+    # Perf Test 3: iperf3 TCP 8 parallel streams - Spoke1 → Spoke2
+    echo ""
+    echo "--- Perf Test 3: Baseline iperf3 TCP 8 parallel streams and 10M TCP window Spoke1 → Spoke2 (30s) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "iperf3 -c $spoke2_vm1_private_ip -t 30 -P 8 -w 10M -i 10 | grep ' 0.00-30' | grep SUM"
+
+    # Perf Test 4: iperf3 UDP - Spoke1 → Spoke2 (10 Gbps target)
+    echo ""
+    echo "--- Perf Test 4: Baseline iperf3 UDP Spoke1 → Spoke2 (10 Gbps, 30s) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "iperf3 -c $spoke2_vm1_private_ip -u -b 10G -t 30 -i 10 | grep ' 0.00-30'"
+
+    # Perf Test 9: Concurrent flows - Multiple iperf3 sessions
+    # echo ""
+    # echo "--- Perf Test 9: Concurrent flows (4 parallel iperf3 sessions, 30s) ---"
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "pkill iperf3; sleep 1; for p in 5201 5202 5203 5204; do iperf3 -s -p \$p -D; done"
+    # sleep 2
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "
+    #     for p in 5201 5202 5203 5204; do
+    #         iperf3 -c $spoke2_vm1_private_ip -p \$p -t 30 -i 30 &
+    #     done
+    #     wait
+    # "
+
+    # Perf Test 10: Packet size sweep - Spoke1 → Spoke2
+    # echo ""
+    # echo "--- Perf Test 10: Packet size sweep Spoke1 → Spoke2 ---"
+    # for psize in 64 512 1024 1472; do
+    #     echo "  Packet size: $psize bytes"
+    #     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "ping -c 20 -s $psize -i 0.1 $spoke2_vm1_private_ip | tail -2"
+    # done
+
+    # Adding VNRA routes back for the next tests with VNRA in the path.
+    echo "Adding VNRA routes back for the next tests with VNRA in the path (can take around 60 seconds)..."
+    add_vnra_routes
+
+    # Perf Test 1a: Latency - Spoke1 → Spoke2 (100 pings)
+    echo ""
+    echo "--- Perf Test 5a: VNRA latency Spoke1 → Spoke2 (100 pings) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "ping -c 100 -i 0.05 $spoke2_vm1_private_ip | tail -3"
+
+    # Perf Test 1b: Latency - Spoke1 → Spoke2 (qperf)
+    echo ""
+    echo "--- Perf Test 5b: VNRA latency Spoke1 → Spoke2 (qperf) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "qperf $spoke2_vm1_private_ip tcp_lat udp_lat"
+
+    # Perf Test 2a: Latency - Hub → Spoke1 (100 pings)
+    echo ""
+    echo "--- Perf Test 6a: VNRA latency Hub → Spoke1 (100 pings) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "ping -c 100 -i 0.05 $spoke1_vm1_private_ip | tail -3"
+
+    # Perf Test 2b: Latency - Hub → Spoke1 (qperf)
+    echo ""
+    echo "--- Perf Test 6b: VNRA latency Hub → Spoke1 (qperf) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "qperf $spoke1_vm1_private_ip tcp_lat udp_lat"
+
+    # Perf Test 3: iperf3 TCP 8 parallel streams - Spoke1 → Spoke2
+    echo ""
+    echo "--- Perf Test 7: VNRA iperf3 TCP 8 parallel streams and 10M TCP window Spoke1 → Spoke2 (30s) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "iperf3 -c $spoke2_vm1_private_ip -t 30 -P 8 -w 10M -i 10 | grep ' 0.00-30' | grep SUM"
+
+    # Perf Test 4: iperf3 UDP - Spoke1 → Spoke2 (10 Gbps target)
+    echo ""
+    echo "--- Perf Test 8: VNRA iperf3 UDP Spoke1 → Spoke2 (10 Gbps, 30s) ---"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "iperf3 -c $spoke2_vm1_private_ip -u -b 10G -t 30 -i 10 | grep ' 0.00-30'"
+
+    # Restart default iperf3 server on spoke2
+    # ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "pkill iperf3; sleep 1; iperf3 -s -D"
+
+    # Kill iperf3 and qperf servers
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "pkill iperf3; pkill qperf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "pkill iperf3; pkill qperf"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "pkill iperf3; pkill qperf"
+fi
+
+##############################################
+# Diagnostics
+##############################################
+
+echo ""
+echo "============================================"
+echo "  DIAGNOSTICS"
+echo "============================================"
+
+echo ""
+echo "--- VM IP Addresses ---"
+az vm list-ip-addresses -g $rg -o table
+
+echo ""
+echo "--- VNRA resource details ---"
+vnra_uri="/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualNetworkAppliances/${vnra_name}?api-version=${vnra_api_version}"
+az rest --method GET --uri "$vnra_uri" -o json 2>/dev/null
+
+echo ""
+echo "--- VNet peering status ---"
+az network vnet peering list -g $rg --vnet-name $hub_vnet_name -o table
+az network vnet peering list -g $rg --vnet-name $spoke1_vnet_name -o table
+az network vnet peering list -g $rg --vnet-name $spoke2_vnet_name -o table
+
+echo ""
+echo "--- Route tables ---"
+az network route-table route list -g $rg --route-table-name $spoke1_rt_name -o table
+az network route-table route list -g $rg --route-table-name $spoke2_rt_name -o table
+az network route-table route list -g $rg --route-table-name $hub_vm_rt_name -o table
+
+echo ""
+echo "--- Effective routes ---"
+hub_nic_id=$(az vm show -n $hub_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke1_nic_id=$(az vm show -n $spoke1_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+spoke2_nic_id=$(az vm show -n $spoke2_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+echo "Hub VM:"
+az network nic show-effective-route-table --ids $hub_nic_id -o table
+echo "Spoke1 VM:"
+az network nic show-effective-route-table --ids $spoke1_nic_id -o table
+echo "Spoke2 VM:"
+az network nic show-effective-route-table --ids $spoke2_nic_id -o table
+
+echo ""
+echo "--- NSG rules ---"
+az network nsg rule list --nsg-name $nsg_name -g $rg -o table
+
+##############################################
+# Cleanup
+##############################################
+
+# Delete VNRA first (in case it blocks RG deletion)
+# az rest --method DELETE --uri "/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualNetworkAppliances/${vnra_name}?api-version=${vnra_api_version}" -o none
+# az group delete -y -n $rg --no-wait
