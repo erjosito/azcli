@@ -373,6 +373,24 @@ echo "Hub VM:    PIP=$hub_vm1_pip  Private=$hub_vm1_private_ip"
 echo "Spoke1 VM: PIP=$spoke1_vm1_pip  Private=$spoke1_vm1_private_ip"
 echo "Spoke2 VM: PIP=$spoke2_vm1_pip  Private=$spoke2_vm1_private_ip"
 
+# To save costs
+function stop_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        echo "Deallocating VM $vm_name..."
+        az vm deallocate -g $rg -n "$vm_name" --no-wait -o none
+    done <<< "$vm_list"
+}
+# Start VMs
+function start_vms() {
+    vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
+    while IFS= read -r vm_name; do
+        echo "Starting VM $vm_name..."
+        az vm start -g $rg -n "$vm_name" --no-wait -o none
+    done <<< "$vm_list"
+}
+
+
 ##############################################
 # Update local IP route (if PIP changed)
 ##############################################
