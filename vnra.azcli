@@ -355,6 +355,10 @@ function create_vms() {
         $(az vm show -g $rg -n $hub_vm1_name --query id -o tsv) \
         $(az vm show -g $rg -n $spoke1_vm1_name --query id -o tsv) \
         $(az vm show -g $rg -n $spoke2_vm1_name --query id -o tsv)
+    echo "Removing entries from SSH hosts file to avoid conflicts after potential VM re-creation..."
+    ssh-keygen -R $hub_vm1_pip 2>/dev/null || true
+    ssh-keygen -R $spoke1_vm1_pip 2>/dev/null || true
+    ssh-keygen -R $spoke2_vm1_pip 2>/dev/null || true
 }
 create_vms
 
@@ -508,21 +512,21 @@ if [[ "$run_performance_tests" == "yes" ]]; then
     # Start iperf3 and qperf servers on all machines
     echo "Starting iperf3 and qperf servers..."
     echo "  Spoke1 VM: (re)starting iperf3 and qperf servers"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "pkill iperf3; sleep 1; nohup iperf3 -s -D"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "pkill qperf; sleep 1; nohup qperf --listen_port 19765 2>&1 &"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "pkill iperf3 || true; sleep 1; nohup iperf3 -s -D"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "pkill qperf || true; sleep 1; setsid -f qperf --listen_port 19765 >/dev/null 2>&1"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "sudo sysctl -w net.core.wmem_max=$net_core_mem_max"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "sudo sysctl -w net.core.rmem_max=$net_core_mem_max"
     echo "  Spoke2 VM: (re)starting iperf3 and qperf servers"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "pkill iperf3; sleep 1; nohup iperf3 -s -D"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "pkill qperf; sleep 1; nohup qperf --listen_port 19765 2>&1 &"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "pkill iperf3 || true; sleep 1; nohup iperf3 -s -D"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "pkill qperf || true; sleep 1; setsid -f qperf --listen_port 19765 >/dev/null 2>&1"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "sudo sysctl -w net.core.wmem_max=$net_core_mem_max"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "sudo sysctl -w net.core.rmem_max=$net_core_mem_max"
     echo "  Hub VM: (re)starting iperf3 and qperf servers"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "pkill iperf3; sleep 1; nohup iperf3 -s -D"
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "pkill qperf; sleep 1; nohup qperf --listen_port 19765 2>&1 &"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "pkill iperf3 || true; sleep 1; nohup iperf3 -s -D"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "pkill qperf || true; sleep 1; setsid -f qperf --listen_port 19765 >/dev/null 2>&1"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo sysctl -w net.core.wmem_max=$net_core_mem_max"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo sysctl -w net.core.rmem_max=$net_core_mem_max"
-    sleep 3
+    sleep 1 # Give servers a moment to start
 
     # Perf Test 1a: Latency - Spoke1 → Spoke2 (100 pings)
     echo ""
@@ -578,32 +582,32 @@ if [[ "$run_performance_tests" == "yes" ]]; then
     echo "Adding VNRA routes back for the next tests with VNRA in the path (can take around 60 seconds)..."
     add_vnra_routes
 
-    # Perf Test 1a: Latency - Spoke1 → Spoke2 (100 pings)
+    # Perf Test 5a: Latency - Spoke1 → Spoke2 (100 pings)
     echo ""
     echo "--- Perf Test 5a: VNRA latency Spoke1 → Spoke2 (100 pings) ---"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "ping -c 100 -i 0.05 $spoke2_vm1_private_ip | tail -3"
 
-    # Perf Test 1b: Latency - Spoke1 → Spoke2 (qperf)
+    # Perf Test 5b: Latency - Spoke1 → Spoke2 (qperf)
     echo ""
     echo "--- Perf Test 5b: VNRA latency Spoke1 → Spoke2 (qperf) ---"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "qperf $spoke2_vm1_private_ip tcp_lat udp_lat"
 
-    # Perf Test 2a: Latency - Hub → Spoke1 (100 pings)
+    # Perf Test 6a: Latency - Hub → Spoke1 (100 pings)
     echo ""
     echo "--- Perf Test 6a: VNRA latency Hub → Spoke1 (100 pings) ---"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "ping -c 100 -i 0.05 $spoke1_vm1_private_ip | tail -3"
 
-    # Perf Test 2b: Latency - Hub → Spoke1 (qperf)
+    # Perf Test 6b: Latency - Hub → Spoke1 (qperf)
     echo ""
     echo "--- Perf Test 6b: VNRA latency Hub → Spoke1 (qperf) ---"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "qperf $spoke1_vm1_private_ip tcp_lat udp_lat"
 
-    # Perf Test 3: iperf3 TCP 8 parallel streams - Spoke1 → Spoke2
+    # Perf Test 7: iperf3 TCP 8 parallel streams - Spoke1 → Spoke2
     echo ""
     echo "--- Perf Test 7: VNRA iperf3 TCP 8 parallel streams and 10M TCP window Spoke1 → Spoke2 (30s) ---"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "iperf3 -c $spoke2_vm1_private_ip -t 30 -P 8 -w 10M -i 10 | grep ' 0.00-30' | grep SUM"
 
-    # Perf Test 4: iperf3 UDP - Spoke1 → Spoke2 (10 Gbps target)
+    # Perf Test 8: iperf3 UDP - Spoke1 → Spoke2 (10 Gbps target)
     echo ""
     echo "--- Perf Test 8: VNRA iperf3 UDP Spoke1 → Spoke2 (10 Gbps, 30s) ---"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "iperf3 -c $spoke2_vm1_private_ip -u -b 10G -t 30 -i 10 | grep ' 0.00-30'"
