@@ -22,10 +22,14 @@ create_vnra=yes
 create_spokes=yes
 run_functional_tests=yes
 run_performance_tests=yes
+create_hub2=yes
+create_vpn=yes
+configure_nva=yes
 
 # General
 rg=vnra
 location=westeurope
+location2=uksouth  # Hub2 region (must be VNRA-supported, D4s_v5 available)
 subscription_id=$(az account show --query id -o tsv)
 
 # Hub VNet
@@ -69,6 +73,60 @@ hub_vm_rt_name=hubvm-rt
 
 # NSG
 nsg_name=vnra-yourvm-nsg
+nsg2_name=vnra-hub2vm-nsg  # Hub2 region NSG
+
+# Hub2 VNet
+hub2_vnet_name=hub2
+hub2_vnet_prefix=10.2.0.0/24
+hub2_vnra_subnet_name=VirtualNetworkApplianceSubnet
+hub2_vnra_subnet_prefix=10.2.0.0/26
+hub2_vm_subnet_name=vm
+hub2_vm_subnet_prefix=10.2.0.64/26
+
+# Spoke3 VNet (hub2)
+spoke3_vnet_name=spoke3
+spoke3_vnet_prefix=10.2.1.0/24
+spoke3_vm_subnet_name=vm
+spoke3_vm_subnet_prefix=10.2.1.0/24
+
+# Spoke4 VNet (hub2)
+spoke4_vnet_name=spoke4
+spoke4_vnet_prefix=10.2.2.0/24
+spoke4_vm_subnet_name=vm
+spoke4_vm_subnet_prefix=10.2.2.0/24
+
+# Hub2 VNRA
+vnra2_name=hub2vnra
+
+# Hub2 VMs
+hub2_vm1_name=hub2vm1
+spoke3_vm1_name=spoke3vm1
+spoke4_vm1_name=spoke4vm1
+
+# Hub2 Route tables
+spoke3_rt_name=spoke3-rt
+spoke4_rt_name=spoke4-rt
+hub2_vm_rt_name=hub2vm-rt
+
+# VNRA subnet route tables (for cross-hub routing)
+hub_vnra_rt_name=hubvnra-rt
+hub2_vnra_rt_name=hub2vnra-rt
+
+# VPN Gateway (in hub1)
+hub_gw_subnet_prefix=10.1.0.128/26
+hub_vpngw_name=hub-vpngw
+hub_vpngw_pip_name=hub-vpngw-pip
+
+# On-premises (simulated)
+onprem_vnet_name=onprem
+onprem_vnet_prefix=192.168.0.0/24
+onprem_vm_subnet_name=vm
+onprem_vm_subnet_prefix=192.168.0.0/26
+onprem_gw_subnet_prefix=192.168.0.64/26
+onprem_vpngw_name=onprem-vpngw
+onprem_vpngw_pip_name=onprem-vpngw-pip
+onprem_vm1_name=onpremvm1
+vpn_shared_key=$(openssl rand -base64 24)
 
 ##############################################
 # Feature registration check
@@ -108,6 +166,36 @@ az network vnet create -g $rg -n $hub_vnet_name --address-prefix $hub_vnet_prefi
     -l $location -o none
 az network vnet subnet create -g $rg --vnet-name $hub_vnet_name \
     -n $hub_vm_subnet_name --address-prefix $hub_vm_subnet_prefix -o none
+if [[ "$create_vpn" == "yes" ]]; then
+    az network vnet subnet create -g $rg --vnet-name $hub_vnet_name \
+        -n GatewaySubnet --address-prefix $hub_gw_subnet_prefix -o none
+fi
+
+##############################################
+# Hub2 VNet
+##############################################
+
+if [[ "$create_hub2" == "yes" ]]; then
+    echo "Creating hub2 VNet in $location2..."
+    az network vnet create -g $rg -n $hub2_vnet_name --address-prefix $hub2_vnet_prefix \
+        --subnet-name $hub2_vnra_subnet_name --subnet-prefix $hub2_vnra_subnet_prefix \
+        -l $location2 -o none
+    az network vnet subnet create -g $rg --vnet-name $hub2_vnet_name \
+        -n $hub2_vm_subnet_name --address-prefix $hub2_vm_subnet_prefix -o none
+fi
+
+##############################################
+# On-premises VNet (simulated)
+##############################################
+
+if [[ "$create_vpn" == "yes" ]]; then
+    echo "Creating on-premises VNet..."
+    az network vnet create -g $rg -n $onprem_vnet_name --address-prefix $onprem_vnet_prefix \
+        --subnet-name $onprem_vm_subnet_name --subnet-prefix $onprem_vm_subnet_prefix \
+        -l $location -o none
+    az network vnet subnet create -g $rg --vnet-name $onprem_vnet_name \
+        -n GatewaySubnet --address-prefix $onprem_gw_subnet_prefix -o none
+fi
 
 ##############################################
 # Spoke VNets
@@ -121,6 +209,20 @@ if [[ "$create_spokes" == "yes" ]]; then
     az network vnet create -g $rg -n $spoke2_vnet_name --address-prefix $spoke2_vnet_prefix \
         --subnet-name $spoke2_vm_subnet_name --subnet-prefix $spoke2_vm_subnet_prefix \
         -l $location -o none
+fi
+
+##############################################
+# Hub2 Spoke VNets
+##############################################
+
+if [[ "$create_hub2" == "yes" ]]; then
+    echo "Creating hub2 spoke VNets in $location2..."
+    az network vnet create -g $rg -n $spoke3_vnet_name --address-prefix $spoke3_vnet_prefix \
+        --subnet-name $spoke3_vm_subnet_name --subnet-prefix $spoke3_vm_subnet_prefix \
+        -l $location2 -o none
+    az network vnet create -g $rg -n $spoke4_vnet_name --address-prefix $spoke4_vnet_prefix \
+        --subnet-name $spoke4_vm_subnet_name --subnet-prefix $spoke4_vm_subnet_prefix \
+        -l $location2 -o none
 fi
 
 ##############################################
@@ -144,6 +246,35 @@ if [[ "$create_spokes" == "yes" ]]; then
         --remote-vnet $spoke2_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
     az network vnet peering create -n spoke22spoke1 -g $rg --vnet-name $spoke2_vnet_name \
         --remote-vnet $spoke1_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+fi
+
+##############################################
+# Hub2 VNet peerings
+##############################################
+
+if [[ "$create_hub2" == "yes" ]]; then
+    echo "Creating hub2 VNet peerings..."
+    # Hub2 to Spoke3
+    az network vnet peering create -n hub22spoke3 -g $rg --vnet-name $hub2_vnet_name \
+        --remote-vnet $spoke3_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n spoke32hub2 -g $rg --vnet-name $spoke3_vnet_name \
+        --remote-vnet $hub2_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    # Hub2 to Spoke4
+    az network vnet peering create -n hub22spoke4 -g $rg --vnet-name $hub2_vnet_name \
+        --remote-vnet $spoke4_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n spoke42hub2 -g $rg --vnet-name $spoke4_vnet_name \
+        --remote-vnet $hub2_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    # Spoke3 to Spoke4
+    az network vnet peering create -n spoke32spoke4 -g $rg --vnet-name $spoke3_vnet_name \
+        --remote-vnet $spoke4_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n spoke42spoke3 -g $rg --vnet-name $spoke4_vnet_name \
+        --remote-vnet $spoke3_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    # Hub1 to Hub2
+    echo "Peering hub1 and hub2..."
+    az network vnet peering create -n hub2hub2 -g $rg --vnet-name $hub_vnet_name \
+        --remote-vnet $hub2_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+    az network vnet peering create -n hub22hub -g $rg --vnet-name $hub2_vnet_name \
+        --remote-vnet $hub_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
 fi
 
 ##############################################
@@ -195,8 +326,63 @@ if [[ "$create_vnra" == "yes" ]]; then
 fi
 
 ##############################################
-# Route tables
+# Deploy Hub2 VNRA via az rest
 ##############################################
+
+if [[ "$create_hub2" == "yes" ]] && [[ "$create_vnra" == "yes" ]]; then
+    echo "Deploying Virtual Network Routing Appliance in hub2 VNet..."
+    vnra2_subnet_id=$(az network vnet subnet show -g $rg --vnet-name $hub2_vnet_name \
+        -n $hub2_vnra_subnet_name --query id -o tsv)
+    vnra2_uri="/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualNetworkAppliances/${vnra2_name}?api-version=${vnra_api_version}"
+    vnra2_body="{
+        \"location\": \"${location2}\",
+        \"properties\": {
+            \"bandwidthInGbps\": \"${vnra_bandwidth}\",
+            \"subnet\": {
+                \"id\": \"${vnra2_subnet_id}\"
+            }
+        }
+    }"
+    az rest --method PUT --uri "$vnra2_uri" --body "$vnra2_body" -o none
+    echo "Waiting for Hub2 VNRA provisioning..."
+    vnra2_state=""
+    while [[ "$vnra2_state" != "Succeeded" ]]; do
+        sleep 15
+        vnra2_state=$(az rest --method GET --uri "$vnra2_uri" --query 'properties.provisioningState' -o tsv 2>/dev/null)
+        echo "  Hub2 VNRA provisioning state: $vnra2_state"
+        if [[ "$vnra2_state" == "Failed" ]]; then
+            echo "ERROR: Hub2 VNRA provisioning failed."
+            az rest --method GET --uri "$vnra2_uri" -o json
+            break
+        fi
+    done
+    vnra2_details=$(az rest --method GET --uri "$vnra2_uri" -o json)
+    echo "Hub2 VNRA deployment details:"
+    echo "$vnra2_details" | jq
+    vnra2_ip=$(echo "$vnra2_details" | jq -r '.properties.ipConfigurations[] | select(.properties.primary==true) | .properties.privateIPAddress')
+    if [[ -z "$vnra2_ip" ]]; then
+        echo "WARNING: Could not auto-detect Hub2 VNRA private IP."
+        echo "Set vnra2_ip manually: vnra2_ip=<ip>"
+    else
+        echo "Hub2 VNRA private IP: $vnra2_ip"
+    fi
+fi
+
+##############################################
+# VPN Gateways (start creation early, they take ~30 min)
+##############################################
+
+if [[ "$create_vpn" == "yes" ]]; then
+    echo "Creating VPN Gateways (this takes 20-40 minutes)..."
+    az network public-ip create -n $hub_vpngw_pip_name -g $rg -l $location --sku Standard --allocation-method Static -o none
+    az network public-ip create -n $onprem_vpngw_pip_name -g $rg -l $location --sku Standard --allocation-method Static -o none
+    az network vnet-gateway create -n $hub_vpngw_name -g $rg --vnet $hub_vnet_name \
+        --public-ip-address $hub_vpngw_pip_name --gateway-type Vpn --vpn-type RouteBased \
+        --sku VpnGw1 --no-wait -o none
+    az network vnet-gateway create -n $onprem_vpngw_name -g $rg --vnet $onprem_vnet_name \
+        --public-ip-address $onprem_vpngw_pip_name --gateway-type Vpn --vpn-type RouteBased \
+        --sku VpnGw1 --no-wait -o none
+fi
 
 echo "Creating route tables..."
 # Get local public IP for SSH access preservation
@@ -223,7 +409,35 @@ az network route-table route create -n mypc -g $rg --route-table-name $hub_vm_rt
 az network vnet subnet update -g $rg --vnet-name $hub_vnet_name -n $hub_vm_subnet_name \
     --route-table $hub_vm_rt_name -o none
 
-# Add routes to every other VNet via the VNRA and overwrites the system peering routes.
+if [[ "$create_hub2" == "yes" ]]; then
+    # Spoke3 route table
+    az network route-table create -n $spoke3_rt_name -g $rg -l $location2 -o none
+    az network route-table route create -n mypc -g $rg --route-table-name $spoke3_rt_name \
+        --address-prefix "${myip}/32" --next-hop-type Internet -o none
+    az network vnet subnet update -g $rg --vnet-name $spoke3_vnet_name -n $spoke3_vm_subnet_name \
+        --route-table $spoke3_rt_name -o none
+    # Spoke4 route table
+    az network route-table create -n $spoke4_rt_name -g $rg -l $location2 -o none
+    az network route-table route create -n mypc -g $rg --route-table-name $spoke4_rt_name \
+        --address-prefix "${myip}/32" --next-hop-type Internet -o none
+    az network vnet subnet update -g $rg --vnet-name $spoke4_vnet_name -n $spoke4_vm_subnet_name \
+        --route-table $spoke4_rt_name -o none
+    # Hub2 VM subnet route table
+    az network route-table create -n $hub2_vm_rt_name -g $rg -l $location2 -o none
+    az network route-table route create -n mypc -g $rg --route-table-name $hub2_vm_rt_name \
+        --address-prefix "${myip}/32" --next-hop-type Internet -o none
+    az network vnet subnet update -g $rg --vnet-name $hub2_vnet_name -n $hub2_vm_subnet_name \
+        --route-table $hub2_vm_rt_name -o none
+    # VNRA subnet route tables (for cross-hub forwarding)
+    az network route-table create -n $hub_vnra_rt_name -g $rg -l $location -o none
+    az network vnet subnet update -g $rg --vnet-name $hub_vnet_name -n $hub_vnra_subnet_name \
+        --route-table $hub_vnra_rt_name -o none
+    az network route-table create -n $hub2_vnra_rt_name -g $rg -l $location2 -o none
+    az network vnet subnet update -g $rg --vnet-name $hub2_vnet_name -n $hub2_vnra_subnet_name \
+        --route-table $hub2_vnra_rt_name -o none
+fi
+
+# Spoke-to-spoke routes via VNRA (overwrites system peering routes)
 function add_vnra_routes() {
     echo "Adding VNRA routes to spoke1 route table..."
     az network route-table route create -n to-spoke2 -g $rg --route-table-name $spoke1_rt_name \
@@ -240,6 +454,46 @@ function add_vnra_routes() {
         --address-prefix $spoke1_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
     az network route-table route create -n to-spoke2 -g $rg --route-table-name $hub_vm_rt_name \
         --address-prefix $spoke2_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+    if [[ "$create_hub2" == "yes" ]]; then
+        echo "Adding VNRA routes for hub2 spoke-to-spoke..."
+        az network route-table route create -n to-spoke4 -g $rg --route-table-name $spoke3_rt_name \
+            --address-prefix $spoke4_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra2_ip -o none
+        az network route-table route create -n to-spoke3 -g $rg --route-table-name $spoke4_rt_name \
+            --address-prefix $spoke3_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra2_ip -o none
+        az network route-table route create -n to-spoke3 -g $rg --route-table-name $hub2_vm_rt_name \
+            --address-prefix $spoke3_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra2_ip -o none
+        az network route-table route create -n to-spoke4 -g $rg --route-table-name $hub2_vm_rt_name \
+            --address-prefix $spoke4_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra2_ip -o none
+        echo "Adding cross-hub VNRA routes (hub1 spokes → hub2 spokes)..."
+        for rt in $spoke1_rt_name $spoke2_rt_name; do
+            az network route-table route create -n to-spoke3 -g $rg --route-table-name $rt \
+                --address-prefix $spoke3_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+            az network route-table route create -n to-spoke4 -g $rg --route-table-name $rt \
+                --address-prefix $spoke4_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+            az network route-table route create -n to-hub2 -g $rg --route-table-name $rt \
+                --address-prefix $hub2_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+        done
+        echo "Adding cross-hub VNRA routes (hub2 spokes → hub1 spokes)..."
+        for rt in $spoke3_rt_name $spoke4_rt_name; do
+            az network route-table route create -n to-spoke1 -g $rg --route-table-name $rt \
+                --address-prefix $spoke1_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra2_ip -o none
+            az network route-table route create -n to-spoke2 -g $rg --route-table-name $rt \
+                --address-prefix $spoke2_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra2_ip -o none
+            az network route-table route create -n to-hub1 -g $rg --route-table-name $rt \
+                --address-prefix $hub_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra2_ip -o none
+        done
+        echo "Adding VNRA subnet cross-hub forwarding routes..."
+        # Hub1 VNRA forwards hub2 spoke traffic to hub2 VNRA
+        az network route-table route create -n to-spoke3 -g $rg --route-table-name $hub_vnra_rt_name \
+            --address-prefix $spoke3_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra2_ip -o none
+        az network route-table route create -n to-spoke4 -g $rg --route-table-name $hub_vnra_rt_name \
+            --address-prefix $spoke4_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra2_ip -o none
+        # Hub2 VNRA forwards hub1 spoke traffic to hub1 VNRA
+        az network route-table route create -n to-spoke1 -g $rg --route-table-name $hub2_vnra_rt_name \
+            --address-prefix $spoke1_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+        az network route-table route create -n to-spoke2 -g $rg --route-table-name $hub2_vnra_rt_name \
+            --address-prefix $spoke2_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $vnra_ip -o none
+    fi
     echo "Waiting for route propagation after route addition..."
     sleep 30
 }
@@ -255,7 +509,53 @@ function remove_vnra_routes() {
     echo "Removing VNRA routes from hub VM route table..."
     az network route-table route delete -n to-spoke1 -g $rg --route-table-name $hub_vm_rt_name -o none
     az network route-table route delete -n to-spoke2 -g $rg --route-table-name $hub_vm_rt_name -o none
+    if [[ "$create_hub2" == "yes" ]]; then
+        echo "Removing hub2 VNRA routes..."
+        az network route-table route delete -n to-spoke4 -g $rg --route-table-name $spoke3_rt_name -o none
+        az network route-table route delete -n to-spoke3 -g $rg --route-table-name $spoke4_rt_name -o none
+        az network route-table route delete -n to-spoke3 -g $rg --route-table-name $hub2_vm_rt_name -o none
+        az network route-table route delete -n to-spoke4 -g $rg --route-table-name $hub2_vm_rt_name -o none
+        for rt in $spoke1_rt_name $spoke2_rt_name; do
+            az network route-table route delete -n to-spoke3 -g $rg --route-table-name $rt -o none
+            az network route-table route delete -n to-spoke4 -g $rg --route-table-name $rt -o none
+            az network route-table route delete -n to-hub2 -g $rg --route-table-name $rt -o none
+        done
+        for rt in $spoke3_rt_name $spoke4_rt_name; do
+            az network route-table route delete -n to-spoke1 -g $rg --route-table-name $rt -o none
+            az network route-table route delete -n to-spoke2 -g $rg --route-table-name $rt -o none
+            az network route-table route delete -n to-hub1 -g $rg --route-table-name $rt -o none
+        done
+        az network route-table route delete -n to-spoke3 -g $rg --route-table-name $hub_vnra_rt_name -o none
+        az network route-table route delete -n to-spoke4 -g $rg --route-table-name $hub_vnra_rt_name -o none
+        az network route-table route delete -n to-spoke1 -g $rg --route-table-name $hub2_vnra_rt_name -o none
+        az network route-table route delete -n to-spoke2 -g $rg --route-table-name $hub2_vnra_rt_name -o none
+    fi
     echo "Waiting for route propagation after route removal..."
+    sleep 30
+}
+
+# NVA routes: spoke-to-onprem and spoke-to-internet via NVA (hub_vm1)
+function add_nva_routes() {
+    if [[ "$configure_nva" != "yes" ]]; then return; fi
+    echo "Adding NVA routes (onprem and internet via hub_vm1)..."
+    for rt in $spoke1_rt_name $spoke2_rt_name; do
+        az network route-table route create -n to-onprem -g $rg --route-table-name $rt \
+            --address-prefix $onprem_vnet_prefix --next-hop-type VirtualAppliance --next-hop-ip-address $hub_vm1_private_ip -o none
+        az network route-table route create -n to-internet -g $rg --route-table-name $rt \
+            --address-prefix '0.0.0.0/0' --next-hop-type VirtualAppliance --next-hop-ip-address $hub_vm1_private_ip -o none
+    done
+    echo "Waiting for NVA route propagation..."
+    sleep 30
+}
+
+function remove_nva_routes() {
+    if [[ "$configure_nva" != "yes" ]]; then return; fi
+    echo "Removing NVA routes..."
+    for rt in $spoke1_rt_name $spoke2_rt_name; do
+        az network route-table route delete -n to-onprem -g $rg --route-table-name $rt -o none 2>/dev/null
+        az network route-table route delete -n to-internet -g $rg --route-table-name $rt -o none 2>/dev/null
+    done
+    echo "Waiting for NVA route removal propagation..."
     sleep 30
 }
 
@@ -284,6 +584,27 @@ az network nsg rule create --nsg-name $nsg_name -g $rg -n AllowQperf --priority 
     --access Allow --protocol Tcp --direction Inbound \
     --destination-port-ranges 19765 -o none
 
+if [[ "$create_hub2" == "yes" ]]; then
+    echo "Creating NSG for hub2 region ($location2)..."
+    az network nsg create -n $nsg2_name -g $rg -l $location2 -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n AllowSSH --priority 1000 \
+        --access Allow --protocol Tcp --direction Inbound \
+        --destination-port-ranges 22 -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n AllowICMP --priority 1010 \
+        --access Allow --protocol Icmp --direction Inbound \
+        --destination-port-ranges '*' -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n AllowRFC1918 --priority 1020 \
+        --access Allow --protocol '*' --direction Inbound \
+        --source-address-prefixes '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' \
+        --destination-port-ranges '*' -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n AllowIperf --priority 1030 \
+        --access Allow --protocol Tcp --direction Inbound \
+        --destination-port-ranges 5201 -o none
+    az network nsg rule create --nsg-name $nsg2_name -g $rg -n AllowQperf --priority 1040 \
+        --access Allow --protocol Tcp --direction Inbound \
+        --destination-port-ranges 19765 -o none
+fi
+
 
 ##############################################
 # Cloud-init for test VMs
@@ -295,6 +616,7 @@ packages:
   - iperf3
   - qperf
   - traceroute
+  - mtr
   - nmap
   - curl
   - net-tools
@@ -373,6 +695,135 @@ echo "Hub VM:    PIP=$hub_vm1_pip  Private=$hub_vm1_private_ip"
 echo "Spoke1 VM: PIP=$spoke1_vm1_pip  Private=$spoke1_vm1_private_ip"
 echo "Spoke2 VM: PIP=$spoke2_vm1_pip  Private=$spoke2_vm1_private_ip"
 
+##############################################
+# Hub2 and on-premises VMs
+##############################################
+
+if [[ "$create_hub2" == "yes" ]]; then
+    echo "Creating hub2 VMs in $location2..."
+    az vm create -n $hub2_vm1_name -g $rg -l $location2 --image $vm_image --size $vm_size \
+        --generate-ssh-keys --public-ip-sku Standard --public-ip-address "${hub2_vm1_name}-pip" \
+        --vnet-name $hub2_vnet_name --subnet $hub2_vm_subnet_name \
+        --nsg $nsg2_name --custom-data $vm_cloudinit_file --no-wait -o none --only-show-errors
+    az vm create -n $spoke3_vm1_name -g $rg -l $location2 --image $vm_image --size $vm_size \
+        --generate-ssh-keys --public-ip-sku Standard --public-ip-address "${spoke3_vm1_name}-pip" \
+        --vnet-name $spoke3_vnet_name --subnet $spoke3_vm_subnet_name \
+        --nsg $nsg2_name --custom-data $vm_cloudinit_file --no-wait -o none --only-show-errors
+    az vm create -n $spoke4_vm1_name -g $rg -l $location2 --image $vm_image --size $vm_size \
+        --generate-ssh-keys --public-ip-sku Standard --public-ip-address "${spoke4_vm1_name}-pip" \
+        --vnet-name $spoke4_vnet_name --subnet $spoke4_vm_subnet_name \
+        --nsg $nsg2_name --custom-data $vm_cloudinit_file --no-wait -o none --only-show-errors
+fi
+
+if [[ "$create_vpn" == "yes" ]]; then
+    echo "Creating on-premises VM..."
+    az vm create -n $onprem_vm1_name -g $rg -l $location --image $vm_image --size $vm_size \
+        --generate-ssh-keys --public-ip-sku Standard --public-ip-address "${onprem_vm1_name}-pip" \
+        --vnet-name $onprem_vnet_name --subnet $onprem_vm_subnet_name \
+        --nsg $nsg_name --custom-data $vm_cloudinit_file --no-wait -o none --only-show-errors
+fi
+
+# Wait for hub2 and onprem VMs
+if [[ "$create_hub2" == "yes" ]]; then
+    echo "Waiting for hub2 VMs..."
+    sleep 5
+    az vm wait -g $rg --created -o none --ids \
+        $(az vm show -g $rg -n $hub2_vm1_name --query id -o tsv) \
+        $(az vm show -g $rg -n $spoke3_vm1_name --query id -o tsv) \
+        $(az vm show -g $rg -n $spoke4_vm1_name --query id -o tsv)
+    hub2_vm1_pip=$(az network public-ip show -n "${hub2_vm1_name}-pip" -g $rg --query ipAddress -o tsv)
+    spoke3_vm1_pip=$(az network public-ip show -n "${spoke3_vm1_name}-pip" -g $rg --query ipAddress -o tsv)
+    spoke4_vm1_pip=$(az network public-ip show -n "${spoke4_vm1_name}-pip" -g $rg --query ipAddress -o tsv)
+    hub2_vm1_private_ip=$(az vm show -g $rg -n $hub2_vm1_name -d --query privateIps -o tsv)
+    spoke3_vm1_private_ip=$(az vm show -g $rg -n $spoke3_vm1_name -d --query privateIps -o tsv)
+    spoke4_vm1_private_ip=$(az vm show -g $rg -n $spoke4_vm1_name -d --query privateIps -o tsv)
+    echo "Hub2 VM:   PIP=$hub2_vm1_pip  Private=$hub2_vm1_private_ip"
+    echo "Spoke3 VM: PIP=$spoke3_vm1_pip  Private=$spoke3_vm1_private_ip"
+    echo "Spoke4 VM: PIP=$spoke4_vm1_pip  Private=$spoke4_vm1_private_ip"
+fi
+
+if [[ "$create_vpn" == "yes" ]]; then
+    echo "Waiting for on-premises VM..."
+    sleep 5
+    az vm wait -g $rg --created -o none --ids $(az vm show -g $rg -n $onprem_vm1_name --query id -o tsv)
+    onprem_vm1_pip=$(az network public-ip show -n "${onprem_vm1_name}-pip" -g $rg --query ipAddress -o tsv)
+    onprem_vm1_private_ip=$(az vm show -g $rg -n $onprem_vm1_name -d --query privateIps -o tsv)
+    echo "Onprem VM: PIP=$onprem_vm1_pip  Private=$onprem_vm1_private_ip"
+fi
+
+##############################################
+# VPN Gateway connections
+##############################################
+
+if [[ "$create_vpn" == "yes" ]]; then
+    echo "Waiting for VPN Gateways to be provisioned (this may take 20-40 min)..."
+    az network vnet-gateway wait -n $hub_vpngw_name -g $rg --created 2>/dev/null
+    az network vnet-gateway wait -n $onprem_vpngw_name -g $rg --created 2>/dev/null
+    echo "VPN Gateways provisioned."
+
+    # Get VPN GW public IPs
+    hub_vpngw_pip_ip=$(az network public-ip show -n $hub_vpngw_pip_name -g $rg --query ipAddress -o tsv)
+    onprem_vpngw_pip_ip=$(az network public-ip show -n $onprem_vpngw_pip_name -g $rg --query ipAddress -o tsv)
+    echo "Hub VPN GW PIP: $hub_vpngw_pip_ip"
+    echo "On-prem VPN GW PIP: $onprem_vpngw_pip_ip"
+
+    # Local network gateways (static routing - define remote address prefixes)
+    echo "Creating local network gateways..."
+    az network local-gateway create -n onprem-lgw -g $rg -l $location \
+        --gateway-ip-address $onprem_vpngw_pip_ip \
+        --local-address-prefixes $onprem_vnet_prefix -o none
+    az network local-gateway create -n hub-lgw -g $rg -l $location \
+        --gateway-ip-address $hub_vpngw_pip_ip \
+        --local-address-prefixes $hub_vnet_prefix $spoke1_vnet_prefix $spoke2_vnet_prefix -o none
+
+    # VPN connections
+    echo "Creating VPN connections..."
+    az network vpn-connection create -n hub2onprem -g $rg -l $location \
+        --vnet-gateway1 $hub_vpngw_name --local-gateway2 onprem-lgw \
+        --shared-key "$vpn_shared_key" -o none
+    az network vpn-connection create -n onprem2hub -g $rg -l $location \
+        --vnet-gateway1 $onprem_vpngw_name --local-gateway2 hub-lgw \
+        --shared-key "$vpn_shared_key" -o none
+    echo "VPN connections created. Waiting for tunnels to establish..."
+    sleep 60
+    # Check connection status
+    echo "Hub→Onprem VPN status:"
+    az network vpn-connection show -n hub2onprem -g $rg --query '{status:connectionStatus,inBytes:ingressBytesTransferred,outBytes:egressBytesTransferred}' -o table
+    echo "Onprem→Hub VPN status:"
+    az network vpn-connection show -n onprem2hub -g $rg --query '{status:connectionStatus,inBytes:ingressBytesTransferred,outBytes:egressBytesTransferred}' -o table
+fi
+
+##############################################
+# Configure NVA (hub_vm1 as Network Virtual Appliance)
+##############################################
+
+if [[ "$configure_nva" == "yes" ]]; then
+    echo "Configuring hub_vm1 as NVA..."
+    # Enable IP forwarding at Azure NIC level
+    hub_vm1_nic_id=$(az vm show -n $hub_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    az network nic update --ids $hub_vm1_nic_id --ip-forwarding -o none
+    echo "  Azure NIC IP forwarding enabled."
+
+    # Enable IP forwarding and SNAT at OS level
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo sysctl -w net.ipv4.ip_forward=1"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo sysctl -w net.ipv4.conf.all.accept_redirects=0"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo sysctl -w net.ipv4.conf.all.send_redirects=0"
+    # SNAT only for Internet-bound traffic (not RFC1918)
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo iptables -t nat -A POSTROUTING ! -d 10.0.0.0/8 ! -d 172.16.0.0/12 ! -d 192.168.0.0/16 -j MASQUERADE"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo iptables -A FORWARD -j ACCEPT"
+    echo "  OS-level IP forwarding and SNAT configured."
+
+    # Verify NVA config
+    echo "  NVA verification:"
+    echo -n "    ip_forward: "
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sysctl -n net.ipv4.ip_forward"
+    echo "    iptables NAT rules:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo iptables -t nat -L POSTROUTING -n --line-numbers"
+
+    # Add NVA routes (spoke-to-onprem and spoke-to-internet via NVA)
+    add_nva_routes
+fi
+
 # To save costs
 function stop_vms() {
     vm_list=$(az vm list -o tsv -g "$rg" --query "[].name")
@@ -399,6 +850,11 @@ myip=$(curl -s4 ifconfig.co)
 az network route-table route update -n mypc -g $rg --route-table-name $spoke1_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none 2>/dev/null
 az network route-table route update -n mypc -g $rg --route-table-name $spoke2_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none 2>/dev/null
 az network route-table route update -n mypc -g $rg --route-table-name $hub_vm_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none 2>/dev/null
+if [[ "$create_hub2" == "yes" ]]; then
+    az network route-table route update -n mypc -g $rg --route-table-name $spoke3_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none 2>/dev/null
+    az network route-table route update -n mypc -g $rg --route-table-name $spoke4_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none 2>/dev/null
+    az network route-table route update -n mypc -g $rg --route-table-name $hub2_vm_rt_name --address-prefix "${myip}/32" --next-hop-type Internet -o none 2>/dev/null
+fi
 
 ##############################################
 # Functional tests
@@ -477,6 +933,142 @@ if [[ "$run_functional_tests" == "yes" ]]; then
     az network nic show-effective-route-table --ids $spoke1_nic_id -o table
     echo "  Spoke2 VM effective routes:"
     az network nic show-effective-route-table --ids $spoke2_nic_id -o table
+
+    ##############################################
+    # Cross-hub functional tests (hub2 spokes)
+    ##############################################
+
+    if [[ "$create_hub2" == "yes" ]]; then
+        echo ""
+        echo "============================================"
+        echo "  CROSS-HUB FUNCTIONAL TESTS"
+        echo "============================================"
+
+        # Test 11: Spoke3 → Spoke4 (hub2 local, via hub2 VNRA)
+        echo ""
+        echo "--- Test 11: mtr Spoke3 → Spoke4 (hub2 VNRA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke3_vm1_pip "mtr --report $spoke4_vm1_private_ip"
+
+        # Test 12: Spoke4 → Spoke3 (hub2 local, via hub2 VNRA)
+        echo ""
+        echo "--- Test 12: mtr Spoke4 → Spoke3 (hub2 VNRA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke4_vm1_pip "mtr --report $spoke3_vm1_private_ip"
+
+        # Test 13: Spoke1 → Spoke3 (cross-hub, via VNRA chain)
+        echo ""
+        echo "--- Test 13: mtr Spoke1 → Spoke3 (cross-hub via VNRA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "mtr --report $spoke3_vm1_private_ip"
+
+        # Test 14: Spoke3 → Spoke1 (cross-hub, via VNRA chain)
+        echo ""
+        echo "--- Test 14: mtr Spoke3 → Spoke1 (cross-hub via VNRA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke3_vm1_pip "mtr --report $spoke1_vm1_private_ip"
+
+        # Test 15: Spoke1 → Spoke4 (cross-hub)
+        echo ""
+        echo "--- Test 15: mtr Spoke1 → Spoke4 (cross-hub via VNRA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "mtr --report $spoke4_vm1_private_ip"
+
+        # Test 16: Spoke2 → Spoke3 (cross-hub)
+        echo ""
+        echo "--- Test 16: mtr Spoke2 → Spoke3 (cross-hub via VNRA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "mtr --report $spoke3_vm1_private_ip"
+
+        # Test 17: Hub2 VM effective routes
+        echo ""
+        echo "--- Test 17: Hub2 effective routes ---"
+        hub2_nic_id=$(az vm show -n $hub2_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        spoke3_nic_id=$(az vm show -n $spoke3_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        spoke4_nic_id=$(az vm show -n $spoke4_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+        echo "  Hub2 VM effective routes:"
+        az network nic show-effective-route-table --ids $hub2_nic_id -o table
+        echo "  Spoke3 VM effective routes:"
+        az network nic show-effective-route-table --ids $spoke3_nic_id -o table
+        echo "  Spoke4 VM effective routes:"
+        az network nic show-effective-route-table --ids $spoke4_nic_id -o table
+    fi
+
+    ##############################################
+    # VPN and on-premises functional tests
+    ##############################################
+
+    if [[ "$create_vpn" == "yes" ]]; then
+        echo ""
+        echo "============================================"
+        echo "  VPN / ON-PREMISES FUNCTIONAL TESTS"
+        echo "============================================"
+
+        # Test 18: Spoke1 → On-premises (via NVA → VPN GW)
+        echo ""
+        echo "--- Test 18: mtr Spoke1 → On-premises (via NVA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "mtr --report $onprem_vm1_private_ip"
+
+        # Test 19: Spoke2 → On-premises
+        echo ""
+        echo "--- Test 19: mtr Spoke2 → On-premises (via NVA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "mtr --report $onprem_vm1_private_ip"
+
+        # Test 20: On-premises → Spoke1
+        echo ""
+        echo "--- Test 20: mtr On-premises → Spoke1 ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_vm1_pip "mtr --report $spoke1_vm1_private_ip"
+
+        # Test 21: On-premises → Spoke2
+        echo ""
+        echo "--- Test 21: mtr On-premises → Spoke2 ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_vm1_pip "mtr --report $spoke2_vm1_private_ip"
+
+        # Test 22: On-premises → Hub VM
+        echo ""
+        echo "--- Test 22: mtr On-premises → Hub VM ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $onprem_vm1_pip "mtr --report $hub_vm1_private_ip"
+
+        # Test 23: VPN connection status
+        echo ""
+        echo "--- Test 23: VPN connection status ---"
+        az network vpn-connection show -n hub2onprem -g $rg --query '{name:name,status:connectionStatus}' -o table
+        az network vpn-connection show -n onprem2hub -g $rg --query '{name:name,status:connectionStatus}' -o table
+    fi
+
+    ##############################################
+    # NVA routing functional tests
+    ##############################################
+
+    if [[ "$configure_nva" == "yes" ]]; then
+        echo ""
+        echo "============================================"
+        echo "  NVA ROUTING FUNCTIONAL TESTS"
+        echo "============================================"
+
+        # Test 24: Spoke-to-Internet via NVA (verify SNAT)
+        echo ""
+        echo "--- Test 24: Spoke1 Internet egress via NVA ---"
+        echo -n "  NVA (hub_vm1) public IP: "
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "curl -s4 ifconfig.me"
+        echo ""
+        echo -n "  Spoke1 egress IP (should match NVA): "
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "curl -s4 --max-time 10 ifconfig.me"
+        echo ""
+        echo -n "  Spoke2 egress IP (should match NVA): "
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke2_vm1_pip "curl -s4 --max-time 10 ifconfig.me"
+        echo ""
+
+        # Test 25: mtr Spoke1 → Internet (verify NVA hop)
+        echo ""
+        echo "--- Test 25: mtr Spoke1 → 8.8.8.8 (Internet via NVA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "mtr --report 8.8.8.8"
+
+        # Test 26: Verify spoke-to-spoke still uses VNRA (not NVA)
+        echo ""
+        echo "--- Test 26: mtr Spoke1 → Spoke2 (should use VNRA, not NVA) ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "mtr --report $spoke2_vm1_private_ip"
+
+        # Test 27: NVA iptables counters
+        echo ""
+        echo "--- Test 27: NVA iptables counters ---"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo iptables -t nat -L POSTROUTING -n -v"
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo iptables -L FORWARD -n -v"
+    fi
 fi
 
 ##############################################
@@ -621,6 +1213,9 @@ if [[ "$run_performance_tests" == "yes" ]]; then
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "qperf $spoke1_vm1_private_ip tcp_lat udp_lat"
 
     # Perf Test 7: iperf3 TCP 8 parallel streams - Spoke1 → Spoke2
+    # Note: iperf3 has a pretty aggressive congestion control, that's why with higher latency, it overcompensates and drastically reduces the throughput. 
+    # Check if you get better results running iperf3 with bbr or cubic congestion control algorithms (should just be a change in argument)
+    # Also tools like ethr and ntttcp do better than iperf3.
     echo ""
     echo "--- Perf Test 7: VNRA iperf3 TCP 8 parallel streams and 10M TCP window Spoke1 → Spoke2 (30s) ---"
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $spoke1_vm1_pip "iperf3 -c $spoke2_vm1_private_ip -t 30 -P 8 -w 10M -i 10 | grep ' 0.00-30' | grep SUM"
@@ -656,18 +1251,36 @@ echo ""
 echo "--- VNRA resource details ---"
 vnra_uri="/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualNetworkAppliances/${vnra_name}?api-version=${vnra_api_version}"
 az rest --method GET --uri "$vnra_uri" -o json 2>/dev/null
+if [[ "$create_hub2" == "yes" ]]; then
+    echo ""
+    echo "--- Hub2 VNRA resource details ---"
+    vnra2_uri="/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualNetworkAppliances/${vnra2_name}?api-version=${vnra_api_version}"
+    az rest --method GET --uri "$vnra2_uri" -o json 2>/dev/null
+fi
 
 echo ""
 echo "--- VNet peering status ---"
 az network vnet peering list -g $rg --vnet-name $hub_vnet_name -o table
 az network vnet peering list -g $rg --vnet-name $spoke1_vnet_name -o table
 az network vnet peering list -g $rg --vnet-name $spoke2_vnet_name -o table
+if [[ "$create_hub2" == "yes" ]]; then
+    az network vnet peering list -g $rg --vnet-name $hub2_vnet_name -o table
+    az network vnet peering list -g $rg --vnet-name $spoke3_vnet_name -o table
+    az network vnet peering list -g $rg --vnet-name $spoke4_vnet_name -o table
+fi
 
 echo ""
 echo "--- Route tables ---"
 az network route-table route list -g $rg --route-table-name $spoke1_rt_name -o table
 az network route-table route list -g $rg --route-table-name $spoke2_rt_name -o table
 az network route-table route list -g $rg --route-table-name $hub_vm_rt_name -o table
+if [[ "$create_hub2" == "yes" ]]; then
+    az network route-table route list -g $rg --route-table-name $spoke3_rt_name -o table
+    az network route-table route list -g $rg --route-table-name $spoke4_rt_name -o table
+    az network route-table route list -g $rg --route-table-name $hub2_vm_rt_name -o table
+    az network route-table route list -g $rg --route-table-name $hub_vnra_rt_name -o table
+    az network route-table route list -g $rg --route-table-name $hub2_vnra_rt_name -o table
+fi
 
 echo ""
 echo "--- Effective routes ---"
@@ -680,15 +1293,50 @@ echo "Spoke1 VM:"
 az network nic show-effective-route-table --ids $spoke1_nic_id -o table
 echo "Spoke2 VM:"
 az network nic show-effective-route-table --ids $spoke2_nic_id -o table
+if [[ "$create_hub2" == "yes" ]]; then
+    hub2_nic_id=$(az vm show -n $hub2_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    spoke3_nic_id=$(az vm show -n $spoke3_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    spoke4_nic_id=$(az vm show -n $spoke4_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    echo "Hub2 VM:"
+    az network nic show-effective-route-table --ids $hub2_nic_id -o table
+    echo "Spoke3 VM:"
+    az network nic show-effective-route-table --ids $spoke3_nic_id -o table
+    echo "Spoke4 VM:"
+    az network nic show-effective-route-table --ids $spoke4_nic_id -o table
+fi
+if [[ "$create_vpn" == "yes" ]]; then
+    onprem_nic_id=$(az vm show -n $onprem_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    echo "On-prem VM:"
+    az network nic show-effective-route-table --ids $onprem_nic_id -o table
+fi
 
 echo ""
 echo "--- NSG rules ---"
 az network nsg rule list --nsg-name $nsg_name -g $rg -o table
 
+if [[ "$create_vpn" == "yes" ]]; then
+    echo ""
+    echo "--- VPN connection status ---"
+    az network vpn-connection show -n hub2onprem -g $rg --query '{name:name,status:connectionStatus}' -o table 2>/dev/null
+    az network vpn-connection show -n onprem2hub -g $rg --query '{name:name,status:connectionStatus}' -o table 2>/dev/null
+fi
+
+if [[ "$configure_nva" == "yes" ]]; then
+    echo ""
+    echo "--- NVA (hub_vm1) status ---"
+    echo "IP forwarding (NIC):"
+    az network nic show --ids $(az vm show -n $hub_vm1_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv) --query enableIPForwarding -o tsv
+    echo "IP forwarding (OS):"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sysctl -n net.ipv4.ip_forward"
+    echo "iptables NAT:"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $hub_vm1_pip "sudo iptables -t nat -L POSTROUTING -n -v"
+fi
+
 ##############################################
 # Cleanup
 ##############################################
 
-# Delete VNRA first (in case it blocks RG deletion)
+# Delete VNRAs first (in case they block RG deletion)
 # az rest --method DELETE --uri "/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualNetworkAppliances/${vnra_name}?api-version=${vnra_api_version}" -o none
+# az rest --method DELETE --uri "/subscriptions/${subscription_id}/resourceGroups/${rg}/providers/Microsoft.Network/virtualNetworkAppliances/${vnra2_name}?api-version=${vnra_api_version}" -o none
 # az group delete -y -n $rg --no-wait
