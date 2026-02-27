@@ -334,6 +334,71 @@ function update_all_ssh_keys() {
     done <<< "$vm_list"
 }
 
+##############################
+#         Resize VMs         #
+##############################
+
+# Resizes a given VM to a given size (1st parameter is the VM name, 2nd parameter is the new size, e.g., Standard_DS2_v2)
+function resize_vm() {
+    vm_name=$1
+    new_size=$2
+    # Verify the size of the VM, if it is already the desired size, skip
+    current_size=$(az vm show -g $rg -n $vm_name --query 'hardwareProfile.vmSize' -o tsv)
+    if [[ "$current_size" == "$new_size" ]]; then
+        echo "VM $vm_name is already of size $new_size, skipping..."
+        return
+    elif [[ -z "$current_size" ]]; then
+        echo "ERROR: VM $vm_name not found or size could not be retrieved"
+        return 1
+    else
+        # Try to resize the VM to the new size, if it fails with a message about the VM needing to be deallocated, deallocate it and try again
+        echo "Resizing VM $vm_name from $current_size to $new_size..."
+        az vm deallocate -g $rg -n $vm_name -o none
+        az vm resize -g $rg -n $vm_name --size $new_size -o none
+        # Verify the size of the VM, if it is already the desired size, we are done
+        current_size=$(az vm show -g $rg -n $vm_name --query 'hardwareProfile.vmSize' -o tsv)
+        if [[ "$current_size" == "$new_size" ]]; then
+            echo "VM $vm_name successfully resized to $new_size"
+        else
+            # Delete the VM and create one with the same name and new size, using the same OS disk and image
+            echo "Resizing VM $vm_name failed, deleting and recreating it with size $new_size..."
+            os_disk_id=$(az vm show -g $rg -n $vm_name --query 'storageProfile.osDisk.managedDisk.id' -o tsv)
+            os_type=$(az vm show -g $rg -n $vm_name --query 'storageProfile.osDisk.osType' -o tsv)
+            image=$(az vm show -g $rg -n $vm_name --query 'storageProfile.imageReference' -o json)
+            image_publisher=$(echo $image | jq -r '.publisher')
+            image_offer=$(echo $image | jq -r '.offer')
+            image_sku=$(echo $image | jq -r '.sku')
+            image_version=$(echo $image | jq -r '.version')
+            image_id="$image_publisher:$image_offer:$image_sku:$image_version"
+            az vm delete -g $rg -n $vm_name --yes -o none
+            # az vm create -g $rg -n $vm_name --attach-os-disk $os_disk_id --image $image_id --size $new_size -o none
+            az vm create -g $rg -n $vm_name --attach-os-disk $os_disk_id --os-type $os_type --size $new_size -o none
+            # Verify that the VM is created before checking the size
+            vm_id=$(az vm show -g $rg -n $vm_name --query 'id' -o tsv)
+            if [[ -z "$vm_id" ]]; then
+                echo "ERROR: VM $vm_name could not be recreated"
+                return 1
+            fi
+            # Verify the size of the VM, if it is already the desired size, we are done
+            current_size=$(az vm show -g $rg -n $vm_name --query 'hardwareProfile.vmSize' -o tsv)
+            if [[ "$current_size" == "$new_size" ]]; then
+                echo "VM $vm_name successfully resized to $new_size"
+            else
+                echo "ERROR: Resizing VM $vm_name failed, even after recreating it"
+            fi
+        fi
+    fi
+}
+
+# Resize all VMs in this resource group
+function resize_all_vms() {
+    new_size=$1
+    vm_list=$(az vm list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r vm_name; do
+        resize_vm $vm_name $new_size
+    done <<< "$vm_list"
+}
+
 ##################################
 #    Start/stop lab resources    #
 ##################################
