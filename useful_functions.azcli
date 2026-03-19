@@ -390,6 +390,34 @@ function resize_vm() {
     fi
 }
 
+# Delete a VM and its associated resources (NIC, public IP, disk)
+function delete_vm() {
+    vm_name=$1
+    echo "Deleting VM $vm_name and its associated resources..."
+    # Get the resource IDs of the VM, NIC, public IP and disk
+    vm_id=$(az vm show -g $rg -n $vm_name --query 'id' -o tsv)
+    nic_id=$(az vm show -g $rg -n $vm_name --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+    pip_id=$(az network nic show --ids $nic_id --query 'ipConfigurations[0].publicIpAddress.id' -o tsv)
+    disk_id=$(az vm show -g $rg -n $vm_name --query 'storageProfile.osDisk.managedDisk.id' -o tsv)
+    # Delete the resources in this order: VM, public IP, NIC and disk
+    az vm delete -g $rg -n $vm_name --yes -o none
+    az network nic delete --ids $nic_id -o none
+    if [[ -n "$pip_id" ]]; then
+        az network public-ip delete --ids $pip_id -o none
+    fi
+    if [[ -n "$disk_id" ]]; then
+        az disk delete --ids $disk_id --yes -o none
+    fi
+}
+
+# Delete all VMs in this resource group
+function delete_all_vms() {
+    vm_list=$(az vm list -g $rg --query '[].name' -o tsv)
+    while IFS= read -r vm_name; do
+        delete_vm $vm_name
+    done <<< "$vm_list"
+}
+
 # Resize all VMs in this resource group
 function resize_all_vms() {
     new_size=$1

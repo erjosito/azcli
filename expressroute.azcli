@@ -5,16 +5,16 @@
 #################################
 
 # Control
-rg=ertest
-location=australiaeast
-er_location=australiaeast
-er_pop=Sydney
+rg=er
+location=germanywestcentral
+er_location=germanywestcentral
+er_pop=Frankfurt
 er_circuit_sku=Standard
 er_circuit_family=MeteredData  # other values: MeteredData, UnlimitedData
-er_circuit_bw=1000   # other values: 50, 100, 200, 500, 1000
-create_spokes=no
-number_of_spokes=2
-simulate_onprem=no
+er_circuit_bw=50   # other values: 50, 100, 200, 500, 1000
+create_spokes=yes
+number_of_spokes=1
+simulate_onprem=yes
 create_ars=no
 flowlogs=no
 traffic_collector=no

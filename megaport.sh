@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!env bash
 
 #########################################
 # Scripts to interact with Megaport API
